@@ -8,7 +8,6 @@
 <div style="text-align: center;">
   <img src="https://img.shields.io/badge/Developed%20with-AI%20(Antigravity)-blueviolet?style=for-the-badge&logo=google-gemini" alt="Developed with AI (Antigravity)">
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-  <img src="https://img.shields.io/badge/Platform-Windows-lightgrey?style=for-the-badge&logo=windows" alt="Platform">
 </div>
 
 ![Screenshot](/preview/2026-07-05-224321.png)
@@ -78,7 +77,7 @@ npm run tauri:dev
 ### 构建打包
 
 ```bash
-# 构建 Windows 下的生产版本可执行程序
+# 构建生产版本可执行程序
 npm run tauri:build
 ```
 

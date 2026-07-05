@@ -102,7 +102,6 @@ pub fn run() {
             commands::open_workshop,
             commands::open_url,
             commands::steam_sync,
-            commands::read_cache_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

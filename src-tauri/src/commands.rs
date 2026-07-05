@@ -952,11 +952,3 @@ pub async fn steam_sync(
     Ok(db.clone())
 }
 
-#[tauri::command]
-pub async fn read_cache_image(
-    filename: String,
-    state: tauri::State<'_, crate::AppState>,
-) -> Result<Vec<u8>, String> {
-    let file_path = state.cache_dir.join(filename);
-    std::fs::read(&file_path).map_err(|e| e.to_string())
-}
