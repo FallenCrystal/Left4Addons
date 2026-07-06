@@ -7,6 +7,7 @@ interface ConfirmModalProps {
   message: string;
   onConfirm: () => void;
   onCancel: () => void;
+  isSubmitting?: boolean;
 }
 
 export const ConfirmModal: React.FC<ConfirmModalProps> = ({
@@ -15,6 +16,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   message,
   onConfirm,
   onCancel,
+  isSubmitting = false,
 }) => {
   if (!open) return null;
 
@@ -35,6 +37,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
             type="button" 
             className="btn btn-secondary" 
             onClick={onCancel}
+            disabled={isSubmitting}
           >
             取消
           </button>
@@ -42,6 +45,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
           <button 
             type="button" 
             className="btn btn-primary"
+            disabled={isSubmitting}
             onClick={() => {
               onConfirm();
               onCancel();

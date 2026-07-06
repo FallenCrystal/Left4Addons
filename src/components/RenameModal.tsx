@@ -12,6 +12,7 @@ interface RenameModalProps {
   addons: Record<string, Addon>;
   onCancel: () => void;
   onConfirm: (currentName: string, newVpkName: string) => void;
+  isSubmitting?: boolean;
 }
 
 export const RenameModal: React.FC<RenameModalProps> = ({
@@ -24,6 +25,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
   addons,
   onCancel,
   onConfirm,
+  isSubmitting = false,
 }) => {
   const [vpkName, setVpkName] = useState('');
 
@@ -72,6 +74,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
               className="btn btn-text" 
               style={{ padding: '4px 0', fontSize: '11px', marginTop: '4px' }}
               onClick={handleApplyTitle}
+              disabled={isSubmitting}
             >
               应用创意工坊标题作为文件名
             </button>
@@ -93,6 +96,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
             value={vpkName}
             onChange={(e) => setVpkName(e.target.value)}
             required
+            disabled={isSubmitting}
           />
         </div>
 
@@ -101,11 +105,12 @@ export const RenameModal: React.FC<RenameModalProps> = ({
             type="button" 
             className="btn btn-secondary" 
             onClick={onCancel}
+            disabled={isSubmitting}
           >
             取消
           </button>
-          <button type="submit" className="btn btn-primary">
-            重命名
+          <button type="submit" className="btn btn-primary" disabled={isSubmitting || !vpkName.trim()}>
+            {isSubmitting ? '正在重命名...' : '重命名'}
           </button>
         </div>
       </form>

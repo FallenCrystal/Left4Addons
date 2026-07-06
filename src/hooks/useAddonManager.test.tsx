@@ -229,4 +229,47 @@ describe('useAddonManager', () => {
 
     expect(result.current.groups).toHaveLength(0);
   });
+
+  test('should set isSubmitting to true during async actions and reset to false afterwards', async () => {
+    let resolvePromise: (value: unknown) => void = () => {};
+    const tauriPromise = new Promise((resolve) => {
+      resolvePromise = resolve;
+    });
+
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
+      }
+      if (cmd === 'save_settings') {
+        return tauriPromise;
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.isSubmitting).toBe(false);
+
+    // Call saveSettings
+    let savePromise: Promise<void> | null = null;
+    act(() => {
+      savePromise = result.current.saveSettings('/new/loading/dir');
+    });
+
+    // isSubmitting should be true immediately after invoking
+    expect(result.current.isSubmitting).toBe(true);
+
+    // Resolve the promise
+    await act(async () => {
+      resolvePromise({ addons: mockAddons, groups: mockGroups, settings: { ...mockSettings, loadingDir: '/new/loading/dir' } });
+      await savePromise;
+    });
+
+    // isSubmitting should reset to false
+    expect(result.current.isSubmitting).toBe(false);
+  });
 });

@@ -22,6 +22,7 @@ export function useAddonManager() {
   const [autoGrouping, setAutoGrouping] = useState(false);
   const [selectedVpkNames, setSelectedVpkNames] = useState<string[]>([]);
   const [isSelectMode, setIsSelectMode] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Modals state
   const [detailModal, setDetailModal] = useState<{ open: boolean; addon: Addon | null }>({ open: false, addon: null });
@@ -51,6 +52,7 @@ export function useAddonManager() {
         await invoke('move_addons', { vpkNames, targetDirType: 'loading' });
       } catch (err) {
         addToast('自动移动附件失败: ' + err, 'error');
+        setIsSubmitting(false);
         return; // Stop if move fails
       }
 
@@ -108,8 +110,10 @@ export function useAddonManager() {
 
   // Toggle addon enable/disable status
   const toggleAddon = async (vpkName: string, currentStatus: boolean) => {
+    if (isSubmitting) return;
     const addon = addons[vpkName];
     if (!addon) return;
+    setIsSubmitting(true);
     executeWithWorkshopCheck([addon], currentStatus ? '禁用组件' : '启用组件', async () => {
       try {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames: [vpkName], enabled: !currentStatus });
@@ -126,11 +130,15 @@ export function useAddonManager() {
         }
       } catch (err) {
         addToast('操作失败: ' + err, 'error');
+      } finally {
+        setIsSubmitting(false);
       }
     });
   };
 
   const toggleGroupAddons = async (addonsList: Addon[], enabled: boolean) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     executeWithWorkshopCheck(addonsList, enabled ? '批量启用组件' : '批量禁用组件', async () => {
       try {
         const vpkNames = addonsList.map(ad => ad.vpkName);
@@ -140,12 +148,16 @@ export function useAddonManager() {
         addToast(enabled ? '分组内所有组件已启用' : '分组内所有组件已禁用', 'success');
       } catch (err) {
         addToast('操作失败: ' + err, 'error');
+      } finally {
+        setIsSubmitting(false);
       }
     });
   };
 
   // Move addon to load or workshop directory
   const moveAddon = async (vpkName: string, currentDirType: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     const targetDirType = currentDirType === 'workshop' ? 'loading' : 'workshop';
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('move_addons', { vpkNames: [vpkName], targetDirType });
@@ -154,6 +166,8 @@ export function useAddonManager() {
       addToast(targetDirType === 'loading' ? '已移动到手动安装目录' : '已移动到创意工坊目录', 'success');
     } catch (err) {
       addToast('移动失败: ' + err, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -202,6 +216,8 @@ export function useAddonManager() {
 
   // Save Settings
   const saveSettings = async (loadingDir: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[]; settings?: Settings } = await invoke('save_settings', {
         loadingDir
@@ -213,13 +229,18 @@ export function useAddonManager() {
       addToast('设置保存并扫描成功', 'success');
     } catch (err) {
       addToast('保存失败: ' + err, 'error');
+      throw err;
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   // Save Rename Addon
   const submitRename = async (currentName: string, newVpkName: string) => {
+    if (isSubmitting) return;
     const addon = addons[currentName];
     if (!addon) return;
+    setIsSubmitting(true);
     executeWithWorkshopCheck([addon], '重命名文件', async () => {
       try {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('rename_addon', {
@@ -232,12 +253,16 @@ export function useAddonManager() {
         addToast('重命名成功', 'success');
       } catch (err) {
         addToast('重命名失败: ' + err, 'error');
+      } finally {
+        setIsSubmitting(false);
       }
     });
   };
 
   // Group Management APIs
   const handleCreateGroup = async (name: string, selectedAddons: string[]) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', {
         action: 'create',
@@ -250,6 +275,8 @@ export function useAddonManager() {
       addToast('新建分组成功', 'success');
     } catch (err) {
       addToast('创建分组失败: ' + err, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -259,6 +286,8 @@ export function useAddonManager() {
       title: '确认删除分组',
       message: '确定要删除这个分组吗？这不会删除文件，只会解散群组。',
       onConfirm: async () => {
+        if (isSubmitting) return;
+        setIsSubmitting(true);
         try {
           const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', { action: 'delete', groupId });
           setAddons(data.addons || {});
@@ -270,12 +299,16 @@ export function useAddonManager() {
           addToast('分组已删除', 'success');
         } catch (err) {
           addToast('删除失败: ' + err, 'error');
+        } finally {
+          setIsSubmitting(false);
         }
       }
     });
   };
 
   const handleRenameGroup = async (groupId: string, name: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', {
         action: 'rename-group',
@@ -288,6 +321,8 @@ export function useAddonManager() {
       addToast('分组已重命名', 'success');
     } catch (err) {
       addToast('操作失败: ' + err, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -295,15 +330,24 @@ export function useAddonManager() {
     const group = groups.find(g => g.id === groupId);
     if (!group) return;
     
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    
     try {
       if (actionType === 'enable' || actionType === 'disable') {
         const enabled = actionType === 'enable';
         const groupAddons = group.addons.map(name => addons[name]).filter(Boolean);
         executeWithWorkshopCheck(groupAddons, enabled ? '批量启用' : '批量禁用', async () => {
-          const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames: group.addons, enabled });
-          setAddons(data.addons || {});
-          setGroups(data.groups || []);
-          addToast(enabled ? '分组内所有组件已启用' : '分组内所有组件已禁用', 'success');
+          try {
+            const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames: group.addons, enabled });
+            setAddons(data.addons || {});
+            setGroups(data.groups || []);
+            addToast(enabled ? '分组内所有组件已启用' : '分组内所有组件已禁用', 'success');
+          } catch (err) {
+            addToast('操作失败: ' + err, 'error');
+          } finally {
+            setIsSubmitting(false);
+          }
         });
       } else if (actionType === 'move-load') {
         const targetDirType = 'loading';
@@ -317,6 +361,8 @@ export function useAddonManager() {
             addToast('分组内所有组件已移动到手动安装目录', 'success');
           } catch (err) {
             addToast('批量操作失败: ' + err, 'error');
+          } finally {
+            setIsSubmitting(false);
           }
         };
 
@@ -333,10 +379,13 @@ export function useAddonManager() {
       }
     } catch (err) {
       addToast('批量操作失败: ' + err, 'error');
+      setIsSubmitting(false);
     }
   };
 
   const removeAddonFromGroup = async (vpkName: string, groupId: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', {
         action: 'remove-addons',
@@ -348,10 +397,14 @@ export function useAddonManager() {
       addToast('已移出该分组', 'success');
     } catch (err) {
       addToast('操作失败: ' + err, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const addAddonToGroup = async (vpkName: string, groupId: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', {
         action: 'add-addons',
@@ -363,6 +416,8 @@ export function useAddonManager() {
       addToast('已加入分组', 'success');
     } catch (err) {
       addToast('操作失败: ' + (err as Error).message, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -442,6 +497,8 @@ export function useAddonManager() {
   // Batch actions
   const handleBatchToggle = async (enabled: boolean) => {
     if (selectedVpkNames.length === 0) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
     executeWithWorkshopCheck(selectedAddonsList, enabled ? '批量启用组件' : '批量禁用组件', async () => {
       try {
@@ -455,12 +512,16 @@ export function useAddonManager() {
         handleClearSelection();
       } catch (err) {
         addToast('操作失败: ' + err, 'error');
+      } finally {
+        setIsSubmitting(false);
       }
     });
   };
 
   const handleBatchMove = async () => {
     if (selectedVpkNames.length === 0) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
     const workshopAddons = selectedAddonsList.filter(ad => ad.dirType === 'workshop');
     
@@ -476,6 +537,8 @@ export function useAddonManager() {
         handleClearSelection();
       } catch (err) {
         addToast('移动失败: ' + err, 'error');
+      } finally {
+        setIsSubmitting(false);
       }
     };
 
@@ -487,12 +550,14 @@ export function useAddonManager() {
         onConfirm: executeMove
       });
     } else {
-      executeMove();
+      await executeMove();
     }
   };
 
   const handleBatchRename = async () => {
     if (selectedVpkNames.length === 0) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     
     const renamesList: { vpkName: string; newVpkName: string }[] = [];
     const currentAddonsMap = { ...addons };
@@ -519,13 +584,14 @@ export function useAddonManager() {
     
     if (renamesList.length === 0) {
       addToast('选中的组件已是推荐文件名，无需重命名', 'success');
+      setIsSubmitting(false);
       return;
     }
 
     setConfirmModal({
       open: true,
       title: '批量自动重命名',
-      message: `确定要自动重命名选中的 ${renamesList.length} 个附件吗？系统将根据创意工坊标题和分组信息自动为它们命名。`,
+      message: `确定要自动重命名选中的 ${renamesList.length} 个附件吗？系统将根据创意工坊标题 and 分组信息自动为它们命名。`,
       onConfirm: async () => {
         const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
         executeWithWorkshopCheck(selectedAddonsList, '批量重命名文件', async () => {
@@ -539,6 +605,8 @@ export function useAddonManager() {
             handleClearSelection();
           } catch (err) {
             addToast('重命名失败: ' + err, 'error');
+          } finally {
+            setIsSubmitting(false);
           }
         });
       }
@@ -547,6 +615,8 @@ export function useAddonManager() {
 
   const handleBatchAddToGroup = async (groupId: string) => {
     if (selectedVpkNames.length === 0) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', {
         action: 'add-addons',
@@ -559,6 +629,8 @@ export function useAddonManager() {
       handleClearSelection();
     } catch (err) {
       addToast('操作失败: ' + err, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -732,6 +804,8 @@ export function useAddonManager() {
     selectedVpkNames,
     isSelectMode,
     setIsSelectMode,
+    isSubmitting,
+    setIsSubmitting,
     
     // Modals state
     detailModal,

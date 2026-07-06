@@ -17,6 +17,7 @@ interface AddonCardProps {
   isSelectMode: boolean;
   isSelected: boolean;
   onSelectToggle: (vpkName: string) => void;
+  isSubmitting?: boolean;
 }
 
 export const AddonCard: React.FC<AddonCardProps> = ({
@@ -32,6 +33,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   isSelectMode,
   isSelected,
   onSelectToggle,
+  isSubmitting = false,
 }) => {
   const categories = getAddonCategories(addon);
   const title = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
@@ -143,6 +145,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
             type="checkbox" 
             checked={addon.isEnabled} 
             onChange={() => onToggle(addon.vpkName, addon.isEnabled)}
+            disabled={isSubmitting}
           />
           <span className="slider"></span>
         </label>
@@ -150,7 +153,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         <div style={{ display: 'flex', gap: '6px' }}>
           {/* Group assign dropdown */}
           <div className="dropdown">
-            <button className="btn btn-secondary btn-icon-only" title="加入或移出群组">
+            <button className="btn btn-secondary btn-icon-only" title="加入或移出群组" disabled={isSubmitting}>
               <FolderPlus size={14} />
             </button>
             <div className="dropdown-content">
@@ -158,7 +161,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                 <button 
                   key={g.id} 
                   onClick={() => onAddToGroup(addon.vpkName, g.id)}
-                  disabled={itemGroup && itemGroup.id === g.id}
+                  disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
                 >
                   {g.name}
                 </button>
@@ -166,6 +169,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
               {itemGroup && (
                 <button 
                   onClick={() => onRemoveFromGroup(addon.vpkName, itemGroup.id)}
+                  disabled={isSubmitting}
                   style={{ color: 'var(--md-sys-color-error)' }}
                 >
                   从当前分组移出 ({itemGroup.name})
@@ -211,6 +215,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
             <button 
               className="btn btn-secondary btn-icon-only"
               onClick={() => onMoveClick(addon)}
+              disabled={isSubmitting}
               title="移动到手动安装目录 (Addons)"
             >
               <Move size={14} />
@@ -221,6 +226,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
           <button 
             className="btn btn-secondary btn-icon-only"
             onClick={() => onRenameClick(addon)}
+            disabled={isSubmitting}
             title="重命名附件文件"
           >
             <Edit3 size={14} />

@@ -6,6 +6,7 @@ interface EditGroupModalProps {
   currentName: string;
   onCancel: () => void;
   onConfirm: (groupId: string, newName: string) => void;
+  isSubmitting?: boolean;
 }
 
 export const EditGroupModal: React.FC<EditGroupModalProps> = ({
@@ -14,6 +15,7 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
   currentName,
   onCancel,
   onConfirm,
+  isSubmitting = false,
 }) => {
   const [name, setName] = useState('');
 
@@ -27,7 +29,7 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) return;
+    if (!name.trim() || isSubmitting) return;
     onConfirm(groupId, name.trim());
   };
 
@@ -44,6 +46,7 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
             value={name}
             onChange={(e) => setName(e.target.value)}
             required
+            disabled={isSubmitting}
           />
         </div>
 
@@ -52,11 +55,12 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
             type="button" 
             className="btn btn-secondary" 
             onClick={onCancel}
+            disabled={isSubmitting}
           >
             取消
           </button>
-          <button type="submit" className="btn btn-primary" disabled={!name.trim()}>
-            保存
+          <button type="submit" className="btn btn-primary" disabled={isSubmitting || !name.trim()}>
+            {isSubmitting ? '正在保存...' : '保存'}
           </button>
         </div>
       </form>

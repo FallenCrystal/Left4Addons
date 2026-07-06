@@ -13,7 +13,7 @@ import { LinkConfirmModal } from './components/LinkConfirmModal';
 import { RenameModal } from './components/RenameModal';
 import { GroupModal } from './components/GroupModal';
 import { EditGroupModal } from './components/EditGroupModal';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsView } from './components/SettingsView';
 import { DetailModal } from './components/DetailModal';
 import { WorkshopActionWarningModal } from './components/WorkshopActionWarningModal';
 import { StatsBar } from './components/StatsBar';
@@ -40,6 +40,8 @@ function App() {
     selectedVpkNames,
     isSelectMode,
     setIsSelectMode,
+    isSubmitting,
+    setIsSubmitting,
 
     // Modals state
     detailModal,
@@ -52,8 +54,6 @@ function App() {
     setGroupModal,
     editGroupModal,
     setEditGroupModal,
-    settingsModal,
-    setSettingsModal,
     linkConfirmModal,
     setLinkConfirmModal,
     confirmModal,
@@ -126,7 +126,6 @@ function App() {
         selectedGroupId={selectedGroupId}
         onFilterTabChange={handleFilterTabChange}
         onOpenGroupModal={() => setGroupModal({ open: true })}
-        onOpenSettingsModal={() => setSettingsModal({ open: true, loadingDir: settings.loadingDir })}
         onAutoGrouping={runAutoGrouping}
         autoGrouping={autoGrouping}
         disabledCount={disabledCount}
@@ -135,110 +134,122 @@ function App() {
 
       {/* Main Panel */}
       <div className="main-content">
-        <TopBar
-          searchQuery={searchQuery}
-          onSearchQueryChange={setSearchQuery}
-          selectedCategory={selectedCategory}
-          onCategoryChange={setSelectedCategory}
-          sortBy={sortBy}
-          onSortByChange={setSortBy}
-          syncingSteam={syncingSteam}
-          onSyncSteam={syncSteamDetails}
-          categoriesList={categoriesList}
-          isSelectMode={isSelectMode}
-          onToggleSelectMode={() => {
-            if (isSelectMode) {
-              handleClearSelection();
-            } else {
-              setIsSelectMode(true);
-            }
-          }}
-        />
-
-        {/* Content body */}
-        <div className="content-body">
-          {/* Group details headers */}
-          {currentGroup && (
-            <GroupHeader
-              currentGroup={currentGroup}
-              onRenameGroup={() => setEditGroupModal({ open: true, groupId: currentGroup.id, name: currentGroup.name })}
-              onDeleteGroup={() => handleDeleteGroup(currentGroup.id)}
-              onGroupActionBatch={(actionType) => groupActionBatch(currentGroup.id, actionType)}
-            />
-          )}
-
-          {/* Stats bar */}
-          {currentFilterTab !== 'groups' && (
-            <StatsBar
-              totalAddonsCount={totalAddonsCount}
-              activeCount={activeCount}
-              disabledCount={disabledCount}
-              totalStorageSize={totalStorageSize}
-            />
-          )}
-
-          {/* Loading empty states */}
-          {loading ? (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '300px', color: 'var(--md-sys-color-outline)' }}>
-              <RefreshCw className="animate-spin" size={36} />
-              <p style={{ marginTop: '16px' }}>正在解析 VPK 文件和加载数据中...</p>
-            </div>
-          ) : filteredItems.length === 0 ? (
-            <div className="empty-state">
-              <FileText className="empty-icon" size={64} />
-              <div className="empty-title">未发现匹配的附加组件</div>
-              <div className="empty-desc">
-                在此筛选条件下未找到任何文件。请确认你的目录中已经放有 L4D2 附件文件。
-              </div>
-              <button className="btn btn-primary" onClick={() => fetchData(true)}>
-                <RefreshCw size={16} />
-                <span>重新扫描</span>
-              </button>
-            </div>
-          ) : (
-            <div className="addons-grid">
-              {renderedItems.map(renderedItem => {
-                if (renderedItem.type === 'group') {
-                  const groupAddons = renderedItem.addons;
-                  const isGroupSelected = groupAddons.every(ad => selectedVpkNames.includes(ad.vpkName));
-                  return (
-                    <GroupCard
-                      key={renderedItem.id}
-                      group={renderedItem.groupObj}
-                      addons={groupAddons}
-                      onToggleGroup={toggleGroupAddons}
-                      onViewGroupDetails={(groupId) => {
-                        handleFilterTabChange('groups', groupId);
-                      }}
-                      isSelectMode={isSelectMode}
-                      isGroupSelected={isGroupSelected}
-                      onSelectGroupToggle={handleSelectGroupToggle}
-                    />
-                  );
+        {currentFilterTab === 'settings' ? (
+          <SettingsView
+            settings={settings}
+            isSubmitting={isSubmitting}
+            onConfirm={saveSettings}
+          />
+        ) : (
+          <>
+            <TopBar
+              searchQuery={searchQuery}
+              onSearchQueryChange={setSearchQuery}
+              selectedCategory={selectedCategory}
+              onCategoryChange={setSelectedCategory}
+              sortBy={sortBy}
+              onSortByChange={setSortBy}
+              syncingSteam={syncingSteam}
+              onSyncSteam={syncSteamDetails}
+              categoriesList={categoriesList}
+              isSelectMode={isSelectMode}
+              onToggleSelectMode={() => {
+                if (isSelectMode) {
+                  handleClearSelection();
                 } else {
-                  const addonData = renderedItem.data;
-                  return (
-                    <AddonCard
-                      key={renderedItem.id}
-                      addon={addonData}
-                      groups={groups}
-                      onToggle={toggleAddon}
-                      onAddToGroup={addAddonToGroup}
-                      onRemoveFromGroup={removeAddonFromGroup}
-                      onOpenLink={handleOpenLink}
-                      onMoveClick={handleMoveClick}
-                      onRenameClick={triggerRenameModal}
-                      onDetailClick={(addon) => setDetailModal({ open: true, addon })}
-                      isSelectMode={isSelectMode}
-                      isSelected={selectedVpkNames.includes(addonData.vpkName)}
-                      onSelectToggle={handleSelectToggle}
-                    />
-                  );
+                  setIsSelectMode(true);
                 }
-              })}
+              }}
+            />
+
+            {/* Content body */}
+            <div className="content-body">
+              {/* Group details headers */}
+              {currentGroup && (
+                <GroupHeader
+                  currentGroup={currentGroup}
+                  onRenameGroup={() => setEditGroupModal({ open: true, groupId: currentGroup.id, name: currentGroup.name })}
+                  onDeleteGroup={() => handleDeleteGroup(currentGroup.id)}
+                  onGroupActionBatch={(actionType) => groupActionBatch(currentGroup.id, actionType)}
+                />
+              )}
+
+              {/* Stats bar */}
+              {currentFilterTab !== 'groups' && (
+                <StatsBar
+                  totalAddonsCount={totalAddonsCount}
+                  activeCount={activeCount}
+                  disabledCount={disabledCount}
+                  totalStorageSize={totalStorageSize}
+                />
+              )}
+
+              {/* Loading empty states */}
+              {loading ? (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '300px', color: 'var(--md-sys-color-outline)' }}>
+                  <RefreshCw className="animate-spin" size={36} />
+                  <p style={{ marginTop: '16px' }}>正在解析 VPK 文件和加载数据中...</p>
+                </div>
+              ) : filteredItems.length === 0 ? (
+                <div className="empty-state">
+                  <FileText className="empty-icon" size={64} />
+                  <div className="empty-title">未发现匹配的附加组件</div>
+                  <div className="empty-desc">
+                    在此筛选条件下未找到任何文件。请确认你的目录中已经放有 L4D2 附件文件。
+                  </div>
+                  <button className="btn btn-primary" onClick={() => fetchData(true)} disabled={loading || isSubmitting}>
+                    <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+                    <span>{loading ? '正在扫描...' : '重新扫描'}</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="addons-grid">
+                  {renderedItems.map(renderedItem => {
+                    if (renderedItem.type === 'group') {
+                      const groupAddons = renderedItem.addons;
+                      const isGroupSelected = groupAddons.every(ad => selectedVpkNames.includes(ad.vpkName));
+                      return (
+                        <GroupCard
+                          key={renderedItem.id}
+                          group={renderedItem.groupObj}
+                          addons={groupAddons}
+                          onToggleGroup={toggleGroupAddons}
+                          onViewGroupDetails={(groupId) => {
+                            handleFilterTabChange('groups', groupId);
+                          }}
+                          isSelectMode={isSelectMode}
+                          isGroupSelected={isGroupSelected}
+                          onSelectGroupToggle={handleSelectGroupToggle}
+                          isSubmitting={isSubmitting}
+                        />
+                      );
+                    } else {
+                      const addonData = renderedItem.data;
+                      return (
+                        <AddonCard
+                          key={renderedItem.id}
+                          addon={addonData}
+                          groups={groups}
+                          onToggle={toggleAddon}
+                          onAddToGroup={addAddonToGroup}
+                          onRemoveFromGroup={removeAddonFromGroup}
+                          onOpenLink={handleOpenLink}
+                          onMoveClick={handleMoveClick}
+                          onRenameClick={triggerRenameModal}
+                          onDetailClick={(addon) => setDetailModal({ open: true, addon })}
+                          isSelectMode={isSelectMode}
+                          isSelected={selectedVpkNames.includes(addonData.vpkName)}
+                          onSelectToggle={handleSelectToggle}
+                          isSubmitting={isSubmitting}
+                        />
+                      );
+                    }
+                  })}
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </>
+        )}
       </div>
 
       {/* Modals */}
@@ -257,7 +268,10 @@ function App() {
         vpkName={moveWarningModal.vpkName}
         currentDirType={moveWarningModal.currentDirType}
         workshopId={moveWarningModal.workshopId}
-        onCancel={() => setMoveWarningModal({ open: false, vpkName: '', currentDirType: '', workshopId: '' })}
+        onCancel={() => {
+          setMoveWarningModal({ open: false, vpkName: '', currentDirType: '', workshopId: '' });
+          setIsSubmitting(false);
+        }}
         onConfirm={async (vpkName, currentDirType, unsubscribe) => {
           if (unsubscribe && moveWarningModal.workshopId) {
             await invoke('open_url', { url: `steam://url/CommunityFilePage/${moveWarningModal.workshopId}` });
@@ -289,14 +303,22 @@ function App() {
         addon={renameAddonObj}
         itemGroup={renameGroupObj}
         addons={addons}
-        onCancel={() => setRenameModal({ open: false, currentName: '', title: '', suggestedName: '' })}
+        isSubmitting={isSubmitting}
+        onCancel={() => {
+          setRenameModal({ open: false, currentName: '', title: '', suggestedName: '' });
+          setIsSubmitting(false);
+        }}
         onConfirm={submitRename}
       />
 
       <GroupModal
         open={groupModal.open}
         addons={addons}
-        onCancel={() => setGroupModal({ open: false })}
+        isSubmitting={isSubmitting}
+        onCancel={() => {
+          setGroupModal({ open: false });
+          setIsSubmitting(false);
+        }}
         onConfirm={handleCreateGroup}
       />
 
@@ -304,15 +326,12 @@ function App() {
         open={editGroupModal.open}
         groupId={editGroupModal.groupId}
         currentName={editGroupModal.name}
-        onCancel={() => setEditGroupModal({ open: false, groupId: '', name: '' })}
+        isSubmitting={isSubmitting}
+        onCancel={() => {
+          setEditGroupModal({ open: false, groupId: '', name: '' });
+          setIsSubmitting(false);
+        }}
         onConfirm={handleRenameGroup}
-      />
-
-      <SettingsModal
-        open={settingsModal.open}
-        initialLoadingDir={settingsModal.loadingDir}
-        onCancel={() => setSettingsModal({ open: false, loadingDir: '' })}
-        onConfirm={saveSettings}
       />
 
       <ConfirmModal
@@ -320,14 +339,20 @@ function App() {
         title={confirmModal.title}
         message={confirmModal.message}
         onConfirm={confirmModal.onConfirm || (() => {})}
-        onCancel={() => setConfirmModal({ open: false, title: '', message: '', onConfirm: null })}
+        onCancel={() => {
+          setConfirmModal({ open: false, title: '', message: '', onConfirm: null });
+          setIsSubmitting(false);
+        }}
       />
 
       <WorkshopActionWarningModal
         open={workshopActionModal.open}
         actionName={workshopActionModal.actionName}
         addons={workshopActionModal.addons}
-        onCancel={() => setWorkshopActionModal({ open: false, actionName: '', addons: [], onProceed: null })}
+        onCancel={() => {
+          setWorkshopActionModal({ open: false, actionName: '', addons: [], onProceed: null });
+          setIsSubmitting(false);
+        }}
         onConfirm={(skipWarning) => {
           if (skipWarning) {
             sessionStorage.setItem('skipWorkshopWarning', 'true');

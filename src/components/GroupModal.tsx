@@ -6,6 +6,7 @@ interface GroupModalProps {
   addons: Record<string, Addon>;
   onCancel: () => void;
   onConfirm: (name: string, selectedAddons: string[]) => void;
+  isSubmitting?: boolean;
 }
 
 export const GroupModal: React.FC<GroupModalProps> = ({
@@ -13,6 +14,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
   addons,
   onCancel,
   onConfirm,
+  isSubmitting = false,
 }) => {
   const [name, setName] = useState('');
   const [selectedAddons, setSelectedAddons] = useState<string[]>([]);
@@ -28,7 +30,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name || selectedAddons.length === 0) return;
+    if (!name || selectedAddons.length === 0 || isSubmitting) return;
     onConfirm(name, selectedAddons);
   };
 
@@ -62,6 +64,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
             value={name}
             onChange={(e) => setName(e.target.value)}
             required
+            disabled={isSubmitting}
           />
         </div>
 
@@ -86,7 +89,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
                     alignItems: 'center', 
                     gap: '8px', 
                     padding: '8px',
-                    cursor: 'pointer',
+                    cursor: isSubmitting ? 'not-allowed' : 'pointer',
                     borderRadius: '8px',
                     backgroundColor: isChecked ? 'rgba(179, 197, 255, 0.08)' : 'transparent'
                   }}
@@ -95,6 +98,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
                     type="checkbox" 
                     checked={isChecked}
                     onChange={(e) => handleCheckboxChange(addon.vpkName, e.target.checked)}
+                    disabled={isSubmitting}
                   />
                   <span style={{ fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {title}
@@ -110,11 +114,12 @@ export const GroupModal: React.FC<GroupModalProps> = ({
             type="button" 
             className="btn btn-secondary" 
             onClick={onCancel}
+            disabled={isSubmitting}
           >
             取消
           </button>
-          <button type="submit" className="btn btn-primary" disabled={!name || selectedAddons.length === 0}>
-            创建分组
+          <button type="submit" className="btn btn-primary" disabled={isSubmitting || !name || selectedAddons.length === 0}>
+            {isSubmitting ? '正在创建...' : '创建分组'}
           </button>
         </div>
       </form>

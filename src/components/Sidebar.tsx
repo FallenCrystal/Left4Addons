@@ -9,7 +9,6 @@ interface SidebarProps {
   selectedGroupId: string | null;
   onFilterTabChange: (tab: string, groupId: string | null) => void;
   onOpenGroupModal: () => void;
-  onOpenSettingsModal: () => void;
   onAutoGrouping: () => void;
   autoGrouping: boolean;
   disabledCount: number;
@@ -23,7 +22,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   selectedGroupId,
   onFilterTabChange,
   onOpenGroupModal,
-  onOpenSettingsModal,
   onAutoGrouping,
   autoGrouping,
   disabledCount,
@@ -137,12 +135,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
 
         <button 
-          className="btn btn-secondary" 
-          style={{ width: '100%', marginTop: '8px' }}
-          onClick={onOpenSettingsModal}
+          className={`menu-item ${currentFilterTab === 'settings' ? 'active' : ''}`}
+          style={{ 
+            width: '100%', 
+            marginTop: '8px', 
+            borderRadius: '100px', 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: '12px',
+            boxSizing: 'border-box'
+          }}
+          onClick={() => onFilterTabChange('settings', null)}
         >
-          <Settings size={16} />
-          <span>路径设置</span>
+          <div className="menu-item-left">
+            <Settings size={18} />
+            <span>设置</span>
+          </div>
         </button>
       </div>
     </div>

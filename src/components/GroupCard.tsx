@@ -12,6 +12,7 @@ interface GroupCardProps {
   isSelectMode?: boolean;
   isGroupSelected?: boolean;
   onSelectGroupToggle?: (addonsList: Addon[]) => void;
+  isSubmitting?: boolean;
 }
 
 export const GroupCard: React.FC<GroupCardProps> = ({
@@ -22,6 +23,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
   isSelectMode = false,
   isGroupSelected = false,
   onSelectGroupToggle,
+  isSubmitting = false,
 }) => {
   const firstAddonWithImage = addons.find(ad => ad.imagePath);
   const imagePath = firstAddonWithImage ? firstAddonWithImage.imagePath : null;
@@ -127,6 +129,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
             type="checkbox" 
             checked={allEnabled} 
             onChange={() => onToggleGroup(addons, !allEnabled)}
+            disabled={isSubmitting}
           />
           <span className="slider"></span>
         </label>
