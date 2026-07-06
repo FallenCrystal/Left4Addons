@@ -121,6 +121,16 @@ export const GroupCard: React.FC<GroupCardProps> = ({
           </div>
 
           <p className="addon-card-desc" style={{ whiteSpace: 'pre-line' }} title={groupDesc}>{groupDesc}</p>
+
+          {group.tags && group.tags.length > 0 && (
+            <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '6px', marginBottom: '6px' }}>
+              {group.tags.map(tag => (
+                <span key={tag} style={{ padding: '2px 8px', borderRadius: '8px', fontSize: '10px', fontWeight: 500, backgroundColor: 'var(--md-sys-color-secondary-container)', color: 'var(--md-sys-color-on-secondary-container)' }}>
+                  {tag}
+                </span>
+              ))}
+            </div>
+          )}
           
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--md-sys-color-outline)', marginTop: '8px' }}>
             <span>{t('groupCard.totalSize', { size: formatBytes(groupSize) })}</span>

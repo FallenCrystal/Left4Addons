@@ -7,6 +7,7 @@ pub mod commands;
 
 pub struct AppState {
     pub db_path: PathBuf,
+    pub known_addons_path: PathBuf,
     pub cache_dir: PathBuf,
     pub db: Mutex<commands::Database>,
 }
@@ -15,7 +16,7 @@ pub struct AppState {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let runtime_dir = std::env::current_exe()
+            let mut runtime_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| {
                     p.parent().map(|d| {
@@ -29,6 +30,13 @@ pub fn run() {
                 })
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
+            if cfg!(debug_assertions) && runtime_dir.ends_with("src-tauri") {
+                if let Some(parent) = runtime_dir.parent() {
+                    runtime_dir = parent.to_path_buf();
+                }
+            }
+
+
             if !runtime_dir.exists() {
                 let _ = std::fs::create_dir_all(&runtime_dir);
             }
@@ -38,15 +46,17 @@ pub fn run() {
             }
 
             let db_path = runtime_dir.join("db.json");
+            let known_addons_path = runtime_dir.join("known_addons.json");
             let cache_dir = runtime_dir.join("cache");
             if !cache_dir.exists() {
                 let _ = std::fs::create_dir_all(&cache_dir);
             }
 
-            let db = commands::load_db(&db_path, app.handle());
+            let db = commands::load_db(&db_path, &known_addons_path, app.handle());
             
             app.manage(AppState {
                 db_path,
+                known_addons_path,
                 cache_dir,
                 db: Mutex::new(db),
             });
@@ -102,6 +112,11 @@ pub fn run() {
             commands::open_workshop,
             commands::open_url,
             commands::steam_sync,
+            commands::fetch_workshop_html,
+            commands::delete_addons,
+            commands::download_addon,
+            commands::fetch_collection,
+            commands::add_known_addon,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

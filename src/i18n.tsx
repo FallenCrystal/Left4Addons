@@ -22,7 +22,8 @@ const zh = {
     rescan: "重新扫描",
     scanning: "正在扫描...",
     error: "错误",
-    success: "成功"
+    success: "成功",
+    search: "搜索"
   },
   categories: {
     All: "全部",
@@ -287,6 +288,95 @@ const zh = {
     batchRenameNoNeed: "选中的组件已是推荐文件名，无需重命名",
     batchRenameSuccess: "批量重命名成功 (重命名了 {{count}} 个文件)",
     batchAddGroupSuccess: "批量加入分组成功"
+  },
+  workshop: {
+    nav: {
+      home: "首页",
+      browse: "浏览",
+      searchPlaceholder: "搜索创意工坊..."
+    },
+    home: {
+      pastWeek: "一周内物品",
+      pastWeekDesc: "过去 1 周内",
+      trending: "最热门",
+      trendingDesc: "过去 3 个月内评价最高",
+      mostRequired: "被最多其他项目需要",
+      mostRequiredDesc: "其他项目正常运行需要得最多的项目",
+      mostSubscribed: "最多人订阅",
+      mostSubscribedDesc: "订阅人数最多的物品",
+      recentlyUpdated: "最近更新",
+      recentlyUpdatedDesc: "最近有更新的物品",
+      newest: "最新",
+      newestDesc: "最新发布的物品",
+      viewAll: "查看全部",
+      loading: "正在加载创意工坊首页...",
+      loadFailed: "无法加载首页数据，请尝试浏览模式。",
+      switchToBrowse: "切换到浏览模式"
+    },
+    browse: {
+      sortTrend: "最热门",
+      sortTextSearch: "相关度",
+      sortTotalProfiles: "最多订阅",
+      sortMostRecent: "最新发布",
+      sortTopRated: "最受好评",
+      sortLastUpdated: "最新更新",
+      sectionAddons: "组件",
+      sectionCollections: "合集",
+      loading: "正在加载创意工坊列表...",
+      retry: "重试",
+      empty: "未找到创意工坊项目，请尝试更换关键词。",
+      page: "第 {{page}} 页"
+    },
+    tags: {
+      browse: "分类浏览",
+      filter: "分类筛选",
+      label: "标签: {{name}}"
+    },
+    badges: {
+      downloaded: "已下载",
+      known: "已知",
+      notDownloaded: "未下载",
+      addon: "组件",
+      collection: "合集"
+    },
+    item: {
+      author: "作者: {{author}}",
+      size: "大小: {{size}}",
+      subscriptions: "订阅: {{count}}"
+    },
+    detail: {
+      loading: "正在加载详细数据...",
+      title: "组件详情",
+      author: "作者",
+      authorPage: "作者页",
+      description: "描述",
+      descriptionLabel: "描述",
+      download: "下载组件并安装",
+      downloaded: "已下载",
+      downloading: "正在下载 ({{progress}}%)",
+      addToKnown: "加入已知组件列表",
+      addToKnownList: "加入已知列表",
+      steamProtocol: "Steam 协议打开",
+      openInSteam: "在 Steam 中打开",
+      openInBrowser: "浏览器打开",
+      viewOnSteam: "在 Steam 中查看",
+      defaultCollectionName: "创意工坊合集",
+      importSuccess: "已将合集中的 {{count}} 个组件导入为分组 \"{{name}}\"。",
+      downloadAllSuccess: "已启动下载合集中的 {{count}} 个组件！",
+      collectionTitle: "合集详情",
+      collectionAuthor: "合集作者",
+      collectionItems: "合集内组件",
+      collectionItemsCount: "{{count}} 个组件",
+      itemsInCollection: "合集内组件",
+      itemSize: "文件大小",
+      workshopId: "创意工坊 ID",
+      status: "状态",
+      importAsGroup: "导入该合集为分组",
+      downloadAll: "批量下载 ({{count}})",
+      addedToKnown: "成功加入已知组件列表！",
+      addFailed: "添加失败: {{err}}",
+      fetchFailed: "无法获取详细信息: {{err}}"
+    }
   }
 };
 
@@ -310,7 +400,8 @@ const en = {
     rescan: "Rescan",
     scanning: "Scanning...",
     error: "Error",
-    success: "Success"
+    success: "Success",
+    search: "Search"
   },
   categories: {
     All: "All",
@@ -575,6 +666,95 @@ const en = {
     batchRenameNoNeed: "Selected addons are already in recommended filename format, no rename needed",
     batchRenameSuccess: "Batch rename successful (renamed {{count}} files)",
     batchAddGroupSuccess: "Batch added to group successfully"
+  },
+  workshop: {
+    nav: {
+      home: "Home",
+      browse: "Browse",
+      searchPlaceholder: "Search Workshop..."
+    },
+    home: {
+      pastWeek: "Items This Week",
+      pastWeekDesc: "Past 1 week",
+      trending: "Trending",
+      trendingDesc: "Top rated in past 3 months",
+      mostRequired: "Most Required by Others",
+      mostRequiredDesc: "Items most needed by other items to function",
+      mostSubscribed: "Most Subscribed",
+      mostSubscribedDesc: "Most subscribed items",
+      recentlyUpdated: "Recently Updated",
+      recentlyUpdatedDesc: "Items with recent updates",
+      newest: "Newest",
+      newestDesc: "Most recently published items",
+      viewAll: "View All",
+      loading: "Loading Workshop homepage...",
+      loadFailed: "Unable to load homepage data, try browse mode.",
+      switchToBrowse: "Switch to Browse Mode"
+    },
+    browse: {
+      sortTrend: "Trending",
+      sortTextSearch: "Relevance",
+      sortTotalProfiles: "Most Subscribed",
+      sortMostRecent: "Most Recent",
+      sortTopRated: "Top Rated",
+      sortLastUpdated: "Last Updated",
+      sectionAddons: "Addons",
+      sectionCollections: "Collections",
+      loading: "Loading Workshop items...",
+      retry: "Retry",
+      empty: "No Workshop items found, try different keywords.",
+      page: "Page {{page}}"
+    },
+    tags: {
+      browse: "Browse by Category",
+      filter: "Filter by Tags",
+      label: "Tag: {{name}}"
+    },
+    badges: {
+      downloaded: "Downloaded",
+      known: "Known",
+      notDownloaded: "Not Downloaded",
+      addon: "Addon",
+      collection: "Collection"
+    },
+    item: {
+      author: "By: {{author}}",
+      size: "Size: {{size}}",
+      subscriptions: "Subs: {{count}}"
+    },
+    detail: {
+      loading: "Loading details...",
+      title: "Item Details",
+      author: "Author",
+      authorPage: "Author Page",
+      description: "Description",
+      descriptionLabel: "Description",
+      download: "Download & Install",
+      downloaded: "Downloaded",
+      downloading: "Downloading ({{progress}}%)",
+      addToKnown: "Add to Known Items",
+      addToKnownList: "Add to Known List",
+      steamProtocol: "Open in Steam",
+      openInSteam: "Open in Steam",
+      openInBrowser: "Open in Browser",
+      viewOnSteam: "View on Steam",
+      defaultCollectionName: "Workshop Collection",
+      importSuccess: "Imported {{count}} items from collection as group \"{{name}}\".",
+      downloadAllSuccess: "Started downloading {{count}} items from collection!",
+      collectionTitle: "Collection Details",
+      collectionAuthor: "Collection Author",
+      collectionItems: "Items in Collection",
+      collectionItemsCount: "{{count}} items",
+      itemsInCollection: "Items in Collection",
+      itemSize: "File Size",
+      workshopId: "Workshop ID",
+      status: "Status",
+      importAsGroup: "Import as Group",
+      downloadAll: "Download All ({{count}})",
+      addedToKnown: "Added to known items list!",
+      addFailed: "Failed to add: {{err}}",
+      fetchFailed: "Unable to fetch details: {{err}}"
+    }
   }
 };
 

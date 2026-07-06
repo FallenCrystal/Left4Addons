@@ -20,11 +20,14 @@ import { WorkshopActionWarningModal } from './components/WorkshopActionWarningMo
 import { StatsBar } from './components/StatsBar';
 import { GroupHeader } from './components/GroupHeader';
 import { BatchActionBar } from './components/BatchActionBar';
+import { KnownUninstalledView } from './components/KnownUninstalledView';
+import { WorkshopBrowser } from './components/WorkshopBrowser';
 
 function App() {
   const { t } = useTranslation();
   const {
     addons,
+    knownUninstalledAddons,
     groups,
     settings,
     loading,
@@ -44,6 +47,7 @@ function App() {
     setIsSelectMode,
     isSubmitting,
     setIsSubmitting,
+    downloadProgress,
 
     // Modals state
     detailModal,
@@ -90,6 +94,8 @@ function App() {
     handleBatchRename,
     handleBatchAddToGroup,
     handleFilterTabChange,
+    downloadAddon,
+    deleteAddons,
 
     // Derived values
     filteredItems,
@@ -132,6 +138,7 @@ function App() {
         autoGrouping={autoGrouping}
         disabledCount={disabledCount}
         totalAddonsCount={totalAddonsCount}
+        knownUninstalledCount={Object.keys(knownUninstalledAddons).length}
       />
 
       {/* Main Panel */}
@@ -141,6 +148,28 @@ function App() {
             settings={settings}
             isSubmitting={isSubmitting}
             onConfirm={saveSettings}
+          />
+        ) : currentFilterTab === 'known-uninstalled' ? (
+          <KnownUninstalledView
+            knownUninstalledAddons={knownUninstalledAddons}
+            downloadProgress={downloadProgress}
+            onDownload={downloadAddon}
+            onDelete={deleteAddons}
+            isSubmitting={isSubmitting}
+            onOpenLink={handleOpenLink}
+          />
+        ) : currentFilterTab === 'workshop-browser' ? (
+          <WorkshopBrowser
+            addons={addons}
+            knownUninstalledAddons={knownUninstalledAddons}
+            downloadProgress={downloadProgress}
+            onDownload={downloadAddon}
+            onOpenLink={handleOpenLink}
+            onImportCollection={async (name, itemIds) => {
+              const vpkNames = itemIds.map(id => `${id}.vpk`);
+              await handleCreateGroup(name, vpkNames);
+            }}
+            isSubmitting={isSubmitting}
           />
         ) : (
           <>
@@ -170,7 +199,13 @@ function App() {
               {currentGroup && (
                 <GroupHeader
                   currentGroup={currentGroup}
-                  onRenameGroup={() => setEditGroupModal({ open: true, groupId: currentGroup.id, name: currentGroup.name })}
+                  onRenameGroup={() => setEditGroupModal({ 
+                    open: true, 
+                    groupId: currentGroup.id, 
+                    name: currentGroup.name,
+                    tags: currentGroup.tags || [],
+                    workshopCollectionId: currentGroup.workshopCollectionId || ''
+                  })}
                   onDeleteGroup={() => handleDeleteGroup(currentGroup.id)}
                   onGroupActionBatch={(actionType) => groupActionBatch(currentGroup.id, actionType)}
                 />
@@ -328,9 +363,12 @@ function App() {
         open={editGroupModal.open}
         groupId={editGroupModal.groupId}
         currentName={editGroupModal.name}
+        currentTags={editGroupModal.tags}
+        currentCollectionId={editGroupModal.workshopCollectionId}
+        addonsInGroup={currentGroup ? currentGroup.addons.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean) : []}
         isSubmitting={isSubmitting}
         onCancel={() => {
-          setEditGroupModal({ open: false, groupId: '', name: '' });
+          setEditGroupModal({ open: false, groupId: '', name: '', tags: [], workshopCollectionId: '' });
           setIsSubmitting(false);
         }}
         onConfirm={handleRenameGroup}

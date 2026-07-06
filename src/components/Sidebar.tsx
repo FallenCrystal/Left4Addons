@@ -1,5 +1,5 @@
 import React from 'react';
-import { Layers, Grid, FolderOpen, Folder, Lock, FolderPlus, Plus, Sparkles, Settings } from 'lucide-react';
+import { Layers, Grid, FolderOpen, Folder, Lock, FolderPlus, Plus, Sparkles, Settings, Download, Globe } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 
@@ -14,6 +14,7 @@ interface SidebarProps {
   autoGrouping: boolean;
   disabledCount: number;
   totalAddonsCount: number;
+  knownUninstalledCount: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -27,6 +28,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   autoGrouping,
   disabledCount,
   totalAddonsCount,
+  knownUninstalledCount,
 }) => {
   const { t } = useTranslation();
   const loadingCount = Object.values(addons).filter(a => a.dirType === 'loading').length;
@@ -87,6 +89,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span>{t('sidebar.disabledAddons')}</span>
           </div>
           <span className="menu-item-badge">{disabledCount}</span>
+        </button>
+
+        <button 
+          className={`menu-item ${currentFilterTab === 'known-uninstalled' ? 'active' : ''}`}
+          onClick={() => onFilterTabChange('known-uninstalled', null)}
+        >
+          <div className="menu-item-left">
+            <Download size={18} />
+            <span>未安装的已知组件</span>
+          </div>
+          <span className="menu-item-badge">{knownUninstalledCount}</span>
+        </button>
+
+        <button 
+          className={`menu-item ${currentFilterTab === 'workshop-browser' ? 'active' : ''}`}
+          onClick={() => onFilterTabChange('workshop-browser', null)}
+        >
+          <div className="menu-item-left">
+            <Globe size={18} />
+            <span>内置创意工坊</span>
+          </div>
         </button>
 
         <div className="sidebar-section-title">{t('sidebar.myGroups')}</div>

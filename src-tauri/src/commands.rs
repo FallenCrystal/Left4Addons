@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
-use tauri::{AppHandle, State, Manager};
+use tauri::{AppHandle, State, Manager, Emitter};
 use regex::Regex;
 use crate::vpk::{extract_addon_metadata, generate_dummy_vpk};
 
@@ -14,6 +14,16 @@ pub struct Settings {
     pub loading_dir: String,
     #[serde(rename = "enableDummyBypass", default)]
     pub enable_dummy_bypass: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub addons: Vec<String>,
+    pub tags: Option<Vec<String>>,
+    #[serde(rename = "workshopCollectionId")]
+    pub workshop_collection_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -37,7 +47,7 @@ pub struct Addon {
     #[serde(rename = "currentPath")]
     pub current_path: String,
     #[serde(rename = "dirType")]
-    pub dir_type: String, // "workshop" or "loading"
+    pub dir_type: String,
     #[serde(rename = "isEnabled")]
     pub is_enabled: bool,
     #[serde(rename = "steamDetails")]
@@ -47,10 +57,48 @@ pub struct Addon {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Group {
-    pub id: String,
-    pub name: String,
-    pub addons: Vec<String>,
+pub struct LocalAddon {
+    #[serde(rename = "vpkName")]
+    pub vpk_name: String,
+    #[serde(rename = "workshopId")]
+    pub workshop_id: Option<String>,
+    #[serde(rename = "filesCount")]
+    pub files_count: usize,
+    #[serde(rename = "fileSize")]
+    pub file_size: u64,
+    #[serde(rename = "parsedAt")]
+    pub parsed_at: String,
+    #[serde(rename = "currentPath")]
+    pub current_path: String,
+    #[serde(rename = "dirType")]
+    pub dir_type: String,
+    #[serde(rename = "isEnabled")]
+    pub is_enabled: bool,
+    #[serde(rename = "isDummy", default)]
+    pub is_dummy: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct KnownAddonEntry {
+    #[serde(rename = "vpkName")]
+    pub vpk_name: String,
+    #[serde(rename = "workshopId")]
+    pub workshop_id: Option<String>,
+    #[serde(rename = "addonInfo")]
+    pub addon_info: serde_json::Value,
+    #[serde(rename = "hasImage")]
+    pub has_image: bool,
+    #[serde(rename = "imagePath")]
+    pub image_path: Option<String>,
+    #[serde(rename = "steamDetails")]
+    pub steam_details: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct LocalDatabase {
+    pub settings: Settings,
+    pub addons: HashMap<String, LocalAddon>,
+    pub groups: Vec<Group>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -58,9 +106,11 @@ pub struct Database {
     pub settings: Settings,
     pub addons: HashMap<String, Addon>,
     pub groups: Vec<Group>,
+    #[serde(rename = "knownUninstalledAddons")]
+    pub known_uninstalled_addons: HashMap<String, Addon>,
 }
 
-pub fn load_db(db_path: &Path, app_handle: &AppHandle) -> Database {
+pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle) -> Database {
     let runtime_dir = db_path.parent().unwrap_or(Path::new(""));
     let default_loading = runtime_dir.join("addons-loading").to_string_lossy().to_string();
     let default_workshop = Path::new(&default_loading).join("workshop").to_string_lossy().to_string();
@@ -73,39 +123,205 @@ pub fn load_db(db_path: &Path, app_handle: &AppHandle) -> Database {
         },
         addons: HashMap::new(),
         groups: Vec::new(),
+        known_uninstalled_addons: HashMap::new(),
     };
 
-    if !db_path.exists() {
-        if let Ok(json) = serde_json::to_string_pretty(&default_db) {
-            let _ = fs::write(db_path, json);
+    let db_json_existed = db_path.exists();
+    
+    let mut local_db: LocalDatabase = if db_path.exists() {
+        match fs::read_to_string(db_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_else(|_| {
+                if let Ok(old_db) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let mut addons_map = HashMap::new();
+                    if let Some(addons_obj) = old_db["addons"].as_object() {
+                        for (k, v) in addons_obj {
+                            if let Ok(addon) = serde_json::from_value::<Addon>(v.clone()) {
+                                addons_map.insert(k.clone(), LocalAddon {
+                                    vpk_name: addon.vpk_name,
+                                    workshop_id: addon.workshop_id,
+                                    files_count: addon.files_count,
+                                    file_size: addon.file_size,
+                                    parsed_at: addon.parsed_at,
+                                    current_path: addon.current_path,
+                                    dir_type: addon.dir_type,
+                                    is_enabled: addon.is_enabled,
+                                    is_dummy: addon.is_dummy,
+                                });
+                            }
+                        }
+                    }
+                    let settings = serde_json::from_value(old_db["settings"].clone()).unwrap_or_default();
+                    let groups = serde_json::from_value(old_db["groups"].clone()).unwrap_or_default();
+                    LocalDatabase { settings, addons: addons_map, groups }
+                } else {
+                    LocalDatabase::default()
+                }
+            }),
+            Err(_) => LocalDatabase::default(),
         }
-        return default_db;
-    }
+    } else {
+        LocalDatabase {
+            settings: default_db.settings.clone(),
+            addons: HashMap::new(),
+            groups: Vec::new(),
+        }
+    };
+
+    let known_addons: HashMap<String, KnownAddonEntry> = if known_addons_path.exists() {
+        match fs::read_to_string(known_addons_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    } else {
+        let mut migrated = HashMap::new();
+        if db_path.exists() {
+            if let Ok(content) = fs::read_to_string(db_path) {
+                if let Ok(old_db) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(addons_obj) = old_db["addons"].as_object() {
+                        for (k, v) in addons_obj {
+                            if let Ok(addon) = serde_json::from_value::<Addon>(v.clone()) {
+                                migrated.insert(k.clone(), KnownAddonEntry {
+                                    vpk_name: addon.vpk_name.clone(),
+                                    workshop_id: addon.workshop_id.clone(),
+                                    addon_info: addon.addon_info,
+                                    has_image: addon.has_image,
+                                    image_path: addon.image_path,
+                                    steam_details: addon.steam_details,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !migrated.is_empty() {
+            let _ = fs::write(known_addons_path, serde_json::to_string_pretty(&migrated).unwrap_or_default());
+        }
+        migrated
+    };
 
     let old_default_loading = app_handle.path().app_data_dir()
         .map(|p| p.join("addons-loading").to_string_lossy().to_string())
         .unwrap_or_default();
 
-    match fs::read_to_string(db_path) {
-        Ok(content) => match serde_json::from_str::<Database>(&content) {
-            Ok(mut data) => {
-                if data.settings.loading_dir.is_empty() || data.settings.loading_dir == old_default_loading {
-                    data.settings.loading_dir = default_db.settings.loading_dir.clone();
-                }
-                // Enforce workshop_dir is loading_dir/workshop
-                let loading_path = Path::new(&data.settings.loading_dir);
-                data.settings.workshop_dir = loading_path.join("workshop").to_string_lossy().to_string();
-                data
-            }
-            Err(_) => default_db,
-        },
-        Err(_) => default_db,
+    if local_db.settings.loading_dir.is_empty() || local_db.settings.loading_dir == old_default_loading {
+        local_db.settings.loading_dir = default_db.settings.loading_dir.clone();
     }
+    let loading_path = Path::new(&local_db.settings.loading_dir);
+    local_db.settings.workshop_dir = loading_path.join("workshop").to_string_lossy().to_string();
+
+    let mut merged_addons = HashMap::new();
+    for (vpk_name, local_addon) in local_db.addons {
+        let entry = known_addons.get(&vpk_name);
+        merged_addons.insert(vpk_name.clone(), Addon {
+            vpk_name: local_addon.vpk_name,
+            workshop_id: local_addon.workshop_id,
+            addon_info: entry.map(|e| e.addon_info.clone()).unwrap_or(serde_json::Value::Null),
+            has_image: entry.map(|e| e.has_image).unwrap_or(false),
+            image_path: entry.and_then(|e| e.image_path.clone()),
+            files_count: local_addon.files_count,
+            file_size: local_addon.file_size,
+            parsed_at: local_addon.parsed_at,
+            current_path: local_addon.current_path,
+            dir_type: local_addon.dir_type,
+            is_enabled: local_addon.is_enabled,
+            steam_details: entry.and_then(|e| e.steam_details.clone()),
+            is_dummy: local_addon.is_dummy,
+        });
+    }
+
+    let mut known_uninstalled_addons = HashMap::new();
+    for (vpk_name, entry) in &known_addons {
+        if !merged_addons.contains_key(vpk_name) {
+            known_uninstalled_addons.insert(vpk_name.clone(), Addon {
+                vpk_name: entry.vpk_name.clone(),
+                workshop_id: entry.workshop_id.clone(),
+                addon_info: entry.addon_info.clone(),
+                has_image: entry.has_image,
+                image_path: entry.image_path.clone(),
+                files_count: 0,
+                file_size: 0,
+                parsed_at: "".to_string(),
+                current_path: "".to_string(),
+                dir_type: "none".to_string(),
+                is_enabled: false,
+                steam_details: entry.steam_details.clone(),
+                is_dummy: false,
+            });
+        }
+    }
+
+    let db = Database {
+        settings: local_db.settings,
+        addons: merged_addons,
+        groups: local_db.groups,
+        known_uninstalled_addons,
+    };
+
+    if !db_json_existed {
+        save_db_internal(db_path, known_addons_path, &db);
+    }
+
+    db
 }
 
-pub fn save_db(db_path: &Path, db: &Database) {
-    if let Ok(json) = serde_json::to_string_pretty(db) {
+pub fn save_db_internal(db_path: &Path, known_addons_path: &Path, db: &Database) {
+    let mut local_addons = HashMap::new();
+    for (k, addon) in &db.addons {
+        local_addons.insert(k.clone(), LocalAddon {
+            vpk_name: addon.vpk_name.clone(),
+            workshop_id: addon.workshop_id.clone(),
+            files_count: addon.files_count,
+            file_size: addon.file_size,
+            parsed_at: addon.parsed_at.clone(),
+            current_path: addon.current_path.clone(),
+            dir_type: addon.dir_type.clone(),
+            is_enabled: addon.is_enabled,
+            is_dummy: addon.is_dummy,
+        });
+    }
+    let local_db = LocalDatabase {
+        settings: db.settings.clone(),
+        addons: local_addons,
+        groups: db.groups.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&local_db) {
         let _ = fs::write(db_path, json);
+    }
+
+    let mut known_addons: HashMap<String, KnownAddonEntry> = if known_addons_path.exists() {
+        match fs::read_to_string(known_addons_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    for (vpk_name, addon) in &db.addons {
+        known_addons.insert(vpk_name.clone(), KnownAddonEntry {
+            vpk_name: addon.vpk_name.clone(),
+            workshop_id: addon.workshop_id.clone(),
+            addon_info: addon.addon_info.clone(),
+            has_image: addon.has_image,
+            image_path: addon.image_path.clone(),
+            steam_details: addon.steam_details.clone(),
+        });
+    }
+
+    for (vpk_name, addon) in &db.known_uninstalled_addons {
+        known_addons.insert(vpk_name.clone(), KnownAddonEntry {
+            vpk_name: addon.vpk_name.clone(),
+            workshop_id: addon.workshop_id.clone(),
+            addon_info: addon.addon_info.clone(),
+            has_image: addon.has_image,
+            image_path: addon.image_path.clone(),
+            steam_details: addon.steam_details.clone(),
+        });
+    }
+
+    if let Ok(json) = serde_json::to_string_pretty(&known_addons) {
+        let _ = fs::write(known_addons_path, json);
     }
 }
 
@@ -147,6 +363,7 @@ async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::
 pub async fn scan_addons_internal(
     db: &mut Database,
     db_path: &Path,
+    known_addons_path: &Path,
     cache_dir: &Path,
 ) -> Result<(), String> {
     let workshop_dir = Path::new(&db.settings.workshop_dir);
@@ -233,7 +450,8 @@ pub async fn scan_addons_internal(
 
     for file_info in files_on_disk {
         let vpk_name = file_info.vpk_name.clone();
-        let cached = db.addons.get(&vpk_name).cloned();
+        let cached = db.addons.get(&vpk_name).cloned()
+            .or_else(|| db.known_uninstalled_addons.get(&vpk_name).cloned());
 
         let has_capitalized_keys = cached.as_ref().map_or(false, |addon| {
             addon.addon_info.as_object().map_or(false, |obj| {
@@ -350,14 +568,51 @@ pub async fn scan_addons_internal(
         }
     }
 
+    // Update known_uninstalled_addons in memory:
+    let known_addons: HashMap<String, KnownAddonEntry> = if known_addons_path.exists() {
+        match fs::read_to_string(known_addons_path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    let mut uninstalled = HashMap::new();
+    for (vpk_name, entry) in &known_addons {
+        if !active_addons.contains_key(vpk_name) {
+            uninstalled.insert(vpk_name.clone(), Addon {
+                vpk_name: entry.vpk_name.clone(),
+                workshop_id: entry.workshop_id.clone(),
+                addon_info: entry.addon_info.clone(),
+                has_image: entry.has_image,
+                image_path: entry.image_path.clone(),
+                files_count: 0,
+                file_size: 0,
+                parsed_at: "".to_string(),
+                current_path: "".to_string(),
+                dir_type: "none".to_string(),
+                is_enabled: false,
+                steam_details: entry.steam_details.clone(),
+                is_dummy: false,
+            });
+        }
+    }
+    for (vpk_name, addon) in &db.known_uninstalled_addons {
+        if !active_addons.contains_key(vpk_name) && !uninstalled.contains_key(vpk_name) {
+            uninstalled.insert(vpk_name.clone(), addon.clone());
+        }
+    }
+
     db.addons = active_addons;
+    db.known_uninstalled_addons = uninstalled;
 
     for g in &mut db.groups {
-        g.addons.retain(|vpk| db.addons.contains_key(vpk));
+        g.addons.retain(|vpk| db.addons.contains_key(vpk) || db.known_uninstalled_addons.contains_key(vpk) || vpk.ends_with(".vpk"));
     }
     db.groups.retain(|g| !g.addons.is_empty());
 
-    save_db(db_path, db);
+    save_db_internal(db_path, known_addons_path, db);
     Ok(())
 }
 
@@ -493,6 +748,8 @@ fn auto_group_internal(db: &mut Database) {
                 id: group_id,
                 name: group_name,
                 addons,
+                tags: None,
+                workshop_collection_id: None,
             });
         }
     }
@@ -529,6 +786,8 @@ fn auto_group_internal(db: &mut Database) {
                 id: group_id,
                 name: prefix,
                 addons,
+                tags: None,
+                workshop_collection_id: None,
             });
         }
     }
@@ -555,9 +814,9 @@ pub async fn save_settings(
     db.settings.workshop_dir = workshop_dir;
     db.settings.loading_dir = loading_dir;
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
-    save_db(&state.db_path, &db);
+    save_db_internal(&state.db_path, &state.known_addons_path, &db);
 
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -566,7 +825,7 @@ pub async fn get_addons(
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -638,7 +897,7 @@ pub async fn move_addons(
         }
     }
 
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -674,7 +933,7 @@ pub async fn toggle_addons(
         }
     }
 
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -759,7 +1018,7 @@ pub async fn rename_addon(
         return Err("Addon not found".to_string());
     }
 
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -853,7 +1112,7 @@ pub async fn rename_addons(
         }
     }
 
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -863,6 +1122,8 @@ pub async fn group_action(
     name: Option<String>,
     group_id: Option<String>,
     vpk_names: Option<Vec<String>>,
+    tags: Option<Vec<String>>,
+    workshop_collection_id: Option<String>,
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
@@ -881,13 +1142,15 @@ pub async fn group_action(
         }
 
         let filtered_vpks: Vec<String> = vpk_names.into_iter()
-            .filter(|n| db.addons.contains_key(n))
+            .filter(|n| db.addons.contains_key(n) || db.known_uninstalled_addons.contains_key(n) || n.ends_with(".vpk"))
             .collect();
 
         db.groups.push(Group {
             id: group_id,
             name,
             addons: filtered_vpks,
+            tags,
+            workshop_collection_id,
         });
 
     } else if action == "delete" {
@@ -903,7 +1166,7 @@ pub async fn group_action(
         }
 
         let valid_vpk_names: Vec<String> = vpk_names.into_iter()
-            .filter(|n| db.addons.contains_key(n))
+            .filter(|n| db.addons.contains_key(n) || db.known_uninstalled_addons.contains_key(n) || n.ends_with(".vpk"))
             .collect();
 
         if let Some(target_group) = db.groups.iter_mut().find(|g| g.id == group_id) {
@@ -916,7 +1179,6 @@ pub async fn group_action(
             return Err("Group not found".to_string());
         }
 
-
     } else if action == "remove-addons" {
         let group_id = group_id.ok_or_else(|| "Missing groupId".to_string())?;
         let vpk_names = vpk_names.ok_or_else(|| "Missing vpkNames".to_string())?;
@@ -925,12 +1187,26 @@ pub async fn group_action(
             group.addons.retain(|n| !vpk_names.contains(n));
         }
 
-    } else if action == "rename-group" {
+    } else if action == "rename-group" || action == "update-group" {
         let group_id = group_id.ok_or_else(|| "Missing groupId".to_string())?;
-        let name = name.ok_or_else(|| "Missing name".to_string())?;
+
+        let valid_addon_names: HashSet<String> = db.addons.keys().cloned()
+            .chain(db.known_uninstalled_addons.keys().cloned())
+            .collect();
 
         if let Some(group) = db.groups.iter_mut().find(|g| g.id == group_id) {
-            group.name = name;
+            if let Some(n) = name {
+                group.name = n;
+            }
+            group.tags = tags;
+            group.workshop_collection_id = workshop_collection_id;
+
+            if let Some(vpks) = vpk_names {
+                let filtered_vpks: Vec<String> = vpks.into_iter()
+                    .filter(|n| valid_addon_names.contains(n) || n.ends_with(".vpk"))
+                    .collect();
+                group.addons = filtered_vpks;
+            }
         }
 
     } else if action == "auto-group" {
@@ -941,8 +1217,8 @@ pub async fn group_action(
 
     db.groups.retain(|g| !g.addons.is_empty());
 
-    save_db(&state.db_path, &db);
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    save_db_internal(&state.db_path, &state.known_addons_path, &db);
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 
@@ -970,7 +1246,7 @@ pub async fn steam_sync(
     let mut db = state.db.lock().await;
     
     // First, scan addons to populate database with any new/removed files
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     
     let mut ids = Vec::new();
     for addon in db.addons.values() {
@@ -1002,8 +1278,273 @@ pub async fn steam_sync(
         }
     }
 
-    save_db(&state.db_path, &db);
-    scan_addons_internal(&mut db, &state.db_path, &state.cache_dir).await?;
+    save_db_internal(&state.db_path, &state.known_addons_path, &db);
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
+    Ok(db.clone())
+}
+
+#[tauri::command]
+pub async fn fetch_workshop_html(url: String) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let res = client.get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let body = res.text()
+        .await
+        .map_err(|e| format!("Failed to get response text: {}", e))?;
+    Ok(body)
+}
+
+#[tauri::command]
+pub async fn delete_addons(
+    vpk_names: Vec<String>,
+    delete_file: bool,
+    remove_from_known: bool,
+    state: State<'_, crate::AppState>,
+) -> Result<Database, String> {
+    let mut db = state.db.lock().await;
+    
+    if delete_file {
+        for vpk_name in &vpk_names {
+            if let Some(addon) = db.addons.get(vpk_name) {
+                let path = PathBuf::from(&addon.current_path);
+                if path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+                let disabled_path = path.with_extension("vpk.disabled");
+                if disabled_path.exists() {
+                    let _ = fs::remove_file(&disabled_path);
+                }
+            }
+        }
+    }
+
+    if remove_from_known {
+        let mut known_addons: HashMap<String, KnownAddonEntry> = if state.known_addons_path.exists() {
+            fs::read_to_string(&state.known_addons_path)
+                .ok()
+                .and_then(|c| serde_json::from_str(&c).ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        for vpk_name in &vpk_names {
+            known_addons.remove(vpk_name);
+            db.known_uninstalled_addons.remove(vpk_name);
+        }
+
+        let _ = fs::write(&state.known_addons_path, serde_json::to_string_pretty(&known_addons).unwrap_or_default());
+    }
+
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
+    Ok(db.clone())
+}
+
+#[tauri::command]
+pub async fn download_addon(
+    workshop_id: String,
+    state: State<'_, crate::AppState>,
+    app_handle: AppHandle,
+) -> Result<Database, String> {
+    let mut db = state.db.lock().await;
+
+    let details_list = fetch_steam_details(&[workshop_id.clone()]).await?;
+    if details_list.is_empty() {
+        return Err("Failed to retrieve details for workshop item".to_string());
+    }
+    let details = &details_list[0];
+    
+    let file_url = details.get("file_url")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| "Workshop item has no download URL (might be hidden or deleted)".to_string())?;
+        
+    let title = details.get("title").and_then(|t| t.as_str()).unwrap_or("Workshop Item");
+
+    let workshop_dir = PathBuf::from(&db.settings.workshop_dir);
+    if !workshop_dir.exists() {
+        fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
+    }
+    let dest_filename = format!("{}.vpk", workshop_id);
+    let dest_path = workshop_dir.join(&dest_filename);
+
+    println!("Downloading: {} (URL: {})", title, file_url);
+    let client = reqwest::Client::new();
+    let mut response = client.get(file_url)
+        .send()
+        .await
+        .map_err(|e| format!("Download request failed: {}", e))?;
+
+    let total_size = response.content_length().unwrap_or(0);
+    let mut file = fs::File::create(&dest_path).map_err(|e| format!("Failed to create local file: {}", e))?;
+    let mut downloaded = 0;
+
+    #[derive(Serialize, Clone)]
+    struct DownloadProgress {
+        #[serde(rename = "workshopId")]
+        workshop_id: String,
+        percent: u32,
+        downloaded: u64,
+        total: u64,
+    }
+
+    while let Some(chunk) = response.chunk().await.map_err(|e| format!("Download chunk failed: {}", e))? {
+        use std::io::Write;
+        file.write_all(&chunk).map_err(|e| format!("Failed to write chunk: {}", e))?;
+        downloaded += chunk.len() as u64;
+
+        let percent = if total_size > 0 {
+            (downloaded as f64 / total_size as f64 * 100.0) as u32
+        } else {
+            0
+        };
+
+        let _ = app_handle.emit("download-progress", DownloadProgress {
+            workshop_id: workshop_id.clone(),
+            percent,
+            downloaded,
+            total: total_size,
+        });
+    }
+
+    let mut known_addons: HashMap<String, KnownAddonEntry> = if state.known_addons_path.exists() {
+        fs::read_to_string(&state.known_addons_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let has_image = details.get("preview_url").is_some();
+    let image_path = details.get("preview_url").and_then(|u| u.as_str()).map(|s| s.to_string());
+    
+    known_addons.insert(dest_filename.clone(), KnownAddonEntry {
+        vpk_name: dest_filename.clone(),
+        workshop_id: Some(workshop_id.clone()),
+        addon_info: serde_json::Value::Null,
+        has_image,
+        image_path,
+        steam_details: Some(details.clone()),
+    });
+
+    let _ = fs::write(&state.known_addons_path, serde_json::to_string_pretty(&known_addons).unwrap_or_default());
+
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
+    Ok(db.clone())
+}
+
+async fn fetch_collection_details_internal(collection_id: &str) -> Result<Vec<String>, String> {
+    let url = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/";
+    let mut params = Vec::new();
+    params.push(("collectioncount".to_string(), "1".to_string()));
+    params.push(("publishedfileids[0]".to_string(), collection_id.to_string()));
+
+    let client = reqwest::Client::new();
+    let res = client.post(url)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to query collection details: {}", e))?;
+
+    if !res.status().is_success() {
+        return Err(format!("Steam Collection API responded with status {}", res.status()));
+    }
+
+    let json: serde_json::Value = res.json()
+        .await
+        .map_err(|e| format!("Failed to parse collection JSON: {}", e))?;
+
+    let details_list = json["response"]["collectiondetails"]
+        .as_array()
+        .ok_or_else(|| "Invalid collectiondetails format".to_string())?;
+
+    if details_list.is_empty() {
+        return Err("Collection not found".to_string());
+    }
+
+    let mut ids = Vec::new();
+    if let Some(children) = details_list[0]["children"].as_array() {
+        for child in children {
+            if let Some(id) = child["publishedfileid"].as_str() {
+                ids.push(id.to_string());
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
+#[tauri::command]
+pub async fn fetch_collection(collection_id: String) -> Result<serde_json::Value, String> {
+    let child_ids = fetch_collection_details_internal(&collection_id).await?;
+
+    let mut query_ids = vec![collection_id.clone()];
+    query_ids.extend(child_ids.clone());
+
+    let details = fetch_steam_details(&query_ids).await?;
+
+    let mut collection_details = serde_json::Value::Null;
+    let mut items = Vec::new();
+
+    for detail in details {
+        if let Some(id) = detail.get("publishedfileid").and_then(|id| id.as_str()) {
+            if id == collection_id {
+                collection_details = detail;
+            } else {
+                items.push(detail);
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "collection": collection_details,
+        "items": items,
+    }))
+}
+
+#[tauri::command]
+pub async fn add_known_addon(
+    workshop_id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<Database, String> {
+    let mut db = state.db.lock().await;
+
+    let details_list = fetch_steam_details(&[workshop_id.clone()]).await?;
+    if details_list.is_empty() {
+        return Err("Failed to retrieve details for workshop item".to_string());
+    }
+    let details = &details_list[0];
+
+    let mut known_addons: HashMap<String, KnownAddonEntry> = if state.known_addons_path.exists() {
+        fs::read_to_string(&state.known_addons_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let dest_filename = format!("{}.vpk", workshop_id);
+    let has_image = details.get("preview_url").is_some();
+    let image_path = details.get("preview_url").and_then(|u| u.as_str()).map(|s| s.to_string());
+
+    known_addons.insert(dest_filename.clone(), KnownAddonEntry {
+        vpk_name: dest_filename.clone(),
+        workshop_id: Some(workshop_id.clone()),
+        addon_info: serde_json::Value::Null,
+        has_image,
+        image_path,
+        steam_details: Some(details.clone()),
+    });
+
+    let _ = fs::write(&state.known_addons_path, serde_json::to_string_pretty(&known_addons).unwrap_or_default());
+
+    scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
     Ok(db.clone())
 }
 

@@ -60,12 +60,21 @@ export interface Group {
   id: string;
   name: string;
   addons: string[];
+  tags?: string[];
+  workshopCollectionId?: string;
 }
 
 export interface Settings {
   workshopDir: string;
   loadingDir: string;
   enableDummyBypass: boolean;
+}
+
+export interface DatabasePayload {
+  settings: Settings;
+  addons: Record<string, Addon>;
+  groups: Group[];
+  knownUninstalledAddons: Record<string, Addon>;
 }
 
 export interface Toast {
