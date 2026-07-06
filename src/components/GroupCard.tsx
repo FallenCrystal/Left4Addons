@@ -128,27 +128,29 @@ export const GroupCard: React.FC<GroupCardProps> = ({
         </div>
       </div>
 
-      <div className="addon-card-footer">
-        <label className="switch" title={t('groupCard.toggleAll')}>
-          <input 
-            type="checkbox" 
-            checked={allEnabled} 
-            onChange={() => onToggleGroup(addons, !allEnabled)}
-            disabled={isSubmitting}
-          />
-          <span className="slider"></span>
-        </label>
+      {!isSelectMode && (
+        <div className="addon-card-footer">
+          <label className="switch" title={t('groupCard.toggleAll')}>
+            <input 
+              type="checkbox" 
+              checked={allEnabled} 
+              onChange={() => onToggleGroup(addons, !allEnabled)}
+              disabled={isSubmitting}
+            />
+            <span className="slider"></span>
+          </label>
 
-        <div style={{ display: 'flex', gap: '6px' }}>
-          <button 
-            className="btn btn-secondary btn-icon-only" 
-            onClick={() => onViewGroupDetails(group.id)}
-            title={t('groupCard.viewDetails')}
-          >
-            <FolderOpen size={14} />
-          </button>
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <button 
+              className="btn btn-secondary btn-icon-only" 
+              onClick={() => onViewGroupDetails(group.id)}
+              title={t('groupCard.viewDetails')}
+            >
+              <FolderOpen size={14} />
+            </button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

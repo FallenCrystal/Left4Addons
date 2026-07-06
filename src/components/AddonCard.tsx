@@ -140,101 +140,103 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         </div>
       </div>
 
-      <div className="addon-card-footer">
-        {/* Enable/Disable Toggle */}
-        <label className="switch" title={addon.isEnabled ? t('addonCard.clickToDisable') : t('addonCard.clickToEnable')}>
-          <input 
-            type="checkbox" 
-            checked={addon.isEnabled} 
-            onChange={() => onToggle(addon.vpkName, addon.isEnabled)}
-            disabled={isSubmitting}
-          />
-          <span className="slider"></span>
-        </label>
+      {!isSelectMode && (
+        <div className="addon-card-footer">
+          {/* Enable/Disable Toggle */}
+          <label className="switch" title={addon.isEnabled ? t('addonCard.clickToDisable') : t('addonCard.clickToEnable')}>
+            <input 
+              type="checkbox" 
+              checked={addon.isEnabled} 
+              onChange={() => onToggle(addon.vpkName, addon.isEnabled)}
+              disabled={isSubmitting}
+            />
+            <span className="slider"></span>
+          </label>
 
-        <div style={{ display: 'flex', gap: '6px' }}>
-          {/* Group assign dropdown */}
-          <div className="dropdown">
-            <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
-              <FolderPlus size={14} />
-            </button>
-            <div className="dropdown-content">
-              {groups.map(g => (
-                <button 
-                  key={g.id} 
-                  onClick={() => onAddToGroup(addon.vpkName, g.id)}
-                  disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
-                >
-                  {g.name}
-                </button>
-              ))}
-              {itemGroup && (
-                <button 
-                  onClick={() => onRemoveFromGroup(addon.vpkName, itemGroup.id)}
-                  disabled={isSubmitting}
-                  style={{ color: 'var(--md-sys-color-error)' }}
-                >
-                  {t('addonCard.removeFromGroup', { name: itemGroup.name })}
-                </button>
-              )}
-              {groups.length === 0 && !itemGroup && (
-                <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
-              )}
-            </div>
-          </div>
-
-          {/* Open Link with Fallbacks (Dropdown or direct link) */}
-          {addon.workshopId ? (
+          <div style={{ display: 'flex', gap: '6px' }}>
+            {/* Group assign dropdown */}
             <div className="dropdown">
-              <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
-                <ExternalLink size={14} />
+              <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
+                <FolderPlus size={14} />
               </button>
               <div className="dropdown-content">
-                <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
-                  {t('addonCard.openInSteam')}
-                </button>
-                <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                  {t('addonCard.openInBrowser')}
-                </button>
-                <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                  {t('addonCard.openInMirror')}
-                </button>
+                {groups.map(g => (
+                  <button 
+                    key={g.id} 
+                    onClick={() => onAddToGroup(addon.vpkName, g.id)}
+                    disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
+                  >
+                    {g.name}
+                  </button>
+                ))}
+                {itemGroup && (
+                  <button 
+                    onClick={() => onRemoveFromGroup(addon.vpkName, itemGroup.id)}
+                    disabled={isSubmitting}
+                    style={{ color: 'var(--md-sys-color-error)' }}
+                  >
+                    {t('addonCard.removeFromGroup', { name: itemGroup.name })}
+                  </button>
+                )}
+                {groups.length === 0 && !itemGroup && (
+                  <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
+                )}
               </div>
             </div>
-          ) : addonUrl ? (
-            <button 
-              className="btn btn-secondary"
-              style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
-              onClick={(e) => handleLinkClick(e, addonUrl)}
-              title={t('addonCard.openBuiltInSource')}
-            >
-              <ExternalLink size={14} />
-            </button>
-          ) : null}
 
-          {/* Move between load and workshop dirs (Only from workshop to loading, no moving back) */}
-          {addon.dirType === 'workshop' && (
+            {/* Open Link with Fallbacks (Dropdown or direct link) */}
+            {addon.workshopId ? (
+              <div className="dropdown">
+                <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
+                  <ExternalLink size={14} />
+                </button>
+                <div className="dropdown-content">
+                  <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
+                    {t('addonCard.openInSteam')}
+                  </button>
+                  <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
+                    {t('addonCard.openInBrowser')}
+                  </button>
+                  <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
+                    {t('addonCard.openInMirror')}
+                  </button>
+                </div>
+              </div>
+            ) : addonUrl ? (
+              <button 
+                className="btn btn-secondary"
+                style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
+                onClick={(e) => handleLinkClick(e, addonUrl)}
+                title={t('addonCard.openBuiltInSource')}
+              >
+                <ExternalLink size={14} />
+              </button>
+            ) : null}
+
+            {/* Move between load and workshop dirs (Only from workshop to loading, no moving back) */}
+            {addon.dirType === 'workshop' && (
+              <button 
+                className="btn btn-secondary btn-icon-only"
+                onClick={() => onMoveClick(addon)}
+                disabled={isSubmitting}
+                title={t('addonCard.moveToManual')}
+              >
+                <Move size={14} />
+              </button>
+            )}
+
+            {/* Rename */}
             <button 
               className="btn btn-secondary btn-icon-only"
-              onClick={() => onMoveClick(addon)}
+              onClick={() => onRenameClick(addon)}
               disabled={isSubmitting}
-              title={t('addonCard.moveToManual')}
+              title={t('addonCard.renameAddon')}
             >
-              <Move size={14} />
+              <Edit3 size={14} />
             </button>
-          )}
-
-          {/* Rename */}
-          <button 
-            className="btn btn-secondary btn-icon-only"
-            onClick={() => onRenameClick(addon)}
-            disabled={isSubmitting}
-            title={t('addonCard.renameAddon')}
-          >
-            <Edit3 size={14} />
-          </button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };
