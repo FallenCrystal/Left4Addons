@@ -10,7 +10,7 @@ export type RenderedItem =
 export function useAddonManager() {
   const [addons, setAddons] = useState<Record<string, Addon>>({});
   const [groups, setGroups] = useState<Group[]>([]);
-  const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '' });
+  const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '', enableDummyBypass: false });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentFilterTab, setCurrentFilterTab] = useState('all'); // all, workshop, loading, disabled, groups
@@ -56,7 +56,7 @@ export function useAddonManager() {
         return; // Stop if move fails
       }
 
-      if (sessionStorage.getItem('skipWorkshopWarning') !== 'true') {
+      if (sessionStorage.getItem('skipWorkshopWarning') !== 'true' && !settings.enableDummyBypass) {
         setWorkshopActionModal({
           open: true,
           actionName,
@@ -78,7 +78,7 @@ export function useAddonManager() {
       const data: { addons?: Record<string, Addon>; groups?: Group[]; settings?: Settings } = await invoke('get_addons');
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      setSettings(data.settings || { workshopDir: '', loadingDir: '' });
+      setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       if (showToastMessage) {
         addToast('数据库刷新成功', 'success');
       }
@@ -173,12 +173,16 @@ export function useAddonManager() {
 
   const handleMoveClick = (addon: Addon) => {
     if (addon.dirType === 'workshop') {
-      setMoveWarningModal({
-        open: true,
-        vpkName: addon.vpkName,
-        currentDirType: addon.dirType,
-        workshopId: addon.workshopId || ''
-      });
+      if (settings.enableDummyBypass) {
+        moveAddon(addon.vpkName, addon.dirType);
+      } else {
+        setMoveWarningModal({
+          open: true,
+          vpkName: addon.vpkName,
+          currentDirType: addon.dirType,
+          workshopId: addon.workshopId || ''
+        });
+      }
     } else {
       moveAddon(addon.vpkName, addon.dirType);
     }
@@ -215,16 +219,17 @@ export function useAddonManager() {
   };
 
   // Save Settings
-  const saveSettings = async (loadingDir: string) => {
+  const saveSettings = async (loadingDir: string, enableDummyBypass: boolean) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[]; settings?: Settings } = await invoke('save_settings', {
-        loadingDir
+        loadingDir,
+        enableDummyBypass
       });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      setSettings(data.settings || { workshopDir: '', loadingDir: '' });
+      setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       setSettingsModal({ open: false, loadingDir: '' });
       addToast('设置保存并扫描成功', 'success');
     } catch (err) {
@@ -367,12 +372,16 @@ export function useAddonManager() {
         };
 
         if (isFromWorkshop) {
-          setConfirmModal({
-            open: true,
-            title: '移动创意工坊附件提示',
-            message: '提示：此分组内含有创意工坊附件。将附件移动到手动安装目录后，建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。是否继续移动？',
-            onConfirm: executeMove
-          });
+          if (settings.enableDummyBypass) {
+            await executeMove();
+          } else {
+            setConfirmModal({
+              open: true,
+              title: '移动创意工坊附件提示',
+              message: '提示：此分组内含有创意工坊附件。将附件移动到手动安装目录后，建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。\n\n...或者 前往 设置 > 实验性 > 创意工坊检测绕过\n在不取消订阅的情况下移动创意工坊物品。',
+              onConfirm: executeMove
+            });
+          }
         } else {
           await executeMove();
         }
@@ -543,12 +552,16 @@ export function useAddonManager() {
     };
 
     if (workshopAddons.length > 0) {
-      setConfirmModal({
-        open: true,
-        title: '移动创意工坊附件提示',
-        message: `确定要将选中的 ${workshopAddons.length} 个创意工坊附件移动到手动安装目录吗？移动后建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。`,
-        onConfirm: executeMove
-      });
+      if (settings.enableDummyBypass) {
+        await executeMove();
+      } else {
+        setConfirmModal({
+          open: true,
+          title: '移动创意工坊附件提示',
+          message: `确定要将选中的 ${workshopAddons.length} 个创意工坊附件移动到手动安装目录吗？移动后建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。\n\n...或者 前往 设置 > 实验性 > 创意工坊检测绕过\n在不取消订阅的情况下移动创意工坊物品。`,
+          onConfirm: executeMove
+        });
+      }
     } else {
       await executeMove();
     }
@@ -636,7 +649,7 @@ export function useAddonManager() {
 
   // Filter and sort addons
   const getFilteredAddons = () => {
-    let items = Object.values(addons);
+    let items = Object.values(addons).filter(item => !item.isDummy);
 
     // Search query filter
     if (searchQuery) {
@@ -765,10 +778,11 @@ export function useAddonManager() {
   const renderedItems = getRenderedItems(filteredItems);
 
   // Statistics calculation
-  const totalAddonsCount = Object.keys(addons).length;
-  const activeCount = Object.values(addons).filter(a => a.isEnabled).length;
+  const nonDummyAddons = Object.values(addons).filter(a => !a.isDummy);
+  const totalAddonsCount = nonDummyAddons.length;
+  const activeCount = nonDummyAddons.filter(a => a.isEnabled).length;
   const disabledCount = totalAddonsCount - activeCount;
-  const totalStorageSize = Object.values(addons).reduce((acc, curr) => acc + (curr.fileSize || 0), 0);
+  const totalStorageSize = nonDummyAddons.reduce((acc, curr) => acc + (curr.fileSize || 0), 0);
 
   const currentGroup = currentFilterTab === 'groups' && selectedGroupId
     ? groups.find(g => g.id === selectedGroupId)

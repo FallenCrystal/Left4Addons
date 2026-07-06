@@ -53,6 +53,7 @@ export interface Addon {
   workshopId?: string;
   addonInfo?: AddonInfo;
   steamDetails?: SteamDetails;
+  isDummy?: boolean;
 }
 
 export interface Group {
@@ -64,6 +65,7 @@ export interface Group {
 export interface Settings {
   workshopDir: string;
   loadingDir: string;
+  enableDummyBypass: boolean;
 }
 
 export interface Toast {

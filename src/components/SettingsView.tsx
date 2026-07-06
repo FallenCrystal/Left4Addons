@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw } from 'lucide-react';
+import { FolderOpen, Info, RefreshCw, FlaskConical } from 'lucide-react';
 import { Settings } from '../types/addon';
 
 interface SettingsViewProps {
   settings: Settings;
   isSubmitting: boolean;
-  onConfirm: (loadingDir: string) => Promise<void>;
+  onConfirm: (loadingDir: string, enableDummyBypass: boolean) => Promise<void>;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -13,17 +13,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   isSubmitting,
   onConfirm,
 }) => {
-  const [activeTab, setActiveTab] = useState<'path' | 'about'>('path');
+  const [activeTab, setActiveTab] = useState<'path' | 'experimental' | 'about'>('path');
   const [loadingDir, setLoadingDir] = useState('');
+  const [enableDummyBypass, setEnableDummyBypass] = useState(false);
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
-  }, [settings.loadingDir]);
+    setEnableDummyBypass(settings.enableDummyBypass || false);
+  }, [settings]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!loadingDir.trim() || isSubmitting) return;
-    await onConfirm(loadingDir.trim());
+    await onConfirm(loadingDir.trim(), enableDummyBypass);
   };
 
   return (
@@ -37,6 +39,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         >
           <FolderOpen size={18} />
           <span>路径设置</span>
+        </button>
+        <button
+          className={`settings-nav-item ${activeTab === 'experimental' ? 'active' : ''}`}
+          onClick={() => setActiveTab('experimental')}
+          type="button"
+        >
+          <FlaskConical size={18} />
+          <span>实验性</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'about' ? 'active' : ''}`}
@@ -98,6 +108,58 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
+        {activeTab === 'experimental' && (
+          <div>
+            <h2 className="settings-title">实验性功能</h2>
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
+              此处的选项处于实验性阶段。启用可能会对文件目录结构做出调整，请谨慎开启。
+            </p>
+            <form onSubmit={handleSubmit}>
+              <div className="settings-section">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
+                  <div style={{ paddingRight: '20px' }}>
+                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                      创意工坊检测绕过
+                    </label>
+                    <span style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      开启后，将 addon 从 workshop 移出时，将在 workshop 目录下自动生成一个 dummy addon（仅保留附件图片、原始 AppID 及版本号，将标题标记为原名 (L4A Dummy) 且说明改为由 L4A 生成），以试图绕过 L4D2 创意工坊订阅同步检测。
+                      <br /><br />
+                      请注意：创意工坊更新可能会导致新旧版本的 addon 同时加载并冲突。
+                    </span>
+                  </div>
+                  <label className="switch" style={{ flexShrink: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={enableDummyBypass}
+                      onChange={(e) => setEnableDummyBypass(e.target.checked)}
+                      disabled={isSubmitting}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-start', marginTop: '32px' }}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={isSubmitting || !loadingDir.trim()}
+                  style={{ minWidth: '160px', height: '42px' }}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <RefreshCw className="animate-spin" size={16} />
+                      <span>正在保存并扫描...</span>
+                    </>
+                  ) : (
+                    <span>保存并重新扫描</span>
+                  )}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+
         {activeTab === 'about' && (
           <div>
             <h2 className="settings-title">关于 Left 4 Addons</h2>
@@ -112,7 +174,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px', fontWeight: '600' }}>主要功能</h4>
               <ul style={{ paddingLeft: '20px', margin: '0', fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
                 <li><b>一键启用/禁用</b>：快速重命名 `.vpk` 文件以在游戏中生效或失效。</li>
-                <li><b>创意工坊同步</b>：自动拉取并缓存创意工坊组件的封面图、标题和作者详情。</li>
+                <li><b>创意工坊同步</b>：自动拉取并缓存创意工坊组件的封面图、标题 and 作者详情。</li>
                 <li><b>分组管理</b>：将多 Part 地图或关联组件组合，实现一键批量操作。</li>
                 <li><b>自动识别</b>：内置战役/地图包识别算法，自动检测并对关联附件进行重组。</li>
                 <li><b>物理隔离</b>：一键将工坊文件转移到本地加载文件夹，防止游戏联机订阅冲突。</li>

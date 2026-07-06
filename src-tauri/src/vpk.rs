@@ -390,6 +390,201 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     result
 }
 
+#[derive(Debug, Clone)]
+pub struct VpkFileToWrite {
+    pub ext: String,
+    pub path: String,
+    pub filename: String,
+    pub content: Vec<u8>,
+}
+
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut c = 0xffffffffu32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            if (c & 1) != 0 {
+                c = (c >> 1) ^ 0xedb88320;
+            } else {
+                c >>= 1;
+            }
+        }
+    }
+    !c
+}
+
+pub fn write_vpk<P: AsRef<Path>>(file_path: P, files: &[VpkFileToWrite]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = File::create(file_path).map_err(|e| e.to_string())?;
+
+    let mut ext_map: HashMap<String, HashMap<String, Vec<&VpkFileToWrite>>> = HashMap::new();
+    for f in files {
+        ext_map.entry(f.ext.clone())
+            .or_default()
+            .entry(f.path.clone())
+            .or_default()
+            .push(f);
+    }
+
+    let mut tree_buf = Vec::new();
+    let mut data_offset = 0u32;
+    let mut files_to_write_data = Vec::new();
+
+    for (ext, paths) in &ext_map {
+        let ext_str = if ext.is_empty() { " " } else { ext };
+        tree_buf.extend_from_slice(ext_str.as_bytes());
+        tree_buf.push(0);
+        
+        for (path, file_list) in paths {
+            let path_str = if path.is_empty() { " " } else { path };
+            tree_buf.extend_from_slice(path_str.as_bytes());
+            tree_buf.push(0);
+            
+            for f in file_list {
+                let filename_str = if f.filename.is_empty() { " " } else { &f.filename };
+                tree_buf.extend_from_slice(filename_str.as_bytes());
+                tree_buf.push(0);
+                
+                let crc_val = crc32(&f.content);
+                let entry_length = f.content.len() as u32;
+                
+                tree_buf.extend_from_slice(&crc_val.to_le_bytes());
+                tree_buf.extend_from_slice(&0u16.to_le_bytes());
+                tree_buf.extend_from_slice(&0x7fffu16.to_le_bytes());
+                tree_buf.extend_from_slice(&data_offset.to_le_bytes());
+                tree_buf.extend_from_slice(&entry_length.to_le_bytes());
+                tree_buf.extend_from_slice(&0xffffu16.to_le_bytes());
+                
+                data_offset += entry_length;
+                files_to_write_data.push(&f.content);
+            }
+            tree_buf.push(0);
+        }
+        tree_buf.push(0);
+    }
+    tree_buf.push(0);
+
+    let tree_size = tree_buf.len() as u32;
+
+    file.write_all(&0x55aa1234u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&tree_size.to_le_bytes()).map_err(|e| e.to_string())?;
+
+    file.write_all(&tree_buf).map_err(|e| e.to_string())?;
+
+    for content in files_to_write_data {
+        file.write_all(content).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
+    original_vpk_path: P,
+    dummy_vpk_path: Q,
+) -> Result<(), String> {
+    let (files, mut file) = parse_vpk(&original_vpk_path)?;
+
+    let addoninfo_key = files.keys().find(|k| {
+        let lower = k.to_lowercase();
+        lower == "addoninfo.txt" || lower.ends_with("/addoninfo.txt") || lower.ends_with("\\addoninfo.txt")
+    });
+
+    let mut steam_app_id = "550".to_string();
+    let mut addon_version = "1.0".to_string();
+    let mut addon_title = original_vpk_path.as_ref()
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .replace(".disabled", "")
+        .replace(".vpk", "");
+
+    if let Some(key) = addoninfo_key {
+        if let Some(entry) = files.get(key) {
+            if let Ok(content_bytes) = get_file_content(&mut file, entry) {
+                let text = String::from_utf8_lossy(&content_bytes);
+                let parsed = parse_key_values(&text);
+                if let serde_json::Value::Object(map) = parsed {
+                    if let Some(v) = map.get("addonsteamappid").and_then(|v| v.as_str()) {
+                        steam_app_id = v.to_string();
+                    } else if let Some(v) = map.get("addonsteamappid").and_then(|v| v.as_number()) {
+                        steam_app_id = v.to_string();
+                    }
+                    if let Some(v) = map.get("addonversion").and_then(|v| v.as_str()) {
+                        addon_version = v.to_string();
+                    } else if let Some(v) = map.get("addonversion").and_then(|v| v.as_number()) {
+                        addon_version = v.to_string();
+                    }
+                    if let Some(v) = map.get("addontitle").and_then(|v| v.as_str()) {
+                        addon_title = v.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    let mut files_to_write = Vec::new();
+
+    // Find and extract addonimage.jpg
+    let addonimage_jpg_key = files.keys().find(|k| {
+        let lower = k.to_lowercase();
+        lower == "addonimage.jpg" || lower.ends_with("/addonimage.jpg") || lower.ends_with("\\addonimage.jpg")
+    });
+    if let Some(key) = addonimage_jpg_key {
+        if let Some(entry) = files.get(key) {
+            if let Ok(content_bytes) = get_file_content(&mut file, entry) {
+                files_to_write.push(VpkFileToWrite {
+                    ext: "jpg".to_string(),
+                    path: "".to_string(),
+                    filename: "addonimage".to_string(),
+                    content: content_bytes,
+                });
+            }
+        }
+    }
+
+    // Find and extract addonimage.vtf
+    let addonimage_vtf_key = files.keys().find(|k| {
+        let lower = k.to_lowercase();
+        lower == "addonimage.vtf" || lower.ends_with("/addonimage.vtf") || lower.ends_with("\\addonimage.vtf")
+    });
+    if let Some(key) = addonimage_vtf_key {
+        if let Some(entry) = files.get(key) {
+            if let Ok(content_bytes) = get_file_content(&mut file, entry) {
+                files_to_write.push(VpkFileToWrite {
+                    ext: "vtf".to_string(),
+                    path: "".to_string(),
+                    filename: "addonimage".to_string(),
+                    content: content_bytes,
+                });
+            }
+        }
+    }
+
+    let addoninfo_content = format!(
+        r#""AddonInfo"
+{{
+    "addonSteamAppID" "{}"
+    "addonversion" "{}"
+    "addontitle" "{} (L4A Dummy)"
+    "addonDescription" "A dummy addon generated by Left 4 Addons"
+}}
+"#,
+        steam_app_id, addon_version, addon_title
+    );
+
+    files_to_write.push(VpkFileToWrite {
+        ext: "txt".to_string(),
+        path: "".to_string(),
+        filename: "addoninfo".to_string(),
+        content: addoninfo_content.into_bytes(),
+    });
+
+    write_vpk(dummy_vpk_path, &files_to_write)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
