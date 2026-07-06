@@ -160,14 +160,6 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setViewMode('search');
   };
 
-  const handleCreatorClick = (id: string, name: string) => {
-    setCreatorId(id);
-    setCreatorName(name);
-    setPage(1);
-    setSelectedItem(null);
-    setSelectedCollection(null);
-    setViewMode('browse');
-  };
 
   const handleClearCreator = () => { setCreatorId(null); setCreatorName(null); setPage(1); };
   const handleClearTag = () => { setActiveTag(null); setActiveTagName(null); setPage(1); };

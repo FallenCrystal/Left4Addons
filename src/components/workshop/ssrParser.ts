@@ -100,7 +100,7 @@ function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: str
     const domData = domMap.get(workshopId) || { authorName: '', authorUrl: '', stars: 0 };
     let authorId = '';
     if (domData.authorUrl) {
-      const idMatch = domData.authorUrl.match(/(?:profiles|id)\/([^\/]+)/);
+      const idMatch = domData.authorUrl.match(/(?:profiles|id)\/([^/]+)/);
       if (idMatch) authorId = idMatch[1];
     }
     // Prefer SSR creator_player_link_details for author info (browse page)
@@ -217,7 +217,7 @@ function parseDOMFallbackItems(html: string): WorkshopItem[] {
     if (/^by\s+/i.test(authorName)) authorName = authorName.replace(/^by\s+/i, '');
     let authorId = '';
     if (authorUrl) {
-      const idMatch = authorUrl.match(/(?:profiles|id)\/([^\/]+)/);
+      const idMatch = authorUrl.match(/(?:profiles|id)\/([^/]+)/);
       if (idMatch) authorId = idMatch[1];
     }
     const stars = parseInt(

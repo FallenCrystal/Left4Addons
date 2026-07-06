@@ -3,7 +3,7 @@ import { AlertTriangle, ExternalLink, CheckCircle2 } from 'lucide-react';
 import { Addon } from '../types/addon';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
-import { TransHTML } from '../i18n';
+import { TransHTML } from './TransHTML';
 
 interface WorkshopActionWarningModalProps {
   open: boolean;

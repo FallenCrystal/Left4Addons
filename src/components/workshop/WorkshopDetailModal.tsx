@@ -91,9 +91,11 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     }
   }, []);
 
+  const firstItemWorkshopId = collection?.items?.[0]?.workshopId;
+
   useEffect(() => {
     if (open) {
-      const id = item?.workshopId || collection?.workshopId || collection?.items?.[0]?.workshopId;
+      const id = item?.workshopId || collection?.workshopId || firstItemWorkshopId;
       if (id) {
         fetchPageDetails(id);
       }
@@ -102,7 +104,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
       setGalleryIndex(0);
       setFullscreenImageIndex(null);
     }
-  }, [open, item?.workshopId, collection?.workshopId, fetchPageDetails]);
+  }, [open, item?.workshopId, collection?.workshopId, firstItemWorkshopId, fetchPageDetails]);
 
   if (!open || (!item && !collection)) return null;
 

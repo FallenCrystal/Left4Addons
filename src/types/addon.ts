@@ -41,11 +41,12 @@ export interface SteamDetails {
   creator_name?: string;
   creator?: string;
   tags?: SteamTag[];
+  file_size?: string;
 }
 
 export interface Addon {
   vpkName: string;
-  dirType: 'workshop' | 'loading';
+  dirType: 'workshop' | 'loading' | 'none';
   isEnabled: boolean;
   fileSize: number;
   filesCount: number;

@@ -1,7 +1,7 @@
 import React from 'react';
 import { AlertTriangle, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { TransHTML } from '../i18n';
+import { TransHTML } from './TransHTML';
 
 interface MoveWarningModalProps {
   open: boolean;

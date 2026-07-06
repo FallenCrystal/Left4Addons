@@ -48,7 +48,7 @@ describe('addonHelpers', () => {
         addonInfo: {
           addoncontent_campaign: '1',
           ADDONCONTENT_SURVIVOR: '1',
-        },
+        } as any,
       };
       const cats = getAddonCategories(addon);
       expect(cats).toContain('Campaign');

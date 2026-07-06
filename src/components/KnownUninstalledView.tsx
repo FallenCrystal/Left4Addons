@@ -2,7 +2,6 @@ import React, { useState } from 'react';
 import { Download, Trash2, Globe, Search, RefreshCw, AlertCircle } from 'lucide-react';
 import { Addon } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, formatBytes } from '../utils/addonHelpers';
-import { invoke } from '@tauri-apps/api/core';
 
 interface KnownUninstalledViewProps {
   knownUninstalledAddons: Record<string, Addon>;

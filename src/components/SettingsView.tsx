@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check } from 'lucide-react';
 import { Settings } from '../types/addon';
 import { useTranslation } from 'react-i18next';
-import { TransHTML } from '../i18n';
+import { TransHTML } from './TransHTML';
 
 interface SettingsViewProps {
   settings: Settings;

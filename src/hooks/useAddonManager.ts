@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Addon, Group, Settings, Toast, DatabasePayload } from '../types/addon';
@@ -41,13 +41,13 @@ export function useAddonManager() {
   const [workshopActionModal, setWorkshopActionModal] = useState<{ open: boolean; actionName: string; addons: Addon[]; onProceed: (() => void) | null }>({ open: false, actionName: '', addons: [], onProceed: null });
 
   // Add toast helper
-  const addToast = (message: string, type: 'success' | 'error' = 'success') => {
+  const addToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
     const id = Math.random().toString(36).substring(2, 11);
     setToasts((prev) => [...prev, { id, message, type }]);
     setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
     }, 4000);
-  };
+  }, []);
 
   // Listen to download progress
   useEffect(() => {
@@ -76,14 +76,14 @@ export function useAddonManager() {
   }, []);
 
   // Update local states from DatabasePayload
-  const updateLocalState = (data: DatabasePayload) => {
+  const updateLocalState = useCallback((data: DatabasePayload) => {
     setAddons(data.addons || {});
     setGroups(data.groups || []);
     setKnownUninstalledAddons(data.knownUninstalledAddons || {});
     if (data.settings) {
       setSettings(data.settings);
     }
-  };
+  }, []);
 
   const executeWithWorkshopCheck = async (addonsList: Addon[], actionName: string, proceed: () => void) => {
     const workshopAddons = addonsList.filter(ad => ad.dirType === 'workshop');
@@ -113,7 +113,7 @@ export function useAddonManager() {
   };
 
   // Fetch all data
-  const fetchData = async (showToastMessage = false) => {
+  const fetchData = useCallback(async (showToastMessage = false) => {
     setLoading(true);
     try {
       const data: DatabasePayload = await invoke('get_addons');
@@ -127,11 +127,11 @@ export function useAddonManager() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [updateLocalState, addToast, t]);
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [fetchData]);
 
   const handleOpenLink = async (url: string) => {
     if (!url) return;
@@ -421,7 +421,7 @@ export function useAddonManager() {
             setConfirmModal({
               open: true,
               title: t('moveWarningModal.title'),
-              message: (t('confirmModal.batchMoveMsg', { count: groupAddons.filter(ad => ad.dirType === 'workshop').length }) as string[]).join('\n\n'),
+              message: (t('confirmModal.batchMoveMsg', { count: groupAddons.filter(ad => ad.dirType === 'workshop').length }) as unknown as string[]).join('\n\n'),
               onConfirm: executeMove
             });
           }
@@ -667,7 +667,7 @@ export function useAddonManager() {
         setConfirmModal({
           open: true,
           title: t('moveWarningModal.title'),
-          message: (t('confirmModal.batchMoveMsg', { count: workshopAddons.length }) as string[]).join('\n\n'),
+          message: (t('confirmModal.batchMoveMsg', { count: workshopAddons.length }) as unknown as string[]).join('\n\n'),
           onConfirm: executeMove
         });
       }

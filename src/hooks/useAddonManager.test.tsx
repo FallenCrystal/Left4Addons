@@ -8,6 +8,9 @@ const mockInvoke = vi.fn();
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
 }));
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 describe('useAddonManager', () => {
   const mockAddons: Record<string, Addon> = {
@@ -37,6 +40,7 @@ describe('useAddonManager', () => {
   const mockSettings: Settings = {
     workshopDir: '/path/to/workshop',
     loadingDir: '/path/to/loading',
+    enableDummyBypass: false,
   };
 
   beforeEach(() => {
@@ -257,7 +261,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir');
+      savePromise = result.current.saveSettings('/new/loading/dir', false);
     });
 
     // isSubmitting should be true immediately after invoking
