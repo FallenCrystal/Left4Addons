@@ -10,7 +10,7 @@ export type RenderedItem =
 export function useAddonManager() {
   const [addons, setAddons] = useState<Record<string, Addon>>({});
   const [groups, setGroups] = useState<Group[]>([]);
-  const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '' });
+  const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '', enableDummyBypass: false });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentFilterTab, setCurrentFilterTab] = useState('all'); // all, workshop, loading, disabled, groups
@@ -78,7 +78,7 @@ export function useAddonManager() {
       const data: { addons?: Record<string, Addon>; groups?: Group[]; settings?: Settings } = await invoke('get_addons');
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      setSettings(data.settings || { workshopDir: '', loadingDir: '' });
+      setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       if (showToastMessage) {
         addToast('数据库刷新成功', 'success');
       }
@@ -215,16 +215,17 @@ export function useAddonManager() {
   };
 
   // Save Settings
-  const saveSettings = async (loadingDir: string) => {
+  const saveSettings = async (loadingDir: string, enableDummyBypass: boolean) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: { addons?: Record<string, Addon>; groups?: Group[]; settings?: Settings } = await invoke('save_settings', {
-        loadingDir
+        loadingDir,
+        enableDummyBypass
       });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      setSettings(data.settings || { workshopDir: '', loadingDir: '' });
+      setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       setSettingsModal({ open: false, loadingDir: '' });
       addToast('设置保存并扫描成功', 'success');
     } catch (err) {
@@ -636,7 +637,7 @@ export function useAddonManager() {
 
   // Filter and sort addons
   const getFilteredAddons = () => {
-    let items = Object.values(addons);
+    let items = Object.values(addons).filter(item => !item.isDummy);
 
     // Search query filter
     if (searchQuery) {
@@ -765,10 +766,11 @@ export function useAddonManager() {
   const renderedItems = getRenderedItems(filteredItems);
 
   // Statistics calculation
-  const totalAddonsCount = Object.keys(addons).length;
-  const activeCount = Object.values(addons).filter(a => a.isEnabled).length;
+  const nonDummyAddons = Object.values(addons).filter(a => !a.isDummy);
+  const totalAddonsCount = nonDummyAddons.length;
+  const activeCount = nonDummyAddons.filter(a => a.isEnabled).length;
   const disabledCount = totalAddonsCount - activeCount;
-  const totalStorageSize = Object.values(addons).reduce((acc, curr) => acc + (curr.fileSize || 0), 0);
+  const totalStorageSize = nonDummyAddons.reduce((acc, curr) => acc + (curr.fileSize || 0), 0);
 
   const currentGroup = currentFilterTab === 'groups' && selectedGroupId
     ? groups.find(g => g.id === selectedGroupId)
