@@ -37,11 +37,11 @@ export const GroupModal: React.FC<GroupModalProps> = ({
     onConfirm(name, selectedAddons);
   };
 
-  const handleCheckboxChange = (vpkName: string, checked: boolean) => {
+  const handleCheckboxChange = (id: string, checked: boolean) => {
     if (checked) {
-      setSelectedAddons(prev => [...prev, vpkName]);
+      setSelectedAddons(prev => [...prev, id]);
     } else {
-      setSelectedAddons(prev => prev.filter(item => item !== vpkName));
+      setSelectedAddons(prev => prev.filter(item => item !== id));
     }
   };
 
@@ -83,10 +83,10 @@ export const GroupModal: React.FC<GroupModalProps> = ({
           }}>
             {Object.values(addons).map(addon => {
               const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
-              const isChecked = selectedAddons.includes(addon.vpkName);
+              const isChecked = selectedAddons.includes(addon.id);
               return (
                 <label 
-                  key={addon.vpkName} 
+                  key={addon.id} 
                   style={{ 
                     display: 'flex', 
                     alignItems: 'center', 
@@ -100,7 +100,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
                   <input 
                      type="checkbox" 
                      checked={isChecked}
-                     onChange={(e) => handleCheckboxChange(addon.vpkName, e.target.checked)}
+                     onChange={(e) => handleCheckboxChange(addon.id, e.target.checked)}
                      disabled={isSubmitting}
                   />
                   <span style={{ fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>

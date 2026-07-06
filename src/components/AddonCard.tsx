@@ -8,16 +8,16 @@ import { useTranslation } from 'react-i18next';
 interface AddonCardProps {
   addon: Addon;
   groups: Group[];
-  onToggle: (vpkName: string, isEnabled: boolean) => void;
-  onAddToGroup: (vpkName: string, groupId: string) => void;
-  onRemoveFromGroup: (vpkName: string, groupId: string) => void;
+  onToggle: (id: string, isEnabled: boolean) => void;
+  onAddToGroup: (id: string, groupId: string) => void;
+  onRemoveFromGroup: (id: string, groupId: string) => void;
   onOpenLink: (url: string) => void;
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
   onDetailClick: (addon: Addon) => void;
   isSelectMode: boolean;
   isSelected: boolean;
-  onSelectToggle: (vpkName: string) => void;
+  onSelectToggle: (id: string) => void;
   isSubmitting?: boolean;
 }
 
@@ -42,7 +42,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   const author = getAddonAuthor(addon);
   const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
   
-  const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
+  const itemGroup = groups.find(g => g.addons.includes(addon.id));
   const addonUrl = getAddonUrl(addon);
 
   const handleLinkClick = (e: React.MouseEvent, url: string) => {
@@ -57,7 +57,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         className={`addon-card-checkbox-wrapper ${isSelected ? 'selected' : ''}`}
         onClick={(e) => {
           e.stopPropagation();
-          onSelectToggle(addon.vpkName);
+          onSelectToggle(addon.id);
         }}
         title={isSelected ? t('addonCard.deselect') : t('addonCard.select')}
       >
@@ -72,7 +72,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         onClick={(e) => {
           if (isSelectMode) {
             e.stopPropagation();
-            onSelectToggle(addon.vpkName);
+            onSelectToggle(addon.id);
           } else {
             onDetailClick(addon);
           }
@@ -147,7 +147,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
             <input 
               type="checkbox" 
               checked={addon.isEnabled} 
-              onChange={() => onToggle(addon.vpkName, addon.isEnabled)}
+              onChange={() => onToggle(addon.id, addon.isEnabled)}
               disabled={isSubmitting}
             />
             <span className="slider"></span>
@@ -163,7 +163,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                 {groups.map(g => (
                   <button 
                     key={g.id} 
-                    onClick={() => onAddToGroup(addon.vpkName, g.id)}
+                    onClick={() => onAddToGroup(addon.id, g.id)}
                     disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
                   >
                     {g.name}
@@ -171,7 +171,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                 ))}
                 {itemGroup && (
                   <button 
-                    onClick={() => onRemoveFromGroup(addon.vpkName, itemGroup.id)}
+                    onClick={() => onRemoveFromGroup(addon.id, itemGroup.id)}
                     disabled={isSubmitting}
                     style={{ color: 'var(--md-sys-color-error)' }}
                   >

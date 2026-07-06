@@ -26,7 +26,7 @@ describe('addonHelpers', () => {
   describe('getAddonCategories', () => {
     test('should return Campaign when addonContent_Campaign is 1', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -40,7 +40,7 @@ describe('addonHelpers', () => {
 
     test('should match category keys case-insensitively', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -57,7 +57,7 @@ describe('addonHelpers', () => {
 
     test('should ignore keys with value 0', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -76,7 +76,7 @@ describe('addonHelpers', () => {
 
     test('should fall back to Other when no categories are present', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -88,7 +88,7 @@ describe('addonHelpers', () => {
 
     test('should extract categories from steam details tags', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -123,7 +123,7 @@ describe('addonHelpers', () => {
   describe('getAddonUrl', () => {
     test('should return correct URL when available', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -137,7 +137,7 @@ describe('addonHelpers', () => {
 
     test('should prepend https to url if it has domain structure', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -151,7 +151,7 @@ describe('addonHelpers', () => {
 
     test('should return null when URL is invalid or empty', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -167,7 +167,7 @@ describe('addonHelpers', () => {
   describe('getAddonAuthor', () => {
     test('should return addonAuthor if present in addonInfo', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -181,7 +181,7 @@ describe('addonHelpers', () => {
 
     test('should return steamDetails creator_name if addonInfo has no author', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -195,7 +195,7 @@ describe('addonHelpers', () => {
 
     test('should return Unknown Author if no author info is present', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -208,7 +208,7 @@ describe('addonHelpers', () => {
   describe('getSuggestedVpkName', () => {
     test('should strip brackets and suggest clean vpk name for non-workshop item', () => {
       const addon: Addon = {
-        vpkName: '[OldGroup]my_addon.vpk',
+        id: '[OldGroup]my_addon.vpk', vpkName: '[OldGroup]my_addon.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -220,7 +220,7 @@ describe('addonHelpers', () => {
 
     test('should suggest name with workshopId prefix for workshop items', () => {
       const addon: Addon = {
-        vpkName: '2938529557.vpk',
+        id: '2938529557.vpk', vpkName: '2938529557.vpk',
         dirType: 'workshop',
         isEnabled: true,
         fileSize: 100,
@@ -236,7 +236,7 @@ describe('addonHelpers', () => {
 
     test('should avoid name conflicts by appending a counter', () => {
       const addon: Addon = {
-        vpkName: 'temp.vpk',
+        id: 'temp.vpk', vpkName: 'temp.vpk',
         dirType: 'workshop',
         isEnabled: true,
         fileSize: 100,
@@ -248,7 +248,7 @@ describe('addonHelpers', () => {
       };
       const existing: Record<string, Addon> = {
         '[123]Cool Map.vpk': {
-          vpkName: '[123]Cool Map.vpk',
+          id: '[123]Cool Map.vpk', vpkName: '[123]Cool Map.vpk',
           dirType: 'loading',
           isEnabled: true,
           fileSize: 100,

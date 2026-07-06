@@ -5,16 +5,16 @@ import { TransHTML } from './TransHTML';
 
 interface MoveWarningModalProps {
   open: boolean;
-  vpkName: string;
+  id: string;
   currentDirType: string;
   workshopId: string;
   onCancel: () => void;
-  onConfirm: (vpkName: string, currentDirType: string, unsubscribe: boolean) => void;
+  onConfirm: (id: string, currentDirType: string, unsubscribe: boolean) => void;
 }
 
 export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
   open,
-  vpkName,
+  id,
   currentDirType,
   workshopId,
   onCancel,
@@ -54,7 +54,7 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
             <button
               type="button"
               className="btn btn-tertiary"
-              onClick={() => onConfirm(vpkName, currentDirType, true)}
+              onClick={() => onConfirm(id, currentDirType, true)}
               style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
             >
               <ExternalLink size={14} />
@@ -65,7 +65,7 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
           <button 
             type="button" 
             className="btn btn-primary"
-            onClick={() => onConfirm(vpkName, currentDirType, false)}
+            onClick={() => onConfirm(id, currentDirType, false)}
           >
             {t('moveWarningModal.moveDirectly')}
           </button>

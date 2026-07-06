@@ -5,8 +5,8 @@ import { Addon, Group } from '../types/addon';
 
 describe('BatchActionBar', () => {
   const mockAddons: Record<string, Addon> = {
-    'addon1.vpk': { vpkName: 'addon1.vpk', dirType: 'loading', isEnabled: true, fileSize: 100, filesCount: 1 },
-    'addon2.vpk': { vpkName: 'addon2.vpk', dirType: 'workshop', isEnabled: false, fileSize: 200, filesCount: 2 },
+    'addon1.vpk': { id: 'addon1.vpk', vpkName: 'addon1.vpk', dirType: 'loading', isEnabled: true, fileSize: 100, filesCount: 1 },
+    'addon2.vpk': { id: 'addon2.vpk', vpkName: 'addon2.vpk', dirType: 'workshop', isEnabled: false, fileSize: 200, filesCount: 2 },
   };
 
   const mockGroups: Group[] = [
@@ -25,7 +25,7 @@ describe('BatchActionBar', () => {
 
     render(
       <BatchActionBar
-        selectedVpkNames={['addon1.vpk']}
+        selectedIds={['addon1.vpk']}
         filteredItems={filteredItems}
         addons={mockAddons}
         groups={mockGroups}
@@ -67,7 +67,7 @@ describe('BatchActionBar', () => {
 
     render(
       <BatchActionBar
-        selectedVpkNames={['addon2.vpk']} // addon2 is workshop
+        selectedIds={['addon2.vpk']} // addon2 is workshop
         filteredItems={filteredItems}
         addons={mockAddons}
         groups={mockGroups}

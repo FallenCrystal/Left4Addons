@@ -6,7 +6,7 @@ import { Addon } from '../types/addon';
 describe('GroupModal', () => {
   const mockAddons: Record<string, Addon> = {
     'addon1.vpk': {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 100,
@@ -14,7 +14,7 @@ describe('GroupModal', () => {
       steamDetails: { title: 'First Addon' },
     },
     'addon2.vpk': {
-      vpkName: 'addon2.vpk',
+      id: 'addon2.vpk', vpkName: 'addon2.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 200,

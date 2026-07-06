@@ -7,7 +7,7 @@ describe('MoveWarningModal', () => {
     const { container } = render(
       <MoveWarningModal
         open={false}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="workshop"
         workshopId="12345"
         onCancel={vi.fn()}
@@ -24,7 +24,7 @@ describe('MoveWarningModal', () => {
     render(
       <MoveWarningModal
         open={true}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="workshop"
         workshopId="12345"
         onCancel={onCancel}
@@ -43,7 +43,7 @@ describe('MoveWarningModal', () => {
     render(
       <MoveWarningModal
         open={true}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="loading"
         workshopId=""
         onCancel={vi.fn()}
@@ -61,7 +61,7 @@ describe('MoveWarningModal', () => {
     render(
       <MoveWarningModal
         open={true}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="workshop"
         workshopId="12345"
         onCancel={onCancel}
@@ -79,7 +79,7 @@ describe('MoveWarningModal', () => {
     render(
       <MoveWarningModal
         open={true}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="workshop"
         workshopId="12345"
         onCancel={vi.fn()}
@@ -97,7 +97,7 @@ describe('MoveWarningModal', () => {
     render(
       <MoveWarningModal
         open={true}
-        vpkName="test.vpk"
+        id="test.vpk"
         currentDirType="workshop"
         workshopId="12345"
         onCancel={vi.fn()}

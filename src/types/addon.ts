@@ -45,6 +45,7 @@ export interface SteamDetails {
 }
 
 export interface Addon {
+  id: string;
   vpkName: string;
   dirType: 'workshop' | 'loading' | 'none';
   isEnabled: boolean;

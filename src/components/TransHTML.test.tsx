@@ -1,5 +1,5 @@
 import { describe, test, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render } from '@testing-library/react';
 import { TransHTML, TransParagraphs } from './TransHTML';
 
 vi.mock('react-i18next', () => ({

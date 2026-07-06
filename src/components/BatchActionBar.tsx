@@ -3,7 +3,7 @@ import { Addon, Group } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 
 interface BatchActionBarProps {
-  selectedVpkNames: string[];
+  selectedIds: string[];
   filteredItems: Addon[];
   addons: Record<string, Addon>;
   groups: Group[];
@@ -16,7 +16,7 @@ interface BatchActionBarProps {
 }
 
 export function BatchActionBar({
-  selectedVpkNames,
+  selectedIds,
   filteredItems,
   addons,
   groups,
@@ -28,13 +28,13 @@ export function BatchActionBar({
   onClearSelection,
 }: BatchActionBarProps) {
   const { t } = useTranslation();
-  const isAllSelected = filteredItems.every(item => selectedVpkNames.includes(item.vpkName));
-  const hasWorkshopSelected = selectedVpkNames.some(name => addons[name]?.dirType === 'workshop');
+  const isAllSelected = filteredItems.every(item => selectedIds.includes(item.id));
+  const hasWorkshopSelected = selectedIds.some(name => addons[name]?.dirType === 'workshop');
 
   return (
     <div className="batch-action-bar">
       <div className="batch-action-info">
-        {t('batchActionBar.selectedCount', { count: selectedVpkNames.length })}
+        {t('batchActionBar.selectedCount', { count: selectedIds.length })}
       </div>
       <div className="batch-action-buttons">
         <button 
@@ -52,7 +52,7 @@ export function BatchActionBar({
           className="btn btn-primary"
           style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
           onClick={() => onBatchToggle(true)}
-          disabled={selectedVpkNames.length === 0}
+          disabled={selectedIds.length === 0}
         >
           <Unlock size={14} />
           <span>{t('batchActionBar.enable')}</span>
@@ -62,7 +62,7 @@ export function BatchActionBar({
           className="btn btn-secondary"
           style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
           onClick={() => onBatchToggle(false)}
-          disabled={selectedVpkNames.length === 0}
+          disabled={selectedIds.length === 0}
         >
           <Lock size={14} />
           <span>{t('batchActionBar.disable')}</span>
@@ -73,7 +73,7 @@ export function BatchActionBar({
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
             onClick={onBatchMove}
-            disabled={selectedVpkNames.length === 0}
+            disabled={selectedIds.length === 0}
           >
             <FolderOpen size={14} />
             <span>{t('batchActionBar.moveToManual')}</span>
@@ -84,7 +84,7 @@ export function BatchActionBar({
           className="btn btn-secondary"
           style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
           onClick={onBatchRename}
-          disabled={selectedVpkNames.length === 0}
+          disabled={selectedIds.length === 0}
         >
           <Edit3 size={14} />
           <span>{t('batchActionBar.autoRename')}</span>
@@ -94,7 +94,7 @@ export function BatchActionBar({
           <button 
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-            disabled={selectedVpkNames.length === 0}
+            disabled={selectedIds.length === 0}
           >
             <FolderPlus size={14} />
             <span>{t('batchActionBar.addToGroup')}</span>

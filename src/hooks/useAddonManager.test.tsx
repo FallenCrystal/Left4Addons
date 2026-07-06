@@ -15,7 +15,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 describe('useAddonManager', () => {
   const mockAddons: Record<string, Addon> = {
     'addon1.vpk': {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 1024 * 1024, // 1 MB
@@ -23,7 +23,7 @@ describe('useAddonManager', () => {
       addonInfo: { addontitle: 'Addon One', addonAuthor: 'Author One' },
     },
     'addon2.vpk': {
-      vpkName: 'addon2.vpk',
+      id: 'addon2.vpk', vpkName: 'addon2.vpk',
       dirType: 'workshop',
       isEnabled: false,
       fileSize: 2 * 1024 * 1024, // 2 MB
@@ -129,20 +129,20 @@ describe('useAddonManager', () => {
     });
 
     expect(result.current.isSelectMode).toBe(false);
-    expect(result.current.selectedVpkNames).toEqual([]);
+    expect(result.current.selectedIds).toEqual([]);
 
     // Toggle select addon1
     act(() => {
       result.current.handleSelectToggle('addon1.vpk');
     });
     expect(result.current.isSelectMode).toBe(true);
-    expect(result.current.selectedVpkNames).toEqual(['addon1.vpk']);
+    expect(result.current.selectedIds).toEqual(['addon1.vpk']);
 
     // Toggle select addon1 again (deselects it)
     act(() => {
       result.current.handleSelectToggle('addon1.vpk');
     });
-    expect(result.current.selectedVpkNames).toEqual([]);
+    expect(result.current.selectedIds).toEqual([]);
   });
 
   test('should perform batch enable and disable', async () => {
@@ -155,7 +155,7 @@ describe('useAddonManager', () => {
         return Promise.resolve({});
       }
       if (cmd === 'toggle_addons') {
-        expect(args).toEqual({ vpkNames: ['addon1.vpk', 'addon2.vpk'], enabled: true });
+        expect(args).toEqual({ ids: ['addon1.vpk', 'addon2.vpk'], enabled: true });
         const updatedAddons = { ...mockAddons };
         updatedAddons['addon1.vpk'].isEnabled = true;
         updatedAddons['addon2.vpk'].isEnabled = true;
@@ -191,7 +191,7 @@ describe('useAddonManager', () => {
       if (cmd === 'group_action') {
         if (args?.action === 'create') {
           expect(args.name).toBe('New Group');
-          expect(args.vpkNames).toEqual(['addon2.vpk']);
+          expect(args.ids).toEqual(['addon2.vpk']);
           const newGroups = [...mockGroups, { id: 'group-2', name: 'New Group', addons: ['addon2.vpk'] }];
           return Promise.resolve({ addons: mockAddons, groups: newGroups });
         }

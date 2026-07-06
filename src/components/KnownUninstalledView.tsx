@@ -7,7 +7,7 @@ interface KnownUninstalledViewProps {
   knownUninstalledAddons: Record<string, Addon>;
   downloadProgress: Record<string, number>;
   onDownload: (workshopId: string) => void;
-  onDelete: (vpkNames: string[], deleteFile: boolean, removeFromKnown: boolean) => void;
+  onDelete: (ids: string[], deleteFile: boolean, removeFromKnown: boolean) => void;
   isSubmitting: boolean;
   onOpenLink: (url: string) => void;
 }
@@ -69,8 +69,8 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
 
   const handleBatchDownload = async () => {
     const idsToDownload = selectedIds
-      .map((vpkName) => knownUninstalledAddons[vpkName])
-      .filter(Boolean)
+      .map((id) => knownUninstalledAddons[id])
+      .filter((addon) => addon !== undefined)
       .map((addon) => addon.workshopId)
       .filter(Boolean) as string[];
 
@@ -187,13 +187,13 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
 
             return (
               <div 
-                key={addon.vpkName} 
-                className={`addon-card ${selectedIds.includes(addon.vpkName) ? 'selected' : ''}`}
+                key={addon.id} 
+                className={`addon-card ${selectedIds.includes(addon.id) ? 'selected' : ''}`}
                 style={{
                   display: 'flex',
                   flexDirection: 'column',
                   borderRadius: '16px',
-                  border: selectedIds.includes(addon.vpkName) 
+                  border: selectedIds.includes(addon.id) 
                     ? '2px solid var(--md-sys-color-primary)' 
                     : '1px solid var(--md-sys-color-outline-variant)',
                   backgroundColor: 'var(--md-sys-color-surface-container-low)',
@@ -208,7 +208,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                   <div style={{ position: 'absolute', top: '12px', left: '12px', zIndex: 10 }}>
                     <input
                       type="checkbox"
-                      checked={selectedIds.includes(addon.vpkName)}
+                      checked={selectedIds.includes(addon.id)}
                       onChange={() => {}} // handled by card onClick
                       style={{ width: '20px', height: '20px', cursor: 'pointer' }}
                     />

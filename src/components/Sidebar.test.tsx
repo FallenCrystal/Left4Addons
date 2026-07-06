@@ -6,14 +6,14 @@ import { Addon, Group } from '../types/addon';
 describe('Sidebar', () => {
   const mockAddons: Record<string, Addon> = {
     'addon1.vpk': {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 100,
       filesCount: 1,
     },
     'addon2.vpk': {
-      vpkName: 'addon2.vpk',
+      id: 'addon2.vpk', vpkName: 'addon2.vpk',
       dirType: 'workshop',
       isEnabled: false,
       fileSize: 200,

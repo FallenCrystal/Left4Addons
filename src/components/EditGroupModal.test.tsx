@@ -19,7 +19,7 @@ describe('EditGroupModal', () => {
 
   const mockAddons: Addon[] = [
     {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 100,

@@ -15,7 +15,7 @@ describe('WorkshopActionWarningModal', () => {
 
   const mockAddons: Addon[] = [
     {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'workshop',
       isEnabled: true,
       fileSize: 100,

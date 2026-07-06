@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, beforeAll, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { ErrorBoundary } from './ErrorBoundary';
-import React from 'react';
+// import React from 'react';
 
 const ThrowError = () => {
   throw new Error('Test Render Error');

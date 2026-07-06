@@ -13,7 +13,7 @@ describe('GroupCard', () => {
 
   const mockAddons: Addon[] = [
     {
-      vpkName: 'addon1.vpk',
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 1024 * 1024 * 10, // 10 MB
@@ -24,7 +24,7 @@ describe('GroupCard', () => {
       },
     },
     {
-      vpkName: 'addon2.vpk',
+      id: 'addon2.vpk', vpkName: 'addon2.vpk',
       dirType: 'loading',
       isEnabled: true,
       fileSize: 1024 * 1024 * 5, // 5 MB

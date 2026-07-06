@@ -29,6 +29,8 @@ pub struct AddonMetadata {
     pub files_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub hash: String,
 }
 
 fn read_string(buf: &[u8], offset: &mut usize) -> String {
@@ -289,11 +291,27 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
+pub fn calculate_file_hash<P: AsRef<Path>>(path: P) -> String {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let mut hasher = Md5::new();
+    if std::io::copy(&mut file, &mut hasher).is_ok() {
+        format!("{:x}", hasher.finalize())
+    } else {
+        String::new()
+    }
+}
+
 pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     vpk_path: P,
     cache_dir: Q,
 ) -> AddonMetadata {
     let mut result = AddonMetadata::default();
+    
+    let hash = calculate_file_hash(&vpk_path);
+    result.hash = hash;
     
     let (files, mut file) = match parse_vpk(&vpk_path) {
         Ok(val) => val,

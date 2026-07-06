@@ -10,7 +10,7 @@ interface DetailModalProps {
   addon: Addon | null;
   groups: Group[];
   onCancel: () => void;
-  onToggle: (vpkName: string, isEnabled: boolean) => void;
+  onToggle: (id: string, isEnabled: boolean) => void;
   onMove: (addon: Addon) => void;
   onOpenLink: (url: string) => void;
 }
@@ -32,7 +32,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   const author = getAddonAuthor(addon);
   const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
   const categories = getAddonCategories(addon);
-  const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
+  const itemGroup = groups.find(g => g.addons.includes(addon.id));
   const addonUrl = getAddonUrl(addon);
   
   const addonauthorSteamID = getAddonInfoValue(addon, 'addonauthorsteamid');
@@ -224,7 +224,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
           <div style={{ display: 'flex', gap: '12px' }}>
             <button 
               className={`btn ${addon.isEnabled ? 'btn-secondary' : 'btn-primary'}`}
-              onClick={() => onToggle(addon.vpkName, addon.isEnabled)}
+              onClick={() => onToggle(addon.id, addon.isEnabled)}
             >
               {addon.isEnabled ? t('detailModal.disableAddon') : t('detailModal.enableAddon')}
             </button>

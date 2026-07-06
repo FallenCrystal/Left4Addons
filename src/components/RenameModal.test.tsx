@@ -5,7 +5,7 @@ import { Addon, Group } from '../types/addon';
 
 describe('RenameModal', () => {
   const mockAddon: Addon = {
-    vpkName: 'old_name.vpk',
+    id: 'old_name.vpk', vpkName: 'old_name.vpk',
     dirType: 'loading',
     isEnabled: true,
     fileSize: 100,

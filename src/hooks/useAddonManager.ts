@@ -24,14 +24,14 @@ export function useAddonManager() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [syncingSteam, setSyncingSteam] = useState(false);
   const [autoGrouping, setAutoGrouping] = useState(false);
-  const [selectedVpkNames, setSelectedVpkNames] = useState<string[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
 
   // Modals state
   const [detailModal, setDetailModal] = useState<{ open: boolean; addon: Addon | null }>({ open: false, addon: null });
-  const [moveWarningModal, setMoveWarningModal] = useState<{ open: boolean; vpkName: string; currentDirType: string; workshopId: string }>({ open: false, vpkName: '', currentDirType: '', workshopId: '' });
+  const [moveWarningModal, setMoveWarningModal] = useState<{ open: boolean; id: string; currentDirType: string; workshopId: string }>({ open: false, id: '', currentDirType: '', workshopId: '' });
   const [renameModal, setRenameModal] = useState<{ open: boolean; currentName: string; title: string; suggestedName: string }>({ open: false, currentName: '', title: '', suggestedName: '' });
   const [groupModal, setGroupModal] = useState<{ open: boolean }>({ open: false });
   const [editGroupModal, setEditGroupModal] = useState<{ open: boolean; groupId: string; name: string; tags: string[]; workshopCollectionId: string }>({ open: false, groupId: '', name: '', tags: [], workshopCollectionId: '' });
@@ -89,8 +89,8 @@ export function useAddonManager() {
     const workshopAddons = addonsList.filter(ad => ad.dirType === 'workshop');
     if (workshopAddons.length > 0) {
       try {
-        const vpkNames = workshopAddons.map(a => a.vpkName);
-        await invoke('move_addons', { vpkNames, targetDirType: 'loading' });
+        const ids = workshopAddons.map(a => a.vpkName);
+        await invoke('move_addons', { ids, targetDirType: 'loading' });
       } catch (err) {
         addToast(t('toasts.autoMoveFailed', { err: String(err) }), 'error');
         setIsSubmitting(false);
@@ -147,9 +147,9 @@ export function useAddonManager() {
   };
 
   // Toggle addon enable/disable status
-  const toggleAddon = async (vpkName: string, currentStatus: boolean) => {
+  const toggleAddon = async (id: string, currentStatus: boolean) => {
     if (isSubmitting) return;
-    const addon = addons[vpkName] || knownUninstalledAddons[vpkName];
+    const addon = addons[id] || knownUninstalledAddons[id];
     if (!addon) return;
     
     // If it's not installed, we can't toggle it (needs download)
@@ -161,11 +161,11 @@ export function useAddonManager() {
     setIsSubmitting(true);
     executeWithWorkshopCheck([addon], currentStatus ? '禁用组件' : '启用组件', async () => {
       try {
-        const data: DatabasePayload = await invoke('toggle_addons', { vpkNames: [vpkName], enabled: !currentStatus });
+        const data: DatabasePayload = await invoke('toggle_addons', { ids: [id], enabled: !currentStatus });
         updateLocalState(data);
         addToast(currentStatus ? t('toasts.addonDisabled') : t('toasts.addonEnabled'), 'success');
         
-        if (detailModal.open && detailModal.addon?.vpkName === vpkName) {
+        if (detailModal.open && detailModal.addon?.id === id) {
           setDetailModal(prev => ({
             ...prev,
             addon: prev.addon ? { ...prev.addon, isEnabled: !currentStatus } : null
@@ -188,8 +188,8 @@ export function useAddonManager() {
     setIsSubmitting(true);
     executeWithWorkshopCheck(installedList, enabled ? '批量启用组件' : '批量禁用组件', async () => {
       try {
-        const vpkNames = installedList.map(ad => ad.vpkName);
-        const data: DatabasePayload = await invoke('toggle_addons', { vpkNames, enabled });
+        const ids = installedList.map(ad => ad.id);
+        const data: DatabasePayload = await invoke('toggle_addons', { ids, enabled });
         updateLocalState(data);
         addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
       } catch (err) {
@@ -201,12 +201,12 @@ export function useAddonManager() {
   };
 
   // Move addon to load or workshop directory
-  const moveAddon = async (vpkName: string, currentDirType: string) => {
+  const moveAddon = async (id: string, currentDirType: string) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     const targetDirType = currentDirType === 'workshop' ? 'loading' : 'workshop';
     try {
-      const data: DatabasePayload = await invoke('move_addons', { vpkNames: [vpkName], targetDirType });
+      const data: DatabasePayload = await invoke('move_addons', { ids: [id], targetDirType });
       updateLocalState(data);
       addToast(targetDirType === 'loading' ? t('toasts.moveSuccessLoading') : t('toasts.moveSuccessWorkshop'), 'success');
     } catch (err) {
@@ -219,17 +219,17 @@ export function useAddonManager() {
   const handleMoveClick = (addon: Addon) => {
     if (addon.dirType === 'workshop') {
       if (settings.enableDummyBypass) {
-        moveAddon(addon.vpkName, addon.dirType);
+        moveAddon(addon.id, addon.dirType);
       } else {
         setMoveWarningModal({
           open: true,
-          vpkName: addon.vpkName,
+          id: addon.id,
           currentDirType: addon.dirType,
           workshopId: addon.workshopId || ''
         });
       }
     } else {
-      moveAddon(addon.vpkName, addon.dirType);
+      moveAddon(addon.id, addon.dirType);
     }
   };
 
@@ -290,7 +290,7 @@ export function useAddonManager() {
     executeWithWorkshopCheck([addon], t('common.rename'), async () => {
       try {
         const data: DatabasePayload = await invoke('rename_addon', {
-          vpkName: currentName,
+          id: currentName, vpkName: currentName,
           newVpkName
         });
         updateLocalState(data);
@@ -312,7 +312,7 @@ export function useAddonManager() {
       const data: DatabasePayload = await invoke('group_action', {
         action: 'create',
         name,
-        vpkNames: selectedAddons,
+        ids: selectedAddons,
         tags,
         workshopCollectionId
       });
@@ -351,7 +351,7 @@ export function useAddonManager() {
     });
   };
 
-  const handleRenameGroup = async (groupId: string, name: string, tags?: string[], workshopCollectionId?: string, vpkNames?: string[]) => {
+  const handleRenameGroup = async (groupId: string, name: string, tags?: string[], workshopCollectionId?: string, ids?: string[]) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
@@ -361,7 +361,7 @@ export function useAddonManager() {
         name,
         tags,
         workshopCollectionId,
-        vpkNames
+        ids
       });
       updateLocalState(data);
       setEditGroupModal({ open: false, groupId: '', name: '', tags: [], workshopCollectionId: '' });
@@ -386,8 +386,8 @@ export function useAddonManager() {
         const installedList = groupAddons.filter(ad => ad.dirType !== 'none');
         executeWithWorkshopCheck(installedList, enabled ? t('batchActionBar.enable') : t('batchActionBar.disable'), async () => {
           try {
-            const vpkNames = installedList.map(ad => ad.vpkName);
-            const data: DatabasePayload = await invoke('toggle_addons', { vpkNames, enabled });
+            const ids = installedList.map(ad => ad.id);
+            const data: DatabasePayload = await invoke('toggle_addons', { ids, enabled });
             updateLocalState(data);
             addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
           } catch (err) {
@@ -403,8 +403,8 @@ export function useAddonManager() {
         
         const executeMove = async () => {
           try {
-            const vpkNames = groupAddons.map(ad => ad.vpkName);
-            const data: DatabasePayload = await invoke('move_addons', { vpkNames, targetDirType });
+            const ids = groupAddons.map(ad => ad.vpkName);
+            const data: DatabasePayload = await invoke('move_addons', { ids, targetDirType });
             updateLocalState(data);
             addToast(t('toasts.batchMoveSuccess'), 'success');
           } catch (err) {
@@ -435,14 +435,14 @@ export function useAddonManager() {
     }
   };
 
-  const removeAddonFromGroup = async (vpkName: string, groupId: string) => {
+  const removeAddonFromGroup = async (id: string, groupId: string) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('group_action', {
         action: 'remove-addons',
         groupId,
-        vpkNames: [vpkName]
+        ids: [id]
       });
       updateLocalState(data);
       addToast(t('toasts.removeFromGroupSuccess'), 'success');
@@ -453,14 +453,14 @@ export function useAddonManager() {
     }
   };
 
-  const addAddonToGroup = async (vpkName: string, groupId: string) => {
+  const addAddonToGroup = async (id: string, groupId: string) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('group_action', {
         action: 'add-addons',
         groupId,
-        vpkNames: [vpkName]
+        ids: [id]
       });
       updateLocalState(data);
       addToast(t('toasts.addToGroupSuccess'), 'success');
@@ -473,7 +473,7 @@ export function useAddonManager() {
 
   // Helper to suggest workshop title for rename
   const triggerRenameModal = (addon: Addon) => {
-    const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
+    const itemGroup = groups.find(g => g.addons.includes(addon.id));
     const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, addons);
     const steamTitle = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
 
@@ -504,11 +504,11 @@ export function useAddonManager() {
   };
 
   // Delete addon(s)
-  const deleteAddons = async (vpkNames: string[], deleteFile: boolean, removeFromKnown: boolean) => {
+  const deleteAddons = async (ids: string[], deleteFile: boolean, removeFromKnown: boolean) => {
     if (isSubmitting) return;
     
-    // Check if any of these vpkNames are local non-workshop items
-    const nonWorkshopItems = vpkNames.filter(name => {
+    // Check if any of these ids are local non-workshop items
+    const nonWorkshopItems = ids.filter(name => {
       const ad = addons[name] || knownUninstalledAddons[name];
       return ad && !ad.workshopId;
     });
@@ -516,7 +516,7 @@ export function useAddonManager() {
     const executeDelete = async () => {
       setIsSubmitting(true);
       try {
-        const data: DatabasePayload = await invoke('delete_addons', { vpkNames, deleteFile, removeFromKnown });
+        const data: DatabasePayload = await invoke('delete_addons', { ids, deleteFile, removeFromKnown });
         updateLocalState(data);
         addToast('删除组件成功', 'success');
         handleClearSelection();
@@ -539,18 +539,18 @@ export function useAddonManager() {
       setConfirmModal({
         open: true,
         title: '删除组件',
-        message: `确定要删除选中的 ${vpkNames.length} 个组件吗？`,
+        message: `确定要删除选中的 ${ids.length} 个组件吗？`,
         onConfirm: executeDelete
       });
     }
   };
 
   // Selection management
-  const handleSelectToggle = (vpkName: string) => {
-    setSelectedVpkNames((prev) => {
-      const next = prev.includes(vpkName)
-        ? prev.filter((name) => name !== vpkName)
-        : [...prev, vpkName];
+  const handleSelectToggle = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = prev.includes(id)
+        ? prev.filter((name) => name !== id)
+        : [...prev, id];
       if (next.length > 0 && !isSelectMode) {
         setIsSelectMode(true);
       }
@@ -560,12 +560,12 @@ export function useAddonManager() {
 
   const handleSelectGroupToggle = (groupAddons: Addon[]) => {
     const addonNames = groupAddons.map((ad) => ad.vpkName);
-    const allSelected = addonNames.every((name) => selectedVpkNames.includes(name));
+    const allSelected = addonNames.every((name) => selectedIds.includes(name));
 
     if (allSelected) {
-      setSelectedVpkNames((prev) => prev.filter((name) => !addonNames.includes(name)));
+      setSelectedIds((prev) => prev.filter((name) => !addonNames.includes(name)));
     } else {
-      setSelectedVpkNames((prev) => {
+      setSelectedIds((prev) => {
         const next = [...prev];
         addonNames.forEach((name) => {
           if (!next.includes(name)) {
@@ -582,12 +582,12 @@ export function useAddonManager() {
 
   const handleSelectAll = (visibleItems: Addon[]) => {
     const visibleNames = visibleItems.map(item => item.vpkName);
-    const allSelected = visibleNames.every(name => selectedVpkNames.includes(name));
+    const allSelected = visibleNames.every(name => selectedIds.includes(name));
     
     if (allSelected) {
-      setSelectedVpkNames((prev) => prev.filter(name => !visibleNames.includes(name)));
+      setSelectedIds((prev) => prev.filter(name => !visibleNames.includes(name)));
     } else {
-      setSelectedVpkNames((prev) => {
+      setSelectedIds((prev) => {
         const next = [...prev];
         visibleNames.forEach(name => {
           if (!next.includes(name)) {
@@ -600,25 +600,25 @@ export function useAddonManager() {
   };
 
   const handleClearSelection = () => {
-    setSelectedVpkNames([]);
+    setSelectedIds([]);
     setIsSelectMode(false);
   };
 
   // Batch actions
   const handleBatchToggle = async (enabled: boolean) => {
-    if (selectedVpkNames.length === 0) return;
+    if (selectedIds.length === 0) return;
     if (isSubmitting) return;
     
-    const selectedAddonsList = selectedVpkNames.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean);
+    const selectedAddonsList = selectedIds.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean);
     const installedList = selectedAddonsList.filter(ad => ad.dirType !== 'none');
     if (installedList.length === 0) return;
 
     setIsSubmitting(true);
     executeWithWorkshopCheck(installedList, enabled ? t('toasts.addonEnabled') : t('toasts.addonDisabled'), async () => {
       try {
-        const vpkNames = installedList.map(ad => ad.vpkName);
+        const ids = installedList.map(ad => ad.id);
         const data: DatabasePayload = await invoke('toggle_addons', { 
-          vpkNames, 
+          ids, 
           enabled 
         });
         updateLocalState(data);
@@ -633,10 +633,10 @@ export function useAddonManager() {
   };
 
   const handleBatchMove = async () => {
-    if (selectedVpkNames.length === 0) return;
+    if (selectedIds.length === 0) return;
     if (isSubmitting) return;
     
-    const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
+    const selectedAddonsList = selectedIds.map(name => addons[name]).filter(Boolean);
     const installedList = selectedAddonsList.filter(ad => ad.dirType !== 'none');
     if (installedList.length === 0) return;
 
@@ -645,9 +645,9 @@ export function useAddonManager() {
     
     const executeMove = async () => {
       try {
-        const vpkNames = installedList.map(ad => ad.vpkName);
+        const ids = installedList.map(ad => ad.id);
         const data: DatabasePayload = await invoke('move_addons', { 
-          vpkNames, 
+          ids, 
           targetDirType: 'loading' 
         });
         updateLocalState(data);
@@ -677,27 +677,27 @@ export function useAddonManager() {
   };
 
   const handleBatchRename = async () => {
-    if (selectedVpkNames.length === 0) return;
+    if (selectedIds.length === 0) return;
     if (isSubmitting) return;
     setIsSubmitting(true);
     
-    const renamesList: { vpkName: string; newVpkName: string }[] = [];
+    const renamesList: { id: string; newVpkName: string }[] = [];
     const currentAddonsMap = { ...addons };
     
-    for (const vpkName of selectedVpkNames) {
-      const addon = addons[vpkName];
+    for (const id of selectedIds) {
+      const addon = addons[id];
       if (!addon) continue;
       
-      const itemGroup = groups.find(g => g.addons.includes(vpkName));
+      const itemGroup = groups.find(g => g.addons.includes(id));
       const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, currentAddonsMap);
       
-      if (suggestedVpkName !== vpkName) {
+      if (suggestedVpkName !== addon.vpkName) {
         renamesList.push({
-          vpkName,
+          id,
           newVpkName: suggestedVpkName
         });
-        delete currentAddonsMap[vpkName];
-        currentAddonsMap[suggestedVpkName] = {
+        delete currentAddonsMap[id];
+        currentAddonsMap[id] = {
           ...addon,
           vpkName: suggestedVpkName
         };
@@ -715,7 +715,7 @@ export function useAddonManager() {
       title: t('confirmModal.batchRenameTitle'),
       message: t('confirmModal.batchRenameMsg', { count: renamesList.length }),
       onConfirm: async () => {
-        const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
+        const selectedAddonsList = selectedIds.map(name => addons[name]).filter(Boolean);
         executeWithWorkshopCheck(selectedAddonsList, t('common.rename'), async () => {
           try {
             const data: DatabasePayload = await invoke('rename_addons', { 
@@ -735,14 +735,14 @@ export function useAddonManager() {
   };
 
   const handleBatchAddToGroup = async (groupId: string) => {
-    if (selectedVpkNames.length === 0) return;
+    if (selectedIds.length === 0) return;
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('group_action', {
         action: 'add-addons',
         groupId,
-        vpkNames: selectedVpkNames
+        ids: selectedIds
       });
       updateLocalState(data);
       addToast(t('toasts.batchAddGroupSuccess'), 'success');
@@ -767,7 +767,7 @@ export function useAddonManager() {
         const title = (item.steamDetails?.title || getAddonInfoValue(item, 'addontitle') || '').toLowerCase();
         const desc = (item.steamDetails?.description || getAddonInfoValue(item, 'addondescription') || getAddonInfoValue(item, 'addontagline') || '').toLowerCase();
         const author = getAddonAuthor(item).toLowerCase();
-        return title.includes(q) || desc.includes(q) || author.includes(q) || item.vpkName.toLowerCase().includes(q) || (item.workshopId || '').includes(q);
+        return title.includes(q) || desc.includes(q) || author.includes(q) || item.id.toLowerCase().includes(q) || (item.workshopId || '').includes(q);
       });
     }
 
@@ -793,7 +793,7 @@ export function useAddonManager() {
       } else if (currentFilterTab === 'groups' && selectedGroupId) {
         const group = groups.find(g => g.id === selectedGroupId);
         if (group) {
-          items = items.filter(item => group.addons.includes(item.vpkName));
+          items = items.filter(item => group.addons.includes(item.id));
         } else {
           items = [];
         }
@@ -819,16 +819,16 @@ export function useAddonManager() {
 
   const getRenderedItems = (filteredAddons: Addon[]): RenderedItem[] => {
     if (currentFilterTab === 'groups' || currentFilterTab === 'known-uninstalled') {
-      return filteredAddons.map(item => ({ type: 'addon' as const, id: item.vpkName, data: item }));
+      return filteredAddons.map(item => ({ type: 'addon' as const, id: item.id, data: item }));
     }
 
     const rendered: RenderedItem[] = [];
     const groupedVpkNames = new Set<string>();
     
     groups.forEach(group => {
-      const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.vpkName));
+      const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.id));
       if (matchingAddons.length > 0) {
-        matchingAddons.forEach(item => groupedVpkNames.add(item.vpkName));
+        matchingAddons.forEach(item => groupedVpkNames.add(item.id));
         rendered.push({
           type: 'group',
           id: group.id,
@@ -840,10 +840,10 @@ export function useAddonManager() {
     });
 
     filteredAddons.forEach(item => {
-      if (!groupedVpkNames.has(item.vpkName)) {
+      if (!groupedVpkNames.has(item.id)) {
         rendered.push({
           type: 'addon',
-          id: item.vpkName,
+          id: item.id,
           data: item
         });
       }
@@ -927,7 +927,7 @@ export function useAddonManager() {
     setToasts,
     syncingSteam,
     autoGrouping,
-    selectedVpkNames,
+    selectedIds,
     isSelectMode,
     setIsSelectMode,
     isSubmitting,

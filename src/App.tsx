@@ -42,7 +42,7 @@ function App() {
     toasts,
     syncingSteam,
     autoGrouping,
-    selectedVpkNames,
+    selectedIds,
     isSelectMode,
     setIsSelectMode,
     isSubmitting,
@@ -166,8 +166,8 @@ function App() {
             onDownload={downloadAddon}
             onOpenLink={handleOpenLink}
             onImportCollection={async (name, itemIds) => {
-              const vpkNames = itemIds.map(id => `${id}.vpk`);
-              await handleCreateGroup(name, vpkNames);
+              const ids = itemIds.map(id => `${id}.vpk`);
+              await handleCreateGroup(name, ids);
             }}
             isSubmitting={isSubmitting}
             groups={groups}
@@ -245,7 +245,7 @@ function App() {
                   {renderedItems.map(renderedItem => {
                     if (renderedItem.type === 'group') {
                       const groupAddons = renderedItem.addons;
-                      const isGroupSelected = groupAddons.every(ad => selectedVpkNames.includes(ad.vpkName));
+                      const isGroupSelected = groupAddons.every(ad => selectedIds.includes(ad.id));
                       return (
                         <GroupCard
                           key={renderedItem.id}
@@ -276,7 +276,7 @@ function App() {
                           onRenameClick={triggerRenameModal}
                           onDetailClick={(addon) => setDetailModal({ open: true, addon })}
                           isSelectMode={isSelectMode}
-                          isSelected={selectedVpkNames.includes(addonData.vpkName)}
+                          isSelected={selectedIds.includes(addonData.id)}
                           onSelectToggle={handleSelectToggle}
                           isSubmitting={isSubmitting}
                         />
@@ -293,7 +293,7 @@ function App() {
       {/* Modals */}
       <DetailModal
         open={detailModal.open}
-        addon={detailModal.addon ? addons[detailModal.addon.vpkName] : null}
+        addon={detailModal.addon ? addons[detailModal.addon.id] : null}
         groups={groups}
         onCancel={() => setDetailModal({ open: false, addon: null })}
         onToggle={toggleAddon}
@@ -303,19 +303,19 @@ function App() {
 
       <MoveWarningModal
         open={moveWarningModal.open}
-        vpkName={moveWarningModal.vpkName}
+        id={moveWarningModal.id}
         currentDirType={moveWarningModal.currentDirType}
         workshopId={moveWarningModal.workshopId}
         onCancel={() => {
-          setMoveWarningModal({ open: false, vpkName: '', currentDirType: '', workshopId: '' });
+          setMoveWarningModal({ open: false, id: '', currentDirType: '', workshopId: '' });
           setIsSubmitting(false);
         }}
-        onConfirm={async (vpkName, currentDirType, unsubscribe) => {
+        onConfirm={async (id, currentDirType, unsubscribe) => {
           if (unsubscribe && moveWarningModal.workshopId) {
             await invoke('open_url', { url: `steam://url/CommunityFilePage/${moveWarningModal.workshopId}` });
           }
-          await moveAddon(vpkName, currentDirType);
-          setMoveWarningModal({ open: false, vpkName: '', currentDirType: '', workshopId: '' });
+          await moveAddon(id, currentDirType);
+          setMoveWarningModal({ open: false, id: '', currentDirType: '', workshopId: '' });
         }}
       />
 
@@ -408,7 +408,7 @@ function App() {
       {/* Floating Batch Action Bar */}
       {isSelectMode && (
         <BatchActionBar
-          selectedVpkNames={selectedVpkNames}
+          selectedIds={selectedIds}
           filteredItems={filteredItems}
           addons={addons}
           groups={groups}
