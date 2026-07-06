@@ -79,6 +79,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const [selectedItem, setSelectedItem] = useState<any | null>(null);
   const [selectedCollection, setSelectedCollection] = useState<CollectionData | null>(null);
   const [tagModalOpen, setTagModalOpen] = useState(false);
+  const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
 
   // ── Fetch homepage ─────────────────────────────────────────────────────────
 
@@ -134,7 +135,14 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!query.trim()) return;
+    if (!query.trim()) {
+      setCommittedQuery('');
+      if (viewMode === 'search') {
+        setViewMode('browse');
+        setPage(1);
+      }
+      return;
+    }
     setCreatorId(null);
     setCreatorName(null);
     setActiveTag(null);
@@ -201,6 +209,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   });
 
   const viewItemDetails = async (workshopId: string) => {
+    setLoadingDetailId(workshopId);
     try {
       const data: any = await invoke('fetch_collection', { collectionId: workshopId });
       const raw = data.collection;
@@ -209,10 +218,13 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       }
     } catch (err) {
       alert(t('workshop.detail.fetchFailed', { err: String(err) }));
+    } finally {
+      setLoadingDetailId(null);
     }
   };
 
   const viewCollectionDetails = async (collectionId: string) => {
+    setLoadingDetailId(collectionId);
     try {
       const data: any = await invoke('fetch_collection', { collectionId });
       const raw = data.collection;
@@ -229,6 +241,8 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       }
     } catch (err) {
       alert(t('workshop.detail.fetchFailed', { err: String(err) }));
+    } finally {
+      setLoadingDetailId(null);
     }
   };
 
@@ -264,6 +278,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
             knownUninstalledAddons={knownUninstalledAddons}
             onItemClick={(item) => viewItemDetails(item.workshopId)}
             onViewAll={handleViewAllSection}
+            loadingDetailId={loadingDetailId}
           />
         ))}
       </div>
@@ -311,7 +326,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           </div>
         ) : (
           <>
-            <div className="addons-grid" style={{ marginBottom: '24px', gap: '24px' }}>
+            <div className="addons-grid" style={{ marginBottom: '24px', gap: '24px', padding: '4px' }}>
               {items.map((item) => (
                 <ItemCard
                   key={item.workshopId}
@@ -320,6 +335,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
                   addons={addons}
                   knownUninstalledAddons={knownUninstalledAddons}
                   onClick={() => section === 'collections' ? viewCollectionDetails(item.workshopId) : viewItemDetails(item.workshopId)}
+                  isLoading={loadingDetailId === item.workshopId}
                 />
               ))}
             </div>
@@ -368,7 +384,20 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
               type="text"
               placeholder={t('workshop.nav.searchPlaceholder')}
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                setQuery(val);
+                if (val.trim() === '' && viewMode === 'search') {
+                  setCommittedQuery('');
+                  setViewMode('browse');
+                  setPage(1);
+                }
+              }}
+              onFocus={() => {
+                if (viewMode === 'home') {
+                  enterBrowseMode();
+                }
+              }}
               style={{ width: '100%', padding: '8px 14px 8px 40px', borderRadius: '100px', border: '1px solid var(--md-sys-color-outline-variant)', backgroundColor: 'var(--md-sys-color-surface-container-high)', color: 'var(--md-sys-color-on-surface)', outline: 'none', fontSize: '13px' }}
             />
           </div>
@@ -377,7 +406,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           </button>
         </form>
 
-        {viewMode === 'browse' && !creatorId && (
+        {(viewMode === 'browse' || viewMode === 'search') && !creatorId && (
           <>
             <select
               value={sort}

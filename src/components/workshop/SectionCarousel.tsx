@@ -22,6 +22,7 @@ interface SectionCarouselProps {
   knownUninstalledAddons: Record<string, any>;
   onItemClick: (item: WorkshopItem) => void;
   onViewAll: (section: HomepageSection) => void;
+  loadingDetailId?: string | null;
 }
 
 export const SectionCarousel: React.FC<SectionCarouselProps> = ({
@@ -31,6 +32,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
   knownUninstalledAddons,
   onItemClick,
   onViewAll,
+  loadingDetailId,
 }) => {
   const { t } = useTranslation();
 
@@ -94,6 +96,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
           display: 'grid',
           gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))',
           gap: '16px',
+          paddingLeft: '32px',
         }}
       >
         {section.items.slice(0, 6).map((item) => (
@@ -104,6 +107,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
             addons={addons}
             knownUninstalledAddons={knownUninstalledAddons}
             onClick={() => onItemClick(item)}
+            isLoading={loadingDetailId === item.workshopId}
           />
         ))}
       </div>

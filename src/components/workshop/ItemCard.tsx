@@ -1,7 +1,7 @@
 /** Workshop item card component */
 
 import React from 'react';
-import { Star } from 'lucide-react';
+import { Star, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem } from './types';
 
@@ -11,6 +11,7 @@ interface ItemCardProps {
   addons: Record<string, any>;
   knownUninstalledAddons: Record<string, any>;
   onClick: () => void;
+  isLoading?: boolean;
 }
 
 export const ItemCard: React.FC<ItemCardProps> = ({
@@ -19,13 +20,19 @@ export const ItemCard: React.FC<ItemCardProps> = ({
   addons,
   knownUninstalledAddons,
   onClick,
+  isLoading,
 }) => {
   const { t } = useTranslation();
   const isDownloaded = addons[item.workshopId + '.vpk'] !== undefined;
   const isKnown = knownUninstalledAddons[item.workshopId + '.vpk'] !== undefined;
 
   return (
-    <div className="addon-card" style={{ cursor: 'pointer' }} onClick={onClick}>
+    <div className="addon-card" style={{ cursor: isLoading ? 'wait' : 'pointer' }} onClick={isLoading ? undefined : onClick}>
+      {isLoading && (
+        <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '28px', backdropFilter: 'blur(2px)' }}>
+          <Loader2 size={32} color="var(--md-sys-color-primary)" className="animate-spin" />
+        </div>
+      )}
       <div className="addon-card-clickable-area">
         <div className="addon-card-image-wrapper">
           <img className="addon-card-image" src={item.imagePath} alt={item.title} />

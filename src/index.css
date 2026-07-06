@@ -291,8 +291,9 @@ body {
 .addon-card:hover {
   transform: scale(1.02);
   border-color: var(--md-sys-color-primary);
-  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 0 0 1px var(--md-sys-color-primary), 0 12px 24px rgba(0, 0, 0, 0.4);
   background-color: var(--md-sys-surface-container-high);
+  z-index: 10;
 }
 
 .addon-card.disabled {
