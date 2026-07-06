@@ -289,7 +289,7 @@ body {
 }
 
 .addon-card:hover {
-  transform: translateY(-6px) scale(1.01);
+  transform: scale(1.02);
   border-color: var(--md-sys-color-primary);
   box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
   background-color: var(--md-sys-surface-container-high);

@@ -7,12 +7,12 @@ import { HomepageSection, WorkshopItem } from './types';
 import { ItemCard } from './ItemCard';
 
 const ICON_MAP: Record<string, React.ReactNode> = {
-  Clock: <Clock size={16} />,
-  Flame: <Flame size={16} />,
-  Package: <Package size={16} />,
-  Users: <Users size={16} />,
-  RefreshCw: <RefreshCw size={16} />,
-  Star: <Star size={16} />,
+  Clock: <Clock size={20} />,
+  Flame: <Flame size={20} />,
+  Package: <Package size={20} />,
+  Users: <Users size={20} />,
+  RefreshCw: <RefreshCw size={20} />,
+  Star: <Star size={20} />,
 };
 
 interface SectionCarouselProps {
@@ -41,30 +41,46 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
       <div
         style={{
           display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          marginBottom: '12px',
+          marginBottom: '16px',
         }}
       >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <div style={{ color: 'var(--md-sys-color-primary)', display: 'flex' }}>
-            {ICON_MAP[section.icon as string] || <Star size={16} />}
+            {ICON_MAP[section.icon as string] || <Star size={20} />}
           </div>
           <div>
-            <h3
-              style={{
-                margin: 0,
-                fontSize: '16px',
-                fontWeight: 600,
-                color: 'var(--md-sys-color-on-surface)',
-              }}
-            >
-              {t(section.title)}
-            </h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: '18px',
+                  fontWeight: 600,
+                  color: 'var(--md-sys-color-on-surface)',
+                }}
+              >
+                {t(section.title)}
+              </h3>
+              <button
+                className="btn btn-outline"
+                onClick={() => onViewAll(section)}
+                style={{
+                  borderRadius: '100px',
+                  padding: '4px 16px',
+                  fontSize: '14px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  minHeight: '32px',
+                  height: '32px',
+                }}
+              >
+                {t('workshop.home.viewAll')} <ChevronRight size={16} />
+              </button>
+            </div>
             <p
               style={{
-                margin: '2px 0 0',
-                fontSize: '12px',
+                margin: '4px 0 0',
+                fontSize: '13px',
                 color: 'var(--md-sys-color-outline)',
               }}
             >
@@ -72,20 +88,6 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
             </p>
           </div>
         </div>
-        <button
-          className="btn btn-outline"
-          onClick={() => onViewAll(section)}
-          style={{
-            borderRadius: '100px',
-            padding: '6px 16px',
-            fontSize: '12px',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '4px',
-          }}
-        >
-          {t('workshop.home.viewAll')} <ChevronRight size={14} />
-        </button>
       </div>
       <div
         style={{
