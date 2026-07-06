@@ -18,7 +18,6 @@ import {
   WorkshopItem,
   HomepageSection,
   TagCategory,
-  CollectionData,
   WorkshopBrowserProps,
 } from './workshop/types';
 import {
@@ -52,6 +51,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   onOpenLink,
   onImportCollection,
   isSubmitting,
+  groups,
 }) => {
   const { t } = useTranslation();
 
@@ -77,7 +77,15 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   // Detail modal
   const [selectedItem, setSelectedItem] = useState<any | null>(null);
-  const [selectedCollection, setSelectedCollection] = useState<CollectionData | null>(null);
+  const [selectedCollection, setSelectedCollection] = useState<{
+    title: string;
+    description: string;
+    imagePath: string;
+    creatorName: string;
+    creatorId: string;
+    items: WorkshopItem[];
+    workshopId?: string;
+  } | null>(null);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
 
@@ -206,6 +214,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     subscriptions: d.subscriptions ? parseInt(d.subscriptions) : undefined,
     timeCreated: d.time_created ? parseInt(d.time_created) : undefined,
     timeUpdated: d.time_updated ? parseInt(d.time_updated) : undefined,
+    childCount: d.num_children !== undefined ? parseInt(d.num_children) : undefined,
   });
 
   const viewItemDetails = async (workshopId: string) => {
@@ -237,6 +246,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           creatorName: raw.creator_name || '',
           creatorId: raw.creator || '',
           items: rawItems.map(mapSteamDetailToItem),
+          workshopId: raw.publishedfileid,
         });
       }
     } catch (err) {
@@ -463,10 +473,13 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         onDownload={onDownload}
         onOpenLink={onOpenLink}
         onImportCollection={onImportCollection}
+        onItemNavigate={(workshopId) => { setSelectedCollection(null); viewItemDetails(workshopId); }}
+        onCollectionNavigate={(workshopId) => { setSelectedItem(null); viewCollectionDetails(workshopId); }}
         addons={addons}
         knownUninstalledAddons={knownUninstalledAddons}
         downloadProgress={downloadProgress}
         isSubmitting={isSubmitting}
+        groups={groups}
       />
 
       {/* Tag browser modal */}

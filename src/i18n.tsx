@@ -342,7 +342,8 @@ const zh = {
     item: {
       author: "作者: {{author}}",
       size: "大小: {{size}}",
-      subscriptions: "订阅: {{count}}"
+      subscriptions: "订阅: {{count}}",
+      childCount: "{{count}} 个组件"
     },
     detail: {
       loading: "正在加载详细数据...",
@@ -371,6 +372,10 @@ const zh = {
       itemSize: "文件大小",
       workshopId: "创意工坊 ID",
       status: "状态",
+      type: "类型",
+      requiredItems: "所需组件",
+      parentCollections: "所属合集",
+      loadingExtra: "正在加载附加信息...",
       importAsGroup: "导入该合集为分组",
       downloadAll: "批量下载 ({{count}})",
       addedToKnown: "成功加入已知组件列表！",
@@ -720,7 +725,8 @@ const en = {
     item: {
       author: "By: {{author}}",
       size: "Size: {{size}}",
-      subscriptions: "Subs: {{count}}"
+      subscriptions: "Subs: {{count}}",
+      childCount: "{{count}} items"
     },
     detail: {
       loading: "Loading details...",
@@ -749,6 +755,10 @@ const en = {
       itemSize: "File Size",
       workshopId: "Workshop ID",
       status: "Status",
+      type: "Type",
+      requiredItems: "Required Items",
+      parentCollections: "Parent Collections",
+      loadingExtra: "Loading extra details...",
       importAsGroup: "Import as Group",
       downloadAll: "Download All ({{count}})",
       addedToKnown: "Added to known items list!",

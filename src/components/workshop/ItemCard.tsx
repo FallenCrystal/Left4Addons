@@ -1,7 +1,7 @@
 /** Workshop item card component */
 
 import React from 'react';
-import { Star, Loader2 } from 'lucide-react';
+import { Star, Loader2, Package } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem } from './types';
 
@@ -97,6 +97,11 @@ export const ItemCard: React.FC<ItemCardProps> = ({
             }}
           >
             {item.fileSize && <span>{t('workshop.item.size', { size: item.fileSize })}</span>}
+            {item.childCount !== undefined && item.childCount > 0 && (
+              <span style={{ display: 'flex', alignItems: 'center', gap: '3px' }}>
+                <Package size={11} /> {t('workshop.item.childCount', { count: item.childCount })}
+              </span>
+            )}
             {item.stars > 0 && (
               <div style={{ display: 'flex', gap: '2px', alignItems: 'center' }}>
                 <Star size={12} fill="#ffb300" color="#ffb300" />

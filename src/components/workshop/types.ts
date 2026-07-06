@@ -14,11 +14,21 @@ export interface WorkshopItem {
   subscriptions?: number;
   timeCreated?: number;
   timeUpdated?: number;
+  childCount?: number;
 }
 
 export interface CollectionData {
   collection: any;
   items: any[];
+}
+
+/** Extra details scraped from the Steam Community workshop page */
+export interface WorkshopPageDetails {
+  imageGallery: string[];
+  tags: { category: string; name: string }[];
+  requiredItems: { title: string; workshopId: string }[];
+  parentCollections: { title: string; workshopId: string }[];
+  backgroundImageUrl?: string;
 }
 
 /** A single homepage section (e.g. "一周内物品", "最热门") */
@@ -49,4 +59,5 @@ export interface WorkshopBrowserProps {
   onOpenLink: (url: string) => void;
   onImportCollection: (name: string, itemIds: string[]) => void;
   isSubmitting: boolean;
+  groups?: import('../../types/addon').Group[];
 }

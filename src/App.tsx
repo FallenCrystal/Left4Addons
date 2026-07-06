@@ -170,6 +170,7 @@ function App() {
               await handleCreateGroup(name, vpkNames);
             }}
             isSubmitting={isSubmitting}
+            groups={groups}
           />
         ) : (
           <>

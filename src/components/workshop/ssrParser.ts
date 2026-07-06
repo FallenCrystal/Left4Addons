@@ -1,7 +1,7 @@
 /** SSR parsing utilities for Steam Workshop pages */
 
 import { formatBytes } from '../../utils/addonHelpers';
-import { WorkshopItem, HomepageSection, TagCategory } from './types';
+import { WorkshopItem, HomepageSection, TagCategory, WorkshopPageDetails } from './types';
 
 // ── Helper: find balanced {…} from a start position in HTML ───────────────────
 
@@ -132,6 +132,7 @@ function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: str
       subscriptions: item.subscriptions,
       timeCreated: item.time_created,
       timeUpdated: item.time_updated,
+      childCount: item.num_children !== undefined ? parseInt(item.num_children) : undefined,
     });
   }
   return items;
@@ -380,4 +381,101 @@ export function parseTagCategories(html: string): TagCategory[] {
   } catch {
     return [];
   }
+}
+
+/** Convert a Steam thumbnail URL to a full-size image URL by removing size/fit params */
+function toFullSizeUrl(thumbUrl: string): string {
+  if (!thumbUrl) return thumbUrl;
+  // Remove imw/imh/ima/impolicy/imcolor/letterbox params to get the full-size image
+  return thumbUrl.replace(/\?imw=.*$/, '');
+}
+
+/** Parse extra details from a Steam Workshop item/collection page HTML */
+export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
+  const result: WorkshopPageDetails = {
+    imageGallery: [],
+    tags: [],
+    requiredItems: [],
+    parentCollections: [],
+  };
+
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+
+    // 1. Image gallery from highlight strip
+    const galleryImgs = doc.evaluate(
+      '//div[@id="highlight_strip_scroll"]/div[@role="button"]/img',
+      doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null,
+    );
+    for (let i = 0; i < galleryImgs.snapshotLength; i++) {
+      const img = galleryImgs.snapshotItem(i) as HTMLImageElement;
+      const src = img.getAttribute('src') || '';
+      if (src) {
+        result.imageGallery.push(toFullSizeUrl(src));
+      }
+    }
+
+    // 2. Tags (Game Content, Game Modes, etc.)
+    const tagGroupXPaths = [
+      '//div[contains(@data-panel, "PanelGroup") and starts-with(./span/text(), "Game Content")]',
+      '//div[contains(@data-panel, "PanelGroup") and starts-with(./span/text(), "Game Modes")]',
+    ];
+    for (const xpath of tagGroupXPaths) {
+      const nodes = doc.evaluate(xpath, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      for (let i = 0; i < nodes.snapshotLength; i++) {
+        const node = nodes.snapshotItem(i) as HTMLElement;
+        const span = node.querySelector('span');
+        const category = (span?.textContent || '').replace(/:$/, '').trim();
+        const links = node.querySelectorAll('a');
+        links.forEach((a) => {
+          const name = (a.textContent || '').trim();
+          if (name) {
+            result.tags.push({ category, name });
+          }
+        });
+      }
+    }
+
+    // 3. Required items
+    const requiredContainer = doc.querySelector('.requiredItemsContainer');
+    if (requiredContainer) {
+      const links = requiredContainer.querySelectorAll('a');
+      links.forEach((a) => {
+        const title = (a.textContent || '').trim();
+        const href = a.getAttribute('href') || '';
+        const idMatch = href.match(/id=(\d+)/);
+        if (title && idMatch) {
+          result.requiredItems.push({ title, workshopId: idMatch[1] });
+        }
+      });
+    }
+
+    // 4. Parent collections
+    const parentCollectionsDiv = doc.querySelector('.parentCollections');
+    if (parentCollectionsDiv) {
+      const collectionDivs = parentCollectionsDiv.querySelectorAll(':scope > div');
+      collectionDivs.forEach((div) => {
+        const title = (div.querySelector('.parentCollectionTitle')?.textContent || '').trim();
+        const onclick = div.getAttribute('onclick') || '';
+        const idMatch = onclick.match(/id=(\d+)/);
+        if (title && idMatch) {
+          result.parentCollections.push({ title, workshopId: idMatch[1] });
+        }
+      });
+    }
+
+    // 5. Collection background image (large hero image)
+    const bgImg = doc.querySelector('img.collectionBackgroundImage') as HTMLImageElement | null;
+    if (bgImg) {
+      const src = bgImg.getAttribute('src') || '';
+      if (src) {
+        result.backgroundImageUrl = toFullSizeUrl(src);
+      }
+    }
+  } catch (e) {
+    console.error('Failed to parse workshop page details:', e);
+  }
+
+  return result;
 }
