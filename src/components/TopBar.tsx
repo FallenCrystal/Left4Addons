@@ -1,5 +1,6 @@
 import React from 'react';
 import { Search, RefreshCw, CheckSquare, X } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 interface TopBarProps {
   searchQuery: string;
@@ -28,6 +29,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   isSelectMode,
   onToggleSelectMode,
 }) => {
+  const { t } = useTranslation();
+
   return (
     <div className="top-bar">
       <div className="search-container">
@@ -35,7 +38,7 @@ export const TopBar: React.FC<TopBarProps> = ({
         <input 
           type="text" 
           className="search-input" 
-          placeholder="搜索组件名称, 描述, 作者或创意工坊 ID..." 
+          placeholder={t('topbar.searchPlaceholder')}
           value={searchQuery}
           onChange={(e) => onSearchQueryChange(e.target.value)}
         />
@@ -57,7 +60,7 @@ export const TopBar: React.FC<TopBarProps> = ({
                 border: '1px solid var(--md-sys-color-outline-variant)'
               }}
             >
-              {cat}
+              {t(`categories.${cat}`, cat)}
             </button>
           ))}
         </div>
@@ -70,9 +73,9 @@ export const TopBar: React.FC<TopBarProps> = ({
           value={sortBy}
           onChange={(e) => onSortByChange(e.target.value)}
         >
-          <option value="title">按名称排序</option>
-          <option value="size">按大小排序</option>
-          <option value="id">按创意工坊ID排序</option>
+          <option value="title">{t('topbar.sortByTitle')}</option>
+          <option value="size">{t('topbar.sortBySize')}</option>
+          <option value="id">{t('topbar.sortById')}</option>
         </select>
 
         <button
@@ -88,10 +91,10 @@ export const TopBar: React.FC<TopBarProps> = ({
             fontSize: '13px'
           }}
           onClick={onToggleSelectMode}
-          title="批量管理附件组件"
+          title={t('topbar.batchManageTooltip')}
         >
           {isSelectMode ? <X size={16} /> : <CheckSquare size={16} />}
-          <span>{isSelectMode ? '退出批量' : '批量管理'}</span>
+          <span>{isSelectMode ? t('topbar.exitBatch') : t('topbar.batchManage')}</span>
         </button>
 
         <button 
@@ -99,7 +102,7 @@ export const TopBar: React.FC<TopBarProps> = ({
           style={{ width: '42px', height: '42px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '12px', flexShrink: 0 }}
           onClick={onSyncSteam}
           disabled={syncingSteam}
-          title="刷新所有组件并同步创意工坊信息"
+          title={t('topbar.refreshTooltip')}
         >
           <RefreshCw size={20} className={syncingSteam ? 'animate-spin' : ''} />
         </button>

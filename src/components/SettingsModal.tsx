@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface SettingsModalProps {
   open: boolean;
@@ -13,6 +14,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onCancel,
   onConfirm,
 }) => {
+  const { t } = useTranslation();
   const [loadingDir, setLoadingDir] = useState('');
 
   useEffect(() => {
@@ -37,23 +39,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         style={{ width: '560px' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="modal-title">设置附加组件加载路径</h2>
+        <h2 className="modal-title">{t('settingsModal.title')}</h2>
         <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '16px' }}>
-          请配置求生之路2的游戏附加组件目录（即 `addons` 文件夹）。程序将自动访问该文件夹及其下的 `workshop` 创意工坊文件夹。
+          {t('settings.desc')}
         </p>
 
         <div className="form-group">
-          <label className="form-label">附加组件目录 (Addons 路径):</label>
+          <label className="form-label">{t('settings.addonsPathLabel')}</label>
           <input 
             type="text" 
             className="form-input" 
             value={loadingDir}
             onChange={(e) => setLoadingDir(e.target.value)}
-            placeholder="例如: C:\Program Files (x86)\Steam\steamapps\common\Left 4 Dead 2\left4dead2\addons"
+            placeholder={t('settings.addonsPathPlaceholder')}
             required
           />
           <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)' }}>
-            请选择游戏目录下的 `left4dead2/addons` 文件夹。
+            {t('settings.addonsPathHelp')}
           </span>
         </div>
 
@@ -63,10 +65,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             className="btn btn-secondary" 
             onClick={onCancel}
           >
-            取消
+            {t('common.cancel')}
           </button>
           <button type="submit" className="btn btn-primary" disabled={!loadingDir.trim()}>
-            保存并重新扫描
+            {t('settings.saveAndRescan')}
           </button>
         </div>
       </form>

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Addon } from '../types/addon';
+import { useTranslation } from 'react-i18next';
 
 interface GroupModalProps {
   open: boolean;
@@ -16,6 +17,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
   onConfirm,
   isSubmitting = false,
 }) => {
+  const { t } = useTranslation();
   const [name, setName] = useState('');
   const [selectedAddons, setSelectedAddons] = useState<string[]>([]);
 
@@ -50,17 +52,17 @@ export const GroupModal: React.FC<GroupModalProps> = ({
         style={{ width: '560px' }} 
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="modal-title">创建新附件分组</h2>
+        <h2 className="modal-title">{t('groupModal.title')}</h2>
         <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '16px' }}>
-          将多个 VPK 文件打包到同一个群组（例如一张地图的 Part 1、2、3），从而一键批量启用、禁用或移动。
+          {t('groupModal.desc')}
         </p>
 
         <div className="form-group">
-          <label className="form-label">分组名称:</label>
+          <label className="form-label">{t('groupModal.groupNameLabel')}</label>
           <input 
             type="text" 
             className="form-input" 
-            placeholder="例如：Early Days 战役地图包"
+            placeholder={t('groupModal.groupNamePlaceholder')}
             value={name}
             onChange={(e) => setName(e.target.value)}
             required
@@ -69,7 +71,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
         </div>
 
         <div className="form-group">
-          <label className="form-label">选择要加入群组的组件 (可多选):</label>
+          <label className="form-label">{t('groupModal.selectAddonsLabel')}</label>
           <div style={{ 
             maxHeight: '200px', 
             overflowY: 'auto', 
@@ -95,10 +97,10 @@ export const GroupModal: React.FC<GroupModalProps> = ({
                   }}
                 >
                   <input 
-                    type="checkbox" 
-                    checked={isChecked}
-                    onChange={(e) => handleCheckboxChange(addon.vpkName, e.target.checked)}
-                    disabled={isSubmitting}
+                     type="checkbox" 
+                     checked={isChecked}
+                     onChange={(e) => handleCheckboxChange(addon.vpkName, e.target.checked)}
+                     disabled={isSubmitting}
                   />
                   <span style={{ fontSize: '13px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {title}
@@ -116,10 +118,10 @@ export const GroupModal: React.FC<GroupModalProps> = ({
             onClick={onCancel}
             disabled={isSubmitting}
           >
-            取消
+            {t('common.cancel')}
           </button>
           <button type="submit" className="btn btn-primary" disabled={isSubmitting || !name || selectedAddons.length === 0}>
-            {isSubmitting ? '正在创建...' : '创建分组'}
+            {isSubmitting ? t('common.creating') : t('groupModal.createGroupBtn')}
           </button>
         </div>
       </form>

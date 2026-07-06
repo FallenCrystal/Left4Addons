@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Addon, Group } from '../types/addon';
 import { getSuggestedVpkName } from '../utils/addonHelpers';
+import { useTranslation } from 'react-i18next';
 
 interface RenameModalProps {
   open: boolean;
@@ -27,6 +28,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
   onConfirm,
   isSubmitting = false,
 }) => {
+  const { t } = useTranslation();
   const [vpkName, setVpkName] = useState('');
 
   useEffect(() => {
@@ -53,9 +55,9 @@ export const RenameModal: React.FC<RenameModalProps> = ({
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <form className="modal-content" onSubmit={handleSubmit} onClick={(e) => e.stopPropagation()}>
-        <h2 className="modal-title">重命名附加组件文件</h2>
+        <h2 className="modal-title">{t('renameModal.title')}</h2>
         <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '16px' }}>
-          修改底层的 VPK 文件名称。建议使用有意义的标题，防止由于一堆数字无法辨认。
+          {t('renameModal.desc')}
         </p>
         
         {title && (
@@ -67,7 +69,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
             marginBottom: '16px',
             fontSize: '12px'
           }}>
-            <div style={{ fontWeight: '700', color: 'var(--md-sys-color-primary)' }}>创意工坊标题:</div>
+            <div style={{ fontWeight: '700', color: 'var(--md-sys-color-primary)' }}>{t('renameModal.workshopTitle')}</div>
             <div style={{ color: '#fff', marginTop: '4px' }}>{title}</div>
             <button 
               type="button" 
@@ -76,20 +78,20 @@ export const RenameModal: React.FC<RenameModalProps> = ({
               onClick={handleApplyTitle}
               disabled={isSubmitting}
             >
-              应用创意工坊标题作为文件名
+              {t('renameModal.applyWorkshopTitle')}
             </button>
           </div>
         )}
 
         <div className="form-group">
-          <label className="form-label">当前文件名:</label>
+          <label className="form-label">{t('renameModal.currentNameLabel')}</label>
           <div style={{ fontStyle: 'italic', fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
             {currentName}
           </div>
         </div>
 
         <div className="form-group">
-          <label className="form-label">新文件名 (.vpk):</label>
+          <label className="form-label">{t('renameModal.newNameLabel')}</label>
           <input 
             type="text" 
             className="form-input" 
@@ -107,10 +109,10 @@ export const RenameModal: React.FC<RenameModalProps> = ({
             onClick={onCancel}
             disabled={isSubmitting}
           >
-            取消
+            {t('common.cancel')}
           </button>
           <button type="submit" className="btn btn-primary" disabled={isSubmitting || !vpkName.trim()}>
-            {isSubmitting ? '正在重命名...' : '重命名'}
+            {isSubmitting ? t('common.renaming') : t('common.rename')}
           </button>
         </div>
       </form>

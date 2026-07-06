@@ -1,5 +1,7 @@
 import React from 'react';
 import { AlertTriangle, ExternalLink } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { TransHTML } from '../i18n';
 
 interface MoveWarningModalProps {
   open: boolean;
@@ -18,6 +20,8 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
   onCancel,
   onConfirm,
 }) => {
+  const { t } = useTranslation();
+
   if (!open) return null;
 
   return (
@@ -25,23 +29,14 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
       <div className="modal-content" style={{ width: '500px' }} onClick={(e) => e.stopPropagation()}>
         <h2 className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#ffb300' }}>
           <AlertTriangle size={24} />
-          <span>移动创意工坊附件提示</span>
+          <span>{t('moveWarningModal.title')}</span>
         </h2>
         
         <div className="warning-box" style={{ marginTop: '16px', marginBottom: '20px' }}>
           <div>
-            <div className="warning-title" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><AlertTriangle size={18} /><span>非常重要：</span></div>
+            <div className="warning-title" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}><AlertTriangle size={18} /><span>{t('moveWarningModal.veryImportant')}</span></div>
             <div style={{ color: '#e2e2e9' }}>
-              您正在将组件从<strong> 创意工坊目录 </strong>移动到<strong> 手动安装目录 (Addons) </strong>。
-              <br /><br />
-              移动后，<strong>请务必在 Steam 客户端或网页中“取消订阅”该组件！</strong>
-              <br /><br />
-              如果不取消订阅，每次您启动游戏时，Steam 客户端都可能会<strong>重新下载</strong>该组件，导致加载目录和创意工坊目录下同时存在两个相同的文件，引发资源冲突或重复加载。
-              <br /><br />
-              <span style={{ color: 'var(--md-sys-color-outline)' }}>
-                ...或者 前往 设置 &gt; 实验性 &gt; 创意工坊检测绕过<br />
-                在不取消订阅的情况下移动创意工坊物品。
-              </span>
+              <TransHTML i18nKey="moveWarningModal.warningDesc" />
             </div>
           </div>
         </div>
@@ -52,7 +47,7 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
             className="btn btn-secondary" 
             onClick={onCancel}
           >
-            取消
+            {t('common.cancel')}
           </button>
           
           {workshopId && (
@@ -63,7 +58,7 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
               style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}
             >
               <ExternalLink size={14} />
-              <span>取消订阅并移动</span>
+              <span>{t('moveWarningModal.unsubscribeAndMove')}</span>
             </button>
           )}
 
@@ -72,7 +67,7 @@ export const MoveWarningModal: React.FC<MoveWarningModalProps> = ({
             className="btn btn-primary"
             onClick={() => onConfirm(vpkName, currentDirType, false)}
           >
-            直接移动
+            {t('moveWarningModal.moveDirectly')}
           </button>
         </div>
       </div>

@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 interface ConfirmModalProps {
   open: boolean;
@@ -18,6 +19,8 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   onCancel,
   isSubmitting = false,
 }) => {
+  const { t } = useTranslation();
+
   if (!open) return null;
 
   return (
@@ -39,7 +42,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
             onClick={onCancel}
             disabled={isSubmitting}
           >
-            取消
+            {t('common.cancel')}
           </button>
           
           <button 
@@ -51,7 +54,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
               onCancel();
             }}
           >
-            确定
+            {t('common.confirm')}
           </button>
         </div>
       </div>

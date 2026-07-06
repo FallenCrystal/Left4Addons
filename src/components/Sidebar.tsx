@@ -1,6 +1,7 @@
 import React from 'react';
 import { Layers, Grid, FolderOpen, Folder, Lock, FolderPlus, Plus, Sparkles, Settings } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
+import { useTranslation } from 'react-i18next';
 
 interface SidebarProps {
   addons: Record<string, Addon>;
@@ -27,6 +28,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   disabledCount,
   totalAddonsCount,
 }) => {
+  const { t } = useTranslation();
   const loadingCount = Object.values(addons).filter(a => a.dirType === 'loading').length;
   const workshopCount = Object.values(addons).filter(a => a.dirType === 'workshop').length;
 
@@ -38,7 +40,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
         <div>
           <h1 className="sidebar-title">Left 4 Addons</h1>
-          <div style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)' }}>求生之路2附加组件管理</div>
+          <div style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)' }}>{t('sidebar.title')}</div>
         </div>
       </div>
 
@@ -49,7 +51,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <div className="menu-item-left">
             <Grid size={18} />
-            <span>全部组件</span>
+            <span>{t('sidebar.allAddons')}</span>
           </div>
           <span className="menu-item-badge">{totalAddonsCount}</span>
         </button>
@@ -60,7 +62,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <div className="menu-item-left">
             <FolderOpen size={18} />
-            <span>手动安装 (Addons)</span>
+            <span>{t('sidebar.manualInstall')}</span>
           </div>
           <span className="menu-item-badge">{loadingCount}</span>
         </button>
@@ -71,7 +73,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <div className="menu-item-left">
             <Folder size={18} />
-            <span>创意工坊目录 (Workshop)</span>
+            <span>{t('sidebar.workshopDir')}</span>
           </div>
           <span className="menu-item-badge">{workshopCount}</span>
         </button>
@@ -82,17 +84,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <div className="menu-item-left">
             <Lock size={18} />
-            <span>被禁用的组件 (.disabled)</span>
+            <span>{t('sidebar.disabledAddons')}</span>
           </div>
           <span className="menu-item-badge">{disabledCount}</span>
         </button>
 
-        <div className="sidebar-section-title">我的分组</div>
+        <div className="sidebar-section-title">{t('sidebar.myGroups')}</div>
         
         <div className="groups-list">
           {groups.length === 0 ? (
             <div style={{ padding: '8px 16px', fontSize: '12px', color: 'var(--md-sys-color-outline)' }}>
-              暂无分组，可自动归类或手动创建。
+              {t('sidebar.noGroups')}
             </div>
           ) : (
             groups.map(group => (
@@ -121,7 +123,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onClick={onOpenGroupModal}
         >
           <Plus size={16} />
-          <span>新建手动分组</span>
+          <span>{t('sidebar.newGroup')}</span>
         </button>
         
         <button 
@@ -131,7 +133,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           disabled={autoGrouping}
         >
           <Sparkles size={16} />
-          <span>{autoGrouping ? '归类中...' : '自动识别战役并归类'}</span>
+          <span>{autoGrouping ? t('sidebar.classifying') : t('sidebar.autoClassify')}</span>
         </button>
 
         <button 
@@ -149,7 +151,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         >
           <div className="menu-item-left">
             <Settings size={18} />
-            <span>设置</span>
+            <span>{t('sidebar.settings')}</span>
           </div>
         </button>
       </div>

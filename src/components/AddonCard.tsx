@@ -3,6 +3,7 @@ import { FolderPlus, ExternalLink, Move, Edit3, FileText } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
+import { useTranslation } from 'react-i18next';
 
 interface AddonCardProps {
   addon: Addon;
@@ -35,6 +36,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   onSelectToggle,
   isSubmitting = false,
 }) => {
+  const { t } = useTranslation();
   const categories = getAddonCategories(addon);
   const title = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
   const author = getAddonAuthor(addon);
@@ -57,7 +59,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
           e.stopPropagation();
           onSelectToggle(addon.vpkName);
         }}
-        title={isSelected ? '取消选择' : '选中此组件'}
+        title={isSelected ? t('addonCard.deselect') : t('addonCard.select')}
       >
         {isSelected ? (
           <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
@@ -97,10 +99,10 @@ export const AddonCard: React.FC<AddonCardProps> = ({
 
         <div className="addon-card-badges">
           <span className={`badge ${addon.isEnabled ? 'badge-enabled' : 'badge-disabled'}`}>
-            {addon.isEnabled ? '已启用' : '已禁用'}
+            {addon.isEnabled ? t('addonCard.enabled') : t('addonCard.disabled')}
           </span>
           <span className="badge badge-dir">
-            {addon.dirType === 'loading' ? '手动安装' : '创意工坊'}
+            {addon.dirType === 'loading' ? t('addonCard.manualInstall') : t('addonCard.workshop')}
           </span>
         </div>
 
@@ -108,26 +110,26 @@ export const AddonCard: React.FC<AddonCardProps> = ({
           <h3 className="addon-card-title" title={title}>{title}</h3>
           
           <div className="addon-card-author">
-            <span>作者: {author}</span>
+            <span>{t('addonCard.author', { author })}</span>
           </div>
 
           {itemGroup && (
             <div className="group-tag">
               <FolderPlus size={12} />
-              <span>分组: {itemGroup.name}</span>
+              <span>{t('addonCard.group', { group: itemGroup.name })}</span>
             </div>
           )}
 
           <p className="addon-card-desc" title={desc}>{desc}</p>
           
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--md-sys-color-outline)', marginTop: '8px' }}>
-            <span>文件大小: {formatBytes(addon.fileSize)}</span>
-            {addon.filesCount > 0 && <span>内含 {addon.filesCount} 个文件</span>}
+            <span>{t('addonCard.fileSize', { size: formatBytes(addon.fileSize) })}</span>
+            {addon.filesCount > 0 && <span>{t('addonCard.containsFiles', { count: addon.filesCount })}</span>}
           </div>
 
           <div className="addon-card-tags">
             {categories.map(c => (
-              <span key={c} className="tag-chip">{c}</span>
+              <span key={c} className="tag-chip">{t(`categories.${c}`, c)}</span>
             ))}
             {addon.workshopId && (
               <span className="tag-chip" style={{ borderColor: 'var(--md-sys-color-primary)', color: 'var(--md-sys-color-primary)' }}>
@@ -140,7 +142,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
 
       <div className="addon-card-footer">
         {/* Enable/Disable Toggle */}
-        <label className="switch" title={addon.isEnabled ? '点击禁用该附件' : '点击启用该附件'}>
+        <label className="switch" title={addon.isEnabled ? t('addonCard.clickToDisable') : t('addonCard.clickToEnable')}>
           <input 
             type="checkbox" 
             checked={addon.isEnabled} 
@@ -153,7 +155,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         <div style={{ display: 'flex', gap: '6px' }}>
           {/* Group assign dropdown */}
           <div className="dropdown">
-            <button className="btn btn-secondary btn-icon-only" title="加入或移出群组" disabled={isSubmitting}>
+            <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
               <FolderPlus size={14} />
             </button>
             <div className="dropdown-content">
@@ -172,11 +174,11 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                   disabled={isSubmitting}
                   style={{ color: 'var(--md-sys-color-error)' }}
                 >
-                  从当前分组移出 ({itemGroup.name})
+                  {t('addonCard.removeFromGroup', { name: itemGroup.name })}
                 </button>
               )}
               {groups.length === 0 && !itemGroup && (
-                <button disabled style={{ fontStyle: 'italic' }}>无分组 (在侧栏创建)</button>
+                <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
               )}
             </div>
           </div>
@@ -184,18 +186,18 @@ export const AddonCard: React.FC<AddonCardProps> = ({
           {/* Open Link with Fallbacks (Dropdown or direct link) */}
           {addon.workshopId ? (
             <div className="dropdown">
-              <button className="btn btn-secondary btn-icon-only" title="打开链接">
+              <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
                 <ExternalLink size={14} />
               </button>
               <div className="dropdown-content">
                 <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
-                  在 Steam 客户端打开
+                  {t('addonCard.openInSteam')}
                 </button>
                 <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                  在浏览器中打开 (官方)
+                  {t('addonCard.openInBrowser')}
                 </button>
                 <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                  在浏览器中打开 (国内镜像)
+                  {t('addonCard.openInMirror')}
                 </button>
               </div>
             </div>
@@ -204,7 +206,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
               className="btn btn-secondary"
               style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
               onClick={(e) => handleLinkClick(e, addonUrl)}
-              title="打开组件内置来源网页"
+              title={t('addonCard.openBuiltInSource')}
             >
               <ExternalLink size={14} />
             </button>
@@ -216,7 +218,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
               className="btn btn-secondary btn-icon-only"
               onClick={() => onMoveClick(addon)}
               disabled={isSubmitting}
-              title="移动到手动安装目录 (Addons)"
+              title={t('addonCard.moveToManual')}
             >
               <Move size={14} />
             </button>
@@ -227,7 +229,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
             className="btn btn-secondary btn-icon-only"
             onClick={() => onRenameClick(addon)}
             disabled={isSubmitting}
-            title="重命名附件文件"
+            title={t('addonCard.renameAddon')}
           >
             <Edit3 size={14} />
           </button>

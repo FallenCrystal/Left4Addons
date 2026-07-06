@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, Group, Settings, Toast } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName } from '../utils/addonHelpers';
+import { useTranslation } from 'react-i18next';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
   | { type: 'addon'; id: string; data: Addon };
 
 export function useAddonManager() {
+  const { t } = useTranslation();
   const [addons, setAddons] = useState<Record<string, Addon>>({});
   const [groups, setGroups] = useState<Group[]>([]);
   const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '', enableDummyBypass: false });
@@ -51,7 +53,7 @@ export function useAddonManager() {
         const vpkNames = workshopAddons.map(a => a.vpkName);
         await invoke('move_addons', { vpkNames, targetDirType: 'loading' });
       } catch (err) {
-        addToast('自动移动附件失败: ' + err, 'error');
+        addToast(t('toasts.autoMoveFailed', { err: String(err) }), 'error');
         setIsSubmitting(false);
         return; // Stop if move fails
       }
@@ -80,11 +82,11 @@ export function useAddonManager() {
       setGroups(data.groups || []);
       setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       if (showToastMessage) {
-        addToast('数据库刷新成功', 'success');
+        addToast(t('toasts.dbRefreshSuccess'), 'success');
       }
     } catch (err) {
       console.error(err);
-      addToast('数据加载失败: ' + err, 'error');
+      addToast(t('toasts.dataLoadFailed', { err: String(err) }), 'error');
     } finally {
       setLoading(false);
     }
@@ -119,7 +121,7 @@ export function useAddonManager() {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames: [vpkName], enabled: !currentStatus });
         setAddons(data.addons || {});
         setGroups(data.groups || []);
-        addToast(!currentStatus ? '附加组件已启用' : '附加组件已禁用', 'success');
+        addToast(currentStatus ? t('toasts.addonDisabled') : t('toasts.addonEnabled'), 'success');
         
         // Update detail modal state in-place if open
         if (detailModal.open && detailModal.addon?.vpkName === vpkName) {
@@ -129,7 +131,7 @@ export function useAddonManager() {
           }));
         }
       } catch (err) {
-        addToast('操作失败: ' + err, 'error');
+        addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
       } finally {
         setIsSubmitting(false);
       }
@@ -145,9 +147,9 @@ export function useAddonManager() {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames, enabled });
         setAddons(data.addons || {});
         setGroups(data.groups || []);
-        addToast(enabled ? '分组内所有组件已启用' : '分组内所有组件已禁用', 'success');
+        addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
       } catch (err) {
-        addToast('操作失败: ' + err, 'error');
+        addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
       } finally {
         setIsSubmitting(false);
       }
@@ -163,9 +165,9 @@ export function useAddonManager() {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('move_addons', { vpkNames: [vpkName], targetDirType });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast(targetDirType === 'loading' ? '已移动到手动安装目录' : '已移动到创意工坊目录', 'success');
+      addToast(targetDirType === 'loading' ? t('toasts.moveSuccessLoading') : t('toasts.moveSuccessWorkshop'), 'success');
     } catch (err) {
-      addToast('移动失败: ' + err, 'error');
+      addToast(t('toasts.moveFailed', { err: String(err) }), 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -195,9 +197,9 @@ export function useAddonManager() {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('steam_sync');
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast('Steam 同步成功', 'success');
+      addToast(t('toasts.steamSyncSuccess'), 'success');
     } catch (err) {
-      addToast('同步失败: ' + err, 'error');
+      addToast(t('toasts.steamSyncFailed', { err: String(err) }), 'error');
     } finally {
       setSyncingSteam(false);
     }
@@ -210,9 +212,9 @@ export function useAddonManager() {
       const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('group_action', { action: 'auto-group' });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast('自动归类完成！已发现并组合了战役/地图包。', 'success');
+      addToast(t('toasts.autoClassifySuccess'), 'success');
     } catch (err) {
-      addToast('自动归类失败: ' + err, 'error');
+      addToast(t('toasts.autoClassifyFailed', { err: String(err) }), 'error');
     } finally {
       setAutoGrouping(false);
     }
@@ -231,9 +233,9 @@ export function useAddonManager() {
       setGroups(data.groups || []);
       setSettings(data.settings || { workshopDir: '', loadingDir: '', enableDummyBypass: false });
       setSettingsModal({ open: false, loadingDir: '' });
-      addToast('设置保存并扫描成功', 'success');
+      addToast(t('toasts.settingsSaveSuccess'), 'success');
     } catch (err) {
-      addToast('保存失败: ' + err, 'error');
+      addToast(t('toasts.settingsSaveFailed', { err: String(err) }), 'error');
       throw err;
     } finally {
       setIsSubmitting(false);
@@ -246,7 +248,7 @@ export function useAddonManager() {
     const addon = addons[currentName];
     if (!addon) return;
     setIsSubmitting(true);
-    executeWithWorkshopCheck([addon], '重命名文件', async () => {
+    executeWithWorkshopCheck([addon], t('common.rename'), async () => {
       try {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('rename_addon', {
           vpkName: currentName,
@@ -255,9 +257,9 @@ export function useAddonManager() {
         setAddons(data.addons || {});
         setGroups(data.groups || []);
         setRenameModal({ open: false, currentName: '', title: '', suggestedName: '' });
-        addToast('重命名成功', 'success');
+        addToast(t('toasts.renameSuccess'), 'success');
       } catch (err) {
-        addToast('重命名失败: ' + err, 'error');
+        addToast(t('toasts.renameFailed', { err: String(err) }), 'error');
       } finally {
         setIsSubmitting(false);
       }
@@ -277,9 +279,9 @@ export function useAddonManager() {
       setAddons(data.addons || {});
       setGroups(data.groups || []);
       setGroupModal({ open: false });
-      addToast('新建分组成功', 'success');
+      addToast(t('toasts.createGroupSuccess'), 'success');
     } catch (err) {
-      addToast('创建分组失败: ' + err, 'error');
+      addToast(t('toasts.createGroupFailed', { err: String(err) }), 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -288,8 +290,8 @@ export function useAddonManager() {
   const handleDeleteGroup = (groupId: string) => {
     setConfirmModal({
       open: true,
-      title: '确认删除分组',
-      message: '确定要删除这个分组吗？这不会删除文件，只会解散群组。',
+      title: t('confirmModal.deleteGroupTitle'),
+      message: t('confirmModal.deleteGroupMsg'),
       onConfirm: async () => {
         if (isSubmitting) return;
         setIsSubmitting(true);
@@ -301,9 +303,9 @@ export function useAddonManager() {
             setSelectedGroupId(null);
             setCurrentFilterTab('all');
           }
-          addToast('分组已删除', 'success');
+          addToast(t('toasts.deleteGroupSuccess'), 'success');
         } catch (err) {
-          addToast('删除失败: ' + err, 'error');
+          addToast(t('toasts.deleteGroupFailed', { err: String(err) }), 'error');
         } finally {
           setIsSubmitting(false);
         }
@@ -323,9 +325,9 @@ export function useAddonManager() {
       setAddons(data.addons || {});
       setGroups(data.groups || []);
       setEditGroupModal({ open: false, groupId: '', name: '' });
-      addToast('分组已重命名', 'success');
+      addToast(t('toasts.renameGroupSuccess'), 'success');
     } catch (err) {
-      addToast('操作失败: ' + err, 'error');
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -342,14 +344,14 @@ export function useAddonManager() {
       if (actionType === 'enable' || actionType === 'disable') {
         const enabled = actionType === 'enable';
         const groupAddons = group.addons.map(name => addons[name]).filter(Boolean);
-        executeWithWorkshopCheck(groupAddons, enabled ? '批量启用' : '批量禁用', async () => {
+        executeWithWorkshopCheck(groupAddons, enabled ? t('batchActionBar.enable') : t('batchActionBar.disable'), async () => {
           try {
             const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { vpkNames: group.addons, enabled });
             setAddons(data.addons || {});
             setGroups(data.groups || []);
-            addToast(enabled ? '分组内所有组件已启用' : '分组内所有组件已禁用', 'success');
+            addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
           } catch (err) {
-            addToast('操作失败: ' + err, 'error');
+            addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
           } finally {
             setIsSubmitting(false);
           }
@@ -363,9 +365,9 @@ export function useAddonManager() {
             const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('move_addons', { vpkNames: group.addons, targetDirType });
             setAddons(data.addons || {});
             setGroups(data.groups || []);
-            addToast('分组内所有组件已移动到手动安装目录', 'success');
+            addToast(t('toasts.batchMoveSuccess'), 'success');
           } catch (err) {
-            addToast('批量操作失败: ' + err, 'error');
+            addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
           } finally {
             setIsSubmitting(false);
           }
@@ -377,8 +379,8 @@ export function useAddonManager() {
           } else {
             setConfirmModal({
               open: true,
-              title: '移动创意工坊附件提示',
-              message: '提示：此分组内含有创意工坊附件。将附件移动到手动安装目录后，建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。\n\n...或者 前往 设置 > 实验性 > 创意工坊检测绕过\n在不取消订阅的情况下移动创意工坊物品。',
+              title: t('moveWarningModal.title'),
+              message: (t('confirmModal.batchMoveMsg', { count: group.addons.filter(name => addons[name]?.dirType === 'workshop').length }) as string[]).join('\n\n'),
               onConfirm: executeMove
             });
           }
@@ -387,7 +389,7 @@ export function useAddonManager() {
         }
       }
     } catch (err) {
-      addToast('批量操作失败: ' + err, 'error');
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
       setIsSubmitting(false);
     }
   };
@@ -403,9 +405,9 @@ export function useAddonManager() {
       });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast('已移出该分组', 'success');
+      addToast(t('toasts.removeFromGroupSuccess'), 'success');
     } catch (err) {
-      addToast('操作失败: ' + err, 'error');
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -422,9 +424,9 @@ export function useAddonManager() {
       });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast('已加入分组', 'success');
+      addToast(t('toasts.addToGroupSuccess'), 'success');
     } catch (err) {
-      addToast('操作失败: ' + (err as Error).message, 'error');
+      addToast(t('toasts.operationFailed', { err: (err as Error).message }), 'error');
     } finally {
       setIsSubmitting(false);
     }
@@ -509,7 +511,7 @@ export function useAddonManager() {
     if (isSubmitting) return;
     setIsSubmitting(true);
     const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
-    executeWithWorkshopCheck(selectedAddonsList, enabled ? '批量启用组件' : '批量禁用组件', async () => {
+    executeWithWorkshopCheck(selectedAddonsList, enabled ? t('toasts.addonEnabled') : t('toasts.addonDisabled'), async () => {
       try {
         const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('toggle_addons', { 
           vpkNames: selectedVpkNames, 
@@ -517,10 +519,10 @@ export function useAddonManager() {
         });
         setAddons(data.addons || {});
         setGroups(data.groups || []);
-        addToast(enabled ? '批量启用成功' : '批量禁用成功', 'success');
+        addToast(enabled ? t('toasts.batchToggleSuccessEnable') : t('toasts.batchToggleSuccessDisable'), 'success');
         handleClearSelection();
       } catch (err) {
-        addToast('操作失败: ' + err, 'error');
+        addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
       } finally {
         setIsSubmitting(false);
       }
@@ -542,10 +544,10 @@ export function useAddonManager() {
         });
         setAddons(data.addons || {});
         setGroups(data.groups || []);
-        addToast('已成功批量移动到手动安装目录', 'success');
+        addToast(t('toasts.batchMoveSuccess'), 'success');
         handleClearSelection();
       } catch (err) {
-        addToast('移动失败: ' + err, 'error');
+        addToast(t('toasts.moveFailed', { err: String(err) }), 'error');
       } finally {
         setIsSubmitting(false);
       }
@@ -557,8 +559,8 @@ export function useAddonManager() {
       } else {
         setConfirmModal({
           open: true,
-          title: '移动创意工坊附件提示',
-          message: `确定要将选中的 ${workshopAddons.length} 个创意工坊附件移动到手动安装目录吗？移动后建议前往 Steam 创意工坊取消订阅这些附件，否则 Steam 会在下次启动游戏时重新下载。\n\n...或者 前往 设置 > 实验性 > 创意工坊检测绕过\n在不取消订阅的情况下移动创意工坊物品。`,
+          title: t('moveWarningModal.title'),
+          message: (t('confirmModal.batchMoveMsg', { count: workshopAddons.length }) as string[]).join('\n\n'),
           onConfirm: executeMove
         });
       }
@@ -596,28 +598,28 @@ export function useAddonManager() {
     }
     
     if (renamesList.length === 0) {
-      addToast('选中的组件已是推荐文件名，无需重命名', 'success');
+      addToast(t('toasts.batchRenameNoNeed'), 'success');
       setIsSubmitting(false);
       return;
     }
 
     setConfirmModal({
       open: true,
-      title: '批量自动重命名',
-      message: `确定要自动重命名选中的 ${renamesList.length} 个附件吗？系统将根据创意工坊标题 and 分组信息自动为它们命名。`,
+      title: t('confirmModal.batchRenameTitle'),
+      message: t('confirmModal.batchRenameMsg', { count: renamesList.length }),
       onConfirm: async () => {
         const selectedAddonsList = selectedVpkNames.map(name => addons[name]).filter(Boolean);
-        executeWithWorkshopCheck(selectedAddonsList, '批量重命名文件', async () => {
+        executeWithWorkshopCheck(selectedAddonsList, t('common.rename'), async () => {
           try {
             const data: { addons?: Record<string, Addon>; groups?: Group[] } = await invoke('rename_addons', { 
               renames: renamesList 
             });
             setAddons(data.addons || {});
             setGroups(data.groups || []);
-            addToast(`批量重命名成功 (重命名了 ${renamesList.length} 个文件)`, 'success');
+            addToast(t('toasts.batchRenameSuccess', { count: renamesList.length }), 'success');
             handleClearSelection();
           } catch (err) {
-            addToast('重命名失败: ' + err, 'error');
+            addToast(t('toasts.renameFailed', { err: String(err) }), 'error');
           } finally {
             setIsSubmitting(false);
           }
@@ -638,10 +640,10 @@ export function useAddonManager() {
       });
       setAddons(data.addons || {});
       setGroups(data.groups || []);
-      addToast('批量加入分组成功', 'success');
+      addToast(t('toasts.batchAddGroupSuccess'), 'success');
       handleClearSelection();
     } catch (err) {
-      addToast('操作失败: ' + err, 'error');
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
     } finally {
       setIsSubmitting(false);
     }

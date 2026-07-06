@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { AlertCircle, CheckCircle, RefreshCw, FileText } from 'lucide-react';
 import { useAddonManager } from './hooks/useAddonManager';
+import { useTranslation } from 'react-i18next';
 
 // Components
 import { Sidebar } from './components/Sidebar';
@@ -21,6 +22,7 @@ import { GroupHeader } from './components/GroupHeader';
 import { BatchActionBar } from './components/BatchActionBar';
 
 function App() {
+  const { t } = useTranslation();
   const {
     addons,
     groups,
@@ -188,18 +190,18 @@ function App() {
               {loading ? (
                 <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '300px', color: 'var(--md-sys-color-outline)' }}>
                   <RefreshCw className="animate-spin" size={36} />
-                  <p style={{ marginTop: '16px' }}>正在解析 VPK 文件和加载数据中...</p>
+                  <p style={{ marginTop: '16px' }}>{t('common.parsing')}</p>
                 </div>
               ) : filteredItems.length === 0 ? (
                 <div className="empty-state">
                   <FileText className="empty-icon" size={64} />
-                  <div className="empty-title">未发现匹配的附加组件</div>
+                  <div className="empty-title">{t('common.emptyStateTitle')}</div>
                   <div className="empty-desc">
-                    在此筛选条件下未找到任何文件。请确认你的目录中已经放有 L4D2 附件文件。
+                    {t('common.emptyStateDesc')}
                   </div>
                   <button className="btn btn-primary" onClick={() => fetchData(true)} disabled={loading || isSubmitting}>
                     <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
-                    <span>{loading ? '正在扫描...' : '重新扫描'}</span>
+                    <span>{loading ? t('common.scanning') : t('common.rescan')}</span>
                   </button>
                 </div>
               ) : (

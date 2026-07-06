@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
-import { AlertTriangle, ExternalLink, CheckCircle2, AlertCircle } from 'lucide-react';
+import { AlertTriangle, ExternalLink, CheckCircle2 } from 'lucide-react';
 import { Addon } from '../types/addon';
 import { invoke } from '@tauri-apps/api/core';
+import { useTranslation } from 'react-i18next';
+import { TransHTML } from '../i18n';
 
 interface WorkshopActionWarningModalProps {
   open: boolean;
@@ -18,6 +20,7 @@ export const WorkshopActionWarningModal: React.FC<WorkshopActionWarningModalProp
   onCancel,
   onConfirm,
 }) => {
+  const { t } = useTranslation();
   const [skipWarning, setSkipWarning] = useState(false);
 
   if (!open) return null;
@@ -35,29 +38,23 @@ export const WorkshopActionWarningModal: React.FC<WorkshopActionWarningModalProp
       <div className="modal-content" style={{ width: '500px' }} onClick={(e) => e.stopPropagation()}>
         <h2 className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#8be19a' }}>
           <AlertTriangle size={24} />
-          <span>创意工坊附件已移动</span>
+          <span>{t('workshopWarningModal.title')}</span>
         </h2>
         
         <div className="warning-box" style={{ marginTop: '16px', marginBottom: '20px', backgroundColor: 'rgba(139, 225, 154, 0.1)', borderColor: 'rgba(139, 225, 154, 0.3)', color: '#8be19a' }}>
           <div>
             <div className="warning-title" style={{ color: '#8be19a', display: 'flex', alignItems: 'center', gap: '6px' }}>
               <CheckCircle2 size={18} />
-              <span>自动转移成功</span>
+              <span>{t('workshopWarningModal.successTitle')}</span>
             </div>
             <div style={{ color: '#e2e2e9', marginTop: '8px' }}>
-              为了防止游戏重新下载覆盖，执行 <strong>{actionName}</strong> 操作前，已自动将相关的创意工坊附件移动至<strong>手动安装目录 (Addons)</strong>。
-              <br /><br />
-              <strong style={{ color: '#ffb4ab', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                <AlertCircle size={16} />
-                <span>请注意：</span>
-              </strong><br />
-              您必须前往 Steam 创意工坊<strong>取消订阅</strong>此组件，否则游戏下次启动时仍会重复下载该附件并导致冲突！
+              <TransHTML i18nKey="workshopWarningModal.warningDesc" values={{ actionName }} />
             </div>
           </div>
         </div>
 
         <div style={{ marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <label className="switch" title="本次运行期间不再提醒" style={{ transform: 'scale(0.8)', transformOrigin: 'left center' }}>
+          <label className="switch" title={t('workshopWarningModal.dontShowAgain')} style={{ transform: 'scale(0.8)', transformOrigin: 'left center' }}>
             <input 
               type="checkbox" 
               checked={skipWarning} 
@@ -65,7 +62,7 @@ export const WorkshopActionWarningModal: React.FC<WorkshopActionWarningModalProp
             />
             <span className="slider"></span>
           </label>
-          <span style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>当前会话不再提醒此警告，并静默执行移动</span>
+          <span style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>{t('workshopWarningModal.dontShowAgain')}</span>
         </div>
 
         <div className="modal-actions">
@@ -74,7 +71,7 @@ export const WorkshopActionWarningModal: React.FC<WorkshopActionWarningModalProp
             className="btn btn-secondary" 
             onClick={() => onConfirm(skipWarning)}
           >
-            我知道了
+            {t('workshopWarningModal.iUnderstand')}
           </button>
           
           <button 
@@ -84,7 +81,7 @@ export const WorkshopActionWarningModal: React.FC<WorkshopActionWarningModalProp
             disabled={!addons.some(ad => ad.workshopId)}
           >
             <ExternalLink size={14} />
-            <span>前往创意工坊</span>
+            <span>{t('workshopWarningModal.goToWorkshop')}</span>
           </button>
         </div>
       </div>

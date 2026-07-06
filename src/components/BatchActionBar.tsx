@@ -1,5 +1,6 @@
 import { CheckSquare, Unlock, Lock, FolderOpen, Edit3, FolderPlus, X } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
+import { useTranslation } from 'react-i18next';
 
 interface BatchActionBarProps {
   selectedVpkNames: string[];
@@ -26,13 +27,14 @@ export function BatchActionBar({
   onBatchAddToGroup,
   onClearSelection,
 }: BatchActionBarProps) {
+  const { t } = useTranslation();
   const isAllSelected = filteredItems.every(item => selectedVpkNames.includes(item.vpkName));
   const hasWorkshopSelected = selectedVpkNames.some(name => addons[name]?.dirType === 'workshop');
 
   return (
     <div className="batch-action-bar">
       <div className="batch-action-info">
-        已选择 {selectedVpkNames.length} 个组件
+        {t('batchActionBar.selectedCount', { count: selectedVpkNames.length })}
       </div>
       <div className="batch-action-buttons">
         <button 
@@ -42,7 +44,7 @@ export function BatchActionBar({
         >
           <CheckSquare size={14} />
           <span>
-            {isAllSelected ? '取消全选' : '全选'}
+            {isAllSelected ? t('batchActionBar.deselectAll') : t('batchActionBar.selectAll')}
           </span>
         </button>
 
@@ -53,7 +55,7 @@ export function BatchActionBar({
           disabled={selectedVpkNames.length === 0}
         >
           <Unlock size={14} />
-          <span>启用</span>
+          <span>{t('batchActionBar.enable')}</span>
         </button>
 
         <button 
@@ -63,7 +65,7 @@ export function BatchActionBar({
           disabled={selectedVpkNames.length === 0}
         >
           <Lock size={14} />
-          <span>禁用</span>
+          <span>{t('batchActionBar.disable')}</span>
         </button>
 
         {hasWorkshopSelected && (
@@ -74,7 +76,7 @@ export function BatchActionBar({
             disabled={selectedVpkNames.length === 0}
           >
             <FolderOpen size={14} />
-            <span>移动至手动安装</span>
+            <span>{t('batchActionBar.moveToManual')}</span>
           </button>
         )}
 
@@ -85,7 +87,7 @@ export function BatchActionBar({
           disabled={selectedVpkNames.length === 0}
         >
           <Edit3 size={14} />
-          <span>自动重命名</span>
+          <span>{t('batchActionBar.autoRename')}</span>
         </button>
 
         <div className="dropdown">
@@ -95,7 +97,7 @@ export function BatchActionBar({
             disabled={selectedVpkNames.length === 0}
           >
             <FolderPlus size={14} />
-            <span>加入分组</span>
+            <span>{t('batchActionBar.addToGroup')}</span>
           </button>
           <div className="dropdown-content">
             {groups.map(g => (
@@ -104,7 +106,7 @@ export function BatchActionBar({
               </button>
             ))}
             {groups.length === 0 && (
-              <button disabled style={{ fontStyle: 'italic' }}>无分组</button>
+              <button disabled style={{ fontStyle: 'italic' }}>{t('batchActionBar.noGroups')}</button>
             )}
           </div>
         </div>
@@ -115,7 +117,7 @@ export function BatchActionBar({
           onClick={onClearSelection}
         >
           <X size={14} />
-          <span>退出批量</span>
+          <span>{t('batchActionBar.exitBatch')}</span>
         </button>
       </div>
     </div>

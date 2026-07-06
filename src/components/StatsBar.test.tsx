@@ -27,6 +27,6 @@ describe('StatsBar', () => {
 
     // Assert size formatted
     expect(screen.getByText('2.5 GB')).toBeDefined();
-    expect(screen.getByText('总磁盘空间')).toBeDefined();
+    expect(screen.getByText('组件总大小')).toBeDefined();
   });
 });

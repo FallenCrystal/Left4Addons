@@ -1,5 +1,6 @@
 import { Edit3, Trash2, Unlock, Lock, FolderOpen } from 'lucide-react';
 import { Group } from '../types/addon';
+import { useTranslation } from 'react-i18next';
 
 interface GroupHeaderProps {
   currentGroup: Group;
@@ -14,6 +15,8 @@ export function GroupHeader({
   onDeleteGroup,
   onGroupActionBatch,
 }: GroupHeaderProps) {
+  const { t } = useTranslation();
+
   return (
     <div style={{ 
       backgroundColor: 'var(--md-sys-surface-container-high)',
@@ -29,7 +32,7 @@ export function GroupHeader({
         <div>
           <h2 style={{ margin: 0, fontSize: '24px', color: '#fff' }}>{currentGroup.name}</h2>
           <p style={{ margin: '4px 0 0 0', fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
-            此分组包含 {currentGroup.addons?.length || 0} 个附件文件，可进行批量管理。
+            {t('groupHeader.desc', { count: currentGroup.addons?.length || 0 })}
           </p>
         </div>
         <div style={{ display: 'flex', gap: '8px' }}>
@@ -38,7 +41,7 @@ export function GroupHeader({
             onClick={onRenameGroup}
           >
             <Edit3 size={14} />
-            <span>重命名分组</span>
+            <span>{t('groupHeader.renameGroup')}</span>
           </button>
           <button 
             className="btn btn-secondary" 
@@ -46,7 +49,7 @@ export function GroupHeader({
             onClick={onDeleteGroup}
           >
             <Trash2 size={14} />
-            <span>解散分组</span>
+            <span>{t('groupHeader.deleteGroup')}</span>
           </button>
         </div>
       </div>
@@ -54,15 +57,15 @@ export function GroupHeader({
       <div style={{ display: 'flex', gap: '8px' }}>
         <button className="btn btn-primary" onClick={() => onGroupActionBatch('enable')}>
           <Unlock size={14} />
-          <span>全部启用</span>
+          <span>{t('groupHeader.enableAll')}</span>
         </button>
         <button className="btn btn-secondary" onClick={() => onGroupActionBatch('disable')}>
           <Lock size={14} />
-          <span>全部禁用</span>
+          <span>{t('groupHeader.disableAll')}</span>
         </button>
         <button className="btn btn-tertiary" onClick={() => onGroupActionBatch('move-load')}>
           <FolderOpen size={14} />
-          <span>全部移动至手动安装</span>
+          <span>{t('groupHeader.moveToManualAll')}</span>
         </button>
       </div>
     </div>

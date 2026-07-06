@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical } from 'lucide-react';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check } from 'lucide-react';
 import { Settings } from '../types/addon';
+import { useTranslation } from 'react-i18next';
+import { TransHTML } from '../i18n';
 
 interface SettingsViewProps {
   settings: Settings;
@@ -13,7 +15,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   isSubmitting,
   onConfirm,
 }) => {
-  const [activeTab, setActiveTab] = useState<'path' | 'experimental' | 'about'>('path');
+  const { t, i18n } = useTranslation();
+  const [activeTab, setActiveTab] = useState<'path' | 'language' | 'experimental' | 'about'>('path');
   const [loadingDir, setLoadingDir] = useState('');
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
 
@@ -28,6 +31,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     await onConfirm(loadingDir.trim(), enableDummyBypass);
   };
 
+  const changeLanguage = (lng: string) => {
+    i18n.changeLanguage(lng);
+    localStorage.setItem('i18n_lang', lng);
+  };
+
+  const featuresList = t('settings.features', { returnObjects: true }) as string[];
+
   return (
     <div className="settings-view">
       {/* Settings Navigation Sidebar */}
@@ -38,7 +48,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           type="button"
         >
           <FolderOpen size={18} />
-          <span>路径设置</span>
+          <span>{t('settings.pathSettings')}</span>
+        </button>
+        <button
+          className={`settings-nav-item ${activeTab === 'language' ? 'active' : ''}`}
+          onClick={() => setActiveTab('language')}
+          type="button"
+        >
+          <Languages size={18} />
+          <span>{t('settings.language')}</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'experimental' ? 'active' : ''}`}
@@ -46,7 +64,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           type="button"
         >
           <FlaskConical size={18} />
-          <span>实验性</span>
+          <span>{t('settings.experimental')}</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'about' ? 'active' : ''}`}
@@ -54,7 +72,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           type="button"
         >
           <Info size={18} />
-          <span>关于软件</span>
+          <span>{t('settings.about')}</span>
         </button>
       </div>
 
@@ -62,28 +80,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       <div className="settings-content">
         {activeTab === 'path' && (
           <div>
-            <h2 className="settings-title">游戏与目录配置</h2>
+            <h2 className="settings-title">{t('settings.title')}</h2>
             <form onSubmit={handleSubmit} className="settings-section">
               <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
-                请配置求生之路2的游戏附加组件目录（即 `addons` 文件夹）。程序将自动访问该文件夹及其下的 `workshop` 创意工坊文件夹，并解析和管理所有的 VPK 附件文件。
+                {t('settings.desc')}
               </p>
 
               <div className="form-group" style={{ marginBottom: '24px' }}>
                 <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
-                  附加组件目录 (Addons 路径):
+                  {t('settings.addonsPathLabel')}
                 </label>
                 <input
                   type="text"
                   className="form-input"
                   value={loadingDir}
                   onChange={(e) => setLoadingDir(e.target.value)}
-                  placeholder="例如: C:\Program Files (x86)\Steam\steamapps\common\Left 4 Dead 2\left4dead2\addons"
+                  placeholder={t('settings.addonsPathPlaceholder')}
                   style={{ width: '100%' }}
                   required
                   disabled={isSubmitting}
                 />
                 <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
-                  请选择游戏目录下的 `left4dead2/addons` 文件夹。保存后程序将自动开始扫描该目录。
+                  {t('settings.addonsPathHelp')}
                 </span>
               </div>
 
@@ -97,10 +115,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {isSubmitting ? (
                     <>
                       <RefreshCw className="animate-spin" size={16} />
-                      <span>正在保存并扫描...</span>
+                      <span>{t('settings.savingAndScanning')}</span>
                     </>
                   ) : (
-                    <span>保存并重新扫描</span>
+                    <span>{t('settings.saveAndRescan')}</span>
                   )}
                 </button>
               </div>
@@ -108,24 +126,69 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         )}
 
+        {activeTab === 'language' && (
+          <div>
+            <h2 className="settings-title">{t('settings.languageTitle')}</h2>
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '24px', lineHeight: '1.6' }}>
+              {t('settings.languageDesc')}
+            </p>
+
+            <div className="language-selector-grid">
+              <div 
+                className={`language-card ${i18n.language === 'zh' ? 'active' : ''}`}
+                onClick={() => changeLanguage('zh')}
+              >
+                <div className="language-card-circle">
+                  文
+                </div>
+                <div className="language-card-info">
+                  <div className="language-card-name">简体中文</div>
+                  <div className="language-card-sub">Simplified Chinese</div>
+                </div>
+                {i18n.language === 'zh' && (
+                  <div className="language-card-check">
+                    <Check size={20} strokeWidth={3} />
+                  </div>
+                )}
+              </div>
+
+              <div 
+                className={`language-card ${i18n.language === 'en' ? 'active' : ''}`}
+                onClick={() => changeLanguage('en')}
+              >
+                <div className="language-card-circle">
+                  A
+                </div>
+                <div className="language-card-info">
+                  <div className="language-card-name">English</div>
+                  <div className="language-card-sub">English</div>
+                </div>
+                {i18n.language === 'en' && (
+                  <div className="language-card-check">
+                    <Check size={20} strokeWidth={3} />
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {activeTab === 'experimental' && (
           <div>
-            <h2 className="settings-title">实验性功能</h2>
+            <h2 className="settings-title">{t('settings.experimentalTitle')}</h2>
             <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
-              此处的选项处于实验性阶段。启用可能会对文件目录结构做出调整，请谨慎开启。
+              {t('settings.experimentalDesc')}
             </p>
             <form onSubmit={handleSubmit}>
               <div className="settings-section">
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
                   <div style={{ paddingRight: '20px' }}>
                     <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
-                      创意工坊检测绕过
+                      {t('settings.dummyBypassTitle')}
                     </label>
-                    <span style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
-                      开启后，将 addon 从 workshop 移出时，将在 workshop 目录下自动生成一个 dummy addon（仅保留附件图片、原始 AppID 及版本号，将标题标记为原名 (L4A Dummy) 且说明改为由 L4A 生成），以试图绕过 L4D2 创意工坊订阅同步检测。
-                      <br /><br />
-                      请注意：创意工坊更新可能会导致新旧版本的 addon 同时加载并冲突。
-                    </span>
+                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      <TransHTML i18nKey="settings.dummyBypassDesc" />
+                    </div>
                   </div>
                   <label className="switch" style={{ flexShrink: 0 }}>
                     <input
@@ -149,10 +212,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {isSubmitting ? (
                     <>
                       <RefreshCw className="animate-spin" size={16} />
-                      <span>正在保存并扫描...</span>
+                      <span>{t('settings.savingAndScanning')}</span>
                     </>
                   ) : (
-                    <span>保存并重新扫描</span>
+                    <span>{t('settings.saveAndRescan')}</span>
                   )}
                 </button>
               </div>
@@ -162,27 +225,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         {activeTab === 'about' && (
           <div>
-            <h2 className="settings-title">关于 Left 4 Addons</h2>
+            <h2 className="settings-title">{t('settings.aboutTitle')}</h2>
             <div className="settings-section" style={{ lineHeight: '1.8' }}>
               <h3 style={{ margin: '0 0 12px 0', fontSize: '18px', color: 'var(--md-sys-color-primary)' }}>
                 Left 4 Addons v1.0.0
               </h3>
               <p style={{ fontSize: '13px', color: 'var(--md-sys-color-on-surface)', marginBottom: '16px' }}>
-                一个专为《求生之路2》（Left 4 Dead 2）设计的附加组件（Addons）管理器。采用 Tauri + React + Rust 驱动，旨在为玩家提供极速、优雅的 VPK 文件管理体验。
+                {t('settings.aboutDesc')}
               </p>
               
-              <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px', fontWeight: '600' }}>主要功能</h4>
+              <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px', fontWeight: '600' }}>{t('settings.featuresTitle')}</h4>
               <ul style={{ paddingLeft: '20px', margin: '0', fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
-                <li><b>一键启用/禁用</b>：快速重命名 `.vpk` 文件以在游戏中生效或失效。</li>
-                <li><b>创意工坊同步</b>：自动拉取并缓存创意工坊组件的封面图、标题 and 作者详情。</li>
-                <li><b>分组管理</b>：将多 Part 地图或关联组件组合，实现一键批量操作。</li>
-                <li><b>自动识别</b>：内置战役/地图包识别算法，自动检测并对关联附件进行重组。</li>
-                <li><b>物理隔离</b>：一键将工坊文件转移到本地加载文件夹，防止游戏联机订阅冲突。</li>
+                {featuresList.map((feature: string, idx: number) => (
+                  <li key={idx} dangerouslySetInnerHTML={{ __html: feature }} />
+                ))}
               </ul>
 
-              <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px', fontWeight: '600' }}>开源许可</h4>
+              <h4 style={{ margin: '20px 0 8px 0', fontSize: '14px', fontWeight: '600' }}>{t('settings.licenseTitle')}</h4>
               <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', margin: '0' }}>
-                本项目遵循 MIT 协议开源。
+                {t('settings.licenseDesc')}
               </p>
             </div>
           </div>

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface EditGroupModalProps {
   open: boolean;
@@ -17,6 +18,7 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
   onConfirm,
   isSubmitting = false,
 }) => {
+  const { t } = useTranslation();
   const [name, setName] = useState('');
 
   useEffect(() => {
@@ -36,10 +38,10 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <form className="modal-content" onSubmit={handleSubmit} onClick={(e) => e.stopPropagation()}>
-        <h2 className="modal-title">重命名分组</h2>
+        <h2 className="modal-title">{t('editGroupModal.title')}</h2>
         
         <div className="form-group">
-          <label className="form-label">分组新名称:</label>
+          <label className="form-label">{t('editGroupModal.newNameLabel')}</label>
           <input 
             type="text" 
             className="form-input" 
@@ -57,10 +59,10 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
             onClick={onCancel}
             disabled={isSubmitting}
           >
-            取消
+            {t('common.cancel')}
           </button>
           <button type="submit" className="btn btn-primary" disabled={isSubmitting || !name.trim()}>
-            {isSubmitting ? '正在保存...' : '保存'}
+            {isSubmitting ? t('common.saving') : t('common.save')}
           </button>
         </div>
       </form>

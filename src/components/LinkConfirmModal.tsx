@@ -1,5 +1,6 @@
 import React from 'react';
 import { ExternalLink } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
 
 interface LinkConfirmModalProps {
   open: boolean;
@@ -14,6 +15,8 @@ export const LinkConfirmModal: React.FC<LinkConfirmModalProps> = ({
   onCancel,
   onConfirm,
 }) => {
+  const { t } = useTranslation();
+
   if (!open) return null;
 
   return (
@@ -21,11 +24,11 @@ export const LinkConfirmModal: React.FC<LinkConfirmModalProps> = ({
       <div className="modal-content" style={{ width: '450px' }} onClick={(e) => e.stopPropagation()}>
         <h2 className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--md-sys-color-primary)' }}>
           <ExternalLink size={24} />
-          <span>即将访问外部网站</span>
+          <span>{t('linkConfirmModal.title')}</span>
         </h2>
         
         <div style={{ marginTop: '16px', marginBottom: '20px', color: '#e2e2e9', fontSize: '14px', lineHeight: '1.6' }}>
-          您点击的链接指向第三方外部网页：
+          {t('linkConfirmModal.desc.0')}
           <div style={{ 
             background: 'var(--md-sys-surface-container-low)', 
             border: '1px solid var(--md-sys-color-outline-variant)', 
@@ -42,7 +45,7 @@ export const LinkConfirmModal: React.FC<LinkConfirmModalProps> = ({
             {url}
           </div>
           <br />
-          请确保您信任该网站，以防止钓鱼和恶意软件威胁。是否继续前往？
+          {t('linkConfirmModal.desc.1')}
         </div>
 
         <div className="modal-actions">
@@ -51,7 +54,7 @@ export const LinkConfirmModal: React.FC<LinkConfirmModalProps> = ({
             className="btn btn-secondary" 
             onClick={onCancel}
           >
-            取消
+            {t('common.cancel')}
           </button>
           
           <button 
@@ -59,7 +62,7 @@ export const LinkConfirmModal: React.FC<LinkConfirmModalProps> = ({
             className="btn btn-primary"
             onClick={() => onConfirm(url)}
           >
-            继续访问
+            {t('linkConfirmModal.continue')}
           </button>
         </div>
       </div>
