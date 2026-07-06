@@ -1,7 +1,7 @@
 import React from 'react';
 import { FolderPlus, ExternalLink, Move, Edit3, FileText } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
-import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor } from '../utils/addonHelpers';
+import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
 import { useTranslation } from 'react-i18next';
 
@@ -38,9 +38,9 @@ export const AddonCard: React.FC<AddonCardProps> = ({
 }) => {
   const { t } = useTranslation();
   const categories = getAddonCategories(addon);
-  const title = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
+  const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
   const author = getAddonAuthor(addon);
-  const desc = addon.steamDetails?.description || addon.addonInfo?.addonDescription || addon.addonInfo?.addontagline || 'No description provided.';
+  const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
   
   const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
   const addonUrl = getAddonUrl(addon);

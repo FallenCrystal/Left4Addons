@@ -1,7 +1,7 @@
 import React from 'react';
 import { X, ExternalLink, FileText, Move, FolderPlus } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
-import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor } from '../utils/addonHelpers';
+import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
 import { useTranslation } from 'react-i18next';
 
@@ -28,12 +28,15 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
   if (!open || !addon) return null;
 
-  const title = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
+  const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
   const author = getAddonAuthor(addon);
-  const desc = addon.steamDetails?.description || addon.addonInfo?.addondescription || addon.addonInfo?.addontagline || 'No description provided.';
+  const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
   const categories = getAddonCategories(addon);
   const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
   const addonUrl = getAddonUrl(addon);
+  
+  const addonauthorSteamID = getAddonInfoValue(addon, 'addonauthorsteamid');
+  const addonversion = getAddonInfoValue(addon, 'addonversion');
 
   const handleOpenLinkClick = (e: React.MouseEvent, url: string) => {
     e.preventDefault();
@@ -130,10 +133,10 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               <span style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
                 {t('detailModal.author', { author: '' })}<strong style={{ color: '#fff' }}>{author}</strong>
               </span>
-              {addon.addonInfo?.addonauthorSteamID && (
+              {addonauthorSteamID && (
                 <a 
                   href="#"
-                  onClick={(e) => handleOpenLinkClick(e, `https://steamcommunity.com/profiles/${addon.addonInfo?.addonauthorSteamID}`)}
+                  onClick={(e) => handleOpenLinkClick(e, `https://steamcommunity.com/profiles/${addonauthorSteamID}`)}
                   className="btn btn-text"
                   style={{ padding: '2px 4px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
                 >
@@ -143,9 +146,9 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               )}
             </div>
 
-            {addon.addonInfo?.addonversion && (
+            {addonversion && (
               <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)' }}>
-                {t('detailModal.version', { version: addon.addonInfo.addonversion })}
+                {t('detailModal.version', { version: addonversion })}
               </div>
             )}
 

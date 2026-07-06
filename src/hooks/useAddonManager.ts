@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, Group, Settings, Toast } from '../types/addon';
-import { getAddonAuthor, getAddonCategories, getSuggestedVpkName } from '../utils/addonHelpers';
+import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 
 export type RenderedItem = 
@@ -436,7 +436,7 @@ export function useAddonManager() {
   const triggerRenameModal = (addon: Addon) => {
     const itemGroup = groups.find(g => g.addons.includes(addon.vpkName));
     const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, addons);
-    const steamTitle = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
+    const steamTitle = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
 
     setRenameModal({
       open: true,
@@ -657,8 +657,8 @@ export function useAddonManager() {
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
       items = items.filter(item => {
-        const title = (item.steamDetails?.title || item.addonInfo?.addontitle || '').toLowerCase();
-        const desc = (item.steamDetails?.description || item.addonInfo?.addonDescription || item.addonInfo?.addontagline || '').toLowerCase();
+        const title = (item.steamDetails?.title || getAddonInfoValue(item, 'addontitle') || '').toLowerCase();
+        const desc = (item.steamDetails?.description || getAddonInfoValue(item, 'addondescription') || getAddonInfoValue(item, 'addontagline') || '').toLowerCase();
         const author = getAddonAuthor(item).toLowerCase();
         return title.includes(q) || desc.includes(q) || author.includes(q) || item.vpkName.toLowerCase().includes(q) || (item.workshopId || '').includes(q);
       });
@@ -694,8 +694,8 @@ export function useAddonManager() {
     // Sorting
     items.sort((a, b) => {
       if (sortBy === 'title') {
-        const titleA = (a.steamDetails?.title || a.addonInfo?.addontitle || a.vpkName).toLowerCase();
-        const titleB = (b.steamDetails?.title || b.addonInfo?.addontitle || b.vpkName).toLowerCase();
+        const titleA = (a.steamDetails?.title || getAddonInfoValue(a, 'addontitle') || a.vpkName).toLowerCase();
+        const titleB = (b.steamDetails?.title || getAddonInfoValue(b, 'addontitle') || b.vpkName).toLowerCase();
         return titleA.localeCompare(titleB);
       } else if (sortBy === 'size') {
         return b.fileSize - a.fileSize; // descending size
@@ -747,7 +747,7 @@ export function useAddonManager() {
       const getSortProps = (item: RenderedItem) => {
         if (item.type === 'addon') {
           const addon = item.data;
-          const title = (addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName).toLowerCase();
+          const title = (addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName).toLowerCase();
           const size = addon.fileSize || 0;
           const id = addon.workshopId ?? '';
           return { title, size, id };

@@ -10,39 +10,58 @@ export function formatBytes(bytes: number, decimals: number = 2): string {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
+// Case-insensitive lookup helper for addonInfo
+export function getAddonInfoValue(addon: Addon, key: string): any {
+  if (!addon || !addon.addonInfo) return undefined;
+  const info = addon.addonInfo;
+  // Direct check first
+  const val = info[key as keyof typeof info];
+  if (val !== undefined) return val;
+  // Case-insensitive check
+  const lowerK = key.toLowerCase();
+  const foundKey = Object.keys(info).find(k => k.toLowerCase() === lowerK);
+  return foundKey ? info[foundKey as keyof typeof info] : undefined;
+}
+
 // Category mappings from keys
 export function getAddonCategories(addon: Addon): string[] {
   const categories = new Set<string>();
-  const info = addon.addonInfo || {};
   
-  if (info.addonContent_Campaign === '1' || info.addonContent_Campaign === 1) categories.add('Campaign');
-  if (info.addonContent_Map === '1' || info.addonContent_Map === 1) categories.add('Map');
-  if (info.addonContent_Survivor === '1' || info.addonContent_Survivor === 1) categories.add('Survivor');
+  const checkKey = (k: string): boolean => {
+    const val = getAddonInfoValue(addon, k);
+    if (val === undefined || val === null) return false;
+    const strVal = String(val).trim();
+    return strVal === '1';
+  };
+
+  if (checkKey('addonContent_Campaign')) categories.add('Campaign');
+  if (checkKey('addonContent_Map')) categories.add('Map');
+  if (checkKey('addonContent_Survivor')) categories.add('Survivor');
   if (
-    info.addonContent_WeaponModel === '1' || info.addonContent_WeaponModel === 1 ||
-    info.Content_WeaponModel === '1' || info.Content_WeaponModel === 1 ||
-    info.Content_weapon === '1' || info.Content_weapon === 1
+    checkKey('addonContent_WeaponModel') ||
+    checkKey('Content_WeaponModel') ||
+    checkKey('Content_weapon')
   ) {
     categories.add('Weapon Model');
   }
-  if (info.addonContent_Skin === '1' || info.addonContent_Skin === 1) categories.add('Skin');
-  if (info.addonContent_Script === '1' || info.addonContent_Script === 1) categories.add('Script');
+  if (checkKey('addonContent_Skin')) categories.add('Skin');
+  if (checkKey('addonContent_Script')) categories.add('Script');
   if (
-    info.addonContent_Music === '1' || info.addonContent_Music === 1 ||
-    info.addonContent_Sound === '1' || info.addonContent_Sound === 1
+    checkKey('addonContent_Music') ||
+    checkKey('addonContent_Sound')
   ) {
     categories.add('Sound/Music');
   }
   if (
-    info.addonContent_BossInfected === '1' || info.addonContent_BossInfected === 1 ||
-    info.addonContent_CommonInfected === '1' || info.addonContent_CommonInfected === 1
+    checkKey('addonContent_BossInfected') ||
+    checkKey('addonContent_CommonInfected')
   ) {
     categories.add('Infected');
   }
   if (
-    info.addonContent_UI === '1' || info.addonContent_UI === 1 ||
-    info.addonContent_Spray === '1' || info.addonContent_Spray === 1 ||
-    info.addonContent_BackgroundMovie === '1' || info.addonContent_BackgroundMovie === 1
+    checkKey('addonContent_UI') ||
+    checkKey('addonContent_Spray') ||
+    checkKey('addonContent_BackgroundMovie')
   ) {
     categories.add('UI/Textures');
   }
@@ -87,9 +106,8 @@ export const getImageUrl = (path?: string): string => {
 };
 
 export const getAddonUrl = (addon: Addon): string | null => {
-  if (!addon || !addon.addonInfo) return null;
-  const info = addon.addonInfo;
-  let url = info.addonurl0 || info.addonURL0 || info.addonurl || info.addonURL || info.addonUrl0 || info.addonUrl;
+  if (!addon) return null;
+  let url = getAddonInfoValue(addon, 'addonurl0') || getAddonInfoValue(addon, 'addonurl');
   if (url && typeof url === 'string') {
     url = url.trim();
     if (url.startsWith('http://') || url.startsWith('https://')) {
@@ -104,8 +122,7 @@ export const getAddonUrl = (addon: Addon): string | null => {
 
 export const getAddonAuthor = (addon: Addon): string => {
   if (!addon) return 'Unknown Author';
-  const info = addon.addonInfo || {};
-  const author = info.addonauthor || info.addonAuthor || info.author;
+  const author = getAddonInfoValue(addon, 'addonauthor') || getAddonInfoValue(addon, 'author');
   if (author && typeof author === 'string' && author.trim()) {
     return author.trim();
   }

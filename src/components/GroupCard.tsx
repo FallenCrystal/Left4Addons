@@ -1,7 +1,7 @@
 import React from 'react';
 import { Folder, FolderOpen } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
-import { formatBytes, getAddonAuthor } from '../utils/addonHelpers';
+import { formatBytes, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
 import { useTranslation } from 'react-i18next';
 
@@ -48,7 +48,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
     : t('groupCard.authorMultiple', { first: authors[0], count: authors.length - 1, total: authors.length });
   
   const groupDesc = t('groupCard.containsAddons', { count: addons.length }) + '\n' + 
-    addons.map(ad => `• ${ad.steamDetails?.title || ad.addonInfo?.addontitle || ad.vpkName}`).join('\n');
+    addons.map(ad => `• ${ad.steamDetails?.title || getAddonInfoValue(ad, 'addontitle') || ad.vpkName}`).join('\n');
   const groupSize = addons.reduce((sum, ad) => sum + (ad.fileSize || 0), 0);
 
   return (

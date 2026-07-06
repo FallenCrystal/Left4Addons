@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Addon } from '../types/addon';
 import { useTranslation } from 'react-i18next';
+import { getAddonInfoValue } from '../utils/addonHelpers';
 
 interface GroupModalProps {
   open: boolean;
@@ -81,7 +82,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
             padding: '8px'
           }}>
             {Object.values(addons).map(addon => {
-              const title = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
+              const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
               const isChecked = selectedAddons.includes(addon.vpkName);
               return (
                 <label 

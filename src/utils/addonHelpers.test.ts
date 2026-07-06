@@ -38,6 +38,42 @@ describe('addonHelpers', () => {
       expect(getAddonCategories(addon)).toContain('Campaign');
     });
 
+    test('should match category keys case-insensitively', () => {
+      const addon: Addon = {
+        vpkName: 'test.vpk',
+        dirType: 'loading',
+        isEnabled: true,
+        fileSize: 100,
+        filesCount: 1,
+        addonInfo: {
+          addoncontent_campaign: '1',
+          ADDONCONTENT_SURVIVOR: '1',
+        },
+      };
+      const cats = getAddonCategories(addon);
+      expect(cats).toContain('Campaign');
+      expect(cats).toContain('Survivor');
+    });
+
+    test('should ignore keys with value 0', () => {
+      const addon: Addon = {
+        vpkName: 'test.vpk',
+        dirType: 'loading',
+        isEnabled: true,
+        fileSize: 100,
+        filesCount: 1,
+        addonInfo: {
+          addonContent_Campaign: '0',
+          addonContent_Survivor: 0,
+          addonContent_Map: '1',
+        },
+      };
+      const cats = getAddonCategories(addon);
+      expect(cats).toContain('Map');
+      expect(cats).not.toContain('Campaign');
+      expect(cats).not.toContain('Survivor');
+    });
+
     test('should fall back to Other when no categories are present', () => {
       const addon: Addon = {
         vpkName: 'test.vpk',
