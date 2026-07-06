@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { X, Download, ExternalLink, CheckCircle, PlusCircle, FileText, FolderPlus, ChevronLeft, ChevronRight, Link2, Package } from 'lucide-react';
+import { X, Download, ExternalLink, CheckCircle, PlusCircle, FileText, FolderPlus, ChevronLeft, ChevronRight, Link2, Package, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem, WorkshopBrowserProps, WorkshopPageDetails } from './types';
 import { parseWorkshopPageDetails } from './ssrParser';
@@ -32,6 +32,7 @@ interface WorkshopDetailModalProps {
   downloadProgress: Record<string, number>;
   isSubmitting: boolean;
   groups?: Group[];
+  isLoading?: boolean;
 }
 
 export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
@@ -49,11 +50,29 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   downloadProgress,
   isSubmitting,
   groups,
+  isLoading,
 }) => {
   const { t } = useTranslation();
   const [pageDetails, setPageDetails] = useState<WorkshopPageDetails | null>(null);
   const [pageDetailsLoading, setPageDetailsLoading] = useState(false);
   const [galleryIndex, setGalleryIndex] = useState(0);
+  const [fullscreenImageIndex, setFullscreenImageIndex] = useState<number | null>(null);
+  const thumbnailContainerRef = useRef<HTMLDivElement>(null);
+
+  // Scroll thumbnail into view when galleryIndex changes
+  useEffect(() => {
+    if (thumbnailContainerRef.current) {
+      const container = thumbnailContainerRef.current;
+      const activeThumb = container.children[galleryIndex] as HTMLElement;
+      if (activeThumb) {
+        const containerRect = container.getBoundingClientRect();
+        const thumbRect = activeThumb.getBoundingClientRect();
+        if (thumbRect.left < containerRect.left || thumbRect.right > containerRect.right) {
+          activeThumb.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+        }
+      }
+    }
+  }, [galleryIndex]);
 
   // Fetch extra details by scraping the workshop page HTML
   const fetchPageDetails = useCallback(async (workshopId: string) => {
@@ -81,6 +100,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     } else {
       setPageDetails(null);
       setGalleryIndex(0);
+      setFullscreenImageIndex(null);
     }
   }, [open, item?.workshopId, collection?.workshopId, fetchPageDetails]);
 
@@ -95,7 +115,12 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
     return (
       <div className="modal-overlay" onClick={onClose}>
-        <div className="modal-content modal-content-wide" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-content modal-content-wide" onClick={(e) => e.stopPropagation()} style={{ position: 'relative' }}>
+          {isLoading && (
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '12px' }}>
+              <Loader2 size={36} className="animate-spin text-primary" style={{ color: 'var(--md-sys-color-primary)' }} />
+            </div>
+          )}
           {/* Header */}
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
             <h2 className="modal-title" style={{ margin: 0 }}>{t('workshop.detail.collectionTitle')}</h2>
@@ -247,7 +272,12 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-content modal-content-wide" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-content modal-content-wide" onClick={(e) => e.stopPropagation()} style={{ position: 'relative' }}>
+        {isLoading && (
+          <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.5)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '12px' }}>
+            <Loader2 size={36} className="animate-spin text-primary" style={{ color: 'var(--md-sys-color-primary)' }} />
+          </div>
+        )}
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
           <h2 className="modal-title" style={{ margin: 0 }}>{t('workshop.detail.title')}</h2>
@@ -259,25 +289,42 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
         <div className="detail-modal-layout">
           {/* Left: preview + metadata */}
           <div className="detail-left">
-            <div className="detail-image-box" style={{ position: 'relative' }}>
+            <div className="detail-image-box" style={{ position: 'relative', overflow: 'hidden' }}>
               {hasGallery ? (
                 <>
-                  <CacheImage srcPath={gallery[galleryIndex]} alt={item.title} className="detail-image" />
+                  <div style={{ position: 'relative', width: '100%', height: '100%', background: '#000' }}>
+                    {gallery.map((url, i) => (
+                      <div
+                        key={url + '-' + i}
+                        onClick={() => setFullscreenImageIndex(i)}
+                        style={{
+                          position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+                          opacity: i === galleryIndex ? 1 : 0,
+                          transition: 'opacity 0.3s ease-in-out',
+                          pointerEvents: i === galleryIndex ? 'auto' : 'none',
+                          zIndex: i === galleryIndex ? 1 : 0,
+                          cursor: 'zoom-in',
+                        }}
+                      >
+                        <CacheImage srcPath={url} alt={item.title} className="detail-image" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                      </div>
+                    ))}
+                  </div>
                   {gallery.length > 1 && (
                     <>
                       <button
                         onClick={() => setGalleryIndex((i) => (i - 1 + gallery.length) % gallery.length)}
-                        style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}
+                        style={{ position: 'absolute', left: 8, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff', zIndex: 2 }}
                       >
                         <ChevronLeft size={16} />
                       </button>
                       <button
                         onClick={() => setGalleryIndex((i) => (i + 1) % gallery.length)}
-                        style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}
+                        style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', background: 'rgba(0,0,0,0.6)', border: 'none', borderRadius: '50%', width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff', zIndex: 2 }}
                       >
                         <ChevronRight size={16} />
                       </button>
-                      <div style={{ position: 'absolute', bottom: 8, right: 8, background: 'rgba(0,0,0,0.6)', borderRadius: 8, padding: '2px 8px', fontSize: '11px', color: '#fff' }}>
+                      <div style={{ position: 'absolute', bottom: 8, right: 8, background: 'rgba(0,0,0,0.6)', borderRadius: 8, padding: '2px 8px', fontSize: '11px', color: '#fff', zIndex: 2 }}>
                         {galleryIndex + 1} / {gallery.length}
                       </div>
                     </>
@@ -292,7 +339,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
             {/* Gallery thumbnails */}
             {hasGallery && gallery.length > 1 && (
-              <div style={{ display: 'flex', gap: '4px', overflowX: 'auto', marginTop: '8px', paddingBottom: '4px' }}>
+              <div ref={thumbnailContainerRef} style={{ display: 'flex', gap: '4px', overflowX: 'auto', marginTop: '8px', paddingBottom: '4px', scrollBehavior: 'smooth' }}>
                 {gallery.map((url, i) => (
                   <img
                     key={i}
@@ -387,16 +434,23 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                   <Package size={14} /> {t('workshop.detail.requiredItems')} ({pageDetails.requiredItems.length})
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '120px', overflowY: 'auto' }}>
-                  {pageDetails.requiredItems.map((req) => (
-                    <a
-                      key={req.workshopId}
-                      href="#"
-                      onClick={(e) => { e.preventDefault(); onItemNavigate(req.workshopId); }}
-                      style={{ fontSize: '12px', color: 'var(--md-sys-color-primary)', textDecoration: 'underline', display: 'flex', alignItems: 'center', gap: '4px' }}
-                    >
-                      <Link2 size={12} /> {req.title}
-                    </a>
-                  ))}
+                  {pageDetails.requiredItems.map((req) => {
+                    const reqIsKnown = !!knownUninstalledAddons[req.workshopId + '.vpk'];
+                    const reqIsDownloaded = !!addons[req.workshopId + '.vpk'];
+                    return (
+                      <div key={req.workshopId} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <a
+                          href="#"
+                          onClick={(e) => { e.preventDefault(); onItemNavigate(req.workshopId); }}
+                          style={{ fontSize: '12px', color: 'var(--md-sys-color-primary)', textDecoration: 'underline', display: 'flex', alignItems: 'center', gap: '4px' }}
+                        >
+                          <Link2 size={12} /> {req.title}
+                        </a>
+                        {reqIsDownloaded && <CheckCircle size={14} className="icon-success" />}
+                        {!reqIsDownloaded && reqIsKnown && <span style={{ fontSize: '11px', color: 'var(--md-sys-color-tertiary)' }}>{t('workshop.badges.known')}</span>}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -477,6 +531,51 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Fullscreen image viewer */}
+      {fullscreenImageIndex !== null && gallery[fullscreenImageIndex] && (
+        <div 
+          style={{
+            position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, 
+            background: 'rgba(0,0,0,0.9)', zIndex: 9999,
+            display: 'flex', alignItems: 'center', justifyContent: 'center'
+          }}
+          onClick={() => setFullscreenImageIndex(null)}
+        >
+          <img 
+            src={gallery[fullscreenImageIndex]} 
+            alt="Fullscreen" 
+            style={{ maxWidth: '90%', maxHeight: '90%', objectFit: 'contain' }}
+            onClick={(e) => e.stopPropagation()}
+          />
+          <button
+            onClick={(e) => { e.stopPropagation(); setFullscreenImageIndex(null); }}
+            style={{ position: 'absolute', top: 24, right: 24, background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%', width: 48, height: 48, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}
+          >
+            <X size={24} />
+          </button>
+          
+          {gallery.length > 1 && (
+            <>
+              <button
+                onClick={(e) => { e.stopPropagation(); setFullscreenImageIndex((i) => (i! - 1 + gallery.length) % gallery.length); setGalleryIndex((i) => (i - 1 + gallery.length) % gallery.length); }}
+                style={{ position: 'absolute', left: 24, top: '50%', transform: 'translateY(-50%)', background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%', width: 64, height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}
+              >
+                <ChevronLeft size={32} />
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); setFullscreenImageIndex((i) => (i! + 1) % gallery.length); setGalleryIndex((i) => (i + 1) % gallery.length); }}
+                style={{ position: 'absolute', right: 24, top: '50%', transform: 'translateY(-50%)', background: 'rgba(255,255,255,0.2)', border: 'none', borderRadius: '50%', width: 64, height: 64, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', color: '#fff' }}
+              >
+                <ChevronRight size={32} />
+              </button>
+              <div style={{ position: 'absolute', bottom: 24, left: '50%', transform: 'translateX(-50%)', background: 'rgba(0,0,0,0.6)', borderRadius: 16, padding: '4px 16px', fontSize: '14px', color: '#fff' }}>
+                {fullscreenImageIndex + 1} / {gallery.length}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 };

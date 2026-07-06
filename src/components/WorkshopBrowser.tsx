@@ -224,6 +224,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const raw = data.collection;
       if (raw && raw.publishedfileid) {
         setSelectedItem(mapSteamDetailToItem(raw));
+        setSelectedCollection(null);
       }
     } catch (err) {
       alert(t('workshop.detail.fetchFailed', { err: String(err) }));
@@ -248,6 +249,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           items: rawItems.map(mapSteamDetailToItem),
           workshopId: raw.publishedfileid,
         });
+        setSelectedItem(null);
       }
     } catch (err) {
       alert(t('workshop.detail.fetchFailed', { err: String(err) }));
@@ -473,13 +475,14 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         onDownload={onDownload}
         onOpenLink={onOpenLink}
         onImportCollection={onImportCollection}
-        onItemNavigate={(workshopId) => { setSelectedCollection(null); viewItemDetails(workshopId); }}
-        onCollectionNavigate={(workshopId) => { setSelectedItem(null); viewCollectionDetails(workshopId); }}
+        onItemNavigate={viewItemDetails}
+        onCollectionNavigate={viewCollectionDetails}
         addons={addons}
         knownUninstalledAddons={knownUninstalledAddons}
         downloadProgress={downloadProgress}
         isSubmitting={isSubmitting}
         groups={groups}
+        isLoading={!!loadingDetailId}
       />
 
       {/* Tag browser modal */}
