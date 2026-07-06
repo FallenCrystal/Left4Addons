@@ -111,29 +111,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         {activeTab === 'experimental' && (
           <div>
             <h2 className="settings-title">实验性功能</h2>
-            <form onSubmit={handleSubmit} className="settings-section">
-              <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
-                此处的选项处于实验性阶段。启用可能会对文件目录结构做出调整，请谨慎开启。
-              </p>
-
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
-                <div style={{ paddingRight: '20px' }}>
-                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
-                    创意工坊检测绕过
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
+              此处的选项处于实验性阶段。启用可能会对文件目录结构做出调整，请谨慎开启。
+            </p>
+            <form onSubmit={handleSubmit}>
+              <div className="settings-section">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
+                  <div style={{ paddingRight: '20px' }}>
+                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                      创意工坊检测绕过
+                    </label>
+                    <span style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      开启后，将 addon 从 workshop 移出时，将在 workshop 目录下自动生成一个 dummy addon（仅保留附件图片、原始 AppID 及版本号，将标题标记为原名 (L4A Dummy) 且说明改为由 L4A 生成），以试图绕过 L4D2 创意工坊订阅同步检测。
+                      <br /><br />
+                      请注意：创意工坊更新可能会导致新旧版本的 addon 同时加载并冲突。
+                    </span>
+                  </div>
+                  <label className="switch" style={{ flexShrink: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={enableDummyBypass}
+                      onChange={(e) => setEnableDummyBypass(e.target.checked)}
+                      disabled={isSubmitting}
+                    />
+                    <span className="slider"></span>
                   </label>
-                  <span style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
-                    开启后，将 addon 从 workshop 移出时，将在 workshop 目录下自动生成一个 dummy addon（仅保留附件图片、原始 AppID 及版本号，将标题标记为原名 (L4A Dummy) 且说明改为由 L4A 生成），以试图绕过 L4D2 创意工坊订阅同步检测。
-                  </span>
                 </div>
-                <label className="switch" style={{ flexShrink: 0 }}>
-                  <input
-                    type="checkbox"
-                    checked={enableDummyBypass}
-                    onChange={(e) => setEnableDummyBypass(e.target.checked)}
-                    disabled={isSubmitting}
-                  />
-                  <span className="slider"></span>
-                </label>
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-start', marginTop: '32px' }}>
