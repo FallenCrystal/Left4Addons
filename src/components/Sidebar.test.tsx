@@ -29,22 +29,25 @@ describe('Sidebar', () => {
     },
   ];
 
+  const defaultProps = {
+    addons: mockAddons,
+    groups: mockGroups,
+    masterCollections: [],
+    currentFilterTab: 'all',
+    selectedGroupId: null,
+    selectedMasterCollectionId: null,
+    onFilterTabChange: vi.fn(),
+    onOpenGroupModal: vi.fn(),
+    onOpenMasterCollectionModal: vi.fn(),
+    onAutoGrouping: vi.fn(),
+    autoGrouping: false,
+    disabledCount: 1,
+    totalAddonsCount: 2,
+    knownUninstalledCount: 3,
+  };
+
   test('renders menu items and badges correctly', () => {
-    render(
-      <Sidebar
-        addons={mockAddons}
-        groups={mockGroups}
-        currentFilterTab="all"
-        selectedGroupId={null}
-        onFilterTabChange={vi.fn()}
-        onOpenGroupModal={vi.fn()}
-        onAutoGrouping={vi.fn()}
-        autoGrouping={false}
-        disabledCount={1}
-        totalAddonsCount={2}
-        knownUninstalledCount={3}
-      />
-    );
+    render(<Sidebar {...defaultProps} />);
 
     expect(screen.getByText('全部组件')).toBeDefined();
     expect(screen.getByText('全部组件').closest('button')?.querySelector('.menu-item-badge')?.textContent).toBe('2');
@@ -66,21 +69,7 @@ describe('Sidebar', () => {
   });
 
   test('renders noGroups text when groups list is empty', () => {
-    render(
-      <Sidebar
-        addons={mockAddons}
-        groups={[]}
-        currentFilterTab="all"
-        selectedGroupId={null}
-        onFilterTabChange={vi.fn()}
-        onOpenGroupModal={vi.fn()}
-        onAutoGrouping={vi.fn()}
-        autoGrouping={false}
-        disabledCount={1}
-        totalAddonsCount={2}
-        knownUninstalledCount={0}
-      />
-    );
+    render(<Sidebar {...defaultProps} groups={[]} knownUninstalledCount={0} />);
 
     expect(screen.getByText('暂无分组，可自动归类或手动创建。')).toBeDefined();
   });
@@ -88,21 +77,7 @@ describe('Sidebar', () => {
   test('calls onFilterTabChange when menu items are clicked', () => {
     const onFilterTabChange = vi.fn();
 
-    render(
-      <Sidebar
-        addons={mockAddons}
-        groups={mockGroups}
-        currentFilterTab="all"
-        selectedGroupId={null}
-        onFilterTabChange={onFilterTabChange}
-        onOpenGroupModal={vi.fn()}
-        onAutoGrouping={vi.fn()}
-        autoGrouping={false}
-        disabledCount={1}
-        totalAddonsCount={2}
-        knownUninstalledCount={0}
-      />
-    );
+    render(<Sidebar {...defaultProps} onFilterTabChange={onFilterTabChange} knownUninstalledCount={0} />);
 
     fireEvent.click(screen.getByText('手动安装 (Addons)'));
     expect(onFilterTabChange).toHaveBeenCalledWith('loading', null);
@@ -117,16 +92,9 @@ describe('Sidebar', () => {
 
     render(
       <Sidebar
-        addons={mockAddons}
-        groups={mockGroups}
-        currentFilterTab="all"
-        selectedGroupId={null}
-        onFilterTabChange={vi.fn()}
+        {...defaultProps}
         onOpenGroupModal={onOpenGroupModal}
         onAutoGrouping={onAutoGrouping}
-        autoGrouping={false}
-        disabledCount={1}
-        totalAddonsCount={2}
         knownUninstalledCount={0}
       />
     );

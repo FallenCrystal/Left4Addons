@@ -120,7 +120,10 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       if (creatorId) {
         url += `&browsesort=myfiles&creatorid=${creatorId}&p=${page}`;
       } else {
-        url += `&searchtext=${encodeURIComponent(committedQuery)}&browsesort=${sort}&section=${section}&p=${page}`;
+        if (committedQuery) {
+          url += `&searchtext=${encodeURIComponent(committedQuery)}`;
+        }
+        url += `&browsesort=${sort}&section=${section}&p=${page}`;
         if (activeTag) {
           url += `&requiredtags[]=${encodeURIComponent(activeTagName || activeTag)}`;
         }

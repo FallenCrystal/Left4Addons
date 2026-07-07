@@ -82,10 +82,11 @@ export function getAddonCategories(addon: Addon): string[] {
     });
   }
   
-  if (categories.size === 0) {
+  // Don't show "Other" for uninstalled items with no metadata
+  if (categories.size === 0 && addon.dirType !== 'none') {
     categories.add('Other');
   }
-  
+
   return Array.from(categories);
 }
 

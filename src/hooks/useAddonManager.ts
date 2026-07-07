@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Addon, Group, Settings, Toast, DatabasePayload } from '../types/addon';
+import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 
@@ -14,17 +14,20 @@ export function useAddonManager() {
   const [addons, setAddons] = useState<Record<string, Addon>>({});
   const [knownUninstalledAddons, setKnownUninstalledAddons] = useState<Record<string, Addon>>({});
   const [groups, setGroups] = useState<Group[]>([]);
+  const [masterCollections, setMasterCollections] = useState<MasterCollection[]>([]);
   const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '', enableDummyBypass: false });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
-  const [currentFilterTab, setCurrentFilterTab] = useState('all'); // all, workshop, loading, disabled, groups, known-uninstalled, workshop-browser
+  const [currentFilterTab, setCurrentFilterTab] = useState('all'); // all, workshop, loading, disabled, groups, known-uninstalled, workshop-browser, master-collection
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [selectedMasterCollectionId, setSelectedMasterCollectionId] = useState<string | null>(null);
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [sortBy, setSortBy] = useState('title'); // title, size, id
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [syncingSteam, setSyncingSteam] = useState(false);
   const [autoGrouping, setAutoGrouping] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedGroupIds, setSelectedGroupIds] = useState<string[]>([]);
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
@@ -80,6 +83,7 @@ export function useAddonManager() {
     setAddons(data.addons || {});
     setGroups(data.groups || []);
     setKnownUninstalledAddons(data.knownUninstalledAddons || {});
+    setMasterCollections(data.masterCollections || []);
     if (data.settings) {
       setSettings(data.settings);
     }
@@ -305,16 +309,17 @@ export function useAddonManager() {
   };
 
   // Group Management APIs
-  const handleCreateGroup = async (name: string, selectedAddons: string[], tags?: string[], workshopCollectionId?: string) => {
+  const handleCreateGroup = async (name: string, selectedAddons?: string[], tags?: string[], workshopCollectionId?: string, source?: string) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('group_action', {
         action: 'create',
         name,
-        ids: selectedAddons,
+        ids: selectedAddons || [],
         tags,
-        workshopCollectionId
+        workshopCollectionId,
+        source
       });
       updateLocalState(data);
       setGroupModal({ open: false });
@@ -491,9 +496,9 @@ export function useAddonManager() {
       setDownloadProgress(prev => ({ ...prev, [workshopId]: 0 }));
       const data: DatabasePayload = await invoke('download_addon', { workshopId });
       updateLocalState(data);
-      addToast('下载组件成功', 'success');
+      addToast(t('toasts.downloadSuccess'), 'success');
     } catch (err) {
-      addToast(`下载失败: ${err}`, 'error');
+      addToast(t('toasts.downloadFailed', { err: String(err) }), 'error');
     } finally {
       setDownloadProgress(prev => {
         const next = { ...prev };
@@ -558,7 +563,22 @@ export function useAddonManager() {
     });
   };
 
-  const handleSelectGroupToggle = (groupAddons: Addon[]) => {
+  const handleSelectGroupToggle = (groupAddons: Addon[], groupId?: string) => {
+    // In master collection view, toggle the group ID
+    if (groupId && currentFilterTab === 'master-collection') {
+      setSelectedGroupIds((prev) => {
+        const next = prev.includes(groupId)
+          ? prev.filter((id) => id !== groupId)
+          : [...prev, groupId];
+        if (next.length > 0 && !isSelectMode) {
+          setIsSelectMode(true);
+        }
+        return next;
+      });
+      return;
+    }
+
+    // Default: toggle all addons in the group
     const addonIds = groupAddons.map((ad) => ad.id);
     const allSelected = addonIds.every((id) => selectedIds.includes(id));
 
@@ -601,7 +621,47 @@ export function useAddonManager() {
 
   const handleClearSelection = () => {
     setSelectedIds([]);
+    setSelectedGroupIds([]);
     setIsSelectMode(false);
+  };
+
+  const handleSelectAllGroups = (visibleGroups: Group[]) => {
+    const visibleIds = visibleGroups.map(g => g.id);
+    const allSelected = visibleIds.every(id => selectedGroupIds.includes(id));
+
+    if (allSelected) {
+      setSelectedGroupIds((prev) => prev.filter(id => !visibleIds.includes(id)));
+    } else {
+      setSelectedGroupIds((prev) => {
+        const next = [...prev];
+        visibleIds.forEach(id => {
+          if (!next.includes(id)) {
+            next.push(id);
+          }
+        });
+        return next;
+      });
+    }
+  };
+
+  const handleBatchAddGroupsToMasterCollection = async (mcId: string) => {
+    if (selectedGroupIds.length === 0) return;
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'add-to-master-collection',
+        groupId: mcId,
+        ids: selectedGroupIds
+      });
+      updateLocalState(data);
+      addToast(t('toasts.addToMasterCollectionSuccess'), 'success');
+      handleClearSelection();
+    } catch (err) {
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   // Batch actions
@@ -754,11 +814,136 @@ export function useAddonManager() {
     }
   };
 
+  // Master Collection Management APIs
+  const handleCreateMasterCollection = async (name: string, selectedGroupIds?: string[]) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'create-master-collection',
+        name,
+        ids: selectedGroupIds || []
+      });
+      updateLocalState(data);
+      addToast(t('toasts.createMasterCollectionSuccess'), 'success');
+    } catch (err) {
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleDeleteMasterCollection = (mcId: string) => {
+    setConfirmModal({
+      open: true,
+      title: t('masterCollections.deleteCollection'),
+      message: t('confirmModal.deleteGroupMsg'),
+      onConfirm: async () => {
+        if (isSubmitting) return;
+        setIsSubmitting(true);
+        try {
+          const data: DatabasePayload = await invoke('group_action', {
+            action: 'delete-master-collection',
+            groupId: mcId
+          });
+          updateLocalState(data);
+          if (selectedMasterCollectionId === mcId) {
+            setSelectedMasterCollectionId(null);
+            setCurrentFilterTab('all');
+          }
+          addToast(t('toasts.deleteMasterCollectionSuccess'), 'success');
+        } catch (err) {
+          addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+        } finally {
+          setIsSubmitting(false);
+        }
+      }
+    });
+  };
+
+  const handleRenameMasterCollection = async (mcId: string, newName: string) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'rename-master-collection',
+        groupId: mcId,
+        name: newName
+      });
+      updateLocalState(data);
+      addToast(t('toasts.renameMasterCollectionSuccess'), 'success');
+    } catch (err) {
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleAddGroupToMasterCollection = async (mcId: string, groupIds: string[]) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'add-to-master-collection',
+        groupId: mcId,
+        ids: groupIds
+      });
+      updateLocalState(data);
+      addToast(t('toasts.addToMasterCollectionSuccess'), 'success');
+    } catch (err) {
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRemoveGroupFromMasterCollection = async (mcId: string, groupIds: string[]) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'remove-from-master-collection',
+        groupId: mcId,
+        ids: groupIds
+      });
+      updateLocalState(data);
+      addToast(t('toasts.removeFromMasterCollectionSuccess'), 'success');
+    } catch (err) {
+      addToast(t('toasts.operationFailed', { err: String(err) }), 'error');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const ensureSystemMasterCollections = async () => {
+    try {
+      const data: DatabasePayload = await invoke('group_action', {
+        action: 'ensure-system-master-collections'
+      });
+      updateLocalState(data);
+    } catch (err) {
+      console.error('Failed to ensure system master collections:', err);
+    }
+  };
+
+  // Batch download uninstalled addons
+  const handleBatchDownload = async (workshopIds: string[]) => {
+    if (workshopIds.length === 0) return;
+    for (const wId of workshopIds) {
+      await downloadAddon(wId);
+    }
+    addToast(t('toasts.batchDownloadSuccess', { count: workshopIds.length }), 'success');
+  };
+
   // Filter and sort addons
   const getFilteredAddons = () => {
-    let items = currentFilterTab === 'known-uninstalled' 
+    // For master-collection and groups views, include uninstalled addons so groups with only uninstalled addons are visible
+    const includeUninstalled = currentFilterTab === 'master-collection' || currentFilterTab === 'groups';
+    let items = currentFilterTab === 'known-uninstalled'
       ? Object.values(knownUninstalledAddons)
-      : Object.values(addons).filter(item => !item.isDummy);
+      : includeUninstalled
+        ? [...Object.values(addons).filter(item => !item.isDummy), ...Object.values(knownUninstalledAddons)]
+        : Object.values(addons).filter(item => !item.isDummy);
 
     // Search query filter
     if (searchQuery) {
@@ -797,6 +982,20 @@ export function useAddonManager() {
         } else {
           items = [];
         }
+      } else if (currentFilterTab === 'master-collection' && selectedMasterCollectionId) {
+        const mc = masterCollections.find(mc => mc.id === selectedMasterCollectionId);
+        if (mc) {
+          const groupAddons = new Set<string>();
+          for (const gid of mc.groupIds) {
+            const group = groups.find(g => g.id === gid);
+            if (group) {
+              group.addons.forEach(id => groupAddons.add(id));
+            }
+          }
+          items = items.filter(item => groupAddons.has(item.id));
+        } else {
+          items = [];
+        }
       }
     }
 
@@ -822,9 +1021,35 @@ export function useAddonManager() {
       return filteredAddons.map(item => ({ type: 'addon' as const, id: item.id, data: item }));
     }
 
+    // For master collection view, show groups within the collection
+    if (currentFilterTab === 'master-collection' && selectedMasterCollectionId) {
+      const mc = masterCollections.find(mc => mc.id === selectedMasterCollectionId);
+      if (mc) {
+        const rendered: RenderedItem[] = [];
+        const groupedVpkNames = new Set<string>();
+        for (const gid of mc.groupIds) {
+          const group = groups.find(g => g.id === gid);
+          if (group) {
+            const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.id));
+            if (matchingAddons.length > 0) {
+              matchingAddons.forEach(item => groupedVpkNames.add(item.id));
+              rendered.push({
+                type: 'group',
+                id: group.id,
+                name: group.name,
+                addons: matchingAddons,
+                groupObj: group
+              });
+            }
+          }
+        }
+        return rendered;
+      }
+    }
+
     const rendered: RenderedItem[] = [];
     const groupedVpkNames = new Set<string>();
-    
+
     groups.forEach(group => {
       const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.id));
       if (matchingAddons.length > 0) {
@@ -899,18 +1124,32 @@ export function useAddonManager() {
     ? groups.find(g => g.id === selectedGroupId)
     : null;
 
+  const currentMasterCollection = currentFilterTab === 'master-collection' && selectedMasterCollectionId
+    ? masterCollections.find(mc => mc.id === selectedMasterCollectionId)
+    : null;
+
   const renameAddonObj = renameModal.currentName ? (addons[renameModal.currentName] || knownUninstalledAddons[renameModal.currentName]) : undefined;
   const renameGroupObj = renameModal.currentName ? groups.find(g => g.addons.includes(renameModal.currentName)) : undefined;
 
   const handleFilterTabChange = (tab: string, groupId: string | null) => {
     setCurrentFilterTab(tab);
     setSelectedGroupId(groupId);
+    if (tab === 'master-collection') {
+      setSelectedMasterCollectionId(groupId);
+    } else {
+      setSelectedMasterCollectionId(null);
+    }
+    // Clear selections when switching tabs
+    setSelectedIds([]);
+    setSelectedGroupIds([]);
+    setIsSelectMode(false);
   };
 
   return {
     addons,
     knownUninstalledAddons,
     groups,
+    masterCollections,
     settings,
     loading,
     searchQuery,
@@ -919,6 +1158,8 @@ export function useAddonManager() {
     setCurrentFilterTab,
     selectedGroupId,
     setSelectedGroupId,
+    selectedMasterCollectionId,
+    setSelectedMasterCollectionId,
     selectedCategory,
     setSelectedCategory,
     sortBy,
@@ -928,12 +1169,14 @@ export function useAddonManager() {
     syncingSteam,
     autoGrouping,
     selectedIds,
+    selectedGroupIds,
+    setSelectedGroupIds,
     isSelectMode,
     setIsSelectMode,
     isSubmitting,
     setIsSubmitting,
     downloadProgress,
-    
+
     // Modals state
     detailModal,
     setDetailModal,
@@ -976,6 +1219,7 @@ export function useAddonManager() {
     handleSelectToggle,
     handleSelectGroupToggle,
     handleSelectAll,
+    handleSelectAllGroups,
     handleClearSelection,
     handleBatchToggle,
     handleBatchMove,
@@ -984,6 +1228,16 @@ export function useAddonManager() {
     handleFilterTabChange,
     downloadAddon,
     deleteAddons,
+    handleBatchDownload,
+
+    // Master Collection handlers
+    handleCreateMasterCollection,
+    handleDeleteMasterCollection,
+    handleRenameMasterCollection,
+    handleAddGroupToMasterCollection,
+    handleRemoveGroupFromMasterCollection,
+    handleBatchAddGroupsToMasterCollection,
+    ensureSystemMasterCollections,
 
     // Derived values
     filteredItems,
@@ -993,6 +1247,7 @@ export function useAddonManager() {
     disabledCount,
     totalStorageSize,
     currentGroup,
+    currentMasterCollection,
     renameAddonObj,
     renameGroupObj,
   };

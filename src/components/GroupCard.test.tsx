@@ -132,7 +132,7 @@ describe('GroupCard', () => {
     // Click the clickable area
     const clickable = screen.getByText('My Group');
     fireEvent.click(clickable);
-    expect(onSelectGroupToggle).toHaveBeenCalledWith(mockAddons);
+    expect(onSelectGroupToggle).toHaveBeenCalledWith(mockAddons, 'group-1');
   });
 
   test('calls onToggleGroup when the switch is toggled', () => {

@@ -22,6 +22,10 @@ import { GroupHeader } from './components/GroupHeader';
 import { BatchActionBar } from './components/BatchActionBar';
 import { KnownUninstalledView } from './components/KnownUninstalledView';
 import { WorkshopBrowser } from './components/WorkshopBrowser';
+import { MasterCollectionModal } from './components/MasterCollectionModal';
+import { MasterCollectionHeader } from './components/MasterCollectionHeader';
+import { AddToGroupModal } from './components/AddToGroupModal';
+import { useState } from 'react';
 
 function App() {
   const { t } = useTranslation();
@@ -29,12 +33,14 @@ function App() {
     addons,
     knownUninstalledAddons,
     groups,
+    masterCollections,
     settings,
     loading,
     searchQuery,
     setSearchQuery,
     currentFilterTab,
     selectedGroupId,
+    selectedMasterCollectionId,
     selectedCategory,
     setSelectedCategory,
     sortBy,
@@ -43,6 +49,7 @@ function App() {
     syncingSteam,
     autoGrouping,
     selectedIds,
+    selectedGroupIds,
     isSelectMode,
     setIsSelectMode,
     isSubmitting,
@@ -88,6 +95,7 @@ function App() {
     handleSelectToggle,
     handleSelectGroupToggle,
     handleSelectAll,
+    handleSelectAllGroups,
     handleClearSelection,
     handleBatchToggle,
     handleBatchMove,
@@ -96,6 +104,13 @@ function App() {
     handleFilterTabChange,
     downloadAddon,
     deleteAddons,
+    handleBatchDownload,
+
+    // Master Collection handlers
+    handleCreateMasterCollection,
+    handleDeleteMasterCollection,
+    handleRenameMasterCollection,
+    handleBatchAddGroupsToMasterCollection,
 
     // Derived values
     filteredItems,
@@ -105,15 +120,32 @@ function App() {
     disabledCount,
     totalStorageSize,
     currentGroup,
+    currentMasterCollection,
     renameAddonObj,
     renameGroupObj,
   } = useAddonManager();
 
+  const [masterCollectionModal, setMasterCollectionModal] = useState(false);
+  const [addToGroupModal, setAddToGroupModal] = useState(false);
+  const [addToMcModal, setAddToMcModal] = useState(false);
+
   // Available categories list
   const categoriesList = [
-    'All', 'Campaign', 'Survivor', 'Weapon Model', 'Script', 
+    'All', 'Campaign', 'Survivor', 'Weapon Model', 'Script',
     'Map', 'Skin', 'Sound/Music', 'Infected', 'UI/Textures', 'Other'
   ];
+
+  // Get all addons (installed + uninstalled) for group rendering
+  const getAllGroupAddons = (groupAddonIds: string[]) => {
+    return groupAddonIds
+      .map(id => addons[id] || knownUninstalledAddons[id])
+      .filter(Boolean);
+  };
+
+  // Get groups in current master collection
+  const groupsInMasterCollection = currentMasterCollection
+    ? groups.filter(g => currentMasterCollection.groupIds.includes(g.id))
+    : [];
 
   return (
     <div className="app-layout">
@@ -130,10 +162,13 @@ function App() {
       <Sidebar
         addons={addons}
         groups={groups}
+        masterCollections={masterCollections}
         currentFilterTab={currentFilterTab}
         selectedGroupId={selectedGroupId}
+        selectedMasterCollectionId={selectedMasterCollectionId}
         onFilterTabChange={handleFilterTabChange}
         onOpenGroupModal={() => setGroupModal({ open: true })}
+        onOpenMasterCollectionModal={() => setMasterCollectionModal(true)}
         onAutoGrouping={runAutoGrouping}
         autoGrouping={autoGrouping}
         disabledCount={disabledCount}
@@ -157,6 +192,13 @@ function App() {
             onDelete={deleteAddons}
             isSubmitting={isSubmitting}
             onOpenLink={handleOpenLink}
+            isSelectMode={isSelectMode}
+            selectedIds={selectedIds}
+            onSelectToggle={handleSelectToggle}
+            onSelectAll={handleSelectAll}
+            onBatchDownload={handleBatchDownload}
+            searchQuery={searchQuery}
+            onSearchQueryChange={setSearchQuery}
           />
         ) : currentFilterTab === 'workshop-browser' ? (
           <WorkshopBrowser
@@ -166,7 +208,7 @@ function App() {
             onDownload={downloadAddon}
             onOpenLink={handleOpenLink}
             onImportCollection={async (name, itemIds) => {
-              await handleCreateGroup(name, itemIds);
+              await handleCreateGroup(name, itemIds, undefined, undefined, 'workshop-import');
             }}
             isSubmitting={isSubmitting}
             groups={groups}
@@ -195,24 +237,42 @@ function App() {
 
             {/* Content body */}
             <div className="content-body">
-              {/* Group details headers */}
+              {/* Master Collection header */}
+              {currentMasterCollection && (
+                <MasterCollectionHeader
+                  currentMasterCollection={currentMasterCollection}
+                  groupsInCollection={groupsInMasterCollection}
+                  onRenameCollection={() => {
+                    const newName = prompt(t('masterCollections.renameCollection'), currentMasterCollection.name);
+                    if (newName && newName.trim()) {
+                      handleRenameMasterCollection(currentMasterCollection.id, newName.trim());
+                    }
+                  }}
+                  onDeleteCollection={() => handleDeleteMasterCollection(currentMasterCollection.id)}
+                />
+              )}
+
+              {/* Group details header */}
               {currentGroup && (
                 <GroupHeader
                   currentGroup={currentGroup}
-                  onRenameGroup={() => setEditGroupModal({ 
-                    open: true, 
-                    groupId: currentGroup.id, 
+                  groupAddons={getAllGroupAddons(currentGroup.addons)}
+                  onRenameGroup={() => setEditGroupModal({
+                    open: true,
+                    groupId: currentGroup.id,
                     name: currentGroup.name,
                     tags: currentGroup.tags || [],
                     workshopCollectionId: currentGroup.workshopCollectionId || ''
                   })}
                   onDeleteGroup={() => handleDeleteGroup(currentGroup.id)}
                   onGroupActionBatch={(actionType) => groupActionBatch(currentGroup.id, actionType)}
+                  onDownloadUninstalled={handleBatchDownload}
+                  downloadProgress={downloadProgress}
                 />
               )}
 
               {/* Stats bar */}
-              {currentFilterTab !== 'groups' && (
+              {currentFilterTab !== 'groups' && currentFilterTab !== 'master-collection' && (
                 <StatsBar
                   totalAddonsCount={totalAddonsCount}
                   activeCount={activeCount}
@@ -244,20 +304,25 @@ function App() {
                   {renderedItems.map(renderedItem => {
                     if (renderedItem.type === 'group') {
                       const groupAddons = renderedItem.addons;
-                      const isGroupSelected = groupAddons.every(ad => selectedIds.includes(ad.id));
+                      const allGroupAddons = getAllGroupAddons(renderedItem.groupObj.addons);
+                      const isGroupSelected = currentFilterTab === 'master-collection'
+                        ? selectedGroupIds.includes(renderedItem.groupObj.id)
+                        : groupAddons.every(ad => selectedIds.includes(ad.id));
                       return (
                         <GroupCard
                           key={renderedItem.id}
                           group={renderedItem.groupObj}
-                          addons={groupAddons}
+                          addons={allGroupAddons}
                           onToggleGroup={toggleGroupAddons}
                           onViewGroupDetails={(groupId) => {
                             handleFilterTabChange('groups', groupId);
                           }}
+                          onDownloadUninstalled={handleBatchDownload}
                           isSelectMode={isSelectMode}
                           isGroupSelected={isGroupSelected}
                           onSelectGroupToggle={handleSelectGroupToggle}
                           isSubmitting={isSubmitting}
+                          downloadProgress={downloadProgress}
                         />
                       );
                     } else {
@@ -274,10 +339,12 @@ function App() {
                           onMoveClick={handleMoveClick}
                           onRenameClick={triggerRenameModal}
                           onDetailClick={(addon) => setDetailModal({ open: true, addon })}
+                          onDownload={downloadAddon}
                           isSelectMode={isSelectMode}
                           isSelected={selectedIds.includes(addonData.id)}
                           onSelectToggle={handleSelectToggle}
                           isSubmitting={isSubmitting}
+                          downloadProgress={downloadProgress}
                         />
                       );
                     }
@@ -292,7 +359,7 @@ function App() {
       {/* Modals */}
       <DetailModal
         open={detailModal.open}
-        addon={detailModal.addon ? addons[detailModal.addon.id] : null}
+        addon={detailModal.addon ? (addons[detailModal.addon.id] || knownUninstalledAddons[detailModal.addon.id]) : null}
         groups={groups}
         onCancel={() => setDetailModal({ open: false, addon: null })}
         onToggle={toggleAddon}
@@ -360,13 +427,12 @@ function App() {
 
       <GroupModal
         open={groupModal.open}
-        addons={addons}
         isSubmitting={isSubmitting}
         onCancel={() => {
           setGroupModal({ open: false });
           setIsSubmitting(false);
         }}
-        onConfirm={handleCreateGroup}
+        onConfirm={(name) => handleCreateGroup(name)}
       />
 
       <EditGroupModal
@@ -414,18 +480,62 @@ function App() {
         }}
       />
 
+      {/* Master Collection Modal */}
+      <MasterCollectionModal
+        open={masterCollectionModal}
+        isSubmitting={isSubmitting}
+        onCancel={() => setMasterCollectionModal(false)}
+        onConfirm={async (name) => {
+          await handleCreateMasterCollection(name);
+          setMasterCollectionModal(false);
+        }}
+      />
+
+      {/* Add to Group Modal */}
+      <AddToGroupModal
+        open={addToGroupModal}
+        groups={groups}
+        isSubmitting={isSubmitting}
+        onCancel={() => setAddToGroupModal(false)}
+        onConfirm={async (groupId) => {
+          await handleBatchAddToGroup(groupId);
+          setAddToGroupModal(false);
+        }}
+      />
+
+      {/* Add to Master Collection Modal */}
+      <AddToGroupModal
+        open={addToMcModal}
+        groups={masterCollections.map(mc => ({
+          id: mc.id,
+          name: mc.nameKey ? t(mc.nameKey, mc.name) : mc.name,
+          addons: [],
+          masterCollectionIds: [],
+        }))}
+        isSubmitting={isSubmitting}
+        onCancel={() => setAddToMcModal(false)}
+        onConfirm={async (mcId) => {
+          await handleBatchAddGroupsToMasterCollection(mcId);
+          setAddToMcModal(false);
+        }}
+      />
+
       {/* Floating Batch Action Bar */}
-      {isSelectMode && (
+      {isSelectMode && currentFilterTab !== 'known-uninstalled' && (
         <BatchActionBar
           selectedIds={selectedIds}
           filteredItems={filteredItems}
           addons={addons}
           groups={groups}
+          masterCollections={masterCollections}
+          selectedGroupIds={selectedGroupIds}
           onSelectAll={handleSelectAll}
+          onSelectAllGroups={handleSelectAllGroups}
           onBatchToggle={handleBatchToggle}
           onBatchMove={handleBatchMove}
           onBatchRename={handleBatchRename}
-          onBatchAddToGroup={handleBatchAddToGroup}
+          onBatchAddToGroup={() => setAddToGroupModal(true)}
+          onBatchAddToMasterCollection={() => setAddToMcModal(true)}
           onClearSelection={handleClearSelection}
         />
       )}

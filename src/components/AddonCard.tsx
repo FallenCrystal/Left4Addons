@@ -1,5 +1,5 @@
 import React from 'react';
-import { FolderPlus, ExternalLink, Move, Edit3, FileText } from 'lucide-react';
+import { FolderPlus, ExternalLink, Move, Edit3, FileText, Download } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
@@ -15,10 +15,12 @@ interface AddonCardProps {
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
   onDetailClick: (addon: Addon) => void;
+  onDownload?: (workshopId: string) => void;
   isSelectMode: boolean;
   isSelected: boolean;
   onSelectToggle: (id: string) => void;
   isSubmitting?: boolean;
+  downloadProgress?: Record<string, number>;
 }
 
 export const AddonCard: React.FC<AddonCardProps> = ({
@@ -31,19 +33,24 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   onMoveClick,
   onRenameClick,
   onDetailClick,
+  onDownload,
   isSelectMode,
   isSelected,
   onSelectToggle,
   isSubmitting = false,
+  downloadProgress = {},
 }) => {
   const { t } = useTranslation();
   const categories = getAddonCategories(addon);
   const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
   const author = getAddonAuthor(addon);
-  const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
-  
+  const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || '';
+
   const itemGroup = groups.find(g => g.addons.includes(addon.id));
   const addonUrl = getAddonUrl(addon);
+  const isUninstalled = addon.dirType === 'none';
+  const isDownloading = addon.workshopId ? downloadProgress[addon.workshopId] !== undefined : false;
+  const downloadPercent = addon.workshopId ? (downloadProgress[addon.workshopId] ?? 0) : 0;
 
   const handleLinkClick = (e: React.MouseEvent, url: string) => {
     e.preventDefault();
@@ -51,9 +58,9 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   };
 
   return (
-    <div className={`addon-card ${!addon.isEnabled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}>
+    <div className={`addon-card ${!addon.isEnabled && !isUninstalled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}>
       {/* Checkbox Wrapper */}
-      <div 
+      <div
         className={`addon-card-checkbox-wrapper ${isSelected ? 'selected' : ''}`}
         onClick={(e) => {
           e.stopPropagation();
@@ -67,7 +74,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
       </div>
 
       {/* Clickable Area for Detail Modal or Selection Toggle */}
-      <div 
+      <div
         className="addon-card-clickable-area"
         onClick={(e) => {
           if (isSelectMode) {
@@ -80,9 +87,9 @@ export const AddonCard: React.FC<AddonCardProps> = ({
       >
         <div className="addon-card-image-wrapper">
           {addon.imagePath ? (
-            <CacheImage 
-              srcPath={addon.imagePath} 
-              alt={title} 
+            <CacheImage
+              srcPath={addon.imagePath}
+              alt={title}
               className="addon-card-image"
               fallback={
                 <div className="addon-placeholder-icon">
@@ -98,20 +105,30 @@ export const AddonCard: React.FC<AddonCardProps> = ({
         </div>
 
         <div className="addon-card-badges">
-          <span className={`badge ${addon.isEnabled ? 'badge-enabled' : 'badge-disabled'}`}>
-            {addon.isEnabled ? t('addonCard.enabled') : t('addonCard.disabled')}
-          </span>
-          <span className="badge badge-dir">
-            {addon.dirType === 'loading' ? t('addonCard.manualInstall') : t('addonCard.workshop')}
-          </span>
+          {isUninstalled ? (
+            <span className="badge" style={{ background: 'var(--md-sys-color-tertiary)', color: 'var(--md-sys-color-on-tertiary)' }}>
+              {t('addonCard.uninstalled')}
+            </span>
+          ) : (
+            <>
+              <span className={`badge ${addon.isEnabled ? 'badge-enabled' : 'badge-disabled'}`}>
+                {addon.isEnabled ? t('addonCard.enabled') : t('addonCard.disabled')}
+              </span>
+              <span className="badge badge-dir">
+                {addon.dirType === 'loading' ? t('addonCard.manualInstall') : t('addonCard.workshop')}
+              </span>
+            </>
+          )}
         </div>
 
         <div className="addon-card-info">
           <h3 className="addon-card-title" title={title}>{title}</h3>
-          
-          <div className="addon-card-author">
-            <span>{t('addonCard.author', { author })}</span>
-          </div>
+
+          {author && author !== 'Unknown Author' && (
+            <div className="addon-card-author">
+              <span>{t('addonCard.author', { author })}</span>
+            </div>
+          )}
 
           {itemGroup && (
             <div className="group-tag">
@@ -120,12 +137,14 @@ export const AddonCard: React.FC<AddonCardProps> = ({
             </div>
           )}
 
-          <p className="addon-card-desc" title={desc}>{desc}</p>
-          
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--md-sys-color-outline)', marginTop: '8px' }}>
-            <span>{t('addonCard.fileSize', { size: formatBytes(addon.fileSize) })}</span>
-            {addon.filesCount > 0 && <span>{t('addonCard.containsFiles', { count: addon.filesCount })}</span>}
-          </div>
+          {desc && <p className="addon-card-desc" title={desc}>{desc}</p>}
+
+          {(addon.fileSize > 0 || addon.filesCount > 0) && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: 'var(--md-sys-color-outline)', marginTop: '8px' }}>
+              {addon.fileSize > 0 && <span>{t('addonCard.fileSize', { size: formatBytes(addon.fileSize) })}</span>}
+              {addon.filesCount > 0 && <span>{t('addonCard.containsFiles', { count: addon.filesCount })}</span>}
+            </div>
+          )}
 
           <div className="addon-card-tags">
             {categories.map(c => (
@@ -142,99 +161,138 @@ export const AddonCard: React.FC<AddonCardProps> = ({
 
       {!isSelectMode && (
         <div className="addon-card-footer">
-          {/* Enable/Disable Toggle */}
-          <label className="switch" title={addon.isEnabled ? t('addonCard.clickToDisable') : t('addonCard.clickToEnable')}>
-            <input 
-              type="checkbox" 
-              checked={addon.isEnabled} 
-              onChange={() => onToggle(addon.id, addon.isEnabled)}
-              disabled={isSubmitting}
-            />
-            <span className="slider"></span>
-          </label>
-
-          <div style={{ display: 'flex', gap: '6px' }}>
-            {/* Group assign dropdown */}
-            <div className="dropdown">
-              <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
-                <FolderPlus size={14} />
-              </button>
-              <div className="dropdown-content">
-                {groups.map(g => (
-                  <button 
-                    key={g.id} 
-                    onClick={() => onAddToGroup(addon.id, g.id)}
-                    disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
+          {isUninstalled ? (
+            // Uninstalled: show download button
+            <>
+              <div />
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {addon.workshopId && onDownload && (
+                  <button
+                    className="btn btn-primary btn-icon-only"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDownload(addon.workshopId!);
+                    }}
+                    disabled={isSubmitting || isDownloading}
+                    title={isDownloading ? `${downloadPercent}%` : t('workshop.detail.download')}
                   >
-                    {g.name}
-                  </button>
-                ))}
-                {itemGroup && (
-                  <button 
-                    onClick={() => onRemoveFromGroup(addon.id, itemGroup.id)}
-                    disabled={isSubmitting}
-                    style={{ color: 'var(--md-sys-color-error)' }}
-                  >
-                    {t('addonCard.removeFromGroup', { name: itemGroup.name })}
+                    {isDownloading ? (
+                      <span style={{ fontSize: '10px', fontWeight: 600 }}>{Math.round(downloadPercent)}%</span>
+                    ) : (
+                      <Download size={14} />
+                    )}
                   </button>
                 )}
-                {groups.length === 0 && !itemGroup && (
-                  <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
+                {addon.workshopId && (
+                  <div className="dropdown">
+                    <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
+                      <ExternalLink size={14} />
+                    </button>
+                    <div className="dropdown-content">
+                      <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
+                        {t('addonCard.openInSteam')}
+                      </button>
+                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
+                        {t('addonCard.openInBrowser')}
+                      </button>
+                    </div>
+                  </div>
                 )}
               </div>
-            </div>
+            </>
+          ) : (
+            // Installed: normal footer
+            <>
+              <label className="switch" title={addon.isEnabled ? t('addonCard.clickToDisable') : t('addonCard.clickToEnable')}>
+                <input
+                  type="checkbox"
+                  checked={addon.isEnabled}
+                  onChange={() => onToggle(addon.id, addon.isEnabled)}
+                  disabled={isSubmitting}
+                />
+                <span className="slider"></span>
+              </label>
 
-            {/* Open Link with Fallbacks (Dropdown or direct link) */}
-            {addon.workshopId ? (
-              <div className="dropdown">
-                <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
-                  <ExternalLink size={14} />
-                </button>
-                <div className="dropdown-content">
-                  <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
-                    {t('addonCard.openInSteam')}
+              <div style={{ display: 'flex', gap: '6px' }}>
+                <div className="dropdown">
+                  <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
+                    <FolderPlus size={14} />
                   </button>
-                  <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                    {t('addonCard.openInBrowser')}
-                  </button>
-                  <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                    {t('addonCard.openInMirror')}
-                  </button>
+                  <div className="dropdown-content">
+                    {groups.map(g => (
+                      <button
+                        key={g.id}
+                        onClick={() => onAddToGroup(addon.id, g.id)}
+                        disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
+                      >
+                        {g.name}
+                      </button>
+                    ))}
+                    {itemGroup && (
+                      <button
+                        onClick={() => onRemoveFromGroup(addon.id, itemGroup.id)}
+                        disabled={isSubmitting}
+                        style={{ color: 'var(--md-sys-color-error)' }}
+                      >
+                        {t('addonCard.removeFromGroup', { name: itemGroup.name })}
+                      </button>
+                    )}
+                    {groups.length === 0 && !itemGroup && (
+                      <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
+                    )}
+                  </div>
                 </div>
+
+                {addon.workshopId ? (
+                  <div className="dropdown">
+                    <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
+                      <ExternalLink size={14} />
+                    </button>
+                    <div className="dropdown-content">
+                      <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
+                        {t('addonCard.openInSteam')}
+                      </button>
+                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
+                        {t('addonCard.openInBrowser')}
+                      </button>
+                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
+                        {t('addonCard.openInMirror')}
+                      </button>
+                    </div>
+                  </div>
+                ) : addonUrl ? (
+                  <button
+                    className="btn btn-secondary"
+                    style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
+                    onClick={(e) => handleLinkClick(e, addonUrl)}
+                    title={t('addonCard.openBuiltInSource')}
+                  >
+                    <ExternalLink size={14} />
+                  </button>
+                ) : null}
+
+                {addon.dirType === 'workshop' && (
+                  <button
+                    className="btn btn-secondary btn-icon-only"
+                    onClick={() => onMoveClick(addon)}
+                    disabled={isSubmitting}
+                    title={t('addonCard.moveToManual')}
+                  >
+                    <Move size={14} />
+                  </button>
+                )}
+
+                <button
+                  className="btn btn-secondary btn-icon-only"
+                  onClick={() => onRenameClick(addon)}
+                  disabled={isSubmitting}
+                  title={t('addonCard.renameAddon')}
+                >
+                  <Edit3 size={14} />
+                </button>
               </div>
-            ) : addonUrl ? (
-              <button 
-                className="btn btn-secondary"
-                style={{ width: '32px', height: '32px', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}
-                onClick={(e) => handleLinkClick(e, addonUrl)}
-                title={t('addonCard.openBuiltInSource')}
-              >
-                <ExternalLink size={14} />
-              </button>
-            ) : null}
-
-            {/* Move between load and workshop dirs (Only from workshop to loading, no moving back) */}
-            {addon.dirType === 'workshop' && (
-              <button 
-                className="btn btn-secondary btn-icon-only"
-                onClick={() => onMoveClick(addon)}
-                disabled={isSubmitting}
-                title={t('addonCard.moveToManual')}
-              >
-                <Move size={14} />
-              </button>
-            )}
-
-            {/* Rename */}
-            <button 
-              className="btn btn-secondary btn-icon-only"
-              onClick={() => onRenameClick(addon)}
-              disabled={isSubmitting}
-              title={t('addonCard.renameAddon')}
-            >
-              <Edit3 size={14} />
-            </button>
-          </div>
+            </>
+          )}
         </div>
       )}
     </div>

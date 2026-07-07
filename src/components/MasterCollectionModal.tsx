@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 
-interface GroupModalProps {
+interface MasterCollectionModalProps {
   open: boolean;
   onCancel: () => void;
   onConfirm: (name: string) => void;
   isSubmitting?: boolean;
 }
 
-export const GroupModal: React.FC<GroupModalProps> = ({
+export const MasterCollectionModal: React.FC<MasterCollectionModalProps> = ({
   open,
   onCancel,
   onConfirm,
@@ -39,17 +39,17 @@ export const GroupModal: React.FC<GroupModalProps> = ({
         style={{ width: '420px' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h2 className="modal-title">{t('groupModal.title')}</h2>
+        <h2 className="modal-title">{t('masterCollections.createTitle')}</h2>
         <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '16px' }}>
-          {t('groupModal.desc')}
+          {t('masterCollections.createDesc')}
         </p>
 
         <div className="form-group">
-          <label className="form-label">{t('groupModal.groupNameLabel')}</label>
+          <label className="form-label">{t('masterCollections.collectionNameLabel')}</label>
           <input
             type="text"
             className="form-input"
-            placeholder={t('groupModal.groupNamePlaceholder')}
+            placeholder={t('masterCollections.collectionNamePlaceholder')}
             value={name}
             onChange={(e) => setName(e.target.value)}
             required
@@ -68,7 +68,7 @@ export const GroupModal: React.FC<GroupModalProps> = ({
             {t('common.cancel')}
           </button>
           <button type="submit" className="btn btn-primary" disabled={isSubmitting || !name.trim()}>
-            {isSubmitting ? t('common.creating') : t('groupModal.createGroupBtn')}
+            {isSubmitting ? t('common.creating') : t('masterCollections.createCollectionBtn')}
           </button>
         </div>
       </form>

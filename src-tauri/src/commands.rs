@@ -25,6 +25,25 @@ pub struct Group {
     pub tags: Option<Vec<String>>,
     #[serde(rename = "workshopCollectionId")]
     pub workshop_collection_id: Option<String>,
+    #[serde(rename = "masterCollectionIds", default)]
+    pub master_collection_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MasterCollection {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "nameKey", default)]
+    pub name_key: Option<String>,
+    #[serde(rename = "groupIds", default)]
+    pub group_ids: Vec<String>,
+    #[serde(rename = "isSystem", default)]
+    pub is_system: bool,
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -105,6 +124,8 @@ pub struct KnownAddonEntry {
 pub struct LocalDatabase {
     pub settings: Settings,
     pub groups: Vec<Group>,
+    #[serde(rename = "masterCollections", default)]
+    pub master_collections: Vec<MasterCollection>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -114,6 +135,8 @@ pub struct Database {
     pub groups: Vec<Group>,
     #[serde(rename = "knownUninstalledAddons")]
     pub known_uninstalled_addons: HashMap<String, Addon>,
+    #[serde(rename = "masterCollections", default)]
+    pub master_collections: Vec<MasterCollection>,
 }
 
 fn is_dummy_addon_info(addon_info: &serde_json::Value) -> bool {
@@ -151,6 +174,7 @@ pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle)
         addons: HashMap::new(),
         groups: Vec::new(),
         known_uninstalled_addons: HashMap::new(),
+        master_collections: Vec::new(),
     };
 
     let db_json_existed = db_path.exists();
@@ -161,7 +185,8 @@ pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle)
                 if let Ok(old_db) = serde_json::from_str::<serde_json::Value>(&content) {
                     let settings = serde_json::from_value(old_db["settings"].clone()).unwrap_or_default();
                     let groups = serde_json::from_value(old_db["groups"].clone()).unwrap_or_default();
-                    LocalDatabase { settings, groups }
+                    let master_collections = serde_json::from_value(old_db["masterCollections"].clone()).unwrap_or_default();
+                    LocalDatabase { settings, groups, master_collections }
                 } else {
                     LocalDatabase::default()
                 }
@@ -172,6 +197,7 @@ pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle)
         LocalDatabase {
             settings: default_db.settings.clone(),
             groups: Vec::new(),
+            master_collections: Vec::new(),
         }
     };
 
@@ -252,6 +278,7 @@ pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle)
         addons: merged_addons,
         groups: local_db.groups,
         known_uninstalled_addons,
+        master_collections: local_db.master_collections,
     };
 
     if !db_json_existed {
@@ -265,6 +292,7 @@ pub fn save_db_internal(db_path: &Path, known_addons_path: &Path, db: &Database)
     let local_db = LocalDatabase {
         settings: db.settings.clone(),
         groups: db.groups.clone(),
+        master_collections: db.master_collections.clone(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&local_db) {
         let _ = fs::write(db_path, json);
@@ -636,6 +664,70 @@ pub async fn scan_addons_internal(
     db.addons = active_addons;
     db.known_uninstalled_addons = uninstalled;
 
+    // Sync Steam details for all addons with workshopId but no steamDetails
+    let mut ids_to_sync: Vec<String> = Vec::new();
+    for addon in db.addons.values() {
+        if addon.workshop_id.is_some() && addon.steam_details.is_none() && !addon.is_dummy {
+            ids_to_sync.push(addon.workshop_id.clone().unwrap());
+        }
+    }
+    for addon in db.known_uninstalled_addons.values() {
+        if addon.workshop_id.is_some() && addon.steam_details.is_none() {
+            ids_to_sync.push(addon.workshop_id.clone().unwrap());
+        }
+    }
+    if !ids_to_sync.is_empty() {
+        ids_to_sync.sort();
+        ids_to_sync.dedup();
+        println!("Syncing Steam details for {} items...", ids_to_sync.len());
+        if let Ok(steam_details_list) = fetch_steam_details(&ids_to_sync).await {
+            for details in steam_details_list {
+                if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
+                    // Update installed addons
+                    for addon in db.addons.values_mut() {
+                        if addon.workshop_id.as_deref() == Some(w_id) {
+                            addon.steam_details = Some(details.clone());
+                            if !addon.has_image {
+                                if let Some(preview_url) = details.get("preview_url").and_then(|u| u.as_str()) {
+                                    addon.image_path = Some(preview_url.to_string());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    // Update uninstalled addons
+                    for addon in db.known_uninstalled_addons.values_mut() {
+                        if addon.workshop_id.as_deref() == Some(w_id) {
+                            addon.steam_details = Some(details.clone());
+                            if !addon.has_image {
+                                if let Some(preview_url) = details.get("preview_url").and_then(|u| u.as_str()) {
+                                    addon.image_path = Some(preview_url.to_string());
+                                    addon.has_image = true;
+                                }
+                            }
+                            if let Some(file_size_str) = details.get("file_size").and_then(|v| v.as_str()) {
+                                if let Ok(file_size) = file_size_str.parse::<u64>() {
+                                    if file_size > 0 {
+                                        addon.file_size = file_size;
+                                    }
+                                }
+                            }
+                            // Update vpk_name to title if it's still just a workshop ID
+                            if addon.vpk_name == w_id || addon.vpk_name == format!("{}.vpk", w_id) {
+                                if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
+                                    if !title.is_empty() {
+                                        addon.vpk_name = title.to_string();
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut vpk_to_id = HashMap::new();
     for addon in db.addons.values() {
         vpk_to_id.insert(addon.vpk_name.clone(), addon.id.clone());
@@ -794,6 +886,8 @@ fn auto_group_internal(db: &mut Database) {
                 addons,
                 tags: None,
                 workshop_collection_id: None,
+                master_collection_ids: None,
+                source: Some("auto-group".to_string()),
             });
         }
     }
@@ -832,6 +926,8 @@ fn auto_group_internal(db: &mut Database) {
                 addons,
                 tags: None,
                 workshop_collection_id: None,
+                master_collection_ids: None,
+                source: Some("auto-group".to_string()),
             });
         }
     }
@@ -1146,6 +1242,7 @@ pub async fn group_action(
     ids: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     workshop_collection_id: Option<String>,
+    source: Option<String>,
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
@@ -1153,6 +1250,7 @@ pub async fn group_action(
     if action == "create" {
         let name = name.ok_or_else(|| "Missing name".to_string())?;
         let ids = ids.ok_or_else(|| "Missing ids".to_string())?;
+        let source = source.unwrap_or_else(|| "manual".to_string());
 
         let group_id = format!("group_{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1163,20 +1261,150 @@ pub async fn group_action(
             g.addons.retain(|n| !ids.contains(n));
         }
 
+        // For workshop imports, add unknown IDs to known_uninstalled_addons
+        let raw_ids = ids.clone();
+        let mut new_workshop_ids: Vec<String> = Vec::new();
+        if source == "workshop-import" {
+            for raw_id in &raw_ids {
+                let workshop_id = raw_id.replace(".vpk", "");
+                // Check both with and without .vpk suffix
+                let vpk_key = format!("{}.vpk", workshop_id);
+                if !db.addons.contains_key(&vpk_key) && !db.known_uninstalled_addons.contains_key(&vpk_key)
+                    && !db.addons.contains_key(&workshop_id) && !db.known_uninstalled_addons.contains_key(&workshop_id) {
+                    db.known_uninstalled_addons.insert(workshop_id.clone(), Addon {
+                        id: workshop_id.clone(),
+                        vpk_name: workshop_id.clone(),
+                        workshop_id: Some(workshop_id.clone()),
+                        addon_info: serde_json::Value::Object(serde_json::Map::new()),
+                        has_image: false,
+                        image_path: None,
+                        files_count: 0,
+                        file_size: 0,
+                        parsed_at: String::new(),
+                        current_path: String::new(),
+                        dir_type: "none".to_string(),
+                        is_enabled: false,
+                        steam_details: None,
+                        is_dummy: false,
+                    });
+                    new_workshop_ids.push(workshop_id);
+                }
+            }
+            // Fetch Steam details for newly added workshop items
+            if !new_workshop_ids.is_empty() {
+                if let Ok(steam_details_list) = fetch_steam_details(&new_workshop_ids).await {
+                    for details in steam_details_list {
+                        let wid = details["publishedfileid"].as_str().unwrap_or("");
+                        if let Some(addon) = db.known_uninstalled_addons.get_mut(wid) {
+                            // Store raw Steam API response
+                            addon.steam_details = Some(details.clone());
+                            if let Some(preview_url) = details["preview_url"].as_str() {
+                                if !preview_url.is_empty() {
+                                    addon.image_path = Some(preview_url.to_string());
+                                    addon.has_image = true;
+                                }
+                            }
+                            if let Some(file_size_str) = details["file_size"].as_str() {
+                                if let Ok(file_size) = file_size_str.parse::<u64>() {
+                                    addon.file_size = file_size;
+                                }
+                            }
+                            // Update vpk_name to title if available
+                            if let Some(title) = details["title"].as_str() {
+                                if !title.is_empty() {
+                                    addon.vpk_name = title.to_string();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let filtered_vpks: Vec<String> = ids.into_iter()
-            .filter(|n| db.addons.contains_key(n) || db.known_uninstalled_addons.contains_key(n) || n.ends_with(".vpk"))
+            .filter_map(|n| {
+                // Already a valid key
+                if db.addons.contains_key(&n) || db.known_uninstalled_addons.contains_key(&n) || n.ends_with(".vpk") {
+                    return Some(n);
+                }
+                // Raw workshop ID → try with .vpk suffix
+                let vpk_key = format!("{}.vpk", n);
+                if db.addons.contains_key(&vpk_key) || db.known_uninstalled_addons.contains_key(&vpk_key) {
+                    return Some(vpk_key);
+                }
+                None
+            })
             .collect();
 
+        // Auto-assign to master collections based on source
+        // Ensure system master collections exist
+        if source == "auto-group" || source == "workshop-import" {
+            if !db.master_collections.iter().any(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto")) {
+                let mc_id = format!("mc_system_auto_{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos());
+                db.master_collections.push(MasterCollection {
+                    id: mc_id,
+                    name: "战役 (自动识别)".to_string(),
+                    name_key: Some("masterCollections.systemCampaignAuto".to_string()),
+                    group_ids: Vec::new(),
+                    is_system: true,
+                    icon: Some("Sparkles".to_string()),
+                });
+            }
+            if !db.master_collections.iter().any(|mc| mc.name_key.as_deref() == Some("masterCollections.systemWorkshopImport")) {
+                let mc_id = format!("mc_system_ws_{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos());
+                db.master_collections.push(MasterCollection {
+                    id: mc_id,
+                    name: "从创意工坊导入".to_string(),
+                    name_key: Some("masterCollections.systemWorkshopImport".to_string()),
+                    group_ids: Vec::new(),
+                    is_system: true,
+                    icon: Some("Globe".to_string()),
+                });
+            }
+        }
+
+        let mut mc_ids: Vec<String> = Vec::new();
+        if source == "auto-group" {
+            if let Some(mc) = db.master_collections.iter().find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto")) {
+                mc_ids.push(mc.id.clone());
+            }
+        } else if source == "workshop-import" {
+            if let Some(mc) = db.master_collections.iter().find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemWorkshopImport")) {
+                mc_ids.push(mc.id.clone());
+            }
+        }
+
         db.groups.push(Group {
-            id: group_id,
+            id: group_id.clone(),
             name,
             addons: filtered_vpks,
             tags,
             workshop_collection_id,
+            master_collection_ids: if mc_ids.is_empty() { None } else { Some(mc_ids.clone()) },
+            source: Some(source),
         });
+
+        // Also update master collections' group_ids
+        for mc_id in &mc_ids {
+            if let Some(mc) = db.master_collections.iter_mut().find(|mc| &mc.id == mc_id) {
+                if !mc.group_ids.contains(&group_id) {
+                    mc.group_ids.push(group_id.clone());
+                }
+            }
+        }
 
     } else if action == "delete" {
         let group_id = group_id.ok_or_else(|| "Missing groupId".to_string())?;
+        // Remove group from all master collections
+        for mc in &mut db.master_collections {
+            mc.group_ids.retain(|gid| gid != &group_id);
+        }
         db.groups.retain(|g| g.id != group_id);
 
     } else if action == "add-addons" {
@@ -1188,7 +1416,16 @@ pub async fn group_action(
         }
 
         let valid_ids: Vec<String> = ids.into_iter()
-            .filter(|n| db.addons.contains_key(n) || db.known_uninstalled_addons.contains_key(n) || n.ends_with(".vpk"))
+            .filter_map(|n| {
+                if db.addons.contains_key(&n) || db.known_uninstalled_addons.contains_key(&n) || n.ends_with(".vpk") {
+                    return Some(n);
+                }
+                let vpk_key = format!("{}.vpk", n);
+                if db.addons.contains_key(&vpk_key) || db.known_uninstalled_addons.contains_key(&vpk_key) {
+                    return Some(vpk_key);
+                }
+                None
+            })
             .collect();
 
         if let Some(target_group) = db.groups.iter_mut().find(|g| g.id == group_id) {
@@ -1233,6 +1470,218 @@ pub async fn group_action(
 
     } else if action == "auto-group" {
         auto_group_internal(&mut db);
+        // Auto-assign auto-grouped groups to system master collection
+        let mc_name_key = "masterCollections.systemCampaignAuto".to_string();
+        if !db.master_collections.iter().any(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto")) {
+            let mc_id = format!("mc_system_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos());
+            db.master_collections.push(MasterCollection {
+                id: mc_id.clone(),
+                name: "战役 (自动识别)".to_string(),
+                name_key: Some(mc_name_key),
+                group_ids: Vec::new(),
+                is_system: true,
+                icon: Some("Sparkles".to_string()),
+            });
+        }
+        // Collect auto-group IDs first to avoid borrow conflicts
+        let auto_group_ids: Vec<String> = db.groups.iter()
+            .filter(|g| g.source.as_deref() == Some("auto-group"))
+            .map(|g| g.id.clone())
+            .collect();
+        let mc_id = db.master_collections.iter()
+            .find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto"))
+            .map(|mc| mc.id.clone())
+            .unwrap();
+        // Update master collection group_ids
+        if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == mc_id) {
+            for gid in &auto_group_ids {
+                if !mc.group_ids.contains(gid) {
+                    mc.group_ids.push(gid.clone());
+                }
+            }
+        }
+        // Update groups' master_collection_ids
+        for g in &mut db.groups {
+            if g.source.as_deref() == Some("auto-group") {
+                if g.master_collection_ids.is_none() {
+                    g.master_collection_ids = Some(vec![mc_id.clone()]);
+                } else if let Some(ref mut ids) = g.master_collection_ids {
+                    if !ids.contains(&mc_id) {
+                        ids.push(mc_id.clone());
+                    }
+                }
+            }
+        }
+    } else if action == "create-master-collection" {
+        let name = name.ok_or_else(|| "Missing name".to_string())?;
+        let mc_id = format!("mc_{}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos());
+        let group_ids = ids.unwrap_or_default();
+        // Update groups to reference this master collection
+        for gid in &group_ids {
+            if let Some(group) = db.groups.iter_mut().find(|g| g.id == *gid) {
+                if group.master_collection_ids.is_none() {
+                    group.master_collection_ids = Some(vec![mc_id.clone()]);
+                } else if let Some(ref mut ids) = group.master_collection_ids {
+                    if !ids.contains(&mc_id) {
+                        ids.push(mc_id.clone());
+                    }
+                }
+            }
+        }
+        db.master_collections.push(MasterCollection {
+            id: mc_id,
+            name,
+            name_key: None,
+            group_ids,
+            is_system: false,
+            icon: None,
+        });
+    } else if action == "delete-master-collection" {
+        let mc_id = group_id.ok_or_else(|| "Missing masterCollectionId".to_string())?;
+        // Remove master collection reference from all groups
+        for group in &mut db.groups {
+            if let Some(ref mut ids) = group.master_collection_ids {
+                ids.retain(|id| id != &mc_id);
+                if ids.is_empty() {
+                    group.master_collection_ids = None;
+                }
+            }
+        }
+        db.master_collections.retain(|mc| mc.id != mc_id);
+    } else if action == "rename-master-collection" {
+        let mc_id = group_id.ok_or_else(|| "Missing masterCollectionId".to_string())?;
+        let name = name.ok_or_else(|| "Missing name".to_string())?;
+        if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == mc_id) {
+            if mc.is_system {
+                return Err("Cannot rename system master collection".to_string());
+            }
+            mc.name = name;
+        } else {
+            return Err("Master collection not found".to_string());
+        }
+    } else if action == "add-to-master-collection" {
+        let mc_id = group_id.ok_or_else(|| "Missing masterCollectionId".to_string())?;
+        let group_ids = ids.ok_or_else(|| "Missing ids".to_string())?;
+        // First update master collection group_ids
+        if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == mc_id) {
+            for gid in &group_ids {
+                if !mc.group_ids.contains(gid) {
+                    mc.group_ids.push(gid.clone());
+                }
+            }
+        } else {
+            return Err("Master collection not found".to_string());
+        }
+        // Then update groups' master_collection_ids
+        for gid in &group_ids {
+            if let Some(group) = db.groups.iter_mut().find(|g| g.id == *gid) {
+                if group.master_collection_ids.is_none() {
+                    group.master_collection_ids = Some(vec![mc_id.clone()]);
+                } else if let Some(ref mut ids) = group.master_collection_ids {
+                    if !ids.contains(&mc_id) {
+                        ids.push(mc_id.clone());
+                    }
+                }
+            }
+        }
+    } else if action == "remove-from-master-collection" {
+        let mc_id = group_id.ok_or_else(|| "Missing masterCollectionId".to_string())?;
+        let group_ids = ids.ok_or_else(|| "Missing ids".to_string())?;
+        if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == mc_id) {
+            mc.group_ids.retain(|gid| !group_ids.contains(gid));
+        }
+        for gid in &group_ids {
+            if let Some(group) = db.groups.iter_mut().find(|g| g.id == *gid) {
+                if let Some(ref mut ids) = group.master_collection_ids {
+                    ids.retain(|id| id != &mc_id);
+                    if ids.is_empty() {
+                        group.master_collection_ids = None;
+                    }
+                }
+            }
+        }
+    } else if action == "ensure-system-master-collections" {
+        // Ensure system master collections exist
+        if !db.master_collections.iter().any(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto")) {
+            let mc_id = format!("mc_system_auto_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos());
+            db.master_collections.push(MasterCollection {
+                id: mc_id,
+                name: "战役 (自动识别)".to_string(),
+                name_key: Some("masterCollections.systemCampaignAuto".to_string()),
+                group_ids: Vec::new(),
+                is_system: true,
+                icon: Some("Sparkles".to_string()),
+            });
+        }
+        if !db.master_collections.iter().any(|mc| mc.name_key.as_deref() == Some("masterCollections.systemWorkshopImport")) {
+            let mc_id = format!("mc_system_ws_{}", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos());
+            db.master_collections.push(MasterCollection {
+                id: mc_id,
+                name: "从创意工坊导入".to_string(),
+                name_key: Some("masterCollections.systemWorkshopImport".to_string()),
+                group_ids: Vec::new(),
+                is_system: true,
+                icon: Some("Globe".to_string()),
+            });
+        }
+        // Sync group memberships
+        let auto_mc_id = db.master_collections.iter().find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemCampaignAuto")).map(|mc| mc.id.clone());
+        let ws_mc_id = db.master_collections.iter().find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemWorkshopImport")).map(|mc| mc.id.clone());
+        for g in &mut db.groups {
+            let source = g.source.clone().unwrap_or_default();
+            if source == "auto-group" {
+                if let Some(ref mc_id) = auto_mc_id {
+                    if let Some(ref mut ids) = g.master_collection_ids {
+                        if !ids.contains(mc_id) {
+                            ids.push(mc_id.clone());
+                        }
+                    } else {
+                        g.master_collection_ids = Some(vec![mc_id.clone()]);
+                    }
+                }
+            } else if source == "workshop-import" {
+                if let Some(ref mc_id) = ws_mc_id {
+                    if let Some(ref mut ids) = g.master_collection_ids {
+                        if !ids.contains(mc_id) {
+                            ids.push(mc_id.clone());
+                        }
+                    } else {
+                        g.master_collection_ids = Some(vec![mc_id.clone()]);
+                    }
+                }
+            }
+        }
+        // Rebuild group_ids for system master collections
+        if let Some(ref mc_id) = auto_mc_id {
+            let auto_group_ids: Vec<String> = db.groups.iter()
+                .filter(|g| g.source.as_deref() == Some("auto-group"))
+                .map(|g| g.id.clone())
+                .collect();
+            if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == *mc_id) {
+                mc.group_ids = auto_group_ids;
+            }
+        }
+        if let Some(ref mc_id) = ws_mc_id {
+            let ws_group_ids: Vec<String> = db.groups.iter()
+                .filter(|g| g.source.as_deref() == Some("workshop-import"))
+                .map(|g| g.id.clone())
+                .collect();
+            if let Some(mc) = db.master_collections.iter_mut().find(|mc| mc.id == *mc_id) {
+                mc.group_ids = ws_group_ids;
+            }
+        }
     } else {
         return Err("Unknown action".to_string());
     }
@@ -1266,16 +1715,23 @@ pub async fn steam_sync(
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
-    
+
     // First, scan addons to populate database with any new/removed files
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    
+
     let mut ids = Vec::new();
     for addon in db.addons.values() {
         if let Some(ref w_id) = addon.workshop_id {
             ids.push(w_id.clone());
         }
     }
+    for addon in db.known_uninstalled_addons.values() {
+        if let Some(ref w_id) = addon.workshop_id {
+            ids.push(w_id.clone());
+        }
+    }
+    ids.sort();
+    ids.dedup();
 
     if ids.is_empty() {
         return Ok(db.clone());
@@ -1283,15 +1739,44 @@ pub async fn steam_sync(
 
     println!("Syncing Steam details manually for {} items...", ids.len());
     let steam_details_list = fetch_steam_details(&ids).await?;
-    
+
     for details in steam_details_list {
         if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
+            // Update installed addons
             for addon in db.addons.values_mut() {
                 if addon.workshop_id.as_deref() == Some(w_id) {
                     addon.steam_details = Some(details.clone());
                     if !addon.has_image {
                         if let Some(preview_url) = details.get("preview_url").and_then(|u| u.as_str()) {
                             addon.image_path = Some(preview_url.to_string());
+                        }
+                    }
+                    break;
+                }
+            }
+            // Update uninstalled addons
+            for addon in db.known_uninstalled_addons.values_mut() {
+                if addon.workshop_id.as_deref() == Some(w_id) {
+                    addon.steam_details = Some(details.clone());
+                    if !addon.has_image {
+                        if let Some(preview_url) = details.get("preview_url").and_then(|u| u.as_str()) {
+                            addon.image_path = Some(preview_url.to_string());
+                            addon.has_image = true;
+                        }
+                    }
+                    if let Some(file_size_str) = details.get("file_size").and_then(|v| v.as_str()) {
+                        if let Ok(file_size) = file_size_str.parse::<u64>() {
+                            if file_size > 0 {
+                                addon.file_size = file_size;
+                            }
+                        }
+                    }
+                    // Update vpk_name to title if it's still just a workshop ID
+                    if addon.vpk_name == w_id || addon.vpk_name == format!("{}.vpk", w_id) {
+                        if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
+                            if !title.is_empty() {
+                                addon.vpk_name = title.to_string();
+                            }
                         }
                     }
                     break;

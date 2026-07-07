@@ -64,6 +64,17 @@ export interface Group {
   addons: string[];
   tags?: string[];
   workshopCollectionId?: string;
+  masterCollectionIds?: string[];
+  source?: 'auto-group' | 'workshop-import' | 'manual' | 'user';
+}
+
+export interface MasterCollection {
+  id: string;
+  name: string;
+  nameKey?: string; // i18n key for system collections
+  groupIds: string[];
+  isSystem: boolean;
+  icon?: string;
 }
 
 export interface Settings {
@@ -77,6 +88,7 @@ export interface DatabasePayload {
   addons: Record<string, Addon>;
   groups: Group[];
   knownUninstalledAddons: Record<string, Addon>;
+  masterCollections: MasterCollection[];
 }
 
 export interface Toast {
