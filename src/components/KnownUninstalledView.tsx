@@ -109,7 +109,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
             return (
               <div
                 key={addon.id}
-                className={`addon-card ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}
+                className={`addon-card uninstalled ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}
               >
                 {/* Checkbox Wrapper */}
                 {isSelectMode && onSelectToggle && (
@@ -157,7 +157,6 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                   </div>
 
                   <div className="addon-card-badges">
-                    <span className="badge badge-disabled">{t('addonCard.disabled')}</span>
                     <span className="badge" style={{ background: 'var(--md-sys-color-tertiary)', color: 'var(--md-sys-color-on-tertiary)' }}>
                       {t('sidebar.disabledAddons') === '被禁用的组件 (.disabled)' ? '未安装' : 'Uninstalled'}
                     </span>

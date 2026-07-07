@@ -300,6 +300,26 @@ body {
   opacity: 0.65;
 }
 
+.addon-card.uninstalled::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.45);
+  border-radius: 28px;
+  pointer-events: none;
+  transition: opacity 0.3s ease;
+  z-index: 3;
+}
+
+.addon-card.uninstalled:hover::after,
+.addon-card.uninstalled:focus-within::after,
+.addon-card.uninstalled.card-selected::after {
+  opacity: 0;
+}
+
 .addon-card-image-wrapper {
   height: 180px;
   background: linear-gradient(135deg, #1d222e 0%, #0f131a 100%);
@@ -336,7 +356,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  z-index: 2;
+  z-index: 4;
 }
 
 .badge {

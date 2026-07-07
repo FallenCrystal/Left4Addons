@@ -58,7 +58,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   };
 
   return (
-    <div className={`addon-card ${!addon.isEnabled && !isUninstalled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}>
+    <div className={`addon-card ${isUninstalled ? 'uninstalled' : ''} ${!addon.isEnabled && !isUninstalled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}>
       {/* Checkbox Wrapper */}
       <div
         className={`addon-card-checkbox-wrapper ${isSelected ? 'selected' : ''}`}
