@@ -3,6 +3,42 @@
 import { formatBytes } from '../../utils/addonHelpers';
 import { WorkshopItem, HomepageSection, TagCategory, WorkshopPageDetails } from './types';
 
+interface AuthorInfo {
+  authorName: string;
+  authorUrl: string;
+  stars: number;
+  authorSteamId?: string;
+  authorVanityId?: string;
+  authorAccountId?: string;
+}
+
+function parseCount(text: string): number | undefined {
+  const normalized = (text || '').replace(/,/g, '').trim();
+  const match = normalized.match(/\d+/);
+  if (!match) return undefined;
+  const value = parseInt(match[0], 10);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function parseProfileIdentifiers(url: string): {
+  profileUrl: string;
+  steamId?: string;
+  vanityId?: string;
+} {
+  const trimmed = (url || '').trim();
+  if (!trimmed) {
+    return { profileUrl: '' };
+  }
+
+  const steamId = trimmed.match(/\/profiles\/(\d+)/)?.[1];
+  const vanityId = trimmed.match(/\/id\/([^/?#]+)/)?.[1];
+  return {
+    profileUrl: trimmed,
+    steamId,
+    vanityId,
+  };
+}
+
 // ── Helper: find balanced {…} from a start position in HTML ───────────────────
 
 function extractBalancedJson(html: string, startIdx: number): string | null {
@@ -76,7 +112,7 @@ function extractSSRQueryData(html: string): any | null {
 
 // ── Helper: extract items from a single SSR query entry ───────────────────────
 
-function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: string; authorUrl: string; stars: number }>): WorkshopItem[] {
+function extractItemsFromQuery(query: any, domMap: Map<string, AuthorInfo>): WorkshopItem[] {
   const items: WorkshopItem[] = [];
   const data = query?.state?.data;
   if (!data) return items;
@@ -98,24 +134,44 @@ function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: str
     if (!item?.publishedfileid) continue;
     const workshopId = item.publishedfileid;
     const domData = domMap.get(workshopId) || { authorName: '', authorUrl: '', stars: 0 };
-    let authorId = '';
-    if (domData.authorUrl) {
-      const idMatch = domData.authorUrl.match(/(?:profiles|id)\/([^/]+)/);
-      if (idMatch) authorId = idMatch[1];
-    }
+    let authorId = domData.authorVanityId || domData.authorSteamId || domData.authorAccountId || '';
+    let authorSteamId = domData.authorSteamId || '';
+    let authorVanityId = domData.authorVanityId || '';
+    let authorAccountId = domData.authorAccountId || '';
     // Prefer SSR creator_player_link_details for author info (browse page)
     let authorName = domData.authorName;
     let authorUrl = domData.authorUrl;
-    if (!authorName && item.creator) {
-      // creator is steamid64, build profile URL
-      authorUrl = `https://steamcommunity.com/profiles/${item.creator}`;
+    if (item.creator) {
+      authorSteamId = String(item.creator);
+      if (!authorUrl) {
+        authorUrl = `https://steamcommunity.com/profiles/${item.creator}`;
+      }
+      if (!authorId) {
+        authorId = authorSteamId;
+      }
     }
     // Check query-level creator_player_link_details
     const creatorDetails = query?.state?.data?.creator_player_link_details;
-    if (!authorName && creatorDetails && item.creator) {
+    if (creatorDetails && item.creator) {
       const cd = creatorDetails[item.creator];
-      if (cd?.persona_name) {
-        authorName = cd.persona_name;
+      const publicData = cd?.public_data || cd;
+      const privateData = cd?.private_data || {};
+      if (!authorName && publicData?.persona_name) {
+        authorName = String(publicData.persona_name);
+      }
+      if (!authorSteamId && publicData?.steamid) {
+        authorSteamId = String(publicData.steamid);
+      }
+      if (!authorVanityId && publicData?.profile_url) {
+        authorVanityId = String(publicData.profile_url);
+      }
+      if (!authorAccountId && privateData?.account_name) {
+        authorAccountId = String(privateData.account_name);
+      }
+      if (authorVanityId) {
+        authorUrl = `https://steamcommunity.com/id/${authorVanityId}`;
+      } else if (authorSteamId) {
+        authorUrl = `https://steamcommunity.com/profiles/${authorSteamId}`;
       }
     }
     items.push({
@@ -125,14 +181,30 @@ function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: str
       authorName,
       authorId,
       authorUrl,
+      authorSteamId: authorSteamId || undefined,
+      authorVanityId: authorVanityId || undefined,
+      authorAccountId: authorAccountId || undefined,
       stars: item.star_rating !== undefined ? item.star_rating : domData.stars,
       shortDescription: item.short_description || '',
       fileSize: item.file_size ? formatBytes(parseInt(item.file_size)) : undefined,
       tags: item.tags ? item.tags.map((t: any) => t.display_name || t.tag) : [],
       subscriptions: item.subscriptions,
+      favorites: item.favorited,
+      lifetimeSubscriptions: item.lifetime_subscriptions,
+      lifetimeFavorites: item.lifetime_favorited,
+      views: item.views,
+      comments: item.num_comments_public,
+      totalVotes: item.total_votes,
       timeCreated: item.time_created,
       timeUpdated: item.time_updated,
       childCount: item.num_children !== undefined ? parseInt(item.num_children) : undefined,
+      previewCount: Array.isArray(item.previews) ? item.previews.length : undefined,
+      childItemIds: Array.isArray(item.children)
+        ? item.children.map((child: any) => String(child?.publishedfileid || child?.publishedfile_id || '')).filter(Boolean)
+        : undefined,
+      galleryPreviewUrls: Array.isArray(item.previews)
+        ? item.previews.map((preview: any) => preview?.url || preview?.preview_url || '').filter(Boolean)
+        : undefined,
     });
   }
   return items;
@@ -140,8 +212,8 @@ function extractItemsFromQuery(query: any, domMap: Map<string, { authorName: str
 
 // ── Helper: parse DOM cards into a lookup map ─────────────────────────────────
 
-function parseDOMCardMap(html: string): Map<string, { authorName: string; authorUrl: string; stars: number }> {
-  const map = new Map<string, { authorName: string; authorUrl: string; stars: number }>();
+function parseDOMCardMap(html: string): Map<string, AuthorInfo> {
+  const map = new Map<string, AuthorInfo>();
   const parser = new DOMParser();
   const doc = parser.parseFromString(html, 'text/html');
   const cardXPath =
@@ -166,12 +238,19 @@ function parseDOMCardMap(html: string): Map<string, { authorName: string; author
       card, null, XPathResult.STRING_TYPE, null,
     ).stringValue.trim();
     if (/^by\s+/i.test(authorName)) authorName = authorName.replace(/^by\s+/i, '');
+    const { steamId, vanityId } = parseProfileIdentifiers(authorUrl);
     const stars = parseInt(
       doc.evaluate("count(.//svg[contains(@class, 'SVGIcon_Star_Filled')])",
         card, null, XPathResult.NUMBER_TYPE, null,
       ).numberValue.toString(),
     ) || 0;
-    map.set(workshopId, { authorName, authorUrl, stars });
+    map.set(workshopId, {
+      authorName,
+      authorUrl,
+      stars,
+      authorSteamId: steamId,
+      authorVanityId: vanityId,
+    });
   }
   return map;
 }
@@ -215,11 +294,8 @@ function parseDOMFallbackItems(html: string): WorkshopItem[] {
       card, null, XPathResult.STRING_TYPE, null,
     ).stringValue.trim();
     if (/^by\s+/i.test(authorName)) authorName = authorName.replace(/^by\s+/i, '');
-    let authorId = '';
-    if (authorUrl) {
-      const idMatch = authorUrl.match(/(?:profiles|id)\/([^/]+)/);
-      if (idMatch) authorId = idMatch[1];
-    }
+    const { steamId, vanityId } = parseProfileIdentifiers(authorUrl);
+    const authorId = vanityId || steamId || '';
     const stars = parseInt(
       doc.evaluate("count(.//svg[contains(@class, 'SVGIcon_Star_Filled')])",
         card, null, XPathResult.NUMBER_TYPE, null,
@@ -232,6 +308,8 @@ function parseDOMFallbackItems(html: string): WorkshopItem[] {
       authorName: authorName || '',
       authorId,
       authorUrl,
+      authorSteamId: steamId,
+      authorVanityId: vanityId,
       stars,
     });
   }
@@ -403,39 +481,96 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html, 'text/html');
 
-    // 1. Image gallery from highlight strip
-    const galleryImgs = doc.evaluate(
-      '//div[@id="highlight_strip_scroll"]/div[@role="button"]/img',
-      doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null,
-    );
-    for (let i = 0; i < galleryImgs.snapshotLength; i++) {
-      const img = galleryImgs.snapshotItem(i) as HTMLImageElement;
-      const src = img.getAttribute('src') || '';
-      if (src) {
-        result.imageGallery.push(toFullSizeUrl(src));
+    const text = (selector: string) => doc.querySelector(selector)?.textContent?.trim() || '';
+    const attr = (selector: string, name: string) => doc.querySelector(selector)?.getAttribute(name)?.trim() || '';
+    const all = (selector: string) => Array.from(doc.querySelectorAll(selector));
+
+    result.title = text('.workshopItemTitle');
+    result.previewUrl = toFullSizeUrl(attr('#previewImageMain', 'src'));
+
+    const descriptionNode = doc.querySelector('.workshopItemDescription');
+    if (descriptionNode) {
+      result.description = descriptionNode.textContent?.trim() || '';
+      result.descriptionHtml = descriptionNode.innerHTML.trim();
+    }
+
+    result.creatorProfileUrl = attr('.friendBlockLinkOverlay', 'href');
+    if (result.creatorProfileUrl) {
+      const ids = parseProfileIdentifiers(result.creatorProfileUrl);
+      result.creatorSteamId = ids.steamId;
+      result.creatorVanityId = ids.vanityId;
+    }
+    const creatorNameNode = doc.querySelector('.friendBlockContent');
+    if (creatorNameNode?.childNodes?.[0]?.textContent) {
+      result.creatorName = creatorNameNode.childNodes[0].textContent.trim();
+    }
+    result.creatorAccountId = attr('.friendBlock', 'data-miniprofile') || undefined;
+
+    const detailLabels = all('.detailsStatsContainerLeft .detailsStatLeft').map((el) => el.textContent?.trim().toLowerCase() || '');
+    const detailValues = all('.detailsStatsContainerRight .detailsStatRight').map((el) => el.textContent?.trim() || '');
+    detailLabels.forEach((label, index) => {
+      const value = detailValues[index] || '';
+      if (!value) return;
+      if (label.includes('file size')) result.fileSizeDisplay = value;
+      if (label.includes('posted')) result.postedDateText = value;
+      if (label.includes('updated')) result.updatedDateText = value;
+    });
+    result.changeNoteCount = parseCount(text('.detailsStatNumChangeNotes'));
+    result.ratingCount = parseCount(text('.numRatings'));
+    if (doc.querySelector('.fileRatingDetails img')?.getAttribute('src')?.includes('5-star')) {
+      result.ratingStars = 5;
+    }
+
+    all('.stats_table tr').forEach((row) => {
+      const cells = Array.from(row.querySelectorAll('td')).map((td) => td.textContent?.trim() || '');
+      if (cells.length < 2) return;
+      const value = parseCount(cells[0]);
+      const label = cells[1].toLowerCase();
+      if (value === undefined) return;
+      if (label.includes('unique visitor')) result.uniqueVisitors = value;
+      if (label.includes('current subscriber')) result.currentSubscribers = value;
+      if (label.includes('current favorite')) result.currentFavorites = value;
+    });
+
+    const fullGalleryMatch = html.match(/var\s+rgFullScreenshotURLs\s*=\s*(\[[\s\S]*?\]);/);
+    if (fullGalleryMatch) {
+      try {
+        const normalized = fullGalleryMatch[1]
+          .replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3')
+          .replace(/'/g, '"');
+        const gallery = JSON.parse(normalized) as Array<{ url?: string }>;
+        gallery.forEach((entry) => {
+          if (entry?.url) {
+            result.imageGallery.push(toFullSizeUrl(entry.url));
+          }
+        });
+      } catch {
+        // Fallback to DOM below.
+      }
+    }
+    if (result.imageGallery.length === 0) {
+      const galleryImgs = doc.evaluate(
+        '//div[@id="highlight_strip_scroll"]/div[@role="button"]/img',
+        doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null,
+      );
+      for (let i = 0; i < galleryImgs.snapshotLength; i++) {
+        const img = galleryImgs.snapshotItem(i) as HTMLImageElement;
+        const src = img.getAttribute('src') || '';
+        if (src) {
+          result.imageGallery.push(toFullSizeUrl(src));
+        }
       }
     }
 
-    // 2. Tags (Game Content, Game Modes, etc.)
-    const tagGroupXPaths = [
-      '//div[contains(@data-panel, "PanelGroup") and starts-with(./span/text(), "Game Content")]',
-      '//div[contains(@data-panel, "PanelGroup") and starts-with(./span/text(), "Game Modes")]',
-    ];
-    for (const xpath of tagGroupXPaths) {
-      const nodes = doc.evaluate(xpath, doc, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      for (let i = 0; i < nodes.snapshotLength; i++) {
-        const node = nodes.snapshotItem(i) as HTMLElement;
-        const span = node.querySelector('span');
-        const category = (span?.textContent || '').replace(/:$/, '').trim();
-        const links = node.querySelectorAll('a');
-        links.forEach((a) => {
-          const name = (a.textContent || '').trim();
-          if (name) {
-            result.tags.push({ category, name });
-          }
-        });
-      }
-    }
+    all('.rightDetailsBlock .workshopTags').forEach((node) => {
+      const category = (node.querySelector('.workshopTagsTitle')?.textContent || '').replace(/:$/, '').trim();
+      node.querySelectorAll('a').forEach((a) => {
+        const name = (a.textContent || '').trim();
+        if (name) {
+          result.tags.push({ category, name });
+        }
+      });
+    });
 
     // 3. Required items
     const requiredContainer = doc.querySelector('.requiredItemsContainer');
@@ -473,6 +608,11 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
         result.backgroundImageUrl = toFullSizeUrl(src);
       }
     }
+
+    result.imageGallery = [...new Set(result.imageGallery.filter(Boolean))];
+    result.tags = result.tags.filter((tag, index, tags) => (
+      !!tag.name && tags.findIndex((candidate) => candidate.category === tag.category && candidate.name === tag.name) === index
+    ));
   } catch (e) {
     console.error('Failed to parse workshop page details:', e);
   }

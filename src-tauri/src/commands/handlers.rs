@@ -316,6 +316,29 @@ fn insert_optional_value(obj: &mut serde_json::Map<String, serde_json::Value>, k
     }
 }
 
+fn insert_optional_u64(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        obj.insert(key.to_string(), serde_json::json!(value));
+    }
+}
+
+fn insert_optional_vec_string(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<Vec<String>>,
+) {
+    if let Some(values) = value {
+        let cleaned: Vec<String> = values
+            .into_iter()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        if !cleaned.is_empty() {
+            obj.insert(key.to_string(), serde_json::json!(cleaned));
+        }
+    }
+}
+
 fn cache_entry_object<'a>(
     cache: &'a mut HashMap<String, serde_json::Value>,
     workshop_id: &str,
@@ -376,6 +399,18 @@ fn merge_workshop_details_into_addon(addon: &mut Addon, details: &serde_json::Va
         .filter(|v| !v.trim().is_empty())
         .map(|v| v.trim().to_string());
 
+    let creator_vanity_id = details
+        .get("creatorVanityId")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string());
+
+    let creator_account_id = details
+        .get("creatorAccountId")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string());
+
     if creator_name.is_some() || creator_id.is_some() {
         let mut steam_details = addon
             .steam_details
@@ -394,6 +429,18 @@ fn merge_workshop_details_into_addon(addon: &mut Addon, details: &serde_json::Va
             if let Some(id) = creator_id {
                 obj.entry("creator".to_string())
                     .or_insert_with(|| serde_json::Value::String(id));
+            }
+            if let Some(vanity_id) = creator_vanity_id {
+                obj.entry("creator_vanity_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(vanity_id));
+            }
+            if let Some(account_id) = creator_account_id {
+                obj.entry("creator_account_id".to_string())
+                    .or_insert_with(|| serde_json::Value::String(account_id));
+            }
+            if let Some(description) = details.get("description").and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty()) {
+                obj.entry("description".to_string())
+                    .or_insert_with(|| serde_json::Value::String(description.trim().to_string()));
             }
         }
         addon.steam_details = Some(steam_details);
@@ -2341,6 +2388,15 @@ pub async fn record_workshop_items_seen(
         insert_non_empty_string(obj, "authorId", &item.author_id);
         insert_non_empty_string(obj, "creatorProfileUrl", &item.author_url);
         insert_non_empty_string(obj, "authorUrl", &item.author_url);
+        if let Some(vanity_id) = item.author_vanity_id.as_deref() {
+            insert_non_empty_string(obj, "creatorVanityId", vanity_id);
+        }
+        if let Some(account_id) = item.author_account_id.as_deref() {
+            insert_non_empty_string(obj, "creatorAccountId", account_id);
+        }
+        if let Some(steam_id) = item.author_steam_id.as_deref() {
+            insert_non_empty_string(obj, "creatorSteamId", steam_id);
+        }
         if item.author_id.chars().all(|c| c.is_ascii_digit()) && !item.author_id.is_empty() {
             insert_non_empty_string(obj, "creatorSteamId", &item.author_id);
         }
@@ -2354,10 +2410,19 @@ pub async fn record_workshop_items_seen(
         insert_optional_value(obj, "shortDescription", item.short_description.map(serde_json::Value::String));
         insert_optional_value(obj, "fileSizeDisplay", item.file_size.map(serde_json::Value::String));
         insert_optional_value(obj, "tags", item.tags.map(|v| serde_json::json!(v)));
-        insert_optional_value(obj, "subscriptions", item.subscriptions.map(|v| serde_json::json!(v)));
-        insert_optional_value(obj, "timeCreated", item.time_created.map(|v| serde_json::json!(v)));
-        insert_optional_value(obj, "timeUpdated", item.time_updated.map(|v| serde_json::json!(v)));
-        insert_optional_value(obj, "childCount", item.child_count.map(|v| serde_json::json!(v)));
+        insert_optional_u64(obj, "subscriptions", item.subscriptions);
+        insert_optional_u64(obj, "favorites", item.favorites);
+        insert_optional_u64(obj, "lifetimeSubscriptions", item.lifetime_subscriptions);
+        insert_optional_u64(obj, "lifetimeFavorites", item.lifetime_favorites);
+        insert_optional_u64(obj, "views", item.views);
+        insert_optional_u64(obj, "comments", item.comments);
+        insert_optional_u64(obj, "totalVotes", item.total_votes);
+        insert_optional_u64(obj, "timeCreated", item.time_created);
+        insert_optional_u64(obj, "timeUpdated", item.time_updated);
+        insert_optional_u64(obj, "childCount", item.child_count);
+        insert_optional_u64(obj, "previewCount", item.preview_count);
+        insert_optional_vec_string(obj, "childItemIds", item.child_item_ids);
+        insert_optional_vec_string(obj, "galleryPreviewUrls", item.gallery_preview_urls);
         insert_non_empty_string(obj, "lastSeenSource", &source);
         insert_non_empty_string(obj, "lastSeenAt", &now);
     }
@@ -2387,6 +2452,55 @@ pub async fn persist_workshop_page_details(
         insert_non_empty_string(obj, "workshopId", &workshop_id);
         insert_non_empty_string(obj, "lastPageFetchedAt", &now);
         insert_non_empty_string(obj, "lastPageSource", &source);
+        if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "title", title);
+        }
+        if let Some(preview_url) = details.get("previewUrl").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "previewUrl", preview_url);
+            insert_non_empty_string(obj, "imagePath", preview_url);
+        }
+        if let Some(description) = details.get("description").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "description", description);
+        }
+        if let Some(description_html) = details.get("descriptionHtml").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "descriptionHtml", description_html);
+        }
+        if let Some(creator_name) = details.get("creatorName").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "creatorName", creator_name);
+            insert_non_empty_string(obj, "authorName", creator_name);
+        }
+        if let Some(profile_url) = details.get("creatorProfileUrl").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "creatorProfileUrl", profile_url);
+            insert_non_empty_string(obj, "authorUrl", profile_url);
+        }
+        if let Some(steam_id) = details.get("creatorSteamId").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "creatorSteamId", steam_id);
+            insert_non_empty_string(obj, "creatorId", steam_id);
+        }
+        if let Some(vanity_id) = details.get("creatorVanityId").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "creatorVanityId", vanity_id);
+            if obj.get("creatorId").and_then(|v| v.as_str()).unwrap_or("").trim().is_empty() {
+                insert_non_empty_string(obj, "creatorId", vanity_id);
+            }
+        }
+        if let Some(account_id) = details.get("creatorAccountId").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "creatorAccountId", account_id);
+        }
+        if let Some(file_size) = details.get("fileSizeDisplay").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "fileSizeDisplay", file_size);
+        }
+        if let Some(posted_text) = details.get("postedDateText").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "postedDateText", posted_text);
+        }
+        if let Some(updated_text) = details.get("updatedDateText").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "updatedDateText", updated_text);
+        }
+        insert_optional_value(obj, "changeNoteCount", details.get("changeNoteCount").cloned());
+        insert_optional_value(obj, "ratingStars", details.get("ratingStars").cloned());
+        insert_optional_value(obj, "ratingCount", details.get("ratingCount").cloned());
+        insert_optional_value(obj, "uniqueVisitors", details.get("uniqueVisitors").cloned());
+        insert_optional_value(obj, "currentSubscribers", details.get("currentSubscribers").cloned());
+        insert_optional_value(obj, "currentFavorites", details.get("currentFavorites").cloned());
 
         if let Some(gallery) = details.get("imageGallery").cloned() {
             obj.insert("imageGallery".to_string(), gallery.clone());

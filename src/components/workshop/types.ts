@@ -9,14 +9,26 @@ export interface WorkshopItem {
   authorName: string;
   authorId: string;
   authorUrl: string;
+  authorSteamId?: string;
+  authorVanityId?: string;
+  authorAccountId?: string;
   stars: number;
   shortDescription?: string;
   fileSize?: string;
   tags?: string[];
   subscriptions?: number;
+  favorites?: number;
+  lifetimeSubscriptions?: number;
+  lifetimeFavorites?: number;
+  views?: number;
+  comments?: number;
+  totalVotes?: number;
   timeCreated?: number;
   timeUpdated?: number;
   childCount?: number;
+  previewCount?: number;
+  childItemIds?: string[];
+  galleryPreviewUrls?: string[];
 }
 
 export interface CollectionData {
@@ -26,10 +38,28 @@ export interface CollectionData {
 
 /** Extra details scraped from the Steam Community workshop page */
 export interface WorkshopPageDetails {
+  title?: string;
+  previewUrl?: string;
+  description?: string;
+  descriptionHtml?: string;
+  creatorName?: string;
+  creatorProfileUrl?: string;
+  creatorSteamId?: string;
+  creatorVanityId?: string;
+  creatorAccountId?: string;
   imageGallery: string[];
   tags: { category: string; name: string }[];
   requiredItems: { title: string; workshopId: string }[];
   parentCollections: { title: string; workshopId: string }[];
+  fileSizeDisplay?: string;
+  postedDateText?: string;
+  updatedDateText?: string;
+  changeNoteCount?: number;
+  ratingStars?: number;
+  ratingCount?: number;
+  uniqueVisitors?: number;
+  currentSubscribers?: number;
+  currentFavorites?: number;
   backgroundImageUrl?: string;
 }
 

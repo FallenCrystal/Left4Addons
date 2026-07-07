@@ -131,6 +131,12 @@ pub struct WorkshopSeenItem {
     pub author_id: String,
     #[serde(rename = "authorUrl", default)]
     pub author_url: String,
+    #[serde(rename = "authorSteamId", default)]
+    pub author_steam_id: Option<String>,
+    #[serde(rename = "authorVanityId", default)]
+    pub author_vanity_id: Option<String>,
+    #[serde(rename = "authorAccountId", default)]
+    pub author_account_id: Option<String>,
     #[serde(rename = "shortDescription", default)]
     pub short_description: Option<String>,
     #[serde(rename = "fileSize", default)]
@@ -139,12 +145,30 @@ pub struct WorkshopSeenItem {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub subscriptions: Option<u64>,
+    #[serde(default)]
+    pub favorites: Option<u64>,
+    #[serde(rename = "lifetimeSubscriptions", default)]
+    pub lifetime_subscriptions: Option<u64>,
+    #[serde(rename = "lifetimeFavorites", default)]
+    pub lifetime_favorites: Option<u64>,
+    #[serde(default)]
+    pub views: Option<u64>,
+    #[serde(default)]
+    pub comments: Option<u64>,
+    #[serde(rename = "totalVotes", default)]
+    pub total_votes: Option<u64>,
     #[serde(rename = "timeCreated", default)]
     pub time_created: Option<u64>,
     #[serde(rename = "timeUpdated", default)]
     pub time_updated: Option<u64>,
     #[serde(rename = "childCount", default)]
     pub child_count: Option<u64>,
+    #[serde(rename = "previewCount", default)]
+    pub preview_count: Option<u64>,
+    #[serde(rename = "childItemIds", default)]
+    pub child_item_ids: Option<Vec<String>>,
+    #[serde(rename = "galleryPreviewUrls", default)]
+    pub gallery_preview_urls: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
