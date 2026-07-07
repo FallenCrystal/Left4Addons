@@ -59,6 +59,49 @@ fn validate_steamcommunity_url(url: &str) -> Result<reqwest::Url, String> {
     }
 }
 
+fn is_background_workshop_fetch_source(source: &str) -> bool {
+    matches!(source, "startup-auto" | "background-refresh")
+}
+
+fn is_known_workshop_id(known_addons_path: &Path, workshop_id: &str) -> bool {
+    let workshop_id = workshop_id.trim();
+    if workshop_id.is_empty() {
+        return false;
+    }
+
+    let known_addons = load_known_addons(known_addons_path);
+    if known_addons.contains_key(workshop_id)
+        || known_addons.contains_key(&format!("{}.vpk", workshop_id))
+    {
+        return true;
+    }
+
+    known_addons.values().any(|entry| {
+        entry.id == workshop_id
+            || entry.vpk_name == format!("{}.vpk", workshop_id)
+            || entry.workshop_id.as_deref() == Some(workshop_id)
+    })
+}
+
+fn ensure_background_workshop_fetch_allowed(
+    source: &str,
+    workshop_id: &str,
+    known_addons_path: &Path,
+) -> Result<(), String> {
+    if !is_background_workshop_fetch_source(source) {
+        return Ok(());
+    }
+
+    if is_known_workshop_id(known_addons_path, workshop_id) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Background workshop fetch blocked: workshop item {} is not present in known_addons",
+        workshop_id
+    ))
+}
+
 fn is_dummy_vpk(path: &Path) -> bool {
     if let Ok((files, mut file)) = crate::vpk::parse_vpk(path) {
         let addoninfo_key = files.keys().find(|k| {
@@ -2507,6 +2550,27 @@ pub async fn fetch_workshop_html(
             return Err(err);
         }
     };
+    if is_background_workshop_fetch_source(&source) {
+        let workshop_id = extract_workshop_id_from_url(parsed.as_str())
+            .ok_or_else(|| "Background workshop fetch requires a workshop item URL".to_string())?;
+        if let Err(err) = ensure_background_workshop_fetch_allowed(
+            &source,
+            &workshop_id,
+            &state.known_addons_path,
+        ) {
+            let _ = append_workshop_crawl_log_internal(
+                &state.workshop_crawl_log_path,
+                serde_json::json!({
+                    "at": started_at,
+                    "source": source,
+                    "url": url,
+                    "ok": false,
+                    "error": err,
+                }),
+            );
+            return Err(err);
+        }
+    }
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
@@ -3013,6 +3077,7 @@ pub async fn persist_workshop_page_details(
     let mut cache = load_workshop_cache(&state.workshop_cache_path);
     let now = chrono::Utc::now().to_rfc3339();
     let source = source.unwrap_or_else(|| "unknown".to_string());
+    ensure_background_workshop_fetch_allowed(&source, &workshop_id, &state.known_addons_path)?;
 
     {
         let obj = cache_entry_object(&mut cache, &workshop_id);
@@ -3180,4 +3245,57 @@ pub async fn append_workshop_crawl_log(
     state: State<'_, crate::AppState>,
 ) -> Result<(), String> {
     append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_background_workshop_fetch_allowed, is_background_workshop_fetch_source};
+    use serde_json::json;
+    use std::fs;
+
+    fn write_known_addons_file(name: &str, value: serde_json::Value) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "left4addons-{}-{}-known_addons.json",
+            name,
+            std::process::id()
+        ));
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn background_source_detection_is_limited_to_silent_refreshes() {
+        assert!(is_background_workshop_fetch_source("startup-auto"));
+        assert!(is_background_workshop_fetch_source("background-refresh"));
+        assert!(!is_background_workshop_fetch_source("workshop-detail"));
+        assert!(!is_background_workshop_fetch_source("workshop-home"));
+    }
+
+    #[test]
+    fn background_fetch_only_allows_known_addons() {
+        let path = write_known_addons_file(
+            "allowed",
+            json!({
+                "12345": {
+                    "id": "12345",
+                    "vpkName": "12345.vpk",
+                    "workshopId": "12345",
+                    "addonInfo": {},
+                    "hasImage": false,
+                    "imagePath": null,
+                    "steamDetails": null
+                }
+            }),
+        );
+
+        let allowed = ensure_background_workshop_fetch_allowed("startup-auto", "12345", &path);
+        let blocked = ensure_background_workshop_fetch_allowed("startup-auto", "99999", &path);
+        let manual = ensure_background_workshop_fetch_allowed("workshop-detail", "99999", &path);
+
+        fs::remove_file(&path).ok();
+
+        assert!(allowed.is_ok());
+        assert!(blocked.is_err());
+        assert!(manual.is_ok());
+    }
 }

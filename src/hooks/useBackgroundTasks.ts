@@ -198,6 +198,26 @@ export function useBackgroundTasks({
     processCrawlQueueRef.current = processCrawlQueue;
   }, [processCrawlQueue]);
 
+  useEffect(() => {
+    if (!enabled) return;
+
+    const knownWorkshopIds = new Set(
+      [...Object.values(addons), ...Object.values(knownUninstalledAddons)]
+        .map((addon) => addon.workshopId?.trim())
+        .filter((id): id is string => !!id)
+    );
+
+    const filteredTasks = tasksRef.current.filter((task) => (
+      task.kind !== 'workshop-crawl' ||
+      task.status === 'running' ||
+      knownWorkshopIds.has(task.targetIds[0]?.trim() || '')
+    ));
+
+    if (filteredTasks.length !== tasksRef.current.length) {
+      commitTasks(filteredTasks);
+    }
+  }, [addons, commitTasks, enabled, knownUninstalledAddons]);
+
   const enqueueWorkshopCrawl = useCallback((workshopIds: string[], source = 'background-refresh') => {
     const cleanIds = [...new Set(workshopIds.map((id) => id.trim()).filter(Boolean))];
     if (cleanIds.length === 0) return;
@@ -249,7 +269,6 @@ export function useBackgroundTasks({
         [...Object.values(addons), ...Object.values(knownUninstalledAddons)].forEach((addon) => {
           if (addon.workshopId) candidateIds.add(addon.workshopId);
         });
-        Object.keys(cache || {}).forEach((id) => candidateIds.add(id));
 
         const staleIds = [...candidateIds].filter((id) => {
           const lastFetched = cache?.[id]?.lastPageFetchedAt;
