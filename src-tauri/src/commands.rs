@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use serde::{Serialize, Deserialize};
@@ -122,6 +122,8 @@ pub struct Addon {
     pub is_enabled: bool,
     #[serde(rename = "steamDetails")]
     pub steam_details: Option<serde_json::Value>,
+    #[serde(rename = "workshopDetails", default)]
+    pub workshop_details: Option<serde_json::Value>,
     #[serde(rename = "isDummy", default)]
     pub is_dummy: bool,
 }
@@ -166,6 +168,36 @@ pub struct KnownAddonEntry {
     pub image_path: Option<String>,
     #[serde(rename = "steamDetails")]
     pub steam_details: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct WorkshopSeenItem {
+    #[serde(rename = "workshopId")]
+    pub workshop_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(rename = "imagePath", default)]
+    pub image_path: String,
+    #[serde(rename = "authorName", default)]
+    pub author_name: String,
+    #[serde(rename = "authorId", default)]
+    pub author_id: String,
+    #[serde(rename = "authorUrl", default)]
+    pub author_url: String,
+    #[serde(rename = "shortDescription", default)]
+    pub short_description: Option<String>,
+    #[serde(rename = "fileSize", default)]
+    pub file_size: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub subscriptions: Option<u64>,
+    #[serde(rename = "timeCreated", default)]
+    pub time_created: Option<u64>,
+    #[serde(rename = "timeUpdated", default)]
+    pub time_updated: Option<u64>,
+    #[serde(rename = "childCount", default)]
+    pub child_count: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -335,6 +367,7 @@ pub fn load_db(db_path: &Path, known_addons_path: &Path, app_handle: &AppHandle)
                 dir_type: "none".to_string(),
                 is_enabled: false,
                 steam_details: entry.steam_details.clone(),
+                workshop_details: None,
                 is_dummy: false,
             });
         }
@@ -400,6 +433,163 @@ pub fn save_db_internal(db_path: &Path, known_addons_path: &Path, db: &Database)
     if let Ok(json) = serde_json::to_string_pretty(&known_addons) {
         let _ = fs::write(known_addons_path, json);
     }
+}
+
+fn load_workshop_cache(cache_path: &Path) -> HashMap<String, serde_json::Value> {
+    if !cache_path.exists() {
+        return HashMap::new();
+    }
+
+    let Ok(content) = fs::read_to_string(cache_path) else {
+        return HashMap::new();
+    };
+
+    if let Ok(map) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&content) {
+        return map;
+    }
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(items) = value.get("items").and_then(|v| v.as_object()) {
+            return items
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+        }
+    }
+
+    HashMap::new()
+}
+
+fn save_workshop_cache(cache_path: &Path, cache: &HashMap<String, serde_json::Value>) -> Result<(), String> {
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create cache directory: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(cache)
+        .map_err(|e| format!("Failed to serialize workshop cache: {}", e))?;
+    fs::write(cache_path, json).map_err(|e| format!("Failed to write workshop cache: {}", e))
+}
+
+fn insert_non_empty_string(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() {
+        obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    }
+}
+
+fn insert_optional_value(obj: &mut serde_json::Map<String, serde_json::Value>, key: &str, value: Option<serde_json::Value>) {
+    if let Some(value) = value {
+        if !value.is_null() {
+            obj.insert(key.to_string(), value);
+        }
+    }
+}
+
+fn cache_entry_object<'a>(
+    cache: &'a mut HashMap<String, serde_json::Value>,
+    workshop_id: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    let entry = cache
+        .entry(workshop_id.to_string())
+        .or_insert_with(|| serde_json::json!({ "workshopId": workshop_id }));
+    if !entry.is_object() {
+        *entry = serde_json::json!({ "workshopId": workshop_id });
+    }
+    entry.as_object_mut().expect("workshop cache entry must be an object")
+}
+
+fn append_workshop_crawl_log_internal(
+    crawl_log_path: &Path,
+    record: serde_json::Value,
+) -> Result<(), String> {
+    if let Some(parent) = crawl_log_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create crawl log directory: {}", e))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crawl_log_path)
+        .map_err(|e| format!("Failed to open crawl log: {}", e))?;
+    let line = serde_json::to_string(&record)
+        .map_err(|e| format!("Failed to serialize crawl log record: {}", e))?;
+    writeln!(file, "{}", line).map_err(|e| format!("Failed to append crawl log: {}", e))
+}
+
+fn merge_workshop_details_into_addon(addon: &mut Addon, details: &serde_json::Value) {
+    addon.workshop_details = Some(details.clone());
+
+    if addon.image_path.is_none() {
+        if let Some(preview_url) = details
+            .get("previewUrl")
+            .or_else(|| details.get("imagePath"))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+        {
+            addon.image_path = Some(preview_url.to_string());
+            addon.has_image = true;
+        }
+    }
+
+    let creator_name = details
+        .get("creatorName")
+        .or_else(|| details.get("authorName"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string());
+
+    let creator_id = details
+        .get("creatorSteamId")
+        .or_else(|| details.get("creatorId"))
+        .or_else(|| details.get("authorId"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.trim().to_string());
+
+    if creator_name.is_some() || creator_id.is_some() {
+        let mut steam_details = addon
+            .steam_details
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !steam_details.is_object() {
+            steam_details = serde_json::Value::Object(serde_json::Map::new());
+        }
+        if let Some(obj) = steam_details.as_object_mut() {
+            if let Some(name) = creator_name {
+                let current = obj.get("creator_name").and_then(|v| v.as_str()).unwrap_or("");
+                if current.trim().is_empty() || current == creator_id.as_deref().unwrap_or_default() {
+                    obj.insert("creator_name".to_string(), serde_json::Value::String(name));
+                }
+            }
+            if let Some(id) = creator_id {
+                obj.entry("creator".to_string())
+                    .or_insert_with(|| serde_json::Value::String(id));
+            }
+        }
+        addon.steam_details = Some(steam_details);
+    }
+}
+
+fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Database {
+    let cache = load_workshop_cache(workshop_cache_path);
+    if cache.is_empty() {
+        return db.clone();
+    }
+
+    let mut response = db.clone();
+    for addon in response.addons.values_mut() {
+        if let Some(workshop_id) = addon.workshop_id.as_deref() {
+            if let Some(details) = cache.get(workshop_id) {
+                merge_workshop_details_into_addon(addon, details);
+            }
+        }
+    }
+    for addon in response.known_uninstalled_addons.values_mut() {
+        if let Some(workshop_id) = addon.workshop_id.as_deref() {
+            if let Some(details) = cache.get(workshop_id) {
+                merge_workshop_details_into_addon(addon, details);
+            }
+        }
+    }
+    response
 }
 
 async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::Value>, String> {
@@ -608,6 +798,7 @@ pub async fn scan_addons_internal(
                 dir_type: file_info.dir_type.clone(),
                 is_enabled: file_info.is_enabled,
                 steam_details,
+                workshop_details: None,
                 is_dummy,
             };
 
@@ -718,6 +909,7 @@ pub async fn scan_addons_internal(
                 dir_type: "none".to_string(),
                 is_enabled: false,
                 steam_details: entry.steam_details.clone(),
+                workshop_details: None,
                 is_dummy: false,
             });
         }
@@ -1024,7 +1216,7 @@ pub async fn save_settings(
     save_db_internal(&state.db_path, &state.known_addons_path, &db);
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1033,7 +1225,7 @@ pub async fn get_addons(
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1134,7 +1326,7 @@ pub async fn move_addons(
     }
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1195,7 +1387,7 @@ pub async fn toggle_addons(
     }
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1269,7 +1461,7 @@ pub async fn rename_addon(
     }
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[derive(Deserialize)]
@@ -1391,7 +1583,7 @@ pub async fn rename_addons(
     }
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1445,6 +1637,7 @@ pub async fn group_action(
                         dir_type: "none".to_string(),
                         is_enabled: false,
                         steam_details: None,
+                        workshop_details: None,
                         is_dummy: false,
                     });
                     new_workshop_ids.push(workshop_id);
@@ -1850,7 +2043,7 @@ pub async fn group_action(
 
     save_db_internal(&state.db_path, &state.known_addons_path, &db);
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -1896,7 +2089,7 @@ pub async fn steam_sync(
         ids.dedup();
 
         if ids.is_empty() {
-            return Ok(db.clone());
+            return Ok(database_with_workshop_cache(&db, &state.workshop_cache_path));
         }
 
         ids
@@ -1953,23 +2146,78 @@ pub async fn steam_sync(
 
     save_db_internal(&state.db_path, &state.known_addons_path, &db);
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
-pub async fn fetch_workshop_html(url: String) -> Result<String, String> {
-    let parsed = validate_steamcommunity_url(&url)?;
+pub async fn fetch_workshop_html(
+    url: String,
+    source: Option<String>,
+    state: State<'_, crate::AppState>,
+) -> Result<String, String> {
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let source = source.unwrap_or_else(|| "unknown".to_string());
+    let parsed = match validate_steamcommunity_url(&url) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let _ = append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, serde_json::json!({
+                "at": started_at,
+                "source": source,
+                "url": url,
+                "ok": false,
+                "error": err,
+            }));
+            return Err(err);
+        }
+    };
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
         .map_err(|e| e.to_string())?;
-    let res = client.get(parsed)
+
+    let res = match client.get(parsed)
         .send()
-        .await
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
-    let body = res.text()
-        .await
-        .map_err(|e| format!("Failed to get response text: {}", e))?;
+        .await {
+            Ok(res) => res,
+            Err(e) => {
+                let err = format!("Failed to fetch URL: {}", e);
+                let _ = append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, serde_json::json!({
+                    "at": started_at,
+                    "source": source,
+                    "url": url,
+                    "ok": false,
+                    "error": err,
+                }));
+                return Err(err);
+            }
+        };
+
+    let status = res.status().as_u16();
+    let body = match res.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            let err = format!("Failed to get response text: {}", e);
+            let _ = append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, serde_json::json!({
+                "at": started_at,
+                "source": source,
+                "url": url,
+                "ok": false,
+                "status": status,
+                "error": err,
+            }));
+            return Err(err);
+        }
+    };
+
+    let _ = append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, serde_json::json!({
+        "at": started_at,
+        "source": source,
+        "url": url,
+        "ok": true,
+        "status": status,
+        "bytes": body.len(),
+    }));
+
     Ok(body)
 }
 
@@ -2014,7 +2262,7 @@ pub async fn delete_addons(
     }
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 #[tauri::command]
@@ -2127,7 +2375,7 @@ pub async fn download_addon(
 
     let mut db = state.db.lock().await;
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
 }
 
 async fn fetch_collection_details_internal(collection_id: &str) -> Result<Vec<String>, String> {
@@ -2232,5 +2480,173 @@ pub async fn add_known_addon(
     let _ = fs::write(&state.known_addons_path, serde_json::to_string_pretty(&known_addons).unwrap_or_default());
 
     scan_addons_internal(&mut db, &state.db_path, &state.known_addons_path, &state.cache_dir).await?;
-    Ok(db.clone())
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
+}
+
+#[tauri::command]
+pub async fn get_workshop_cache(
+    state: State<'_, crate::AppState>,
+) -> Result<HashMap<String, serde_json::Value>, String> {
+    Ok(load_workshop_cache(&state.workshop_cache_path))
+}
+
+#[tauri::command]
+pub async fn record_workshop_items_seen(
+    items: Vec<WorkshopSeenItem>,
+    source: Option<String>,
+    state: State<'_, crate::AppState>,
+) -> Result<Database, String> {
+    let mut cache = load_workshop_cache(&state.workshop_cache_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let source = source.unwrap_or_else(|| "unknown".to_string());
+
+    for item in items {
+        if item.workshop_id.trim().is_empty() {
+            continue;
+        }
+
+        let obj = cache_entry_object(&mut cache, &item.workshop_id);
+        insert_non_empty_string(obj, "workshopId", &item.workshop_id);
+        insert_non_empty_string(obj, "title", &item.title);
+        insert_non_empty_string(obj, "previewUrl", &item.image_path);
+        insert_non_empty_string(obj, "imagePath", &item.image_path);
+        insert_non_empty_string(obj, "creatorName", &item.author_name);
+        insert_non_empty_string(obj, "authorName", &item.author_name);
+        insert_non_empty_string(obj, "creatorId", &item.author_id);
+        insert_non_empty_string(obj, "authorId", &item.author_id);
+        insert_non_empty_string(obj, "creatorProfileUrl", &item.author_url);
+        insert_non_empty_string(obj, "authorUrl", &item.author_url);
+        if item.author_id.chars().all(|c| c.is_ascii_digit()) && !item.author_id.is_empty() {
+            insert_non_empty_string(obj, "creatorSteamId", &item.author_id);
+        }
+        if item.author_url.contains("/profiles/") {
+            if let Some(id) = item.author_url.split("/profiles/").nth(1).and_then(|s| s.split('/').next()) {
+                if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                    insert_non_empty_string(obj, "creatorSteamId", id);
+                }
+            }
+        }
+        insert_optional_value(obj, "shortDescription", item.short_description.map(serde_json::Value::String));
+        insert_optional_value(obj, "fileSizeDisplay", item.file_size.map(serde_json::Value::String));
+        insert_optional_value(obj, "tags", item.tags.map(|v| serde_json::json!(v)));
+        insert_optional_value(obj, "subscriptions", item.subscriptions.map(|v| serde_json::json!(v)));
+        insert_optional_value(obj, "timeCreated", item.time_created.map(|v| serde_json::json!(v)));
+        insert_optional_value(obj, "timeUpdated", item.time_updated.map(|v| serde_json::json!(v)));
+        insert_optional_value(obj, "childCount", item.child_count.map(|v| serde_json::json!(v)));
+        insert_non_empty_string(obj, "lastSeenSource", &source);
+        insert_non_empty_string(obj, "lastSeenAt", &now);
+    }
+
+    save_workshop_cache(&state.workshop_cache_path, &cache)?;
+    let db = state.db.lock().await;
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
+}
+
+#[tauri::command]
+pub async fn persist_workshop_page_details(
+    workshop_id: String,
+    details: serde_json::Value,
+    source: Option<String>,
+    state: State<'_, crate::AppState>,
+) -> Result<Database, String> {
+    if workshop_id.trim().is_empty() {
+        return Err("Missing workshop id".to_string());
+    }
+
+    let mut cache = load_workshop_cache(&state.workshop_cache_path);
+    let now = chrono::Utc::now().to_rfc3339();
+    let source = source.unwrap_or_else(|| "unknown".to_string());
+
+    {
+        let obj = cache_entry_object(&mut cache, &workshop_id);
+        insert_non_empty_string(obj, "workshopId", &workshop_id);
+        insert_non_empty_string(obj, "lastPageFetchedAt", &now);
+        insert_non_empty_string(obj, "lastPageSource", &source);
+
+        if let Some(gallery) = details.get("imageGallery").cloned() {
+            obj.insert("imageGallery".to_string(), gallery.clone());
+            obj.insert("galleryUrls".to_string(), gallery);
+        }
+        if let Some(tags) = details.get("tags").cloned() {
+            obj.insert("pageTags".to_string(), tags);
+        }
+        if let Some(required) = details.get("requiredItems").cloned() {
+            obj.insert("requiredItems".to_string(), required);
+        }
+        if let Some(parent_collections) = details.get("parentCollections").cloned() {
+            obj.insert("parentCollections".to_string(), parent_collections);
+        }
+        if let Some(background) = details.get("backgroundImageUrl").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "backgroundImageUrl", background);
+        }
+    }
+
+    if let Some(required_items) = details.get("requiredItems").and_then(|v| v.as_array()) {
+        for item in required_items {
+            let Some(child_id) = item.get("workshopId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let child_obj = cache_entry_object(&mut cache, child_id);
+            insert_non_empty_string(child_obj, "workshopId", child_id);
+            if let Some(title) = item.get("title").and_then(|v| v.as_str()) {
+                insert_non_empty_string(child_obj, "title", title);
+            }
+            insert_non_empty_string(child_obj, "lastSeenSource", &source);
+            insert_non_empty_string(child_obj, "lastSeenAt", &now);
+        }
+    }
+
+    if let Some(parent_collections) = details.get("parentCollections").and_then(|v| v.as_array()) {
+        for item in parent_collections {
+            let Some(collection_id) = item.get("workshopId").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let collection_obj = cache_entry_object(&mut cache, collection_id);
+            insert_non_empty_string(collection_obj, "workshopId", collection_id);
+            if let Some(title) = item.get("title").and_then(|v| v.as_str()) {
+                insert_non_empty_string(collection_obj, "title", title);
+            }
+            insert_non_empty_string(collection_obj, "lastSeenSource", &source);
+            insert_non_empty_string(collection_obj, "lastSeenAt", &now);
+        }
+    }
+
+    save_workshop_cache(&state.workshop_cache_path, &cache)?;
+    let db = state.db.lock().await;
+    Ok(database_with_workshop_cache(&db, &state.workshop_cache_path))
+}
+
+#[tauri::command]
+pub async fn get_background_tasks(
+    state: State<'_, crate::AppState>,
+) -> Result<serde_json::Value, String> {
+    if !state.background_tasks_path.exists() {
+        return Ok(serde_json::json!([]));
+    }
+    let content = fs::read_to_string(&state.background_tasks_path)
+        .map_err(|e| format!("Failed to read background tasks: {}", e))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse background tasks: {}", e))
+}
+
+#[tauri::command]
+pub async fn save_background_task_snapshot(
+    tasks: serde_json::Value,
+    state: State<'_, crate::AppState>,
+) -> Result<(), String> {
+    if let Some(parent) = state.background_tasks_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create task directory: {}", e))?;
+    }
+    let json = serde_json::to_string_pretty(&tasks)
+        .map_err(|e| format!("Failed to serialize background tasks: {}", e))?;
+    fs::write(&state.background_tasks_path, json)
+        .map_err(|e| format!("Failed to write background tasks: {}", e))
+}
+
+#[tauri::command]
+pub async fn append_workshop_crawl_log(
+    record: serde_json::Value,
+    state: State<'_, crate::AppState>,
+) -> Result<(), String> {
+    append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, record)
 }

@@ -4,6 +4,7 @@ import { listen } from '@tauri-apps/api/event';
 import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
+import { useBackgroundTasks } from './useBackgroundTasks';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
@@ -88,6 +89,31 @@ export function useAddonManager() {
       setSettings(data.settings);
     }
   }, []);
+
+  const {
+    backgroundTasks,
+    enqueueDownloads,
+    enqueueWorkshopCrawl,
+    recordSeenItems,
+  } = useBackgroundTasks({
+    enabled: !loading,
+    addons,
+    knownUninstalledAddons,
+    updateLocalState,
+    onDownloadSuccess: () => {
+      addToast(t('toasts.downloadSuccess'), 'success');
+    },
+    onTaskError: (message, workshopId) => {
+      if (workshopId) {
+        setDownloadProgress((prev) => {
+          const next = { ...prev };
+          delete next[workshopId];
+          return next;
+        });
+      }
+      addToast(t('toasts.downloadFailed', { err: message }), 'error');
+    },
+  });
 
   const executeWithWorkshopCheck = async (addonsList: Addon[], actionName: string, proceed: () => void) => {
     const workshopAddons = addonsList.filter(ad => ad.dirType === 'workshop');
@@ -496,20 +522,8 @@ export function useAddonManager() {
 
   // Download addon
   const downloadAddon = async (workshopId: string) => {
-    try {
-      setDownloadProgress(prev => ({ ...prev, [workshopId]: 0 }));
-      const data: DatabasePayload = await invoke('download_addon', { workshopId });
-      updateLocalState(data);
-      addToast(t('toasts.downloadSuccess'), 'success');
-    } catch (err) {
-      addToast(t('toasts.downloadFailed', { err: String(err) }), 'error');
-    } finally {
-      setDownloadProgress(prev => {
-        const next = { ...prev };
-        delete next[workshopId];
-        return next;
-      });
-    }
+    setDownloadProgress(prev => ({ ...prev, [workshopId]: 0 }));
+    enqueueDownloads([workshopId], 'single-download');
   };
 
   // Delete addon(s)
@@ -933,9 +947,14 @@ export function useAddonManager() {
   // Batch download uninstalled addons
   const handleBatchDownload = async (workshopIds: string[]) => {
     if (workshopIds.length === 0) return;
-    for (const wId of workshopIds) {
-      await downloadAddon(wId);
-    }
+    setDownloadProgress(prev => {
+      const next = { ...prev };
+      workshopIds.forEach((wId) => {
+        next[wId] = next[wId] ?? 0;
+      });
+      return next;
+    });
+    enqueueDownloads(workshopIds, 'batch-download');
     addToast(t('toasts.batchDownloadSuccess', { count: workshopIds.length }), 'success');
   };
 
@@ -1180,6 +1199,7 @@ export function useAddonManager() {
     isSubmitting,
     setIsSubmitting,
     downloadProgress,
+    backgroundTasks,
 
     // Modals state
     detailModal,
@@ -1203,6 +1223,7 @@ export function useAddonManager() {
 
     // Handlers
     fetchData,
+    applyDatabaseUpdate: updateLocalState,
     addToast,
     handleOpenLink,
     toggleAddon,
@@ -1233,6 +1254,8 @@ export function useAddonManager() {
     downloadAddon,
     deleteAddons,
     handleBatchDownload,
+    enqueueWorkshopCrawl,
+    recordSeenItems,
 
     // Master Collection handlers
     handleCreateMasterCollection,

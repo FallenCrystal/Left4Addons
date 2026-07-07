@@ -44,6 +44,31 @@ export interface SteamDetails {
   file_size?: string;
 }
 
+export interface WorkshopDetails {
+  workshopId?: string;
+  title?: string;
+  previewUrl?: string;
+  imagePath?: string;
+  creatorName?: string;
+  authorName?: string;
+  creatorId?: string;
+  authorId?: string;
+  creatorSteamId?: string;
+  creatorProfileUrl?: string;
+  authorUrl?: string;
+  shortDescription?: string;
+  fileSizeDisplay?: string;
+  tags?: string[];
+  pageTags?: { category: string; name: string }[];
+  imageGallery?: string[];
+  galleryUrls?: string[];
+  requiredItems?: { title: string; workshopId: string }[];
+  parentCollections?: { title: string; workshopId: string }[];
+  backgroundImageUrl?: string;
+  lastSeenAt?: string;
+  lastPageFetchedAt?: string;
+}
+
 export interface Addon {
   id: string;
   vpkName: string;
@@ -55,7 +80,21 @@ export interface Addon {
   workshopId?: string;
   addonInfo?: AddonInfo;
   steamDetails?: SteamDetails;
+  workshopDetails?: WorkshopDetails;
   isDummy?: boolean;
+}
+
+export interface BackgroundTask {
+  id: string;
+  kind: 'download' | 'workshop-crawl';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
+  source?: string;
+  targetIds: string[];
+  progress: number;
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
 }
 
 export interface Group {

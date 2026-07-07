@@ -8,6 +8,9 @@ pub mod commands;
 pub struct AppState {
     pub db_path: PathBuf,
     pub known_addons_path: PathBuf,
+    pub workshop_cache_path: PathBuf,
+    pub workshop_crawl_log_path: PathBuf,
+    pub background_tasks_path: PathBuf,
     pub cache_dir: PathBuf,
     pub db: Mutex<commands::Database>,
 }
@@ -47,6 +50,9 @@ pub fn run() {
 
             let db_path = runtime_dir.join("db.json");
             let known_addons_path = runtime_dir.join("known_addons.json");
+            let workshop_cache_path = runtime_dir.join("workshop_cache.json");
+            let workshop_crawl_log_path = runtime_dir.join("workshop_crawl_log.jsonl");
+            let background_tasks_path = runtime_dir.join("background_tasks.json");
             let cache_dir = runtime_dir.join("cache");
             if !cache_dir.exists() {
                 let _ = std::fs::create_dir_all(&cache_dir);
@@ -57,6 +63,9 @@ pub fn run() {
             app.manage(AppState {
                 db_path,
                 known_addons_path,
+                workshop_cache_path,
+                workshop_crawl_log_path,
+                background_tasks_path,
                 cache_dir,
                 db: Mutex::new(db),
             });
@@ -88,6 +97,12 @@ pub fn run() {
             commands::download_addon,
             commands::fetch_collection,
             commands::add_known_addon,
+            commands::get_workshop_cache,
+            commands::record_workshop_items_seen,
+            commands::persist_workshop_page_details,
+            commands::get_background_tasks,
+            commands::save_background_task_snapshot,
+            commands::append_workshop_crawl_log,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

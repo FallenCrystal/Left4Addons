@@ -1,5 +1,7 @@
 /** Shared types for the Workshop browser */
 
+import type { DatabasePayload } from '../../types/addon';
+
 export interface WorkshopItem {
   workshopId: string;
   title: string;
@@ -58,6 +60,8 @@ export interface WorkshopBrowserProps {
   onDownload: (workshopId: string) => void;
   onOpenLink: (url: string) => void;
   onImportCollection: (name: string, itemIds: string[]) => void;
+  onRecordSeenItems?: (items: WorkshopItem[], source?: string) => void;
+  onDatabaseUpdate?: (data: DatabasePayload) => void;
   isSubmitting: boolean;
   groups?: import('../../types/addon').Group[];
 }

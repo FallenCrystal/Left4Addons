@@ -5,7 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { WorkshopItem, WorkshopBrowserProps, WorkshopPageDetails } from './types';
 import { parseWorkshopPageDetails } from './ssrParser';
 import { CacheImage } from '../CacheImage';
-import { Group } from '../../types/addon';
+import { DatabasePayload, Group } from '../../types/addon';
 import { Gallery } from '../Gallery';
 import { RequiredItems, ParentCollections } from '../WorkshopCommon';
 
@@ -35,6 +35,7 @@ interface WorkshopDetailModalProps {
   isSubmitting: boolean;
   groups?: Group[];
   isLoading?: boolean;
+  onDatabaseUpdate?: (data: DatabasePayload) => void;
 }
 
 export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
@@ -53,6 +54,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   isSubmitting,
   groups,
   isLoading,
+  onDatabaseUpdate,
 }) => {
   const { t } = useTranslation();
   const [pageDetails, setPageDetails] = useState<WorkshopPageDetails | null>(null);
@@ -65,15 +67,21 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     setPageDetails(null);
     try {
       const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
-      const html: string = await invoke('fetch_workshop_html', { url });
+      const html: string = await invoke('fetch_workshop_html', { url, source: 'workshop-detail' });
       const details = parseWorkshopPageDetails(html);
       setPageDetails(details);
+      const data: DatabasePayload = await invoke('persist_workshop_page_details', {
+        workshopId,
+        details,
+        source: 'workshop-detail',
+      });
+      onDatabaseUpdate?.(data);
     } catch (err) {
       console.error('Failed to fetch workshop page details:', err);
     } finally {
       setPageDetailsLoading(false);
     }
-  }, []);
+  }, [onDatabaseUpdate]);
 
   const firstItemWorkshopId = collection?.items?.[0]?.workshopId;
 

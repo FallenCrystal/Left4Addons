@@ -50,6 +50,8 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   onDownload,
   onOpenLink,
   onImportCollection,
+  onRecordSeenItems,
+  onDatabaseUpdate,
   isSubmitting,
   groups,
 }) => {
@@ -96,15 +98,18 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     try {
       const html: string = await invoke('fetch_workshop_html', {
         url: 'https://steamcommunity.com/app/550/workshop/',
+        source: 'workshop-home',
       });
-      setHomepageSections(parseHomepageSections(html));
+      const sections = parseHomepageSections(html);
+      setHomepageSections(sections);
+      onRecordSeenItems?.(sections.flatMap((sec) => sec.items), 'workshop-home');
       setTagCategories(parseTagCategories(html));
     } catch (err) {
       console.error('Failed to fetch homepage:', err);
     } finally {
       setHomepageLoading(false);
     }
-  }, []);
+  }, [onRecordSeenItems]);
 
   useEffect(() => {
     if (viewMode === 'home') fetchHomepage();
@@ -128,15 +133,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           url += `&requiredtags[]=${encodeURIComponent(activeTagName || activeTag)}`;
         }
       }
-      const html: string = await invoke('fetch_workshop_html', { url });
-      setItems(parseSSRItems(html, 'workshop_query'));
+      const html: string = await invoke('fetch_workshop_html', { url, source: creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse' });
+      const parsedItems = parseSSRItems(html, 'workshop_query');
+      setItems(parsedItems);
+      onRecordSeenItems?.(parsedItems, creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse');
     } catch (err) {
       console.error(err);
       setError(`${t('common.error')}: ${err}`);
     } finally {
       setLoading(false);
     }
-  }, [committedQuery, sort, section, page, creatorId, activeTag, activeTagName, t]);
+  }, [committedQuery, sort, section, page, creatorId, activeTag, activeTagName, onRecordSeenItems, t]);
 
   useEffect(() => {
     if (viewMode === 'browse' || viewMode === 'search') fetchItems();
@@ -218,7 +225,9 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const data: any = await invoke('fetch_collection', { collectionId: workshopId });
       const raw = data.collection;
       if (raw && raw.publishedfileid) {
-        setSelectedItem(mapSteamDetailToItem(raw));
+        const item = mapSteamDetailToItem(raw);
+        setSelectedItem(item);
+        onRecordSeenItems?.([item], 'workshop-item-detail');
         setSelectedCollection(null);
       }
     } catch (err) {
@@ -235,15 +244,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const raw = data.collection;
       const rawItems: any[] = data.items || [];
       if (raw && raw.publishedfileid) {
+        const collectionItems = rawItems.map(mapSteamDetailToItem);
         setSelectedCollection({
           title: (raw.title || '').trim(),
           description: raw.description || '',
           imagePath: raw.preview_url || '',
           creatorName: raw.creator_name || '',
           creatorId: raw.creator || '',
-          items: rawItems.map(mapSteamDetailToItem),
+          items: collectionItems,
           workshopId: raw.publishedfileid,
         });
+        onRecordSeenItems?.([mapSteamDetailToItem(raw), ...collectionItems], 'workshop-collection');
         setSelectedItem(null);
       }
     } catch (err) {
@@ -478,6 +489,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         isSubmitting={isSubmitting}
         groups={groups}
         isLoading={!!loadingDetailId}
+        onDatabaseUpdate={onDatabaseUpdate}
       />
 
       {/* Tag browser modal */}

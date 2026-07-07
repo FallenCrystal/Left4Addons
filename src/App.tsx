@@ -76,6 +76,7 @@ function App() {
 
     // Handlers
     fetchData,
+    applyDatabaseUpdate,
     handleOpenLink,
     toggleAddon,
     toggleGroupAddons,
@@ -105,6 +106,7 @@ function App() {
     downloadAddon,
     deleteAddons,
     handleBatchDownload,
+    recordSeenItems,
 
     // Master Collection handlers
     handleCreateMasterCollection,
@@ -210,6 +212,8 @@ function App() {
             onImportCollection={async (name, itemIds) => {
               await handleCreateGroup(name, itemIds, undefined, undefined, 'workshop-import');
             }}
+            onRecordSeenItems={recordSeenItems}
+            onDatabaseUpdate={applyDatabaseUpdate}
             isSubmitting={isSubmitting}
             groups={groups}
           />
@@ -367,6 +371,7 @@ function App() {
         onOpenLink={handleOpenLink}
         addons={addons}
         knownUninstalledAddons={knownUninstalledAddons}
+        onDatabaseUpdate={applyDatabaseUpdate}
         onItemNavigate={(workshopId) => {
           const vpkKey = `${workshopId}.vpk`;
           if (addons[vpkKey]) {

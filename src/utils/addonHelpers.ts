@@ -81,6 +81,23 @@ export function getAddonCategories(addon: Addon): string[] {
       if (tag.includes('ui') || tag.includes('hud') || tag.includes('icon')) categories.add('UI/Textures');
     });
   }
+
+  const cachedTags = [
+    ...(addon.workshopDetails?.tags || []),
+    ...(addon.workshopDetails?.pageTags || []).map(t => t.name),
+  ];
+  cachedTags.forEach((tagStr) => {
+    if (typeof tagStr !== 'string' || !tagStr) return;
+    const tag = tagStr.toLowerCase();
+    if (tag.includes('campaign') || tag.includes('map')) categories.add('Campaign');
+    if (tag.includes('survivor') || tag.includes('character')) categories.add('Survivor');
+    if (tag.includes('weapon') || tag.includes('melee') || tag.includes('gun')) categories.add('Weapon Model');
+    if (tag.includes('skin') || tag.includes('texture') || tag.includes('material')) categories.add('Skin');
+    if (tag.includes('script') || tag.includes('mod')) categories.add('Script');
+    if (tag.includes('sound') || tag.includes('music') || tag.includes('voice')) categories.add('Sound/Music');
+    if (tag.includes('infected') || tag.includes('monster')) categories.add('Infected');
+    if (tag.includes('ui') || tag.includes('hud') || tag.includes('icon')) categories.add('UI/Textures');
+  });
   
   // Don't show "Other" for uninstalled items with no metadata
   if (categories.size === 0 && addon.dirType !== 'none') {
@@ -118,6 +135,10 @@ export const getAddonAuthor = (addon: Addon): string => {
   const author = getAddonInfoValue(addon, 'addonauthor') || getAddonInfoValue(addon, 'author');
   if (author && typeof author === 'string' && author.trim()) {
     return author.trim();
+  }
+  const workshopAuthor = addon.workshopDetails?.creatorName || addon.workshopDetails?.authorName;
+  if (workshopAuthor && typeof workshopAuthor === 'string' && workshopAuthor.trim()) {
+    return workshopAuthor.trim();
   }
   if (addon.steamDetails?.creator_name) {
     return addon.steamDetails.creator_name;

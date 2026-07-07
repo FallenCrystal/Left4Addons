@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, ExternalLink, Move, FolderPlus, Loader2 } from 'lucide-react';
-import { Addon, Group } from '../types/addon';
+import { Addon, DatabasePayload, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { invoke } from '@tauri-apps/api/core';
@@ -20,6 +20,7 @@ interface DetailModalProps {
   addons: Record<string, Addon>;
   knownUninstalledAddons: Record<string, any>;
   onItemNavigate: (workshopId: string) => void;
+  onDatabaseUpdate?: (data: DatabasePayload) => void;
 }
 
 export const DetailModal: React.FC<DetailModalProps> = ({
@@ -33,6 +34,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   addons,
   knownUninstalledAddons,
   onItemNavigate,
+  onDatabaseUpdate,
 }) => {
   const { t } = useTranslation();
 
@@ -44,15 +46,21 @@ export const DetailModal: React.FC<DetailModalProps> = ({
     setPageDetails(null);
     try {
       const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
-      const html: string = await invoke('fetch_workshop_html', { url });
+      const html: string = await invoke('fetch_workshop_html', { url, source: 'addon-detail' });
       const details = parseWorkshopPageDetails(html);
       setPageDetails(details);
+      const data: DatabasePayload = await invoke('persist_workshop_page_details', {
+        workshopId,
+        details,
+        source: 'addon-detail',
+      });
+      onDatabaseUpdate?.(data);
     } catch (err) {
       console.error('Failed to fetch workshop page details:', err);
     } finally {
       setPageDetailsLoading(false);
     }
-  }, []);
+  }, [onDatabaseUpdate]);
 
   useEffect(() => {
     if (open && addon?.workshopId) {
@@ -70,6 +78,9 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   const categories = getAddonCategories(addon);
   const itemGroup = groups.find(g => g.addons.includes(addon.id));
   const addonUrl = getAddonUrl(addon);
+  const cachedGallery = addon.workshopDetails?.imageGallery || addon.workshopDetails?.galleryUrls || [];
+  const galleryDetails = pageDetails?.imageGallery || cachedGallery;
+  const requiredItems = pageDetails?.requiredItems || addon.workshopDetails?.requiredItems || [];
   
   const addonauthorSteamID = getAddonInfoValue(addon, 'addonauthorsteamid');
   const addonversion = getAddonInfoValue(addon, 'addonversion');
@@ -97,8 +108,8 @@ export const DetailModal: React.FC<DetailModalProps> = ({
             <Gallery
               gallery={
                 addon.imagePath
-                  ? [addon.imagePath, ...(pageDetails?.imageGallery || []).filter((u) => u !== addon.imagePath)]
-                  : pageDetails?.imageGallery || []
+                  ? [addon.imagePath, ...galleryDetails.filter((u) => u !== addon.imagePath)]
+                  : galleryDetails
               }
               title={title}
               fallbackImage={addon.imagePath}
@@ -204,7 +215,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
             {/* Required items */}
             <RequiredItems
-              requiredItems={pageDetails?.requiredItems || []}
+              requiredItems={requiredItems}
               addons={addons}
               knownUninstalledAddons={knownUninstalledAddons}
               onItemNavigate={onItemNavigate}
