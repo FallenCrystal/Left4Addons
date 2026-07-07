@@ -1,9 +1,13 @@
-import React from 'react';
-import { X, ExternalLink, FileText, Move, FolderPlus } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { X, ExternalLink, Move, FolderPlus, Loader2 } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
-import { CacheImage } from './CacheImage';
 import { useTranslation } from 'react-i18next';
+import { invoke } from '@tauri-apps/api/core';
+import { parseWorkshopPageDetails } from './workshop/ssrParser';
+import { WorkshopPageDetails } from './workshop/types';
+import { Gallery } from './Gallery';
+import { RequiredItems } from './WorkshopCommon';
 
 interface DetailModalProps {
   open: boolean;
@@ -13,6 +17,9 @@ interface DetailModalProps {
   onToggle: (id: string, isEnabled: boolean) => void;
   onMove: (addon: Addon) => void;
   onOpenLink: (url: string) => void;
+  addons: Record<string, Addon>;
+  knownUninstalledAddons: Record<string, any>;
+  onItemNavigate: (workshopId: string) => void;
 }
 
 export const DetailModal: React.FC<DetailModalProps> = ({
@@ -23,8 +30,37 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   onToggle,
   onMove,
   onOpenLink,
+  addons,
+  knownUninstalledAddons,
+  onItemNavigate,
 }) => {
   const { t } = useTranslation();
+
+  const [pageDetails, setPageDetails] = useState<WorkshopPageDetails | null>(null);
+  const [pageDetailsLoading, setPageDetailsLoading] = useState(false);
+
+  const fetchPageDetails = useCallback(async (workshopId: string) => {
+    setPageDetailsLoading(true);
+    setPageDetails(null);
+    try {
+      const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
+      const html: string = await invoke('fetch_workshop_html', { url });
+      const details = parseWorkshopPageDetails(html);
+      setPageDetails(details);
+    } catch (err) {
+      console.error('Failed to fetch workshop page details:', err);
+    } finally {
+      setPageDetailsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open && addon?.workshopId) {
+      fetchPageDetails(addon.workshopId);
+    } else {
+      setPageDetails(null);
+    }
+  }, [open, addon?.workshopId, fetchPageDetails]);
 
   if (!open || !addon) return null;
 
@@ -58,22 +94,20 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
         <div className="detail-modal-layout">
           <div className="detail-left">
-            <div className="detail-image-box">
-              {addon.imagePath ? (
-                <CacheImage 
-                  srcPath={addon.imagePath} 
-                  alt={title} 
-                  className="detail-image" 
-                  fallback={
-                    <div className="addon-placeholder-icon" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                      <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-secondary"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>
-                    </div>
-                  }
-                />
-              ) : (
-                <FileText size={64} className="text-secondary" />
-              )}
-            </div>
+            <Gallery
+              gallery={
+                addon.imagePath
+                  ? [addon.imagePath, ...(pageDetails?.imageGallery || []).filter((u) => u !== addon.imagePath)]
+                  : pageDetails?.imageGallery || []
+              }
+              title={title}
+              fallbackImage={addon.imagePath}
+              fallbackIcon={
+                <div className="addon-placeholder-icon" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-secondary"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg>
+                </div>
+              }
+            />
 
             <div className="detail-meta-list">
               <div className="detail-meta-item">
@@ -167,6 +201,22 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
             <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('detailModal.descriptionLabel')}</div>
             <div className="description-block">{desc}</div>
+
+            {/* Required items */}
+            <RequiredItems
+              requiredItems={pageDetails?.requiredItems || []}
+              addons={addons}
+              knownUninstalledAddons={knownUninstalledAddons}
+              onItemNavigate={onItemNavigate}
+            />
+
+            {/* Loading indicator for page details */}
+            {pageDetailsLoading && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '12px', fontSize: '13px', color: 'var(--md-sys-color-outline)' }}>
+                <Loader2 size={14} className="animate-spin" />
+                <span>{t('workshop.detail.loadingExtra')}</span>
+              </div>
+            )}
           </div>
         </div>
 

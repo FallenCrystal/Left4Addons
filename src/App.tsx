@@ -298,6 +298,16 @@ function App() {
         onToggle={toggleAddon}
         onMove={handleMoveClick}
         onOpenLink={handleOpenLink}
+        addons={addons}
+        knownUninstalledAddons={knownUninstalledAddons}
+        onItemNavigate={(workshopId) => {
+          const vpkKey = `${workshopId}.vpk`;
+          if (addons[vpkKey]) {
+            setDetailModal({ open: true, addon: addons[vpkKey] });
+          } else {
+            handleOpenLink(`https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`);
+          }
+        }}
       />
 
       <MoveWarningModal
