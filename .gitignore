@@ -38,3 +38,4 @@ src-tauri/target/
 # Left4Addons specific ignores
 .playwright-mcp
 known_addons.json
+/l4a
