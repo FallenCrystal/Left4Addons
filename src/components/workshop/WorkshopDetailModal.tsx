@@ -385,7 +385,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
               <Download size={14} />
               <span>
                 {downloading
-                  ? t('workshop.detail.downloading', { progress: Math.round((progress || 0) * 100) })
+                  ? t('workshop.detail.downloading', { progress: Math.round(progress || 0) })
                   : isDownloaded
                     ? t('workshop.detail.downloaded')
                     : t('workshop.detail.download')}

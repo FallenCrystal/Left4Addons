@@ -261,7 +261,7 @@ const ItemDetail: React.FC<ItemDetailProps> = ({
         >
           <Download size={16} />
           {downloadProgress[item.publishedfileid] !== undefined
-            ? t('workshop.detail.downloading', { percent: downloadProgress[item.publishedfileid] })
+            ? t('workshop.detail.downloading', { progress: downloadProgress[item.publishedfileid] })
             : t('workshop.detail.download')}
         </button>
         <button
