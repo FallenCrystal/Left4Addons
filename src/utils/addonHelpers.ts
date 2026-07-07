@@ -95,14 +95,6 @@ export const getImageUrl = (path?: string): string => {
   if (path.startsWith('http://') || path.startsWith('https://')) {
     return path;
   }
-  if (path.startsWith('/cache/')) {
-    const filename = path.slice(7);
-    const isApple = navigator.userAgent.includes('Mac OS X') || navigator.userAgent.includes('iPhone') || navigator.userAgent.includes('iPad');
-    if (!isApple) {
-      return `http://cache.localhost/${filename}`;
-    }
-    return `cache://localhost/${filename}`;
-  }
   return path;
 };
 
@@ -194,4 +186,3 @@ export function getSuggestedVpkName(
 
   return finalName;
 }
-

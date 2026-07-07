@@ -91,25 +91,29 @@ export function useAddonManager() {
 
   const executeWithWorkshopCheck = async (addonsList: Addon[], actionName: string, proceed: () => void) => {
     const workshopAddons = addonsList.filter(ad => ad.dirType === 'workshop');
-    if (workshopAddons.length > 0) {
+    const moveWorkshopAddonsAndProceed = async () => {
       try {
         const ids = workshopAddons.map(a => a.id);
-        await invoke('move_addons', { ids, targetDirType: 'loading' });
+        const data: DatabasePayload = await invoke('move_addons', { ids, targetDirType: 'loading' });
+        updateLocalState(data);
       } catch (err) {
         addToast(t('toasts.autoMoveFailed', { err: String(err) }), 'error');
         setIsSubmitting(false);
         return;
       }
+      proceed();
+    };
 
+    if (workshopAddons.length > 0) {
       if (sessionStorage.getItem('skipWorkshopWarning') !== 'true' && !settings.enableDummyBypass) {
         setWorkshopActionModal({
           open: true,
           actionName,
           addons: workshopAddons,
-          onProceed: proceed
+          onProceed: moveWorkshopAddonsAndProceed
         });
       } else {
-        proceed();
+        moveWorkshopAddonsAndProceed();
       }
     } else {
       proceed();

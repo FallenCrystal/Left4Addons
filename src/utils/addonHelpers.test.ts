@@ -113,10 +113,10 @@ describe('addonHelpers', () => {
       expect(getImageUrl('http://example.com/test.jpg')).toBe('http://example.com/test.jpg');
     });
 
-    test('should convert cache path to localhost cache url', () => {
+    test('should return cache path unchanged for IPC image loading', () => {
       const cachePath = '/cache/abc_image.jpg';
       const result = getImageUrl(cachePath);
-      expect(result).toSatisfy((val: string) => val.includes('localhost/abc_image.jpg'));
+      expect(result).toBe(cachePath);
     });
   });
 

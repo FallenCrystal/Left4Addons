@@ -70,40 +70,11 @@ pub fn run() {
             }
             Ok(())
         })
-        .register_uri_scheme_protocol("cache", |ctx, request| {
-            let uri = request.uri();
-            let path = uri.path();
-            let filename = path.trim_start_matches('/');
-            let decoded_filename = url_decode(filename);
-            
-            let state = ctx.app_handle().state::<AppState>();
-
-            let file_path = state.cache_dir.join(decoded_filename);
-            
-            let response = if file_path.exists() {
-                if let Ok(bytes) = std::fs::read(&file_path) {
-                    tauri::http::Response::builder()
-                        .header("content-type", "image/jpeg")
-                        .header("access-control-allow-origin", "*")
-                        .body(bytes)
-                } else {
-                    tauri::http::Response::builder()
-                        .status(500)
-                        .body(Vec::new())
-                }
-            } else {
-                tauri::http::Response::builder()
-                    .status(404)
-                    .body(Vec::new())
-            };
-            
-            response.unwrap()
-
-        })
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::save_settings,
             commands::get_addons,
+            commands::get_cache_image,
             commands::move_addons,
             commands::toggle_addons,
             commands::rename_addon,
@@ -175,34 +146,4 @@ fn move_or_copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Re
     }
     let _ = std::fs::remove_dir_all(src);
     Ok(())
-}
-
-fn url_decode(input: &str) -> String {
-    let mut bytes = Vec::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let mut hex = String::new();
-            if let Some(&h1) = chars.peek() {
-                hex.push(h1);
-                chars.next();
-            }
-            if let Some(&h2) = chars.peek() {
-                hex.push(h2);
-                chars.next();
-            }
-            if hex.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    bytes.push(byte);
-                    continue;
-                }
-            }
-            bytes.push(b'%');
-            bytes.extend_from_slice(hex.as_bytes());
-        } else {
-            let mut buf = [0; 4];
-            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    String::from_utf8_lossy(&bytes).into_owned()
 }
