@@ -6,7 +6,7 @@
  *   • Browse    — filterable grid with tag sidebar
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import {
@@ -56,6 +56,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   groups,
 }) => {
   const { t } = useTranslation();
+  const scrollIdleTimerRef = useRef<number | null>(null);
 
   // View mode
   const [viewMode, setViewMode] = useState<'home' | 'browse' | 'search'>('home');
@@ -90,6 +91,26 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   } | null>(null);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
+  const [isScrollInteracting, setIsScrollInteracting] = useState(false);
+
+  const markScrollInteraction = useCallback(() => {
+    setIsScrollInteracting(true);
+    if (scrollIdleTimerRef.current !== null) {
+      window.clearTimeout(scrollIdleTimerRef.current);
+    }
+    scrollIdleTimerRef.current = window.setTimeout(() => {
+      setIsScrollInteracting(false);
+      scrollIdleTimerRef.current = null;
+    }, 140);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scrollIdleTimerRef.current !== null) {
+        window.clearTimeout(scrollIdleTimerRef.current);
+      }
+    };
+  }, []);
 
   // ── Fetch homepage ─────────────────────────────────────────────────────────
 
@@ -286,7 +307,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       );
     }
     return (
-      <div style={{ flex: 1, overflowY: 'auto', paddingRight: '8px' }}>
+      <div style={{ flex: 1, minHeight: 0, paddingRight: '8px' }}>
         {homepageSections.map((sec) => (
           <SectionCarousel
             key={sec.id}
@@ -306,7 +327,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   // ── Render: Browse view ────────────────────────────────────────────────────
 
   const renderBrowseView = () => (
-    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflowY: 'auto' }}>
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
       {/* Active filter chips */}
         {(creatorName || activeTagName) && (
           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>
@@ -375,7 +396,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   // ── Main render ────────────────────────────────────────────────────────────
 
   return (
-    <div className="workshop-browser" style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+    <div className={`workshop-browser${isScrollInteracting ? ' is-scroll-interacting' : ''}`} style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
       {/* Top navigation bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '16px 24px', borderBottom: '1px solid var(--md-sys-color-outline-variant)', flexShrink: 0 }}>
         <div style={{ display: 'flex', borderRadius: '100px', backgroundColor: 'var(--md-sys-color-surface-container-high)', padding: '4px' }}>
@@ -468,7 +489,12 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       </div>
 
       {/* Content area */}
-      <div style={{ flex: 1, overflow: 'hidden', padding: '24px', display: 'flex', flexDirection: 'column' }}>
+      <div
+        className="workshop-browser-scroll-root"
+        style={{ flex: 1, padding: '24px', display: 'flex', flexDirection: 'column' }}
+        onWheelCapture={markScrollInteraction}
+        onScroll={markScrollInteraction}
+      >
         {viewMode === 'home' ? renderHomepage() : renderBrowseView()}
       </div>
 

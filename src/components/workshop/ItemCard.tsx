@@ -35,7 +35,7 @@ export const ItemCard: React.FC<ItemCardProps> = ({
       )}
       <div className="addon-card-clickable-area">
         <div className="addon-card-image-wrapper">
-          <img className="addon-card-image" src={item.imagePath} alt={item.title} />
+          <img className="addon-card-image" src={item.imagePath} alt={item.title} loading="lazy" decoding="async" />
         </div>
         <div className="addon-card-badges">
           {isDownloaded && (
