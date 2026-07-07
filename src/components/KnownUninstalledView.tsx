@@ -19,6 +19,7 @@ interface KnownUninstalledViewProps {
   onBatchDownload?: (workshopIds: string[]) => void;
   searchQuery?: string;
   onSearchQueryChange?: (query: string) => void;
+  onDetailClick?: (addon: Addon) => void;
 }
 
 export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
@@ -35,6 +36,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
   onBatchDownload: _onBatchDownload,
   searchQuery: externalSearchQuery,
   onSearchQueryChange,
+  onDetailClick,
 }) => {
   const { t } = useTranslation();
   const searchQuery = externalSearchQuery || '';
@@ -130,6 +132,8 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                   onClick={() => {
                     if (isSelectMode && onSelectToggle) {
                       onSelectToggle(addon.id);
+                    } else if (onDetailClick) {
+                      onDetailClick(addon);
                     }
                   }}
                 >

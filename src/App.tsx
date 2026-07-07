@@ -201,6 +201,7 @@ function App() {
             onBatchDownload={handleBatchDownload}
             searchQuery={searchQuery}
             onSearchQueryChange={setSearchQuery}
+            onDetailClick={(addon) => setDetailModal({ open: true, addon })}
           />
         ) : currentFilterTab === 'workshop-browser' ? (
           <WorkshopBrowser
@@ -363,7 +364,7 @@ function App() {
       {/* Modals */}
       <DetailModal
         open={detailModal.open}
-        addon={detailModal.addon ? (addons[detailModal.addon.id] || knownUninstalledAddons[detailModal.addon.id]) : null}
+        addon={detailModal.addon ? (addons[detailModal.addon.id] || knownUninstalledAddons[detailModal.addon.id] || detailModal.addon) : null}
         groups={groups}
         onCancel={() => setDetailModal({ open: false, addon: null })}
         onToggle={toggleAddon}
@@ -372,12 +373,28 @@ function App() {
         addons={addons}
         knownUninstalledAddons={knownUninstalledAddons}
         onDatabaseUpdate={applyDatabaseUpdate}
+        onDownload={downloadAddon}
+        downloadProgress={downloadProgress}
+        isSubmitting={isSubmitting}
         onItemNavigate={(workshopId) => {
           const vpkKey = `${workshopId}.vpk`;
           if (addons[vpkKey]) {
             setDetailModal({ open: true, addon: addons[vpkKey] });
+          } else if (knownUninstalledAddons[vpkKey]) {
+            setDetailModal({ open: true, addon: knownUninstalledAddons[vpkKey] });
           } else {
-            handleOpenLink(`https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`);
+            setDetailModal({
+              open: true,
+              addon: {
+                id: vpkKey,
+                vpkName: vpkKey,
+                workshopId: workshopId,
+                dirType: 'none',
+                isEnabled: false,
+                fileSize: 0,
+                filesCount: 0,
+              }
+            });
           }
         }}
       />

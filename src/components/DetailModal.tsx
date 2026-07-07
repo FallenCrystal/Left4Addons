@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { X, ExternalLink, Move, FolderPlus, Loader2 } from 'lucide-react';
+import { X, ExternalLink, Move, FolderPlus, Loader2, Download } from 'lucide-react';
 import { Addon, DatabasePayload, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
@@ -21,6 +21,9 @@ interface DetailModalProps {
   knownUninstalledAddons: Record<string, any>;
   onItemNavigate: (workshopId: string) => void;
   onDatabaseUpdate?: (data: DatabasePayload) => void;
+  onDownload?: (workshopId: string) => void;
+  downloadProgress?: Record<string, number>;
+  isSubmitting?: boolean;
 }
 
 export const DetailModal: React.FC<DetailModalProps> = ({
@@ -35,6 +38,9 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   knownUninstalledAddons,
   onItemNavigate,
   onDatabaseUpdate,
+  onDownload,
+  downloadProgress = {},
+  isSubmitting = false,
 }) => {
   const { t } = useTranslation();
 
@@ -85,6 +91,18 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   const addonauthorSteamID = getAddonInfoValue(addon, 'addonauthorsteamid');
   const addonversion = getAddonInfoValue(addon, 'addonversion');
 
+  const isUninstalled = addon.dirType === 'none';
+  const isDownloading = addon.workshopId ? (downloadProgress[addon.workshopId] !== undefined) : false;
+  const downloadPercent = addon.workshopId ? (downloadProgress[addon.workshopId] ?? 0) : 0;
+  
+  const displaySize = addon.fileSize 
+    ? formatBytes(addon.fileSize) 
+    : addon.steamDetails?.file_size 
+      ? formatBytes(parseInt(addon.steamDetails.file_size)) 
+      : addon.workshopDetails?.fileSizeDisplay 
+        ? addon.workshopDetails.fileSizeDisplay 
+        : null;
+
   const handleOpenLinkClick = (e: React.MouseEvent, url: string) => {
     e.preventDefault();
     onOpenLink(url);
@@ -125,10 +143,12 @@ export const DetailModal: React.FC<DetailModalProps> = ({
                 <span className="detail-meta-label">{t('detailModal.fileName')}</span>
                 <span className="detail-meta-value">{addon.vpkName}</span>
               </div>
-              <div className="detail-meta-item">
-                <span className="detail-meta-label">{t('detailModal.addonSize')}</span>
-                <span className="detail-meta-value">{formatBytes(addon.fileSize)}</span>
-              </div>
+              {displaySize && (
+                <div className="detail-meta-item">
+                  <span className="detail-meta-label">{t('detailModal.addonSize')}</span>
+                  <span className="detail-meta-value">{displaySize}</span>
+                </div>
+              )}
               {addon.filesCount > 0 && (
                 <div className="detail-meta-item">
                   <span className="detail-meta-label">{t('detailModal.filesInVpk')}</span>
@@ -138,14 +158,24 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               <div className="detail-meta-item">
                 <span className="detail-meta-label">{t('detailModal.directory')}</span>
                 <span className="detail-meta-value">
-                  {addon.dirType === 'loading' ? t('detailModal.manualInstall') : t('detailModal.workshop')}
+                  {isUninstalled 
+                    ? t('addonCard.uninstalled') 
+                    : addon.dirType === 'loading' 
+                      ? t('detailModal.manualInstall') 
+                      : t('detailModal.workshop')}
                 </span>
               </div>
               <div className="detail-meta-item">
                 <span className="detail-meta-label">{t('detailModal.currentStatus')}</span>
-                <span className="detail-meta-value" style={{ color: addon.isEnabled ? 'var(--md-sys-color-success)' : 'var(--md-sys-color-error)' }}>
-                  {addon.isEnabled ? t('detailModal.enabled') : t('detailModal.disabled')}
-                </span>
+                {isUninstalled ? (
+                  <span className="detail-meta-value" style={{ color: 'var(--md-sys-color-tertiary)' }}>
+                    {t('addonCard.uninstalled')}
+                  </span>
+                ) : (
+                  <span className="detail-meta-value" style={{ color: addon.isEnabled ? 'var(--md-sys-color-success)' : 'var(--md-sys-color-error)' }}>
+                    {addon.isEnabled ? t('detailModal.enabled') : t('detailModal.disabled')}
+                  </span>
+                )}
               </div>
               {addon.workshopId && (
                 <div className="detail-meta-item">
@@ -283,12 +313,30 @@ export const DetailModal: React.FC<DetailModalProps> = ({
           </div>
           
           <div style={{ display: 'flex', gap: '12px' }}>
-            <button 
-              className={`btn ${addon.isEnabled ? 'btn-secondary' : 'btn-primary'}`}
-              onClick={() => onToggle(addon.id, addon.isEnabled)}
-            >
-              {addon.isEnabled ? t('detailModal.disableAddon') : t('detailModal.enableAddon')}
-            </button>
+            {isUninstalled ? (
+              addon.workshopId && onDownload && (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => onDownload(addon.workshopId!)}
+                  disabled={isSubmitting || isDownloading}
+                  style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}
+                >
+                  <Download size={14} />
+                  <span>
+                    {isDownloading
+                      ? t('workshop.detail.downloading', { progress: Math.round(downloadPercent) })
+                      : t('workshop.detail.download')}
+                  </span>
+                </button>
+              )
+            ) : (
+              <button 
+                className={`btn ${addon.isEnabled ? 'btn-secondary' : 'btn-primary'}`}
+                onClick={() => onToggle(addon.id, addon.isEnabled)}
+              >
+                {addon.isEnabled ? t('detailModal.disableAddon') : t('detailModal.enableAddon')}
+              </button>
+            )}
 
             {addon.dirType === 'workshop' && (
               <button 
