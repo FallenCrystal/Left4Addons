@@ -1,12 +1,13 @@
-use std::path::PathBuf;
-use tauri::Manager;
+use std::path::{Path, PathBuf};
 use tauri::async_runtime::Mutex;
+use tauri::Manager;
 
-pub mod vpk;
 pub mod commands;
+pub mod vpk;
 
 pub struct AppState {
-    pub db_path: PathBuf,
+    pub settings_path: PathBuf,
+    pub groups_path: PathBuf,
     pub known_addons_path: PathBuf,
     pub workshop_cache_path: PathBuf,
     pub workshop_crawl_log_path: PathBuf,
@@ -19,7 +20,7 @@ pub struct AppState {
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
-            let mut runtime_dir = std::env::current_exe()
+            let mut host_runtime_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| {
                     p.parent().map(|d| {
@@ -33,35 +34,48 @@ pub fn run() {
                 })
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-            if cfg!(debug_assertions) && runtime_dir.ends_with("src-tauri") {
-                if let Some(parent) = runtime_dir.parent() {
-                    runtime_dir = parent.to_path_buf();
+            if cfg!(debug_assertions) && host_runtime_dir.ends_with("src-tauri") {
+                if let Some(parent) = host_runtime_dir.parent() {
+                    host_runtime_dir = parent.to_path_buf();
                 }
             }
 
+            let runtime_dir = if host_runtime_dir.ends_with("l4a") {
+                host_runtime_dir.clone()
+            } else {
+                host_runtime_dir.join("l4a")
+            };
+            let config_dir = runtime_dir.join("config");
+            let cache_root_dir = runtime_dir.join("cache");
+            let cache_dir = cache_root_dir.join("images");
 
-            if !runtime_dir.exists() {
-                let _ = std::fs::create_dir_all(&runtime_dir);
-            }
+            let _ = std::fs::create_dir_all(&config_dir);
+            let _ = std::fs::create_dir_all(&cache_root_dir);
+            let _ = std::fs::create_dir_all(&cache_dir);
 
-            if let Some(app_data_dir) = app.path().app_data_dir().ok() {
-                migrate_data(&app_data_dir, &runtime_dir);
-            }
+            migrate_data(
+                app.path().app_data_dir().ok().as_deref(),
+                &host_runtime_dir,
+                &runtime_dir,
+            );
 
-            let db_path = runtime_dir.join("db.json");
-            let known_addons_path = runtime_dir.join("known_addons.json");
-            let workshop_cache_path = runtime_dir.join("workshop_cache.json");
-            let workshop_crawl_log_path = runtime_dir.join("workshop_crawl_log.jsonl");
-            let background_tasks_path = runtime_dir.join("background_tasks.json");
-            let cache_dir = runtime_dir.join("cache");
-            if !cache_dir.exists() {
-                let _ = std::fs::create_dir_all(&cache_dir);
-            }
+            let settings_path = config_dir.join("settings.json");
+            let groups_path = config_dir.join("groups.json");
+            let known_addons_path = config_dir.join("known_addons.json");
+            let workshop_cache_path = cache_root_dir.join("workshop_cache.json");
+            let workshop_crawl_log_path = cache_root_dir.join("workshop_crawl_log.jsonl");
+            let background_tasks_path = cache_root_dir.join("background_tasks.json");
+            let db = commands::load_db(
+                &settings_path,
+                &groups_path,
+                &known_addons_path,
+                &runtime_dir,
+                app.handle(),
+            );
 
-            let db = commands::load_db(&db_path, &known_addons_path, app.handle());
-            
             app.manage(AppState {
-                db_path,
+                settings_path,
+                groups_path,
                 known_addons_path,
                 workshop_cache_path,
                 workshop_crawl_log_path,
@@ -108,45 +122,180 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-
-
-fn migrate_data(app_data_dir: &std::path::Path, runtime_dir: &std::path::Path) {
-    if app_data_dir == runtime_dir {
-        return;
-    }
-
-    let old_db = app_data_dir.join("db.json");
-    let new_db = runtime_dir.join("db.json");
-
-    if !new_db.exists() && old_db.exists() {
-        if std::fs::copy(&old_db, &new_db).is_ok() {
-            let _ = std::fs::remove_file(&old_db);
+fn migrate_data(app_data_dir: Option<&Path>, legacy_runtime_dir: &Path, runtime_dir: &Path) {
+    if let Some(app_data_dir) = app_data_dir {
+        if app_data_dir != runtime_dir {
+            migrate_from_root(app_data_dir, runtime_dir);
         }
     }
 
-    let old_cache = app_data_dir.join("cache");
-    let new_cache = runtime_dir.join("cache");
-    if !new_cache.exists() && old_cache.exists() {
-        let _ = move_or_copy_dir(&old_cache, &new_cache);
-    }
-
-    let old_loading = app_data_dir.join("addons-loading");
-    let new_loading = runtime_dir.join("addons-loading");
-    if !new_loading.exists() && old_loading.exists() {
-        let _ = move_or_copy_dir(&old_loading, &new_loading);
+    if legacy_runtime_dir != runtime_dir {
+        migrate_from_root(legacy_runtime_dir, runtime_dir);
     }
 }
 
-fn move_or_copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+fn migrate_from_root(src_root: &Path, runtime_dir: &Path) {
+    if src_root == runtime_dir {
+        return;
+    }
+
+    let target_config_dir = runtime_dir.join("config");
+    let target_cache_dir = runtime_dir.join("cache");
+    let target_image_cache_dir = target_cache_dir.join("images");
+    let target_loading_dir = runtime_dir.join("addons-loading");
+
+    let _ = std::fs::create_dir_all(&target_config_dir);
+    let _ = std::fs::create_dir_all(&target_cache_dir);
+
+    migrate_legacy_db_file(
+        &src_root.join("db.json"),
+        &target_config_dir.join("settings.json"),
+        &target_config_dir.join("groups.json"),
+        &target_config_dir.join("known_addons.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("settings.json"),
+        &target_config_dir.join("settings.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("groups.json"),
+        &target_config_dir.join("groups.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("known_addons.json"),
+        &target_config_dir.join("known_addons.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("workshop_cache.json"),
+        &target_cache_dir.join("workshop_cache.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("background_tasks.json"),
+        &target_cache_dir.join("background_tasks.json"),
+    );
+    move_file_if_missing(
+        &src_root.join("workshop_crawl_log.jsonl"),
+        &target_cache_dir.join("workshop_crawl_log.jsonl"),
+    );
+
+    let old_cache = src_root.join("cache");
+    if old_cache.exists() {
+        let _ = move_or_copy_dir(&old_cache, &target_image_cache_dir);
+    }
+
+    let old_loading = src_root.join("addons-loading");
+    if old_loading.exists() {
+        let _ = move_or_copy_dir(&old_loading, &target_loading_dir);
+    }
+}
+
+fn move_file_if_missing(src: &Path, dst: &Path) {
+    if !src.exists() || dst.exists() {
+        return;
+    }
+
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if std::fs::rename(src, dst).is_ok() {
+        return;
+    }
+
+    if std::fs::copy(src, dst).is_ok() {
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+fn migrate_legacy_db_file(
+    legacy_db_path: &Path,
+    settings_path: &Path,
+    groups_path: &Path,
+    known_addons_path: &Path,
+) {
+    if !legacy_db_path.exists() {
+        return;
+    }
+
+    let Ok(content) = std::fs::read_to_string(legacy_db_path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return;
+    };
+
+    if !settings_path.exists() {
+        let settings = commands::SettingsStore {
+            settings: serde_json::from_value(value.get("settings").cloned().unwrap_or_default())
+                .unwrap_or_default(),
+            master_collections: serde_json::from_value(
+                value.get("masterCollections").cloned().unwrap_or_default(),
+            )
+            .unwrap_or_default(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&settings) {
+            let _ = std::fs::write(settings_path, json);
+        }
+    }
+
+    if !groups_path.exists() {
+        let groups: Vec<commands::Group> =
+            serde_json::from_value(value.get("groups").cloned().unwrap_or_default())
+                .unwrap_or_default();
+        if let Ok(json) = serde_json::to_string_pretty(&groups) {
+            let _ = std::fs::write(groups_path, json);
+        }
+    }
+
+    if !known_addons_path.exists() {
+        let mut known_addons = std::collections::HashMap::new();
+        if let Some(addons) = value.get("addons").and_then(|v| v.as_object()) {
+            for item in addons.values() {
+                if let Ok(mut addon) = serde_json::from_value::<commands::Addon>(item.clone()) {
+                    if addon.id.is_empty() {
+                        addon.id = addon
+                            .workshop_id
+                            .clone()
+                            .unwrap_or_else(|| addon.vpk_name.clone());
+                    }
+                    if addon.is_dummy || commands::is_dummy_addon_info(&addon.addon_info) {
+                        continue;
+                    }
+                    let id = addon.id.clone();
+                    known_addons.insert(
+                        id.clone(),
+                        commands::KnownAddonEntry {
+                            id,
+                            vpk_name: addon.vpk_name.clone(),
+                            workshop_id: addon.workshop_id.clone(),
+                            addon_info: addon.addon_info,
+                            has_image: addon.has_image,
+                            image_path: addon.image_path,
+                            steam_details: addon.steam_details,
+                        },
+                    );
+                }
+            }
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&known_addons) {
+            let _ = std::fs::write(known_addons_path, json);
+        }
+    }
+
+    if settings_path.exists() && groups_path.exists() && known_addons_path.exists() {
+        let _ = std::fs::remove_file(legacy_db_path);
+    }
+}
+
+fn move_or_copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     if !src.exists() {
         return Ok(());
     }
-    if dst.exists() {
+
+    if !dst.exists() && std::fs::rename(src, dst).is_ok() {
         return Ok(());
     }
-    if std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
+
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -155,7 +304,7 @@ fn move_or_copy_dir(src: &std::path::Path, dst: &std::path::Path) -> std::io::Re
         let dst_path = dst.join(entry.file_name());
         if file_type.is_dir() {
             move_or_copy_dir(&src_path, &dst_path)?;
-        } else {
+        } else if !dst_path.exists() {
             std::fs::copy(&src_path, &dst_path)?;
         }
     }

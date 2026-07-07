@@ -172,9 +172,8 @@ pub struct WorkshopSeenItem {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct LocalDatabase {
+pub struct SettingsStore {
     pub settings: Settings,
-    pub groups: Vec<Group>,
     #[serde(rename = "masterCollections", default)]
     pub master_collections: Vec<MasterCollection>,
 }
