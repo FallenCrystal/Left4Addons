@@ -47,7 +47,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
   };
 
   const handleSelectAll = () => {
-    const allIds = filteredAddons.map((ad) => ad.vpkName);
+    const allIds = filteredAddons.map((ad) => ad.id);
     const allSelected = allIds.every((id) => selectedIds.includes(id));
     if (allSelected) {
       setSelectedIds((prev) => prev.filter((id) => !allIds.includes(id)));
@@ -201,7 +201,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                   cursor: isSelectMode ? 'pointer' : 'default',
                   position: 'relative'
                 }}
-                onClick={() => isSelectMode && handleSelectToggle(addon.vpkName)}
+                onClick={() => isSelectMode && handleSelectToggle(addon.id)}
               >
                 {/* Checkbox for selection */}
                 {isSelectMode && (
@@ -310,7 +310,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
 
                       <button 
                         className="btn btn-outline" 
-                        onClick={() => onDelete([addon.vpkName], false, true)}
+                        onClick={() => onDelete([addon.id], false, true)}
                         disabled={isSubmitting}
                         style={{ borderRadius: '50%', padding: '8px', minWidth: '38px', width: '38px', height: '38px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderColor: 'var(--md-sys-color-error)', color: 'var(--md-sys-color-error)' }}
                         title="从已知列表删除"

@@ -291,27 +291,11 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
     serde_json::Value::Object(serde_json::Map::new())
 }
 
-pub fn calculate_file_hash<P: AsRef<Path>>(path: P) -> String {
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
-    let mut hasher = Md5::new();
-    if std::io::copy(&mut file, &mut hasher).is_ok() {
-        format!("{:x}", hasher.finalize())
-    } else {
-        String::new()
-    }
-}
-
 pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     vpk_path: P,
     cache_dir: Q,
 ) -> AddonMetadata {
     let mut result = AddonMetadata::default();
-    
-    let hash = calculate_file_hash(&vpk_path);
-    result.hash = hash;
     
     let (files, mut file) = match parse_vpk(&vpk_path) {
         Ok(val) => val,
@@ -324,6 +308,7 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     result.files_count = files.len();
 
     // Find addoninfo.txt
+    let mut addoninfo_content = String::new();
     let addoninfo_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
         lower == "addoninfo.txt" || lower.ends_with("/addoninfo.txt") || lower.ends_with("\\addoninfo.txt")
@@ -333,9 +318,20 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
             if let Ok(content_bytes) = get_file_content(&mut file, entry) {
                 let text = String::from_utf8_lossy(&content_bytes);
                 result.addon_info = parse_key_values(&text);
+                addoninfo_content = text.to_string();
             }
         }
     }
+
+    // Fast hash based on addoninfo and directory structure
+    let mut hasher = Md5::new();
+    hasher.update(addoninfo_content.as_bytes());
+    let mut paths: Vec<&String> = files.keys().collect();
+    paths.sort();
+    for p in paths {
+        hasher.update(p.as_bytes());
+    }
+    result.hash = format!("{:x}", hasher.finalize());
 
     // Find addonimage.jpg or addonimage.vtf
     let addonimage_jpg_key = files.keys().find(|k| {

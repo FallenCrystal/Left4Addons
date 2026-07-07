@@ -183,7 +183,7 @@ export function getSuggestedVpkName(
   let counter = 1;
   let finalName = baseSuggestedName;
   while (
-    Object.keys(addons).some(key => key.toLowerCase() === finalName.toLowerCase() && key !== addon.vpkName)
+    Object.keys(addons).some(key => key.toLowerCase() === finalName.toLowerCase() && key !== addon.id)
   ) {
     const dotIndex = baseSuggestedName.lastIndexOf('.vpk');
     const nameWithoutExt = baseSuggestedName.slice(0, dotIndex);

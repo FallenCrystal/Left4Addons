@@ -166,8 +166,7 @@ function App() {
             onDownload={downloadAddon}
             onOpenLink={handleOpenLink}
             onImportCollection={async (name, itemIds) => {
-              const ids = itemIds.map(id => `${id}.vpk`);
-              await handleCreateGroup(name, ids);
+              await handleCreateGroup(name, itemIds);
             }}
             isSubmitting={isSubmitting}
             groups={groups}
