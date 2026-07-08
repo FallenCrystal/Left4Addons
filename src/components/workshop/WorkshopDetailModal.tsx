@@ -217,7 +217,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 <FolderPlus size={14} />
                 <span>{t('workshop.detail.importAsGroup')}</span>
               </button>
-              <button className="btn btn-secondary" onClick={() => allWorkshopIds.forEach((id) => onDownload(id))} disabled={isSubmitting}>
+              <button className="btn btn-secondary" onClick={() => collection.items.forEach((subItem) => onDownload(subItem.workshopId, subItem.title, subItem.imagePath))} disabled={isSubmitting}>
                 <Download size={14} />
                 <span>{t('workshop.detail.downloadAll', { count: allWorkshopIds.length })}</span>
               </button>
@@ -389,7 +389,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
           <div style={{ display: 'flex', gap: '12px' }}>
             <button
               className="btn btn-primary"
-              onClick={() => onDownload(item.workshopId)}
+              onClick={() => onDownload(item.workshopId, item.title, (item as any).previewUrl || item.imagePath)}
               disabled={isSubmitting || isDownloaded || downloading}
             >
               <Download size={14} />

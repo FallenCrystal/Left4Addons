@@ -19,6 +19,11 @@ interface AddonsWatchErrorEvent {
   message: string;
 }
 
+interface DownloadProgressEvent {
+  workshopId: string;
+  percent: number;
+}
+
 export function useAddonManager() {
   const { t } = useTranslation();
   const [addons, setAddons] = useState<Record<string, Addon>>({});
@@ -41,6 +46,17 @@ export function useAddonManager() {
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
+
+  const clearDownloadProgress = useCallback((workshopId: string) => {
+    setDownloadProgress((prev) => {
+      if (prev[workshopId] === undefined) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[workshopId];
+      return next;
+    });
+  }, []);
 
   // Modals state
   const [detailModal, setDetailModal] = useState<{ open: boolean; addon: Addon | null }>({ open: false, addon: null });
@@ -98,18 +114,17 @@ export function useAddonManager() {
     let unlistenWatchError: (() => void) | undefined;
 
     const setupListeners = async () => {
-      unlistenDownload = await listen<{ workshopId: string; percent: number }>('download-progress', (event) => {
+      unlistenDownload = await listen<DownloadProgressEvent>('download-progress', (event) => {
+        const { workshopId, percent } = event.payload;
+
         setDownloadProgress((prev) => ({
           ...prev,
-          [event.payload.workshopId]: event.payload.percent,
+          [workshopId]: percent,
         }));
-        if (event.payload.percent === 100) {
+
+        if (percent === 100) {
           setTimeout(() => {
-            setDownloadProgress((prev) => {
-              const next = { ...prev };
-              delete next[event.payload.workshopId];
-              return next;
-            });
+            clearDownloadProgress(workshopId);
           }, 3000);
         }
       });
@@ -133,13 +148,16 @@ export function useAddonManager() {
       if (unlistenDbUpdate) unlistenDbUpdate();
       if (unlistenWatchError) unlistenWatchError();
     };
-  }, [addToast, t, updateLocalState]);
+  }, [addToast, clearDownloadProgress, t, updateLocalState]);
 
   const {
     backgroundTasks,
     enqueueDownloads,
     enqueueWorkshopCrawl,
     recordSeenItems,
+    cancelTask,
+    retryTask,
+    clearFinishedTasks,
   } = useBackgroundTasks({
     enabled: !loading,
     addons,
@@ -148,13 +166,12 @@ export function useAddonManager() {
     onDownloadSuccess: () => {
       addToast(t('toasts.downloadSuccess'), 'success');
     },
+    onDownloadCancelled: (workshopId) => {
+      clearDownloadProgress(workshopId);
+    },
     onTaskError: (message, workshopId) => {
       if (workshopId) {
-        setDownloadProgress((prev) => {
-          const next = { ...prev };
-          delete next[workshopId];
-          return next;
-        });
+        clearDownloadProgress(workshopId);
       }
       addToast(t('toasts.downloadFailed', { err: message }), 'error');
     },
@@ -566,9 +583,9 @@ export function useAddonManager() {
   };
 
   // Download addon
-  const downloadAddon = async (workshopId: string) => {
+  const downloadAddon = async (workshopId: string, title?: string, imagePath?: string) => {
     setDownloadProgress(prev => ({ ...prev, [workshopId]: 0 }));
-    enqueueDownloads([workshopId], 'single-download');
+    enqueueDownloads([{ workshopId, title, imagePath }], 'single-download');
   };
 
   // Delete addon(s)
@@ -1301,6 +1318,9 @@ export function useAddonManager() {
     handleBatchDownload,
     enqueueWorkshopCrawl,
     recordSeenItems,
+    cancelTask,
+    retryTask,
+    clearFinishedTasks,
 
     // Master Collection handlers
     handleCreateMasterCollection,

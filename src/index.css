@@ -1364,3 +1364,30 @@ select option {
 .custom-select-dropdown::-webkit-scrollbar-thumb:hover {
   background: var(--md-sys-color-outline);
 }
+
+/* Task Center Styling */
+.btn-warning {
+  background-color: #fcc015 !important;
+  color: #1e1b04 !important;
+  border: none !important;
+}
+
+.btn-warning:hover {
+  background-color: #ffd040 !important;
+  color: #1e1b04 !important;
+  box-shadow: 0 4px 12px rgba(252, 192, 21, 0.4) !important;
+}
+
+@keyframes task-download-bounce {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(4px);
+  }
+}
+
+.task-download-bounce {
+  display: inline-block;
+  animation: task-download-bounce 1.2s infinite ease-in-out;
+}

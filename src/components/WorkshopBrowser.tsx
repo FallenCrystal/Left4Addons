@@ -23,6 +23,7 @@ import { ItemCard } from './workshop/ItemCard';
 import { TagBrowserModal } from './workshop/TagBrowserModal';
 import { SectionCarousel } from './workshop/SectionCarousel';
 import { WorkshopDetailModal } from './workshop/WorkshopDetailModal';
+import { TaskCenterButton } from './TaskCenterButton';
 import { AlertModal } from './AlertModal';
 import { CustomSelect } from './CustomSelect';
 import {
@@ -57,6 +58,9 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   onDatabaseUpdate,
   isSubmitting,
   groups,
+  backgroundTasks,
+  syncingSteam,
+  onOpenTaskCenter,
 }) => {
   const { t } = useTranslation();
   const scrollIdleTimerRef = useRef<number | null>(null);
@@ -475,6 +479,14 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
             <span>{activeTagName || t('workshop.tags.browse')}</span>
           </button>
         )}
+
+        <div style={{ marginLeft: tagCategories.length > 0 ? '0' : 'auto' }}>
+          <TaskCenterButton
+            syncingSteam={syncingSteam}
+            backgroundTasks={backgroundTasks}
+            onClick={onOpenTaskCenter}
+          />
+        </div>
       </div>
 
       {/* Content area */}

@@ -10,7 +10,7 @@ describe('TopBar', () => {
     const onCategoryChange = vi.fn();
     const onSortByChange = vi.fn();
     const onToggleSelectMode = vi.fn();
-    const onSyncSteam = vi.fn();
+    const onOpenTaskCenter = vi.fn();
 
     render(
       <TopBar
@@ -21,10 +21,11 @@ describe('TopBar', () => {
         sortBy="size"
         onSortByChange={onSortByChange}
         syncingSteam={false}
-        onSyncSteam={onSyncSteam}
         categoriesList={categoriesList}
         isSelectMode={false}
         onToggleSelectMode={onToggleSelectMode}
+        backgroundTasks={[]}
+        onOpenTaskCenter={onOpenTaskCenter}
       />
     );
 
@@ -62,11 +63,11 @@ describe('TopBar', () => {
     fireEvent.click(screen.getByText('批量管理'));
     expect(onToggleSelectMode).toHaveBeenCalledTimes(1);
 
-    // Sync button
+    // Task Center button
     const buttons = screen.getAllByRole('button');
-    const syncButton = buttons[buttons.length - 1]; // last button is Sync Steam icon-only
-    fireEvent.click(syncButton);
-    expect(onSyncSteam).toHaveBeenCalledTimes(1);
+    const taskCenterBtn = buttons[buttons.length - 1]; // last button is Task Center
+    fireEvent.click(taskCenterBtn);
+    expect(onOpenTaskCenter).toHaveBeenCalledTimes(1);
   });
 
   test('renders batch management correctly in active select mode', () => {
@@ -81,10 +82,11 @@ describe('TopBar', () => {
         sortBy="title"
         onSortByChange={vi.fn()}
         syncingSteam={false}
-        onSyncSteam={vi.fn()}
         categoriesList={categoriesList}
         isSelectMode={true}
         onToggleSelectMode={onToggleSelectMode}
+        backgroundTasks={[]}
+        onOpenTaskCenter={vi.fn()}
       />
     );
 

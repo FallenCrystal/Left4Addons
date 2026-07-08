@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::Mutex as StdMutex;
 use tauri::async_runtime::Mutex;
 use tauri::Manager;
@@ -19,6 +20,7 @@ pub struct AppState {
     pub workshop_service: steam::WorkshopService,
     pub db: Mutex<commands::Database>,
     pub addon_watcher: StdMutex<watcher::AddonWatcherController>,
+    pub cancelled_downloads: StdMutex<HashSet<String>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -94,6 +96,7 @@ pub fn run() {
                 workshop_service: steam::WorkshopService::new(&bridge_base_dir),
                 db: Mutex::new(db),
                 addon_watcher: StdMutex::new(watcher::AddonWatcherController::default()),
+                cancelled_downloads: StdMutex::new(HashSet::new()),
             });
 
             if let Err(err) =
@@ -139,6 +142,7 @@ pub fn run() {
             commands::handlers::persist_workshop_page_details,
             commands::handlers::get_background_tasks,
             commands::handlers::save_background_task_snapshot,
+            commands::handlers::cancel_download,
             commands::handlers::append_workshop_crawl_log,
         ])
         .run(tauri::generate_context!())

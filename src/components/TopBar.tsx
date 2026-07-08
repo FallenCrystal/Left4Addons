@@ -1,7 +1,9 @@
 import React from 'react';
-import { Search, RefreshCw, CheckSquare, X } from 'lucide-react';
+import { Search, CheckSquare, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CustomSelect } from './CustomSelect';
+import { TaskCenterButton } from './TaskCenterButton';
+import { BackgroundTask } from '../types/addon';
 
 interface TopBarProps {
   searchQuery: string;
@@ -11,10 +13,11 @@ interface TopBarProps {
   sortBy: string;
   onSortByChange: (sortBy: string) => void;
   syncingSteam: boolean;
-  onSyncSteam: () => void;
   categoriesList: string[];
   isSelectMode: boolean;
   onToggleSelectMode: () => void;
+  backgroundTasks: BackgroundTask[];
+  onOpenTaskCenter: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -25,10 +28,11 @@ export const TopBar: React.FC<TopBarProps> = ({
   sortBy,
   onSortByChange,
   syncingSteam,
-  onSyncSteam,
   categoriesList,
   isSelectMode,
   onToggleSelectMode,
+  backgroundTasks,
+  onOpenTaskCenter,
 }) => {
   const { t } = useTranslation();
 
@@ -96,15 +100,11 @@ export const TopBar: React.FC<TopBarProps> = ({
           <span>{isSelectMode ? t('topbar.exitBatch') : t('topbar.batchManage')}</span>
         </button>
 
-        <button 
-          className="btn btn-primary btn-icon-only" 
-          style={{ width: '42px', height: '42px', display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '12px', flexShrink: 0 }}
-          onClick={onSyncSteam}
-          disabled={syncingSteam}
-          title={t('topbar.refreshTooltip')}
-        >
-          <RefreshCw size={20} className={syncingSteam ? 'animate-spin' : ''} />
-        </button>
+        <TaskCenterButton
+          syncingSteam={syncingSteam}
+          backgroundTasks={backgroundTasks}
+          onClick={onOpenTaskCenter}
+        />
       </div>
     </div>
   );

@@ -26,6 +26,7 @@ import { MasterCollectionModal } from './components/MasterCollectionModal';
 import { MasterCollectionHeader } from './components/MasterCollectionHeader';
 import { AddToGroupModal } from './components/AddToGroupModal';
 import { PromptModal } from './components/PromptModal';
+import { TaskCenterModal } from './components/TaskCenterModal';
 import { useState } from 'react';
 
 function App() {
@@ -108,6 +109,10 @@ function App() {
     deleteAddons,
     handleBatchDownload,
     recordSeenItems,
+    backgroundTasks,
+    cancelTask,
+    retryTask,
+    clearFinishedTasks,
 
     // Master Collection handlers
     handleCreateMasterCollection,
@@ -129,6 +134,7 @@ function App() {
   } = useAddonManager();
 
   const [masterCollectionModal, setMasterCollectionModal] = useState(false);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [addToGroupModal, setAddToGroupModal] = useState(false);
   const [addToMcModal, setAddToMcModal] = useState(false);
   const [renameCollectionModal, setRenameCollectionModal] = useState<{ open: boolean; collectionId: string; currentName: string }>({
@@ -208,6 +214,9 @@ function App() {
             searchQuery={searchQuery}
             onSearchQueryChange={setSearchQuery}
             onDetailClick={(addon) => setDetailModal({ open: true, addon })}
+            backgroundTasks={backgroundTasks}
+            syncingSteam={syncingSteam}
+            onOpenTaskCenter={() => setTaskCenterOpen(true)}
           />
         ) : currentFilterTab === 'workshop-browser' ? (
           <WorkshopBrowser
@@ -223,6 +232,9 @@ function App() {
             onDatabaseUpdate={applyDatabaseUpdate}
             isSubmitting={isSubmitting}
             groups={groups}
+            backgroundTasks={backgroundTasks}
+            syncingSteam={syncingSteam}
+            onOpenTaskCenter={() => setTaskCenterOpen(true)}
           />
         ) : (
           <>
@@ -234,7 +246,6 @@ function App() {
               sortBy={sortBy}
               onSortByChange={setSortBy}
               syncingSteam={syncingSteam}
-              onSyncSteam={syncSteamDetails}
               categoriesList={categoriesList}
               isSelectMode={isSelectMode}
               onToggleSelectMode={() => {
@@ -244,6 +255,8 @@ function App() {
                   setIsSelectMode(true);
                 }
               }}
+              backgroundTasks={backgroundTasks}
+              onOpenTaskCenter={() => setTaskCenterOpen(true)}
             />
 
             {/* Content body */}
@@ -384,12 +397,12 @@ function App() {
         downloadProgress={downloadProgress}
         isSubmitting={isSubmitting}
         onItemNavigate={(workshopId) => {
-          const vpkKey = `${workshopId}.vpk`;
-          if (addons[vpkKey]) {
-            setDetailModal({ open: true, addon: addons[vpkKey] });
-          } else if (knownUninstalledAddons[vpkKey]) {
-            setDetailModal({ open: true, addon: knownUninstalledAddons[vpkKey] });
+          const foundAddon = Object.values(addons).find((a) => a.workshopId === workshopId) ||
+                             Object.values(knownUninstalledAddons).find((a) => a.workshopId === workshopId);
+          if (foundAddon) {
+            setDetailModal({ open: true, addon: foundAddon });
           } else {
+            const vpkKey = `${workshopId}.vpk`;
             setDetailModal({
               open: true,
               addon: {
@@ -562,6 +575,19 @@ function App() {
           await handleBatchAddGroupsToMasterCollection(mcId);
           setAddToMcModal(false);
         }}
+      />
+
+      {/* Task Center Modal */}
+      <TaskCenterModal
+        open={taskCenterOpen}
+        onCancel={() => setTaskCenterOpen(false)}
+        backgroundTasks={backgroundTasks}
+        downloadProgress={downloadProgress}
+        syncingSteam={syncingSteam}
+        onSyncSteam={syncSteamDetails}
+        onCancelTask={cancelTask}
+        onRetryTask={retryTask}
+        onClearFinishedTasks={clearFinishedTasks}
       />
 
       {/* Floating Batch Action Bar */}

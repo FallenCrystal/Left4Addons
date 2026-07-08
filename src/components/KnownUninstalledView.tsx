@@ -1,14 +1,15 @@
 import React from 'react';
 import { Download, Globe, Trash2, Search, RefreshCw, AlertCircle, FileText } from 'lucide-react';
-import { Addon } from '../types/addon';
+import { Addon, BackgroundTask } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, formatBytes, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
 import { useTranslation } from 'react-i18next';
+import { TaskCenterButton } from './TaskCenterButton';
 
 interface KnownUninstalledViewProps {
   knownUninstalledAddons: Record<string, Addon>;
   downloadProgress: Record<string, number>;
-  onDownload: (workshopId: string) => void;
+  onDownload: (workshopId: string, title?: string, imagePath?: string) => void;
   onDelete: (ids: string[], deleteFile: boolean, removeFromKnown: boolean) => void;
   isSubmitting: boolean;
   onOpenLink: (url: string) => void;
@@ -20,6 +21,9 @@ interface KnownUninstalledViewProps {
   searchQuery?: string;
   onSearchQueryChange?: (query: string) => void;
   onDetailClick?: (addon: Addon) => void;
+  backgroundTasks: BackgroundTask[];
+  syncingSteam: boolean;
+  onOpenTaskCenter: () => void;
 }
 
 export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
@@ -37,6 +41,9 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
   searchQuery: externalSearchQuery,
   onSearchQueryChange,
   onDetailClick,
+  backgroundTasks,
+  syncingSteam,
+  onOpenTaskCenter,
 }) => {
   const { t } = useTranslation();
   const searchQuery = externalSearchQuery || '';
@@ -65,6 +72,11 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
               : 'Manage addons previously scanned, from collections, or manually added but not currently on disk.'}
           </p>
         </div>
+        <TaskCenterButton
+          syncingSteam={syncingSteam}
+          backgroundTasks={backgroundTasks}
+          onClick={onOpenTaskCenter}
+        />
       </div>
 
       {/* Search */}
@@ -199,7 +211,11 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                       {addon.workshopId ? (
                         <button
                           className="btn btn-primary btn-icon-only"
-                          onClick={() => onDownload(addon.workshopId!)}
+                          onClick={() => onDownload(
+                            addon.workshopId!,
+                            addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName,
+                            addon.imagePath
+                          )}
                           disabled={isDownloading || isSubmitting}
                           title={isDownloading ? t('workshop.detail.downloading', { progress }) : t('workshop.detail.download')}
                         >

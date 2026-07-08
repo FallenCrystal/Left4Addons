@@ -13,6 +13,7 @@ interface UseBackgroundTasksArgs {
   knownUninstalledAddons: Record<string, Addon>;
   updateLocalState: (data: DatabasePayload) => void;
   onDownloadSuccess: (workshopId: string) => void;
+  onDownloadCancelled: (workshopId: string) => void;
   onTaskError: (message: string, workshopId?: string) => void;
 }
 
@@ -43,6 +44,7 @@ export function useBackgroundTasks({
   knownUninstalledAddons,
   updateLocalState,
   onDownloadSuccess,
+  onDownloadCancelled,
   onTaskError,
 }: UseBackgroundTasksArgs) {
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
@@ -64,9 +66,13 @@ export function useBackgroundTasks({
   }, []);
 
   const patchTask = useCallback((id: string, patch: Partial<BackgroundTask>) => {
-    commitTasks(tasksRef.current.map((task) => (
-      task.id === id ? { ...task, ...patch } : task
-    )));
+    commitTasks(tasksRef.current.map((task) => {
+      if (task.id !== id) return task;
+      if (task.status === 'cancelled' && patch.status && patch.status !== 'cancelled') {
+        return task;
+      }
+      return { ...task, ...patch };
+    }));
   }, [commitTasks]);
 
   useEffect(() => {
@@ -97,17 +103,27 @@ export function useBackgroundTasks({
       if (isDatabasePayload(data)) {
         updateLocalState(data);
       }
+      const currentTask = tasksRef.current.find((t) => t.id === task.id);
+      if (currentTask?.status === 'cancelled') {
+        onDownloadCancelled(workshopId);
+        return;
+      }
       patchTask(task.id, { status: 'completed', progress: 100, finishedAt: nowIso() });
       onDownloadSuccess(workshopId);
     } catch (err) {
       const message = String(err);
-      patchTask(task.id, { status: 'failed', error: message, finishedAt: nowIso() });
-      onTaskError(message, workshopId);
+      const currentTask = tasksRef.current.find((t) => t.id === task.id);
+      if (currentTask?.status === 'cancelled') {
+        onDownloadCancelled(workshopId);
+      } else {
+        patchTask(task.id, { status: 'failed', error: message, finishedAt: nowIso() });
+        onTaskError(message, workshopId);
+      }
     } finally {
       activeDownloadsRef.current = Math.max(0, activeDownloadsRef.current - 1);
       processDownloadQueueRef.current();
     }
-  }, [onDownloadSuccess, onTaskError, patchTask, updateLocalState]);
+  }, [onDownloadCancelled, onDownloadSuccess, onTaskError, patchTask, updateLocalState]);
 
   const processDownloadQueue = useCallback(() => {
     while (activeDownloadsRef.current < DOWNLOAD_CONCURRENCY) {
@@ -121,9 +137,22 @@ export function useBackgroundTasks({
     processDownloadQueueRef.current = processDownloadQueue;
   }, [processDownloadQueue]);
 
-  const enqueueDownloads = useCallback((workshopIds: string[], source = 'user') => {
-    const cleanIds = [...new Set(workshopIds.map((id) => id.trim()).filter(Boolean))];
-    if (cleanIds.length === 0) return;
+  const enqueueDownloads = useCallback((
+    items: (string | { workshopId: string; title?: string; imagePath?: string })[],
+    source = 'user'
+  ) => {
+    const normalized = items.map((item) => {
+      if (typeof item === 'string') {
+        return { workshopId: item.trim() };
+      }
+      return {
+        workshopId: item.workshopId.trim(),
+        title: item.title,
+        imagePath: item.imagePath,
+      };
+    }).filter((x) => !!x.workshopId);
+
+    if (normalized.length === 0) return;
 
     const existing = new Set(
       tasksRef.current
@@ -131,22 +160,31 @@ export function useBackgroundTasks({
         .map((task) => task.targetIds[0])
     );
     const createdAt = nowIso();
-    const newTasks = cleanIds
-      .filter((id) => !existing.has(id))
-      .map<BackgroundTask>((id) => ({
-        id: taskId('download', id),
-        kind: 'download',
-        status: 'queued',
-        source,
-        targetIds: [id],
-        progress: 0,
-        createdAt,
-      }));
+    const newTasks = normalized
+      .filter((item) => !existing.has(item.workshopId))
+      .map<BackgroundTask>((item) => {
+        const id = item.workshopId;
+        const ad = Object.values(addons).find((a) => a.workshopId === id) ||
+                   Object.values(knownUninstalledAddons).find((a) => a.workshopId === id);
+        const resolvedTitle = item.title || ad?.steamDetails?.title || ad?.addonInfo?.addontitle || ad?.vpkName;
+        const taskTitle = resolvedTitle && resolvedTitle !== id ? `${resolvedTitle} (${id})` : id;
+        return {
+          id: taskId('download', id),
+          kind: 'download',
+          status: 'queued',
+          source,
+          targetIds: [id],
+          progress: 0,
+          createdAt,
+          title: taskTitle,
+          imagePath: item.imagePath || ad?.imagePath || undefined,
+        };
+      });
 
     if (newTasks.length === 0) return;
     commitTasks([...tasksRef.current, ...newTasks]);
     processDownloadQueueRef.current();
-  }, [commitTasks]);
+  }, [addons, knownUninstalledAddons, commitTasks]);
 
   const runCrawlTask = useCallback(async (task: BackgroundTask) => {
     const workshopId = task.targetIds[0];
@@ -221,20 +259,28 @@ export function useBackgroundTasks({
     const createdAt = nowIso();
     const newTasks = cleanIds
       .filter((id) => !existing.has(id))
-      .map<BackgroundTask>((id) => ({
-        id: taskId('workshop-crawl', id),
-        kind: 'workshop-crawl',
-        status: 'queued',
-        source,
-        targetIds: [id],
-        progress: 0,
-        createdAt,
-      }));
+      .map<BackgroundTask>((id) => {
+        const ad = Object.values(addons).find((a) => a.workshopId === id) ||
+                   Object.values(knownUninstalledAddons).find((a) => a.workshopId === id);
+        const resolvedTitle = ad?.steamDetails?.title || ad?.addonInfo?.addontitle || ad?.vpkName;
+        const taskTitle = resolvedTitle && resolvedTitle !== id ? `${resolvedTitle} (${id})` : id;
+        return {
+          id: taskId('workshop-crawl', id),
+          kind: 'workshop-crawl',
+          status: 'queued',
+          source,
+          targetIds: [id],
+          progress: 0,
+          createdAt,
+          title: taskTitle,
+          imagePath: ad?.imagePath || undefined,
+        };
+      });
 
     if (newTasks.length === 0) return;
     commitTasks([...tasksRef.current, ...newTasks]);
     processCrawlQueueRef.current();
-  }, [commitTasks]);
+  }, [addons, knownUninstalledAddons, commitTasks]);
 
   const recordSeenItems = useCallback(async (items: any[], source = 'workshop-browser') => {
     if (items.length === 0) return;
@@ -275,12 +321,67 @@ export function useBackgroundTasks({
     })();
   }, [addons, enabled, enqueueWorkshopCrawl, knownUninstalledAddons]);
 
-  // Future task-manager UI should consume these values/actions instead of invoking
-  // download/crawl commands directly.
+  const cancelTask = useCallback((id: string) => {
+    const task = tasksRef.current.find((t) => t.id === id);
+    if (!task) return;
+
+    patchTask(id, { status: 'cancelled', finishedAt: nowIso() });
+
+    if (task.kind === 'download') {
+      const workshopId = task.targetIds[0];
+      if (workshopId) {
+        onDownloadCancelled(workshopId);
+        if (task.status === 'running') {
+          void invoke('cancel_download', { workshopId }).catch((err) => {
+            console.error('Failed to cancel download:', err);
+          });
+        }
+      }
+    }
+
+    if (task.status !== 'queued') return;
+
+    if (task.kind === 'download') {
+      setTimeout(() => processDownloadQueueRef.current(), 0);
+    } else if (task.kind === 'workshop-crawl') {
+      setTimeout(() => processCrawlQueueRef.current(), 0);
+    }
+  }, [onDownloadCancelled, patchTask]);
+
+  const retryTask = useCallback((id: string) => {
+    const task = tasksRef.current.find((t) => t.id === id);
+    if (!task) return;
+
+    patchTask(id, {
+      status: 'queued',
+      progress: 0,
+      error: undefined,
+      createdAt: nowIso(),
+      startedAt: undefined,
+      finishedAt: undefined
+    });
+
+    if (task.kind === 'download') {
+      setTimeout(() => processDownloadQueueRef.current(), 0);
+    } else if (task.kind === 'workshop-crawl') {
+      setTimeout(() => processCrawlQueueRef.current(), 0);
+    }
+  }, [patchTask]);
+
+  const clearFinishedTasks = useCallback(() => {
+    const activeTasks = tasksRef.current.filter(
+      (task) => task.status === 'queued' || task.status === 'running'
+    );
+    commitTasks(activeTasks);
+  }, [commitTasks]);
+
   return {
     backgroundTasks,
     enqueueDownloads,
     enqueueWorkshopCrawl,
     recordSeenItems,
+    cancelTask,
+    retryTask,
+    clearFinishedTasks,
   };
 }

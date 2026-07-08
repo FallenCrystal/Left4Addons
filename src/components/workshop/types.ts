@@ -93,13 +93,16 @@ export interface WorkshopBrowserProps {
   addons: Record<string, any>;
   knownUninstalledAddons: Record<string, any>;
   downloadProgress: Record<string, number>;
-  onDownload: (workshopId: string) => void;
+  onDownload: (workshopId: string, title?: string, imagePath?: string) => void;
   onOpenLink: (url: string) => void;
   onImportCollection: (name: string, itemIds: string[]) => void;
   onRecordSeenItems?: (items: WorkshopItem[], source?: string) => void;
   onDatabaseUpdate?: (data: DatabasePayload) => void;
   isSubmitting: boolean;
   groups?: import('../../types/addon').Group[];
+  backgroundTasks: import('../../types/addon').BackgroundTask[];
+  syncingSteam: boolean;
+  onOpenTaskCenter: () => void;
 }
 
 export interface WorkshopCapabilities {

@@ -15,7 +15,7 @@ interface DetailDrawerProps {
   downloadProgress: Record<string, number>;
   isSubmitting: boolean;
   onClose: () => void;
-  onDownload: (workshopId: string) => void;
+  onDownload: (workshopId: string, title?: string, imagePath?: string) => void;
   onOpenLink: (url: string) => void;
   onCreatorClick: (id: string, name: string) => void;
   onTagClick: (tagId: string, tagName: string) => void;
@@ -59,12 +59,13 @@ export const DetailDrawer: React.FC<DetailDrawerProps> = ({
 
   const handleDownloadAllCollection = () => {
     if (!selectedCollection) return;
-    const itemIds = selectedCollection.items.map((item) => item.publishedfileid);
-    itemIds.forEach((id) => onDownload(id));
+    selectedCollection.items.forEach((item) => {
+      onDownload(item.publishedfileid, item.title, item.preview_url);
+    });
     setAlertInfo({
       open: true,
       title: t('common.success') || '成功',
-      message: t('workshop.detail.downloadAllSuccess', { count: itemIds.length }),
+      message: t('workshop.detail.downloadAllSuccess', { count: selectedCollection.items.length }),
     });
   };
 
@@ -153,7 +154,7 @@ interface ItemDetailProps {
   item: any;
   downloadProgress: Record<string, number>;
   isSubmitting: boolean;
-  onDownload: (workshopId: string) => void;
+  onDownload: (workshopId: string, title?: string, imagePath?: string) => void;
   onOpenLink: (url: string) => void;
   onCreatorClick: (id: string, name: string) => void;
   onTagClick: (tagId: string, tagName: string) => void;
@@ -287,7 +288,7 @@ const ItemDetail: React.FC<ItemDetailProps> = ({
       <div style={{ marginTop: 'auto', display: 'flex', flexDirection: 'column', gap: '8px' }}>
         <button
           className="btn btn-primary"
-          onClick={() => onDownload(item.publishedfileid)}
+          onClick={() => onDownload(item.publishedfileid, item.title, item.preview_url)}
           disabled={downloadProgress[item.publishedfileid] !== undefined || isSubmitting}
           style={{
             borderRadius: '100px',

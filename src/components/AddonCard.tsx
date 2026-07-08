@@ -15,7 +15,7 @@ interface AddonCardProps {
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
   onDetailClick: (addon: Addon) => void;
-  onDownload?: (workshopId: string) => void;
+  onDownload?: (workshopId: string, title?: string, imagePath?: string) => void;
   isSelectMode: boolean;
   isSelected: boolean;
   onSelectToggle: (id: string) => void;
@@ -171,7 +171,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                     className="btn btn-primary btn-icon-only"
                     onClick={(e) => {
                       e.stopPropagation();
-                      onDownload(addon.workshopId!);
+                      onDownload(addon.workshopId!, title, addon.imagePath);
                     }}
                     disabled={isSubmitting || isDownloading}
                     title={isDownloading ? `${downloadPercent}%` : t('workshop.detail.download')}

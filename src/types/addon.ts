@@ -117,6 +117,8 @@ export interface BackgroundTask {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  title?: string;
+  imagePath?: string;
 }
 
 export interface Group {

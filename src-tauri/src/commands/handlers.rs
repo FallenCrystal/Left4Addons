@@ -18,6 +18,8 @@ use super::types::{
     Settings, SettingsStore, WorkshopSeenItem,
 };
 
+const DOWNLOAD_CANCELLED_ERR: &str = "Download cancelled";
+
 fn resolve_cache_file(cache_dir: &Path, image_path: &str) -> Result<PathBuf, String> {
     let filename = image_path.strip_prefix("/cache/").unwrap_or(image_path);
     let rel_path = Path::new(filename);
@@ -106,6 +108,32 @@ fn ensure_background_workshop_fetch_allowed(
         "Background workshop fetch blocked: workshop item {} is not present in known_addons",
         workshop_id
     ))
+}
+
+fn request_download_cancellation(state: &crate::AppState, workshop_id: &str) -> Result<(), String> {
+    let mut cancelled = state
+        .cancelled_downloads
+        .lock()
+        .map_err(|_| "Failed to acquire cancelled downloads lock".to_string())?;
+    cancelled.insert(workshop_id.to_string());
+    Ok(())
+}
+
+fn clear_download_cancellation(state: &crate::AppState, workshop_id: &str) -> Result<(), String> {
+    let mut cancelled = state
+        .cancelled_downloads
+        .lock()
+        .map_err(|_| "Failed to acquire cancelled downloads lock".to_string())?;
+    cancelled.remove(workshop_id);
+    Ok(())
+}
+
+fn is_download_cancelled(state: &crate::AppState, workshop_id: &str) -> Result<bool, String> {
+    let cancelled = state
+        .cancelled_downloads
+        .lock()
+        .map_err(|_| "Failed to acquire cancelled downloads lock".to_string())?;
+    Ok(cancelled.contains(workshop_id))
 }
 
 fn is_dummy_vpk(path: &Path) -> bool {
@@ -734,6 +762,7 @@ async fn fetch_collection_children_hybrid(
 }
 
 async fn attempt_bridge_download(
+    state: &crate::AppState,
     workshop_service: &WorkshopService,
     workshop_id: &str,
     workshop_dir: &Path,
@@ -760,6 +789,10 @@ async fn attempt_bridge_download(
     let expected_disabled_path = workshop_dir.join(format!("{}.vpk.disabled", workshop_id));
 
     for _ in 0..40 {
+        if is_download_cancelled(state, workshop_id)? {
+            return Err(DOWNLOAD_CANCELLED_ERR.to_string());
+        }
+
         let status: BridgeDownloadStatus =
             match workshop_service.bridge_download_status(workshop_id) {
                 Ok(status) => status,
@@ -2852,188 +2885,212 @@ pub async fn download_addon(
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
-    let details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
-    if details_list.is_empty() {
-        return Err("Failed to retrieve details for workshop item".to_string());
-    }
-    let details = details_list[0].clone();
+    clear_download_cancellation(&state, &workshop_id)?;
 
-    let title = details
-        .get("title")
-        .and_then(|t| t.as_str())
-        .unwrap_or("Workshop Item");
+    let result = async {
+        let details_list =
+            fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
+        if details_list.is_empty() {
+            return Err("Failed to retrieve details for workshop item".to_string());
+        }
+        let details = details_list[0].clone();
 
-    let workshop_dir = {
-        let db = state.db.lock().await;
-        PathBuf::from(&db.settings.workshop_dir)
-    };
-    if !workshop_dir.exists() {
-        fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
-    }
-    let dest_filename = format!("{}.vpk", workshop_id);
-    let dest_path = workshop_dir.join(&dest_filename);
-    if dest_path.exists() {
-        return Err(format!(
-            "Addon file already exists: {}",
-            dest_path.display()
-        ));
-    }
-    let disabled_dest_path = dest_path.with_extension("vpk.disabled");
-    if disabled_dest_path.exists() {
-        return Err(format!(
-            "Disabled addon file already exists: {}",
-            disabled_dest_path.display()
-        ));
-    }
-    let tmp_path = workshop_dir.join(format!("{}.download", dest_filename));
-    if tmp_path.exists() {
-        fs::remove_file(&tmp_path)
-            .map_err(|e| format!("Failed to remove stale download file: {}", e))?;
-    }
+        let title = details
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Workshop Item");
 
-    if let Ok(downloaded_via_bridge) = attempt_bridge_download(
-        &state.workshop_service,
-        &workshop_id,
-        &workshop_dir,
-        &app_handle,
-    )
-    .await
-    {
-        if downloaded_via_bridge {
-            crate::watcher::suppress_internal_refresh(&state);
-            let mut db = state.db.lock().await;
-            scan_addons_internal(
-                &mut db,
-                &state.settings_path,
-                &state.groups_path,
-                &state.known_addons_path,
-                &state.cache_dir,
-                &state.workshop_service,
-            )
-            .await?;
-            return Ok(database_with_workshop_cache(
-                &db,
-                &state.workshop_cache_path,
+        let workshop_dir = {
+            let db = state.db.lock().await;
+            PathBuf::from(&db.settings.workshop_dir)
+        };
+        if !workshop_dir.exists() {
+            fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
+        }
+        let dest_filename = format!("{}.vpk", workshop_id);
+        let dest_path = workshop_dir.join(&dest_filename);
+        if dest_path.exists() {
+            return Err(format!(
+                "Addon file already exists: {}",
+                dest_path.display()
             ));
         }
-    }
+        let disabled_dest_path = dest_path.with_extension("vpk.disabled");
+        if disabled_dest_path.exists() {
+            return Err(format!(
+                "Disabled addon file already exists: {}",
+                disabled_dest_path.display()
+            ));
+        }
+        let tmp_path = workshop_dir.join(format!("{}.download", dest_filename));
+        if tmp_path.exists() {
+            fs::remove_file(&tmp_path)
+                .map_err(|e| format!("Failed to remove stale download file: {}", e))?;
+        }
 
-    let file_url = details
-        .get("file_url")
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            "Workshop item has no download URL (SDK did not install it and Web API has no direct file URL)".to_string()
-        })?;
-
-    println!("Downloading: {} (URL: {})", title, file_url);
-    let client = reqwest::Client::new();
-    let mut response = client
-        .get(&file_url)
-        .send()
+        match attempt_bridge_download(
+            &state,
+            &state.workshop_service,
+            &workshop_id,
+            &workshop_dir,
+            &app_handle,
+        )
         .await
-        .map_err(|e| format!("Download request failed: {}", e))?;
-    if !response.status().is_success() {
-        return Err(format!(
-            "Download server responded with status {}",
-            response.status()
-        ));
-    }
+        {
+            Ok(true) => {
+                crate::watcher::suppress_internal_refresh(&state);
+                let mut db = state.db.lock().await;
+                scan_addons_internal(
+                    &mut db,
+                    &state.settings_path,
+                    &state.groups_path,
+                    &state.known_addons_path,
+                    &state.cache_dir,
+                    &state.workshop_service,
+                )
+                .await?;
+                return Ok(database_with_workshop_cache(
+                    &db,
+                    &state.workshop_cache_path,
+                ));
+            }
+            Ok(false) => {}
+            Err(err) if err == DOWNLOAD_CANCELLED_ERR => return Err(err),
+            Err(_) => {}
+        }
 
-    let total_size = response.content_length().unwrap_or(0);
-    let mut file =
-        fs::File::create(&tmp_path).map_err(|e| format!("Failed to create local file: {}", e))?;
-    let mut downloaded = 0;
+        let file_url = details
+            .get("file_url")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| {
+                "Workshop item has no download URL (SDK did not install it and Web API has no direct file URL)".to_string()
+            })?;
 
-    #[derive(Serialize, Clone)]
-    struct DownloadProgress {
-        #[serde(rename = "workshopId")]
-        workshop_id: String,
-        percent: u32,
-        downloaded: u64,
-        total: u64,
-        source: String,
-        phase: String,
-    }
+        println!("Downloading: {} (URL: {})", title, file_url);
+        let client = reqwest::Client::new();
+        let mut response = client
+            .get(&file_url)
+            .send()
+            .await
+            .map_err(|e| format!("Download request failed: {}", e))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Download server responded with status {}",
+                response.status()
+            ));
+        }
 
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("Download chunk failed: {}", e))?
-    {
-        use std::io::Write;
-        file.write_all(&chunk)
-            .map_err(|e| format!("Failed to write chunk: {}", e))?;
-        downloaded += chunk.len() as u64;
+        let total_size = response.content_length().unwrap_or(0);
+        let mut file = fs::File::create(&tmp_path)
+            .map_err(|e| format!("Failed to create local file: {}", e))?;
+        let mut downloaded = 0;
 
-        let percent = if total_size > 0 {
-            (downloaded as f64 / total_size as f64 * 100.0) as u32
-        } else {
-            0
-        };
+        #[derive(Serialize, Clone)]
+        struct DownloadProgress {
+            #[serde(rename = "workshopId")]
+            workshop_id: String,
+            percent: u32,
+            downloaded: u64,
+            total: u64,
+            source: String,
+            phase: String,
+        }
 
-        let _ = app_handle.emit(
-            "download-progress",
-            DownloadProgress {
-                workshop_id: workshop_id.clone(),
-                percent,
-                downloaded,
-                total: total_size,
-                source: "web-fallback".to_string(),
-                phase: "fallback-download".to_string(),
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| format!("Download chunk failed: {}", e))?
+        {
+            if is_download_cancelled(&state, &workshop_id)? {
+                drop(file);
+                fs::remove_file(&tmp_path).ok();
+                return Err(DOWNLOAD_CANCELLED_ERR.to_string());
+            }
+
+            use std::io::Write;
+            file.write_all(&chunk)
+                .map_err(|e| format!("Failed to write chunk: {}", e))?;
+            downloaded += chunk.len() as u64;
+
+            let percent = if total_size > 0 {
+                (downloaded as f64 / total_size as f64 * 100.0) as u32
+            } else {
+                0
+            };
+
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgress {
+                    workshop_id: workshop_id.clone(),
+                    percent,
+                    downloaded,
+                    total: total_size,
+                    source: "web-fallback".to_string(),
+                    phase: "fallback-download".to_string(),
+                },
+            );
+        }
+        file.flush()
+            .map_err(|e| format!("Failed to flush downloaded file: {}", e))?;
+        drop(file);
+
+        if is_download_cancelled(&state, &workshop_id)? {
+            fs::remove_file(&tmp_path).ok();
+            return Err(DOWNLOAD_CANCELLED_ERR.to_string());
+        }
+
+        crate::watcher::suppress_internal_refresh(&state);
+        fs::rename(&tmp_path, &dest_path)
+            .map_err(|e| format!("Failed to finalize downloaded file: {}", e))?;
+
+        let mut known_addons = load_known_addons(&state.known_addons_path);
+
+        let has_image = details.get("preview_url").is_some();
+        let image_path = details
+            .get("preview_url")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+
+        let id = workshop_id.clone();
+        known_addons.insert(
+            id.clone(),
+            KnownAddonEntry {
+                id: id.clone(),
+                vpk_name: dest_filename.clone(),
+                workshop_id: Some(workshop_id.clone()),
+                addon_info: serde_json::Value::Null,
+                has_image,
+                image_path,
+                steam_details: Some(details.clone()),
             },
         );
+
+        fs::write(
+            &state.known_addons_path,
+            serde_json::to_string_pretty(&known_addons).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+
+        let mut db = state.db.lock().await;
+        scan_addons_internal(
+            &mut db,
+            &state.settings_path,
+            &state.groups_path,
+            &state.known_addons_path,
+            &state.cache_dir,
+            &state.workshop_service,
+        )
+        .await?;
+        Ok(database_with_workshop_cache(
+            &db,
+            &state.workshop_cache_path,
+        ))
     }
-    file.flush()
-        .map_err(|e| format!("Failed to flush downloaded file: {}", e))?;
-    drop(file);
-    crate::watcher::suppress_internal_refresh(&state);
-    fs::rename(&tmp_path, &dest_path)
-        .map_err(|e| format!("Failed to finalize downloaded file: {}", e))?;
+    .await;
 
-    let mut known_addons = load_known_addons(&state.known_addons_path);
-
-    let has_image = details.get("preview_url").is_some();
-    let image_path = details
-        .get("preview_url")
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string());
-
-    let id = workshop_id.clone();
-    known_addons.insert(
-        id.clone(),
-        KnownAddonEntry {
-            id: id.clone(),
-            vpk_name: dest_filename.clone(),
-            workshop_id: Some(workshop_id.clone()),
-            addon_info: serde_json::Value::Null,
-            has_image,
-            image_path,
-            steam_details: Some(details.clone()),
-        },
-    );
-
-    fs::write(
-        &state.known_addons_path,
-        serde_json::to_string_pretty(&known_addons).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-
-    let mut db = state.db.lock().await;
-    scan_addons_internal(
-        &mut db,
-        &state.settings_path,
-        &state.groups_path,
-        &state.known_addons_path,
-        &state.cache_dir,
-        &state.workshop_service,
-    )
-    .await?;
-    Ok(database_with_workshop_cache(
-        &db,
-        &state.workshop_cache_path,
-    ))
+    let _ = clear_download_cancellation(&state, &workshop_id);
+    result
 }
 
 #[tauri::command]
@@ -3402,6 +3459,14 @@ pub async fn save_background_task_snapshot(
         .map_err(|e| format!("Failed to serialize background tasks: {}", e))?;
     fs::write(&state.background_tasks_path, json)
         .map_err(|e| format!("Failed to write background tasks: {}", e))
+}
+
+#[tauri::command]
+pub async fn cancel_download(
+    workshop_id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<(), String> {
+    request_download_cancellation(&state, &workshop_id)
 }
 
 #[tauri::command]

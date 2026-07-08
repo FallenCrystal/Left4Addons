@@ -379,4 +379,92 @@ describe('useAddonManager', () => {
 
     expect(result.current.toasts.some((toast) => toast.message.includes('watcher failed'))).toBe(true);
   });
+
+  test('should track download progress from progress events', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      eventListeners.get('download-progress')?.({
+        payload: {
+          workshopId: '12345',
+          percent: 50,
+          downloaded: 8 * 1024 * 1024,
+          total: 16 * 1024 * 1024,
+          source: 'web-fallback',
+          phase: 'fallback-download',
+        },
+      });
+    });
+
+    expect(result.current.downloadProgress['12345']).toBe(50);
+  });
+
+  test('should request backend download cancellation when cancelling a running download task', async () => {
+    let resolveDownload: ((value: DatabasePayload) => void) | undefined;
+    const downloadPromise = new Promise<DatabasePayload>((resolve) => {
+      resolveDownload = resolve;
+    });
+
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: mockGroups,
+          settings: mockSettings,
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([
+          {
+            id: 'download_12345_test',
+            kind: 'download',
+            status: 'running',
+            targetIds: ['12345'],
+            progress: 42,
+            createdAt: new Date().toISOString(),
+            title: 'Addon Two (12345)',
+          },
+        ]);
+      }
+      if (cmd === 'cancel_download') {
+        return Promise.resolve(null);
+      }
+      if (cmd === 'download_addon') {
+        return downloadPromise;
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+      expect(result.current.backgroundTasks).toHaveLength(1);
+      expect(result.current.backgroundTasks[0].status).toBe('running');
+    });
+
+    act(() => {
+      result.current.cancelTask('download_12345_test');
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('cancel_download', { workshopId: '12345' });
+    expect(result.current.backgroundTasks[0].status).toBe('cancelled');
+
+    resolveDownload?.({
+      addons: mockAddons,
+      knownUninstalledAddons: {},
+      groups: mockGroups,
+      masterCollections: [],
+      settings: mockSettings,
+    });
+  });
 });

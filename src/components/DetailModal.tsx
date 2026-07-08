@@ -20,7 +20,7 @@ interface DetailModalProps {
   knownUninstalledAddons: Record<string, any>;
   onItemNavigate: (workshopId: string) => void;
   onDatabaseUpdate?: (data: DatabasePayload) => void;
-  onDownload?: (workshopId: string) => void;
+  onDownload?: (workshopId: string, title?: string, imagePath?: string) => void;
   downloadProgress?: Record<string, number>;
   isSubmitting?: boolean;
 }
@@ -310,7 +310,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               addon.workshopId && onDownload && (
                 <button
                   className="btn btn-primary"
-                  onClick={() => onDownload(addon.workshopId!)}
+                  onClick={() => onDownload(addon.workshopId!, title, addon.imagePath)}
                   disabled={isSubmitting || isDownloading}
                   style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}
                 >
