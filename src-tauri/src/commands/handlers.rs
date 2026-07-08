@@ -180,6 +180,16 @@ fn cache_image_extension(content_type: Option<&str>, url: &reqwest::Url) -> &'st
     "jpg"
 }
 
+fn find_cached_remote_image(cache_dir: &Path, hash: &str) -> Option<String> {
+    for extension in ["jpg", "png", "webp"] {
+        let filename = format!("{}_remote_image.{}", hash, extension);
+        if cache_dir.join(&filename).exists() {
+            return Some(format!("/cache/{}", filename));
+        }
+    }
+    None
+}
+
 fn workshop_html_fetch_gate() -> &'static Mutex<WorkshopHtmlFetchGate> {
     WORKSHOP_HTML_FETCH_GATE.get_or_init(|| Mutex::new(WorkshopHtmlFetchGate::default()))
 }
@@ -331,8 +341,13 @@ fn persist_seen_workshop_item_entry(
 ) {
     insert_non_empty_string(obj, "workshopId", &item.workshop_id);
     insert_non_empty_string(obj, "title", &item.title);
-    insert_non_empty_string(obj, "creatorName", &item.author_name);
-    insert_non_empty_string(obj, "authorName", &item.author_name);
+    let author_ids = [
+        item.author_id.clone(),
+        item.author_steam_id.clone().unwrap_or_default(),
+        item.author_account_id.clone().unwrap_or_default(),
+        item.author_vanity_id.clone().unwrap_or_default(),
+    ];
+    insert_author_name_if_useful(obj, &item.author_name, &author_ids);
     insert_non_empty_string(obj, "creatorId", &item.author_id);
     insert_non_empty_string(obj, "authorId", &item.author_id);
     insert_non_empty_string(obj, "creatorProfileUrl", &item.author_url);
@@ -413,8 +428,24 @@ fn persist_workshop_page_details_entry(
         insert_non_empty_string(obj, "title", title);
     }
     if let Some(creator_name) = details.get("creatorName").and_then(|v| v.as_str()) {
-        insert_non_empty_string(obj, "creatorName", creator_name);
-        insert_non_empty_string(obj, "authorName", creator_name);
+        let author_ids = [
+            details
+                .get("creatorSteamId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            details
+                .get("creatorAccountId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            details
+                .get("creatorVanityId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ];
+        insert_author_name_if_useful(obj, creator_name, &author_ids);
     }
     if let Some(profile_url) = details.get("creatorProfileUrl").and_then(|v| v.as_str()) {
         insert_non_empty_string(obj, "creatorProfileUrl", profile_url);
@@ -894,6 +925,253 @@ fn load_workshop_cache(cache_path: &Path) -> HashMap<String, serde_json::Value> 
     HashMap::new()
 }
 
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn account_id_to_steam_id(account_id: &str) -> Option<String> {
+    let account = account_id.trim().parse::<u64>().ok()?;
+    Some((76561197960265728u64 + account).to_string())
+}
+
+fn known_addon_to_workshop_cache_entry(
+    key: &str,
+    entry: &KnownAddonEntry,
+) -> Option<(String, serde_json::Value)> {
+    let workshop_id = entry
+        .workshop_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or_else(|| {
+            let trimmed = key.trim();
+            trimmed
+                .chars()
+                .all(|c| c.is_ascii_digit())
+                .then_some(trimmed)
+        })?;
+
+    let mut obj = serde_json::Map::new();
+    insert_non_empty_string(&mut obj, "workshopId", workshop_id);
+    insert_non_empty_string(&mut obj, "title", &entry.vpk_name);
+    if let Some(image_path) = entry.image_path.as_deref() {
+        insert_non_empty_string(&mut obj, "imagePath", image_path);
+        insert_non_empty_string(&mut obj, "previewUrl", image_path);
+    }
+
+    if let Some(details) = entry.steam_details.as_ref() {
+        if let Some(title) = json_string(details, "title") {
+            insert_non_empty_string(&mut obj, "title", &title);
+        }
+        if let Some(preview_url) = json_string(details, "preview_url") {
+            insert_non_empty_string(&mut obj, "previewUrl", &preview_url);
+            insert_non_empty_string(&mut obj, "imagePath", &preview_url);
+        }
+        if let Some(description) = json_string(details, "description") {
+            insert_non_empty_string(&mut obj, "description", &description);
+            insert_non_empty_string(&mut obj, "shortDescription", &description);
+        }
+        if let Some(creator) = json_string(details, "creator") {
+            insert_non_empty_string(&mut obj, "creatorId", &creator);
+            if creator.chars().all(|c| c.is_ascii_digit()) {
+                insert_non_empty_string(&mut obj, "creatorSteamId", &creator);
+            }
+        }
+        if let Some(account_id) = json_string(details, "creator_account_id") {
+            insert_non_empty_string(&mut obj, "creatorAccountId", &account_id);
+            if let Some(steam_id) = account_id_to_steam_id(&account_id) {
+                insert_non_empty_string(&mut obj, "creatorSteamId", &steam_id);
+            }
+        }
+        if let Some(vanity_id) = json_string(details, "creator_vanity_id") {
+            insert_non_empty_string(&mut obj, "creatorVanityId", &vanity_id);
+        }
+        if let Some(creator_name) = json_string(details, "creator_name") {
+            let ids = [
+                json_string(&serde_json::Value::Object(obj.clone()), "creatorSteamId")
+                    .unwrap_or_default(),
+                json_string(&serde_json::Value::Object(obj.clone()), "creatorAccountId")
+                    .unwrap_or_default(),
+                json_string(&serde_json::Value::Object(obj.clone()), "creatorVanityId")
+                    .unwrap_or_default(),
+            ];
+            insert_author_name_if_useful(&mut obj, &creator_name, &ids);
+        }
+        if let Some(file_size) = json_string(details, "file_size") {
+            insert_non_empty_string(&mut obj, "fileSizeDisplay", &file_size);
+        }
+        if let Some(tags) = details.get("tags").cloned() {
+            obj.insert("tags".to_string(), tags);
+        }
+        obj.insert("steamDetails".to_string(), details.clone());
+    }
+
+    Some((workshop_id.to_string(), serde_json::Value::Object(obj)))
+}
+
+fn merge_workshop_cache_values(base: &mut serde_json::Value, overlay: serde_json::Value) {
+    let Some(base_obj) = base.as_object_mut() else {
+        *base = overlay;
+        return;
+    };
+    let Some(overlay_obj) = overlay.as_object() else {
+        *base = overlay;
+        return;
+    };
+    for (key, value) in overlay_obj {
+        if !value.is_null() {
+            base_obj.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+fn load_known_addons_as_workshop_cache(
+    known_addons_path: &Path,
+) -> HashMap<String, serde_json::Value> {
+    load_known_addons(known_addons_path)
+        .iter()
+        .filter_map(|(key, entry)| known_addon_to_workshop_cache_entry(key, entry))
+        .collect()
+}
+
+fn author_identity_values(obj: &serde_json::Map<String, serde_json::Value>) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for key in [
+        "creatorSteamId",
+        "creatorAccountId",
+        "creatorVanityId",
+        "creatorId",
+        "authorId",
+        "creatorProfileUrl",
+        "authorUrl",
+    ] {
+        if let Some(value) = obj.get(key).and_then(|v| v.as_str()) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                ids.insert(trimmed.to_lowercase());
+                if key == "creatorAccountId" {
+                    if let Some(steam_id) = account_id_to_steam_id(trimmed) {
+                        ids.insert(steam_id);
+                    }
+                }
+                if let Some(profile_id) = trimmed
+                    .split("/profiles/")
+                    .nth(1)
+                    .and_then(|s| s.split('/').next())
+                {
+                    if !profile_id.is_empty() {
+                        ids.insert(profile_id.to_lowercase());
+                    }
+                }
+                if let Some(vanity_id) = trimmed
+                    .split("/id/")
+                    .nth(1)
+                    .and_then(|s| s.split('/').next())
+                {
+                    if !vanity_id.is_empty() {
+                        ids.insert(vanity_id.to_lowercase());
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn propagate_author_names(cache: &mut HashMap<String, serde_json::Value>) {
+    let learned: Vec<(String, Option<String>, HashSet<String>)> = cache
+        .values()
+        .filter_map(|value| {
+            let obj = value.as_object()?;
+            let ids = author_identity_values(obj);
+            let name = obj
+                .get("creatorName")
+                .or_else(|| obj.get("authorName"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|name| {
+                    !looks_like_placeholder_author_name(
+                        name,
+                        &ids.iter().cloned().collect::<Vec<_>>(),
+                    )
+                })?;
+            let url = obj
+                .get("creatorProfileUrl")
+                .or_else(|| obj.get("authorUrl"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty());
+            Some((name.to_string(), url, ids))
+        })
+        .collect();
+
+    if learned.is_empty() {
+        return;
+    }
+
+    for value in cache.values_mut() {
+        let Some(obj) = value.as_object_mut() else {
+            continue;
+        };
+        let ids = author_identity_values(obj);
+        if ids.is_empty() {
+            continue;
+        }
+        let current_name = obj
+            .get("creatorName")
+            .or_else(|| obj.get("authorName"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        for (name, url, learned_ids) in &learned {
+            if ids.is_disjoint(learned_ids) {
+                continue;
+            }
+            let ids_vec = ids.iter().cloned().collect::<Vec<_>>();
+            if looks_like_placeholder_author_name(current_name, &ids_vec) {
+                insert_non_empty_string(obj, "creatorName", name);
+                insert_non_empty_string(obj, "authorName", name);
+            }
+            if let Some(url) = url {
+                insert_non_empty_string(obj, "creatorProfileUrl", url);
+                insert_non_empty_string(obj, "authorUrl", url);
+            }
+            break;
+        }
+    }
+}
+
+fn merge_known_addon_snapshots_into_cache(
+    cache: &mut HashMap<String, serde_json::Value>,
+    known_addons_path: &Path,
+) {
+    for (workshop_id, mut known_value) in load_known_addons_as_workshop_cache(known_addons_path) {
+        if let Some(existing) = cache.get(&workshop_id).cloned() {
+            merge_workshop_cache_values(&mut known_value, existing);
+        }
+        cache.insert(workshop_id, known_value);
+    }
+}
+
+fn workshop_cache_with_known_addons(
+    cache_path: &Path,
+    known_addons_path: &Path,
+) -> HashMap<String, serde_json::Value> {
+    let mut combined = load_known_addons_as_workshop_cache(known_addons_path);
+    for (workshop_id, value) in load_workshop_cache(cache_path) {
+        if let Some(existing) = combined.get_mut(&workshop_id) {
+            merge_workshop_cache_values(existing, value);
+        } else {
+            combined.insert(workshop_id, value);
+        }
+    }
+    propagate_author_names(&mut combined);
+    combined
+}
+
 fn save_workshop_cache(
     cache_path: &Path,
     cache: &HashMap<String, serde_json::Value>,
@@ -922,6 +1200,30 @@ fn insert_non_empty_string(
             serde_json::Value::String(value.to_string()),
         );
     }
+}
+
+fn looks_like_placeholder_author_name(name: &str, ids: &[String]) -> bool {
+    let name = name.trim();
+    if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+
+    ids.iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .any(|id| name.eq_ignore_ascii_case(id))
+}
+
+fn insert_author_name_if_useful(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    ids: &[String],
+) {
+    if looks_like_placeholder_author_name(name, ids) {
+        return;
+    }
+    insert_non_empty_string(obj, "creatorName", name);
+    insert_non_empty_string(obj, "authorName", name);
 }
 
 fn insert_optional_value(
@@ -1082,8 +1384,12 @@ fn merge_workshop_details_into_addon(addon: &mut Addon, details: &serde_json::Va
     }
 }
 
-fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Database {
-    let cache = load_workshop_cache(workshop_cache_path);
+fn database_with_workshop_cache(
+    db: &Database,
+    workshop_cache_path: &Path,
+    known_addons_path: &Path,
+) -> Database {
+    let cache = workshop_cache_with_known_addons(workshop_cache_path, known_addons_path);
     if cache.is_empty() {
         return db.clone();
     }
@@ -1109,7 +1415,8 @@ fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Da
 pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<(Database, bool), String> {
     let state = app_handle.state::<crate::AppState>();
     let mut db = state.db.lock().await;
-    let before = database_with_workshop_cache(&db, &state.workshop_cache_path);
+    let before =
+        database_with_workshop_cache(&db, &state.workshop_cache_path, &state.known_addons_path);
     scan_addons_internal(
         &mut db,
         &state.settings_path,
@@ -1119,7 +1426,8 @@ pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<(Databas
         &state.workshop_service,
     )
     .await?;
-    let after = database_with_workshop_cache(&db, &state.workshop_cache_path);
+    let after =
+        database_with_workshop_cache(&db, &state.workshop_cache_path, &state.known_addons_path);
     let changed = after != before;
     Ok((after, changed))
 }
@@ -2008,6 +2316,7 @@ pub async fn save_settings(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -2026,6 +2335,7 @@ pub async fn get_addons(state: State<'_, crate::AppState>) -> Result<Database, S
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -2052,6 +2362,9 @@ pub async fn cache_remote_image(
     let mut hasher = Md5::new();
     hasher.update(parsed.as_str().as_bytes());
     let hash = format!("{:x}", hasher.finalize());
+    if let Some(cached_path) = find_cached_remote_image(&state.cache_dir, &hash) {
+        return Ok(cached_path);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
@@ -2205,6 +2518,7 @@ pub async fn move_addons(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -2281,6 +2595,7 @@ pub async fn toggle_addons(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -2372,6 +2687,7 @@ pub async fn rename_addon(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -2509,6 +2825,7 @@ pub async fn rename_addons(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -3081,6 +3398,7 @@ pub async fn group_action(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -3227,6 +3545,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         return Ok(database_with_workshop_cache(
             &db,
             &state.workshop_cache_path,
+            &state.known_addons_path,
         ));
     }
 
@@ -3235,6 +3554,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         return Ok(database_with_workshop_cache(
             &db,
             &state.workshop_cache_path,
+            &state.known_addons_path,
         ));
     }
 
@@ -3474,6 +3794,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -3704,6 +4025,7 @@ pub async fn delete_addons(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -3790,6 +4112,7 @@ pub async fn download_addon(
                 return Ok(database_with_workshop_cache(
                     &db,
                     &state.workshop_cache_path,
+                    &state.known_addons_path,
                 ));
             }
             Ok(false) => {}
@@ -3923,6 +4246,7 @@ pub async fn download_addon(
         Ok(database_with_workshop_cache(
             &db,
             &state.workshop_cache_path,
+            &state.known_addons_path,
         ))
     }
     .await;
@@ -4059,6 +4383,7 @@ pub async fn add_known_addon(
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -4066,7 +4391,10 @@ pub async fn add_known_addon(
 pub async fn get_workshop_cache(
     state: State<'_, crate::AppState>,
 ) -> Result<HashMap<String, serde_json::Value>, String> {
-    Ok(load_workshop_cache(&state.workshop_cache_path))
+    Ok(workshop_cache_with_known_addons(
+        &state.workshop_cache_path,
+        &state.known_addons_path,
+    ))
 }
 
 #[tauri::command]
@@ -4093,11 +4421,14 @@ pub async fn record_workshop_items_seen(
         persist_seen_workshop_item_entry(obj, &item, &source, &now, allow_rich_content);
     }
 
+    merge_known_addon_snapshots_into_cache(&mut cache, &state.known_addons_path);
+    propagate_author_names(&mut cache);
     save_workshop_cache(&state.workshop_cache_path, &cache)?;
     let db = state.db.lock().await;
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -4121,11 +4452,8 @@ pub async fn persist_workshop_page_details(
         &state.known_addons_path,
         &state.groups_path,
     )?;
-    let allow_rich_content = is_known_workshop_id(
-        &state.known_addons_path,
-        &state.groups_path,
-        &workshop_id,
-    );
+    let allow_rich_content =
+        is_known_workshop_id(&state.known_addons_path, &state.groups_path, &workshop_id);
 
     {
         let obj = cache_entry_object(&mut cache, &workshop_id);
@@ -4169,11 +4497,14 @@ pub async fn persist_workshop_page_details(
         }
     }
 
+    merge_known_addon_snapshots_into_cache(&mut cache, &state.known_addons_path);
+    propagate_author_names(&mut cache);
     save_workshop_cache(&state.workshop_cache_path, &cache)?;
     let db = state.db.lock().await;
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
+        &state.known_addons_path,
     ))
 }
 
@@ -4224,8 +4555,9 @@ pub async fn append_workshop_crawl_log(
 mod tests {
     use super::{
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
-        is_background_workshop_fetch_source, persist_seen_workshop_item_entry,
-        persist_workshop_page_details_entry,
+        is_background_workshop_fetch_source, merge_known_addon_snapshots_into_cache,
+        persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
+        propagate_author_names, workshop_cache_with_known_addons,
     };
     use crate::commands::types::WorkshopSeenItem;
     use serde_json::json;
@@ -4464,5 +4796,99 @@ mod tests {
         assert!(obj.get("imageGallery").is_none());
         assert!(obj.get("galleryUrls").is_none());
         assert!(obj.get("backgroundImageUrl").is_none());
+    }
+
+    #[test]
+    fn known_addons_are_exposed_as_workshop_snapshots() {
+        let known_addons_path = write_known_addons_file(
+            "snapshot",
+            json!({
+                "3560883926": {
+                    "id": "3560883926",
+                    "vpkName": "Early Days PART 1/6",
+                    "workshopId": "3560883926",
+                    "addonInfo": null,
+                    "hasImage": true,
+                    "imagePath": "https://example.com/preview.jpg",
+                    "steamDetails": {
+                        "publishedfileid": "3560883926",
+                        "title": "Early Days PART 1/6",
+                        "creator": "76561198012020581",
+                        "description": "[b]UPDATE:[/b]\n\n[h2]Gameplay[/h2]",
+                        "preview_url": "https://example.com/preview.jpg",
+                        "tags": [{ "tag": "Campaigns" }]
+                    }
+                }
+            }),
+        );
+        let cache_path = std::env::temp_dir().join(format!(
+            "left4addons-{}-{}-workshop_cache.json",
+            "snapshot",
+            std::process::id()
+        ));
+        fs::remove_file(&cache_path).ok();
+
+        let cache = workshop_cache_with_known_addons(&cache_path, &known_addons_path);
+        let entry = cache.get("3560883926").unwrap();
+
+        fs::remove_file(&known_addons_path).ok();
+        fs::remove_file(&cache_path).ok();
+
+        assert_eq!(
+            entry.get("description").and_then(|v| v.as_str()),
+            Some("[b]UPDATE:[/b]\n\n[h2]Gameplay[/h2]")
+        );
+        assert_eq!(
+            entry.get("creatorSteamId").and_then(|v| v.as_str()),
+            Some("76561198012020581")
+        );
+    }
+
+    #[test]
+    fn learned_author_name_updates_known_snapshots_with_matching_steam_id() {
+        let known_addons_path = write_known_addons_file(
+            "author-propagation",
+            json!({
+                "3560886114": {
+                    "id": "3560886114",
+                    "vpkName": "Early Days PART 2/6",
+                    "workshopId": "3560886114",
+                    "addonInfo": null,
+                    "hasImage": false,
+                    "imagePath": null,
+                    "steamDetails": {
+                        "publishedfileid": "3560886114",
+                        "title": "Early Days PART 2/6",
+                        "creator": "76561198012020581",
+                        "creator_name": "76561198012020581"
+                    }
+                }
+            }),
+        );
+        let mut cache = std::collections::HashMap::from([(
+            "3560883926".to_string(),
+            json!({
+                "workshopId": "3560883926",
+                "creatorName": "perfect_buddy",
+                "creatorSteamId": "76561198012020581",
+                "creatorAccountId": "51754853",
+                "creatorProfileUrl": "https://steamcommunity.com/id/perfectbuddy"
+            }),
+        )]);
+
+        merge_known_addon_snapshots_into_cache(&mut cache, &known_addons_path);
+        propagate_author_names(&mut cache);
+
+        fs::remove_file(&known_addons_path).ok();
+
+        let related = cache.get("3560886114").unwrap();
+        assert_eq!(
+            related.get("creatorName").and_then(|v| v.as_str()),
+            Some("perfect_buddy")
+        );
+        assert_eq!(
+            related.get("creatorProfileUrl").and_then(|v| v.as_str()),
+            Some("https://steamcommunity.com/id/perfectbuddy")
+        );
     }
 }

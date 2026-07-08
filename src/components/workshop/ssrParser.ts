@@ -39,6 +39,16 @@ function parseProfileIdentifiers(url: string): {
   };
 }
 
+function accountIdToSteamId(accountId?: string): string | undefined {
+  const normalized = (accountId || '').trim();
+  if (!/^\d+$/.test(normalized)) return undefined;
+  try {
+    return (BigInt(normalized) + 76561197960265728n).toString();
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Helper: find balanced {…} from a start position in HTML ───────────────────
 
 function extractBalancedJson(html: string, startIdx: number): string | null {
@@ -468,6 +478,69 @@ function toFullSizeUrl(thumbUrl: string): string {
   return thumbUrl.replace(/\?imw=.*$/, '');
 }
 
+function appendLineBreak(output: string[]): void {
+  const last = output[output.length - 1] || '';
+  if (!last.endsWith('\n')) {
+    output.push('\n');
+  }
+}
+
+function appendBlockBreak(output: string[]): void {
+  const text = output.join('');
+  if (!text.endsWith('\n\n')) {
+    if (!text.endsWith('\n')) output.push('\n');
+    output.push('\n');
+  }
+}
+
+function descriptionNodeToText(node: Element): string {
+  const blockTags = new Set(['DIV', 'P', 'UL', 'OL', 'TABLE', 'TR', 'H1', 'H2', 'H3', 'H4']);
+  const output: string[] = [];
+
+  const walk = (current: Node) => {
+    if (current.nodeType === Node.TEXT_NODE) {
+      output.push(current.textContent || '');
+      return;
+    }
+    if (current.nodeType !== Node.ELEMENT_NODE) {
+      return;
+    }
+
+    const element = current as Element;
+    const tag = element.tagName;
+
+    if (tag === 'BR') {
+      appendLineBreak(output);
+      return;
+    }
+
+    if (tag === 'LI') {
+      appendLineBreak(output);
+      output.push('* ');
+    } else if (blockTags.has(tag) && output.join('').trim()) {
+      appendBlockBreak(output);
+    }
+
+    element.childNodes.forEach(walk);
+
+    if (tag === 'LI') {
+      appendLineBreak(output);
+    } else if (blockTags.has(tag)) {
+      appendBlockBreak(output);
+    }
+  };
+
+  node.childNodes.forEach(walk);
+
+  return output
+    .join('')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 /** Parse extra details from a Steam Workshop item/collection page HTML */
 export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
   const result: WorkshopPageDetails = {
@@ -490,7 +563,7 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
 
     const descriptionNode = doc.querySelector('.workshopItemDescription');
     if (descriptionNode) {
-      result.description = descriptionNode.textContent?.trim() || '';
+      result.description = descriptionNodeToText(descriptionNode);
       result.descriptionHtml = descriptionNode.innerHTML.trim();
     }
 
@@ -505,6 +578,7 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
       result.creatorName = creatorNameNode.childNodes[0].textContent.trim();
     }
     result.creatorAccountId = attr('.friendBlock', 'data-miniprofile') || undefined;
+    result.creatorSteamId = result.creatorSteamId || accountIdToSteamId(result.creatorAccountId);
 
     const detailLabels = all('.detailsStatsContainerLeft .detailsStatLeft').map((el) => el.textContent?.trim().toLowerCase() || '');
     const detailValues = all('.detailsStatsContainerRight .detailsStatRight').map((el) => el.textContent?.trim() || '');

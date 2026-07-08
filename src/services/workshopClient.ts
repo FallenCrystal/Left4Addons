@@ -3,6 +3,7 @@ import {
   HomepageSection,
   WorkshopCapabilities,
   WorkshopItem,
+  WorkshopPageDetails,
 } from '../components/workshop/types';
 import type { WorkshopSourceSettings } from '../types/addon';
 import {
@@ -14,6 +15,7 @@ import {
 import {
   rememberWorkshopItems,
   rememberWorkshopPageDetails,
+  resolveWorkshopItemAuthor,
 } from '../components/workshop/authorDirectory';
 
 interface WorkshopHomeResponse {
@@ -136,7 +138,11 @@ function readCachedValue<T>(key: string): T | null {
 }
 
 async function readWorkshopItemCache(): Promise<Record<string, any>> {
-  return invoke<Record<string, any>>('get_workshop_cache').catch(() => ({}));
+  try {
+    return await invoke<Record<string, any>>('get_workshop_cache');
+  } catch {
+    return {};
+  }
 }
 
 function cachedDetailToWorkshopItem(workshopId: string, detail: any): WorkshopItem {
@@ -149,6 +155,172 @@ function cachedDetailToWorkshopItem(workshopId: string, detail: any): WorkshopIt
     creator_steam_id: detail?.creator_steam_id || detail?.creatorSteamId,
     creator_account_id: detail?.creator_account_id || detail?.creatorAccountId,
   }, detail?.lastSeenSource || detail?.lastPageSource || 'cache');
+}
+
+function normalizeCachedTags(tags: any): { category: string; name: string }[] {
+  if (!Array.isArray(tags)) return [];
+  return tags
+    .map((tag) => {
+      if (typeof tag === 'string') {
+        return { category: '', name: tag };
+      }
+      return {
+        category: normalizeText(tag?.category),
+        name: normalizeText(tag?.name || tag?.display_name || tag?.tag),
+      };
+    })
+    .filter((tag) => tag.name);
+}
+
+function normalizeCachedRelations(value: any): { title: string; workshopId: string }[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => ({
+      title: normalizeText(item?.title),
+      workshopId: normalizeText(item?.workshopId || item?.publishedfileid),
+    }))
+    .filter((item) => item.workshopId);
+}
+
+function mapCachedDetailToPageDetails(detail: any): WorkshopPageDetails {
+  const steamDetails = detail?.steamDetails || {};
+  const gallery = detail?.imageGallery || detail?.galleryUrls || detail?.galleryPreviewUrls || [];
+  return {
+    title: normalizeText(detail?.title || steamDetails?.title) || undefined,
+    previewUrl: normalizeText(detail?.previewUrl || detail?.imagePath || detail?.preview_url || steamDetails?.preview_url) || undefined,
+    description: normalizeText(detail?.description || steamDetails?.description || detail?.shortDescription) || undefined,
+    descriptionHtml: normalizeText(detail?.descriptionHtml) || undefined,
+    creatorName: normalizeText(detail?.creatorName || detail?.authorName || detail?.creator_name || steamDetails?.creator_name) || undefined,
+    creatorProfileUrl: normalizeText(detail?.creatorProfileUrl || detail?.authorUrl) || undefined,
+    creatorSteamId: normalizeText(detail?.creatorSteamId || detail?.creator_steam_id || steamDetails?.creator) || undefined,
+    creatorVanityId: normalizeText(detail?.creatorVanityId || steamDetails?.creator_vanity_id) || undefined,
+    creatorAccountId: normalizeText(detail?.creatorAccountId || detail?.creator_account_id || steamDetails?.creator_account_id) || undefined,
+    imageGallery: Array.isArray(gallery) ? gallery.map(String).filter(Boolean) : [],
+    tags: normalizeCachedTags(detail?.pageTags || detail?.tags || steamDetails?.tags),
+    requiredItems: normalizeCachedRelations(detail?.requiredItems),
+    parentCollections: normalizeCachedRelations(detail?.parentCollections),
+    fileSizeDisplay: normalizeText(detail?.fileSizeDisplay || detail?.fileSize || steamDetails?.file_size) || undefined,
+    postedDateText: normalizeText(detail?.postedDateText) || undefined,
+    updatedDateText: normalizeText(detail?.updatedDateText) || undefined,
+    changeNoteCount: toNumericOrUndefined(detail?.changeNoteCount),
+    ratingStars: toNumericOrUndefined(detail?.ratingStars),
+    ratingCount: toNumericOrUndefined(detail?.ratingCount),
+    uniqueVisitors: toNumericOrUndefined(detail?.uniqueVisitors),
+    currentSubscribers: toNumericOrUndefined(detail?.currentSubscribers),
+    currentFavorites: toNumericOrUndefined(detail?.currentFavorites),
+    backgroundImageUrl: normalizeText(detail?.backgroundImageUrl) || undefined,
+  };
+}
+
+function normalizePageDetails(details: Partial<WorkshopPageDetails> | null | undefined): WorkshopPageDetails {
+  return {
+    ...details,
+    imageGallery: Array.isArray(details?.imageGallery) ? details.imageGallery.filter(Boolean) : [],
+    tags: Array.isArray(details?.tags) ? details.tags.filter((tag) => normalizeText(tag?.name)) : [],
+    requiredItems: Array.isArray(details?.requiredItems)
+      ? details.requiredItems.filter((item) => normalizeText(item?.workshopId))
+      : [],
+    parentCollections: Array.isArray(details?.parentCollections)
+      ? details.parentCollections.filter((item) => normalizeText(item?.workshopId))
+      : [],
+  };
+}
+
+function chooseDescription(current?: string, incoming?: string): string | undefined {
+  const existing = normalizeText(current);
+  const next = normalizeText(incoming);
+  return existing || next || undefined;
+}
+
+function chooseArray<T>(current: T[] | undefined, incoming: T[] | undefined): T[] {
+  const existing = Array.isArray(current) ? current : [];
+  const next = Array.isArray(incoming) ? incoming : [];
+  return next.length > 0 ? next : existing;
+}
+
+function chooseNumber(current: number | undefined, incoming: number | undefined): number | undefined {
+  return incoming !== undefined ? incoming : current;
+}
+
+function resolvePageDetailsAuthor(details: WorkshopPageDetails): WorkshopPageDetails {
+  const resolved = resolveWorkshopItemAuthor({
+    workshopId: '',
+    title: details.title || '',
+    imagePath: details.previewUrl || '',
+    authorName: details.creatorName || '',
+    authorId: details.creatorSteamId || details.creatorVanityId || details.creatorAccountId || '',
+    authorUrl: details.creatorProfileUrl || '',
+    authorSteamId: details.creatorSteamId,
+    authorVanityId: details.creatorVanityId,
+    authorAccountId: details.creatorAccountId,
+    stars: 0,
+  });
+
+  return {
+    ...details,
+    creatorName: resolved.authorName || details.creatorName,
+    creatorProfileUrl: resolved.authorUrl || details.creatorProfileUrl,
+    creatorSteamId: resolved.authorSteamId || details.creatorSteamId,
+    creatorVanityId: resolved.authorVanityId || details.creatorVanityId,
+    creatorAccountId: resolved.authorAccountId || details.creatorAccountId,
+  };
+}
+
+export function mergeWorkshopPageDetails(
+  current: Partial<WorkshopPageDetails> | null | undefined,
+  incoming: Partial<WorkshopPageDetails> | null | undefined,
+): WorkshopPageDetails {
+  const existing = normalizePageDetails(current);
+  const next = normalizePageDetails(incoming);
+  const merged = resolvePageDetailsAuthor(normalizePageDetails({
+    title: normalizeText(next.title) || existing.title,
+    previewUrl: normalizeText(next.previewUrl) || existing.previewUrl,
+    description: chooseDescription(existing.description, next.description),
+    descriptionHtml: normalizeText(next.descriptionHtml) || existing.descriptionHtml,
+    creatorName: normalizeText(next.creatorName) || existing.creatorName,
+    creatorProfileUrl: normalizeText(next.creatorProfileUrl) || existing.creatorProfileUrl,
+    creatorSteamId: normalizeText(next.creatorSteamId) || existing.creatorSteamId,
+    creatorVanityId: normalizeText(next.creatorVanityId) || existing.creatorVanityId,
+    creatorAccountId: normalizeText(next.creatorAccountId) || existing.creatorAccountId,
+    imageGallery: chooseArray(existing.imageGallery, next.imageGallery),
+    tags: chooseArray(existing.tags, next.tags),
+    requiredItems: chooseArray(existing.requiredItems, next.requiredItems),
+    parentCollections: chooseArray(existing.parentCollections, next.parentCollections),
+    fileSizeDisplay: normalizeText(next.fileSizeDisplay) || existing.fileSizeDisplay,
+    postedDateText: normalizeText(next.postedDateText) || existing.postedDateText,
+    updatedDateText: normalizeText(next.updatedDateText) || existing.updatedDateText,
+    changeNoteCount: chooseNumber(existing.changeNoteCount, next.changeNoteCount),
+    ratingStars: chooseNumber(existing.ratingStars, next.ratingStars),
+    ratingCount: chooseNumber(existing.ratingCount, next.ratingCount),
+    uniqueVisitors: chooseNumber(existing.uniqueVisitors, next.uniqueVisitors),
+    currentSubscribers: chooseNumber(existing.currentSubscribers, next.currentSubscribers),
+    currentFavorites: chooseNumber(existing.currentFavorites, next.currentFavorites),
+    backgroundImageUrl: normalizeText(next.backgroundImageUrl) || existing.backgroundImageUrl,
+  }));
+  rememberWorkshopPageDetails(merged);
+  return merged;
+}
+
+function hasUsefulPageSnapshot(details: WorkshopPageDetails): boolean {
+  return Boolean(
+    details.title ||
+    details.creatorName ||
+    details.description ||
+    details.imageGallery.length > 0 ||
+    details.requiredItems.length > 0 ||
+    details.parentCollections.length > 0 ||
+    details.tags.length > 0,
+  );
+}
+
+async function enrichItemsFromSnapshot(items: WorkshopItem[]): Promise<WorkshopItem[]> {
+  if (items.length === 0) return items;
+  const cache = await readWorkshopItemCache();
+  if (Object.keys(cache).length === 0) return items;
+  const cachedItems = items
+    .map((item) => cache[item.workshopId] ? cachedDetailToWorkshopItem(item.workshopId, cache[item.workshopId]) : null)
+    .filter((item): item is WorkshopItem => Boolean(item));
+  return enrichWorkshopItems(items, cachedItems);
 }
 
 function resolveBrowseSort(input: FetchWorkshopItemsInput): string | undefined {
@@ -177,10 +349,21 @@ function normalizeText(value: unknown): string {
   return String(value || '').trim();
 }
 
+function accountIdToSteamId(accountId: unknown): string {
+  const normalized = normalizeText(accountId);
+  if (!/^\d+$/.test(normalized)) return '';
+  try {
+    return (BigInt(normalized) + 76561197960265728n).toString();
+  } catch {
+    return '';
+  }
+}
+
 function isPlaceholderAuthorName(name: unknown, ids: string[]): boolean {
   const normalized = normalizeText(name);
   if (!normalized) return true;
   const lowered = normalized.toLowerCase();
+  if (/^\d+$/.test(normalized)) return true;
   return ids.some((id) => lowered === normalizeText(id).toLowerCase());
 }
 
@@ -214,7 +397,13 @@ function mapSteamScoreToStars(detail: any): number {
 }
 
 function needsHtmlAuthorEnrichment(item: WorkshopItem): boolean {
-  return !normalizeText(item.authorName) || !normalizeText(item.authorUrl);
+  return isPlaceholderAuthorName(item.authorName, [
+    item.authorSteamId || '',
+    item.authorAccountId || '',
+    item.authorId || '',
+    item.ownerSteamId || '',
+    item.ownerAccountId || '',
+  ]) || !normalizeText(item.authorUrl);
 }
 
 function enrichWorkshopItems(primary: WorkshopItem[], fallback: WorkshopItem[]): WorkshopItem[] {
@@ -226,9 +415,26 @@ function enrichWorkshopItems(primary: WorkshopItem[], fallback: WorkshopItem[]):
       return item;
     }
 
+    const primaryAuthorIsPlaceholder = isPlaceholderAuthorName(item.authorName, [
+      item.authorSteamId || '',
+      item.authorAccountId || '',
+      item.authorId || '',
+      item.ownerSteamId || '',
+      item.ownerAccountId || '',
+    ]);
+    const fallbackAuthorIsUsable = !isPlaceholderAuthorName(fallbackItem.authorName, [
+      fallbackItem.authorSteamId || '',
+      fallbackItem.authorAccountId || '',
+      fallbackItem.authorId || '',
+      fallbackItem.ownerSteamId || '',
+      fallbackItem.ownerAccountId || '',
+    ]);
+
     return {
       ...item,
-      authorName: normalizeText(item.authorName) || fallbackItem.authorName,
+      authorName: primaryAuthorIsPlaceholder && fallbackAuthorIsUsable
+        ? fallbackItem.authorName
+        : normalizeText(item.authorName) || fallbackItem.authorName,
       authorId: item.authorId || fallbackItem.authorId,
       authorUrl: normalizeText(item.authorUrl) || fallbackItem.authorUrl,
       authorSteamId: item.authorSteamId || fallbackItem.authorSteamId,
@@ -238,7 +444,7 @@ function enrichWorkshopItems(primary: WorkshopItem[], fallback: WorkshopItem[]):
       ownerAccountId: item.ownerAccountId || fallbackItem.ownerAccountId,
       stars: item.stars > 0 ? item.stars : fallbackItem.stars,
       imagePath: item.imagePath || fallbackItem.imagePath,
-      shortDescription: item.shortDescription || fallbackItem.shortDescription,
+      shortDescription: chooseDescription(item.shortDescription, fallbackItem.shortDescription),
     };
   });
 }
@@ -297,6 +503,10 @@ export async function fetchWorkshopHome() {
         ),
         browseParams: section.browseParams,
       }));
+      sdkSections = await Promise.all(sdkSections.map(async (section) => ({
+        ...section,
+        items: rememberWorkshopItems(await enrichItemsFromSnapshot(section.items)),
+      })));
       source = data.source;
     } catch (err) {
       console.warn('Steam SDK home query failed, falling back to HTML:', err);
@@ -319,10 +529,10 @@ export async function fetchWorkshopHome() {
       url: 'https://steamcommunity.com/app/550/workshop/',
       source: 'workshop-home',
     });
-    const htmlSections = parseHomepageSections(html).map((section) => ({
+    const htmlSections = await Promise.all(parseHomepageSections(html).map(async (section) => ({
       ...section,
-      items: rememberWorkshopItems(section.items),
-    }));
+      items: rememberWorkshopItems(await enrichItemsFromSnapshot(section.items)),
+    })));
     const tagCategories = parseTagCategories(html);
     const result = {
       source: 'web-fallback',
@@ -340,10 +550,10 @@ export async function fetchWorkshopHome() {
       url: 'https://steamcommunity.com/app/550/workshop/',
       source: 'workshop-home',
     });
-    htmlSections = parseHomepageSections(html).map((section) => ({
+    htmlSections = await Promise.all(parseHomepageSections(html).map(async (section) => ({
       ...section,
-      items: rememberWorkshopItems(section.items),
-    }));
+      items: rememberWorkshopItems(await enrichItemsFromSnapshot(section.items)),
+    })));
     tagCategories = parseTagCategories(html);
   } catch (err) {
     console.warn('Workshop home HTML enrichment failed:', err);
@@ -382,6 +592,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
         });
         reportWorkshopWarnings(data.warnings);
         let items = data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source));
+        items = await enrichItemsFromSnapshot(items);
         if (items.some(needsHtmlAuthorEnrichment) && shouldUseSteamCommunityHtml(capabilities)) {
           try {
             const html: string = await invoke('fetch_workshop_html', {
@@ -417,9 +628,10 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
       url,
       source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
     });
+    const items = await enrichItemsFromSnapshot(parseSSRItems(html, 'workshop_query'));
     const result = {
       source: 'web-fallback',
-      items: rememberWorkshopItems(parseSSRItems(html, 'workshop_query')),
+      items: rememberWorkshopItems(items),
     };
     writeListCache(cacheKey, result);
     return result;
@@ -431,6 +643,14 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
 }
 
 export async function fetchWorkshopItem(workshopId: string) {
+  const cache = await readWorkshopItemCache();
+  if (cache[workshopId]) {
+    return {
+      source: 'snapshot',
+      item: rememberWorkshopItems([cachedDetailToWorkshopItem(workshopId, cache[workshopId])])[0],
+    };
+  }
+
   const capabilities = shouldUseSteamworksSdk()
     ? await getWorkshopCapabilities().catch(() => null)
     : null;
@@ -454,7 +674,6 @@ export async function fetchWorkshopItem(workshopId: string) {
       item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.collection, 'web-fallback')])[0],
     };
   } catch (err) {
-    const cache = await readWorkshopItemCache();
     if (cache[workshopId]) {
       return {
         source: 'cache',
@@ -466,6 +685,31 @@ export async function fetchWorkshopItem(workshopId: string) {
 }
 
 export async function fetchWorkshopCollection(workshopId: string) {
+  const cache = await readWorkshopItemCache();
+  const cachedCollection = cache[workshopId];
+  if (cachedCollection) {
+    const resolvedCollection = cachedDetailToWorkshopItem(workshopId, cachedCollection);
+    const childIds = cachedCollection.childItemIds || [];
+    return {
+      source: 'snapshot',
+      collection: {
+        ...cachedCollection,
+        publishedfileid: workshopId,
+        title: resolvedCollection.title,
+        preview_url: resolvedCollection.imagePath,
+        creator_name: resolvedCollection.authorName,
+        creator: resolvedCollection.authorId,
+        creator_steam_id: resolvedCollection.authorSteamId,
+        creator_account_id: resolvedCollection.authorAccountId,
+      },
+      items: rememberWorkshopItems(
+        childIds
+          .map((childId: string) => cache[childId] ? cachedDetailToWorkshopItem(childId, cache[childId]) : null)
+          .filter(Boolean),
+      ),
+    };
+  }
+
   const capabilities = shouldUseSteamworksSdk()
     ? await getWorkshopCapabilities().catch(() => null)
     : null;
@@ -488,7 +732,7 @@ export async function fetchWorkshopCollection(workshopId: string) {
           creator_account_id: resolvedCollection.authorAccountId,
         },
         items: rememberWorkshopItems(
-          data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+          await enrichItemsFromSnapshot(data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source))),
         ),
       };
     } catch (err) {
@@ -513,11 +757,10 @@ export async function fetchWorkshopCollection(workshopId: string) {
         creator_account_id: resolvedCollection.authorAccountId,
       },
       items: rememberWorkshopItems(
-        (data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback')),
+        await enrichItemsFromSnapshot((data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback'))),
       ),
     };
   } catch (err) {
-    const cache = await readWorkshopItemCache();
     const collection = cache[workshopId];
     if (collection) {
       const resolvedCollection = cachedDetailToWorkshopItem(workshopId, collection);
@@ -551,10 +794,24 @@ export async function fetchWorkshopHtml(url: string, source: string) {
 
 export async function fetchWorkshopPageDetails(workshopId: string, source: string) {
   const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
-  const html = await fetchWorkshopHtml(url, source);
-  const details = parseWorkshopPageDetails(html);
-  rememberWorkshopPageDetails(details);
-  return details;
+  const snapshot = await getWorkshopPageSnapshot(workshopId);
+  try {
+    const html = await fetchWorkshopHtml(url, source);
+    const details = mergeWorkshopPageDetails(snapshot, parseWorkshopPageDetails(html));
+    return details;
+  } catch (err) {
+    if (snapshot) return snapshot;
+    throw err;
+  }
+}
+
+export async function getWorkshopPageSnapshot(workshopId: string): Promise<WorkshopPageDetails | null> {
+  const cache = await readWorkshopItemCache();
+  const detail = cache[workshopId];
+  if (!detail) return null;
+  const snapshot = mergeWorkshopPageDetails(null, mapCachedDetailToPageDetails(detail));
+  if (!hasUsefulPageSnapshot(snapshot)) return null;
+  return snapshot;
 }
 
 export async function persistWorkshopPageDetails(workshopId: string, details: any, source: string) {
@@ -589,6 +846,7 @@ export function mapSteamDetailToWorkshopItem(detail: any, source = 'steam-sdk'):
     detail.owner_steam_id ||
     detail.ownerSteamId ||
     (detail.creator && /^\d{17,20}$/.test(String(detail.creator)) ? detail.creator : '') ||
+    accountIdToSteamId(detail.creator_account_id || detail.creatorAccountId || detail.owner_account_id || detail.ownerAccountId) ||
     '',
   );
   const ownerAccountId = normalizeText(

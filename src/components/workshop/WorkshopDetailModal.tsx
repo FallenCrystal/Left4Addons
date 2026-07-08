@@ -7,8 +7,9 @@ import { CacheImage } from '../CacheImage';
 import { DatabasePayload, Group } from '../../types/addon';
 import { Gallery } from '../Gallery';
 import { RequiredItems, ParentCollections } from '../WorkshopCommon';
-import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../../services/workshopClient';
+import { fetchWorkshopPageDetails, getWorkshopPageSnapshot, persistWorkshopPageDetails } from '../../services/workshopClient';
 import { resolveWorkshopItemAuthor } from './authorDirectory';
+import { isKnownWorkshopItem } from '../../utils/workshopKnown';
 
 interface WorkshopDetailModalProps {
   open: boolean;
@@ -65,7 +66,12 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   // Fetch extra details by scraping the workshop page HTML
   const fetchPageDetails = useCallback(async (workshopId: string) => {
     setPageDetailsLoading(true);
-    setPageDetails(null);
+    const snapshot = await getWorkshopPageSnapshot(workshopId);
+    if (snapshot) {
+      setPageDetails(snapshot);
+    } else {
+      setPageDetails(null);
+    }
     try {
       const details = await fetchWorkshopPageDetails(workshopId, 'workshop-detail');
       setPageDetails(details);
@@ -182,8 +188,8 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px', maxHeight: '200px', overflowY: 'auto' }}>
                 {collection.items.map((ci) => {
-                  const isKnown = !!knownUninstalledAddons[ci.workshopId + '.vpk'];
-                  const isDownloaded = !!addons[ci.workshopId + '.vpk'];
+                  const isKnown = isKnownWorkshopItem(knownUninstalledAddons, ci.workshopId);
+                  const isDownloaded = isKnownWorkshopItem(addons, ci.workshopId);
                   const shouldCacheRemote = isDownloaded || isKnown;
                   return (
                     <div
@@ -250,9 +256,8 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   // ── Item detail ──────────────────────────────────────────────────────────────
   if (!item) return null;
 
-  const vpkKey = item.workshopId + '.vpk';
-  const isKnown = !!knownUninstalledAddons[vpkKey];
-  const isDownloaded = !!addons[vpkKey];
+  const isKnown = isKnownWorkshopItem(knownUninstalledAddons, item.workshopId);
+  const isDownloaded = isKnownWorkshopItem(addons, item.workshopId);
   const downloading = downloadProgress[item.workshopId] !== undefined;
   const progress = downloadProgress[item.workshopId];
   const shouldCacheRemote = isDownloaded || isKnown;
@@ -261,7 +266,13 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   const displayAuthorUrl = pageDetails?.creatorProfileUrl || resolvedItem.authorUrl;
 
   // Find group this addon belongs to
-  const itemGroup = groups?.find(g => g.addons.includes(vpkKey));
+  const itemGroup = groups?.find(g => (
+    g.addons.includes(item.workshopId) ||
+    g.addons.some((addonId) => {
+      const addon = addons[addonId] || knownUninstalledAddons[addonId];
+      return addon?.workshopId === item.workshopId;
+    })
+  ));
 
   // Build gallery: cover image first, then scraped screenshots
   const scrapedGallery = pageDetails?.imageGallery || [];

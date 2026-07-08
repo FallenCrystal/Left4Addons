@@ -231,6 +231,51 @@ describe('workshopClient', () => {
     expect(mockInvoke).not.toHaveBeenCalledWith('fetch_workshop_html', expect.anything());
   });
 
+  test('fetchWorkshopItems enriches SDK placeholder author from snapshot cache', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          canQueryItems: true,
+          canQueryHome: true,
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': {
+            workshopId: '12345',
+            title: 'Cached Item',
+            creatorName: 'Cached Author',
+            creatorSteamId: '76561198000000001',
+            authorUrl: 'https://steamcommunity.com/profiles/76561198000000001',
+          },
+        });
+      }
+      if (cmd === 'query_workshop_items') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          items: [{
+            publishedfileid: '12345',
+            title: 'SDK Item',
+            creator: '76561198000000001',
+            creator_steam_id: '76561198000000001',
+            creator_name: '76561198000000001',
+          }],
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    const result = await workshopClient.fetchWorkshopItems({ query: 'tank' });
+
+    expect(result.source).toBe('steam-sdk');
+    expect(result.items[0]).toMatchObject({
+      authorName: 'Cached Author',
+      authorUrl: 'https://steamcommunity.com/profiles/76561198000000001',
+    });
+  });
+
   test('mapSteamDetailToWorkshopItem keeps 64-bit creator id and converts score to stars', async () => {
     const workshopClient = await import('./workshopClient');
     const item = workshopClient.mapSteamDetailToWorkshopItem({

@@ -5,6 +5,7 @@ import { Star, Loader2, Package, FileText } from 'lucide-react';
 import { CacheImage } from '../CacheImage';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem } from './types';
+import { isKnownWorkshopItem } from '../../utils/workshopKnown';
 
 interface ItemCardProps {
   item: WorkshopItem;
@@ -26,8 +27,8 @@ export const ItemCard: React.FC<ItemCardProps> = ({
   isLoading,
 }) => {
   const { t } = useTranslation();
-  const isDownloaded = addons[item.workshopId + '.vpk'] !== undefined;
-  const isKnown = knownUninstalledAddons[item.workshopId + '.vpk'] !== undefined;
+  const isDownloaded = isKnownWorkshopItem(addons, item.workshopId);
+  const isKnown = isKnownWorkshopItem(knownUninstalledAddons, item.workshopId);
   const isKnownCollection = section === 'collections' && !!knownCollectionIds?.has(item.workshopId);
   const isKnownEntry = isKnown || isKnownCollection;
   const shouldCacheRemote = isDownloaded || isKnownEntry;

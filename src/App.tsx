@@ -406,12 +406,11 @@ function App() {
           if (foundAddon) {
             setDetailModal({ open: true, addon: foundAddon });
           } else {
-            const vpkKey = `${workshopId}.vpk`;
             setDetailModal({
               open: true,
               addon: {
-                id: vpkKey,
-                vpkName: vpkKey,
+                id: workshopId,
+                vpkName: workshopId,
                 workshopId: workshopId,
                 dirType: 'none',
                 isEnabled: false,

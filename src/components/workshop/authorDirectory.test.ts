@@ -100,4 +100,26 @@ describe('authorDirectory', () => {
     expect(resolved.authorName).toBe('Page Author');
     expect(resolved.authorUrl).toBe('https://steamcommunity.com/profiles/76561198000000002');
   });
+
+  test('matches Steam account id to SteamID64 for page author mappings', () => {
+    rememberWorkshopPageDetails({
+      creatorName: 'perfect_buddy',
+      creatorProfileUrl: 'https://steamcommunity.com/id/perfectbuddy',
+      creatorAccountId: '51754853',
+      imageGallery: [],
+      tags: [],
+      requiredItems: [],
+      parentCollections: [],
+    });
+
+    const resolved = resolveWorkshopItemAuthor(createItem({
+      workshopId: '105',
+      authorName: '76561198012020581',
+      authorId: '76561198012020581',
+      authorSteamId: '76561198012020581',
+    }));
+
+    expect(resolved.authorName).toBe('perfect_buddy');
+    expect(resolved.authorUrl).toBe('https://steamcommunity.com/id/perfectbuddy');
+  });
 });

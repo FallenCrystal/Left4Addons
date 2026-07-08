@@ -1,6 +1,7 @@
 import React from 'react';
 import { Package, Link2, CheckCircle, FolderPlus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { isKnownWorkshopItem } from '../utils/workshopKnown';
 
 interface RequiredItemsProps {
   requiredItems: { title: string; workshopId: string }[];
@@ -36,8 +37,8 @@ export const RequiredItems: React.FC<RequiredItemsProps> = ({
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', maxHeight: '120px', overflowY: 'auto' }}>
         {requiredItems.map((req) => {
-          const reqIsKnown = !!knownUninstalledAddons[req.workshopId + '.vpk'];
-          const reqIsDownloaded = !!addons[req.workshopId + '.vpk'];
+          const reqIsKnown = isKnownWorkshopItem(knownUninstalledAddons, req.workshopId);
+          const reqIsDownloaded = isKnownWorkshopItem(addons, req.workshopId);
           return (
             <div key={req.workshopId} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <a

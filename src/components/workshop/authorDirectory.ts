@@ -47,6 +47,20 @@ function isNumericIdentifier(value?: string | null): boolean {
   return /^\d+$/.test(normalizeValue(value));
 }
 
+function isSteamId64(value?: string | null): boolean {
+  return /^\d{17,20}$/.test(normalizeValue(value));
+}
+
+function accountIdToSteamId(accountId?: string | null): string {
+  const normalized = normalizeValue(accountId);
+  if (!/^\d+$/.test(normalized)) return '';
+  try {
+    return (BigInt(normalized) + 76561197960265728n).toString();
+  } catch {
+    return '';
+  }
+}
+
 function looksLikePlaceholderName(name?: string | null, ids: string[] = []): boolean {
   const trimmed = normalizeValue(name);
   if (!trimmed) return true;
@@ -60,7 +74,13 @@ function looksLikePlaceholderName(name?: string | null, ids: string[] = []): boo
 function collectIdentity(input: AuthorIdentity): Required<AuthorIdentity> {
   const parsedFromUrl = parseProfileIdentifiers(input.authorUrl);
   const authorId = normalizeValue(input.authorId);
-  const authorSteamId = normalizeValue(input.authorSteamId || input.ownerSteamId || (isNumericIdentifier(authorId) ? authorId : ''));
+  const accountId = normalizeValue(input.authorAccountId || input.ownerAccountId);
+  const authorSteamId = normalizeValue(
+    input.authorSteamId
+    || input.ownerSteamId
+    || (isSteamId64(authorId) ? authorId : '')
+    || accountIdToSteamId(accountId),
+  );
   const authorVanityId = normalizeValue(
     input.authorVanityId || (!isNumericIdentifier(authorId) ? authorId : '') || parsedFromUrl.vanityId,
   );
@@ -70,7 +90,7 @@ function collectIdentity(input: AuthorIdentity): Required<AuthorIdentity> {
     authorUrl: normalizeValue(input.authorUrl),
     authorSteamId: authorSteamId || normalizeValue(parsedFromUrl.steamId),
     authorVanityId,
-    authorAccountId: normalizeValue(input.authorAccountId || input.ownerAccountId),
+    authorAccountId: accountId,
     authorId,
     ownerSteamId: normalizeValue(input.ownerSteamId),
     ownerAccountId: normalizeValue(input.ownerAccountId),

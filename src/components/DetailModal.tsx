@@ -6,7 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { WorkshopPageDetails } from './workshop/types';
 import { Gallery } from './Gallery';
 import { RequiredItems } from './WorkshopCommon';
-import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../services/workshopClient';
+import { fetchWorkshopPageDetails, getWorkshopPageSnapshot, persistWorkshopPageDetails } from '../services/workshopClient';
 
 interface DetailModalProps {
   open: boolean;
@@ -48,7 +48,12 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
   const fetchPageDetails = useCallback(async (workshopId: string) => {
     setPageDetailsLoading(true);
-    setPageDetails(null);
+    const snapshot = await getWorkshopPageSnapshot(workshopId);
+    if (snapshot) {
+      setPageDetails(snapshot);
+    } else {
+      setPageDetails(null);
+    }
     try {
       const details = await fetchWorkshopPageDetails(workshopId, 'addon-detail');
       setPageDetails(details);

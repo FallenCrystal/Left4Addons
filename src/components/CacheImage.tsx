@@ -56,6 +56,9 @@ export const CacheImage: React.FC<CacheImageProps> = ({
       cacheRemoteImage();
       return () => {
         cancelled = true;
+        if (objectUrl) {
+          URL.revokeObjectURL(objectUrl);
+        }
       };
     }
 
