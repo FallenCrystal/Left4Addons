@@ -71,9 +71,21 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
   if (!open || !addon) return null;
 
-  const title = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
-  const author = getAddonAuthor(addon);
-  const desc = addon.steamDetails?.description || getAddonInfoValue(addon, 'addondescription') || getAddonInfoValue(addon, 'addontagline') || 'No description provided.';
+  const title = pageDetails?.title
+    || addon.workshopDetails?.title
+    || addon.steamDetails?.title
+    || getAddonInfoValue(addon, 'addontitle')
+    || addon.vpkName;
+  const author = pageDetails?.creatorName
+    || addon.workshopDetails?.creatorName
+    || addon.workshopDetails?.authorName
+    || getAddonAuthor(addon);
+  const desc = pageDetails?.description
+    || addon.workshopDetails?.description
+    || addon.steamDetails?.description
+    || getAddonInfoValue(addon, 'addondescription')
+    || getAddonInfoValue(addon, 'addontagline')
+    || 'No description provided.';
   const categories = getAddonCategories(addon);
   const itemGroup = groups.find(g => g.addons.includes(addon.id));
   const addonUrl = getAddonUrl(addon);
@@ -81,7 +93,9 @@ export const DetailModal: React.FC<DetailModalProps> = ({
   const galleryDetails = pageDetails?.imageGallery || cachedGallery;
   const requiredItems = pageDetails?.requiredItems || addon.workshopDetails?.requiredItems || [];
   
-  const addonauthorSteamID = getAddonInfoValue(addon, 'addonauthorsteamid');
+  const addonauthorSteamID = pageDetails?.creatorSteamId
+    || addon.workshopDetails?.creatorSteamId
+    || getAddonInfoValue(addon, 'addonauthorsteamid');
   const addonversion = getAddonInfoValue(addon, 'addonversion');
 
   const isUninstalled = addon.dirType === 'none';

@@ -11,6 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::types::{
@@ -19,6 +21,17 @@ use super::types::{
 };
 
 const DOWNLOAD_CANCELLED_ERR: &str = "Download cancelled";
+const WORKSHOP_HTML_FETCH_INTERVAL: Duration = Duration::from_secs(6);
+const WORKSHOP_HTML_FETCH_PAUSE_DURATION: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Default)]
+struct WorkshopHtmlFetchGate {
+    next_allowed_at: Option<Instant>,
+    pause_until: Option<Instant>,
+    pause_reason: Option<String>,
+}
+
+static WORKSHOP_HTML_FETCH_GATE: OnceLock<Mutex<WorkshopHtmlFetchGate>> = OnceLock::new();
 
 fn resolve_cache_file(cache_dir: &Path, image_path: &str) -> Result<PathBuf, String> {
     let filename = image_path.strip_prefix("/cache/").unwrap_or(image_path);
@@ -64,6 +77,70 @@ fn validate_steamcommunity_url(url: &str) -> Result<reqwest::Url, String> {
         Ok(parsed)
     } else {
         Err("Only steamcommunity.com URLs are allowed".to_string())
+    }
+}
+
+fn workshop_html_fetch_gate() -> &'static Mutex<WorkshopHtmlFetchGate> {
+    WORKSHOP_HTML_FETCH_GATE.get_or_init(|| Mutex::new(WorkshopHtmlFetchGate::default()))
+}
+
+fn reserve_workshop_html_fetch_slot() -> Result<Option<Duration>, String> {
+    let now = Instant::now();
+    let mut gate = workshop_html_fetch_gate()
+        .lock()
+        .map_err(|_| "Workshop HTML fetch gate mutex poisoned".to_string())?;
+
+    if let Some(pause_until) = gate.pause_until {
+        if pause_until > now {
+            return Err(gate.pause_reason.clone().unwrap_or_else(|| {
+                "Steam Workshop HTML fetching is temporarily paused".to_string()
+            }));
+        }
+        gate.pause_until = None;
+        gate.pause_reason = None;
+    }
+
+    let scheduled_at = gate.next_allowed_at.unwrap_or(now).max(now);
+    gate.next_allowed_at = Some(scheduled_at + WORKSHOP_HTML_FETCH_INTERVAL);
+    let wait = scheduled_at.saturating_duration_since(now);
+    if wait.is_zero() {
+        Ok(None)
+    } else {
+        Ok(Some(wait))
+    }
+}
+
+fn pause_workshop_html_fetches(reason: &str) {
+    if let Ok(mut gate) = workshop_html_fetch_gate().lock() {
+        let until = Instant::now() + WORKSHOP_HTML_FETCH_PAUSE_DURATION;
+        gate.pause_until = Some(until);
+        gate.pause_reason = Some(reason.trim().to_string());
+        gate.next_allowed_at = Some(until);
+    }
+}
+
+fn strip_html_tags(input: &str) -> String {
+    let tag_re = Regex::new(r"(?is)<[^>]+>").expect("valid tag regex");
+    let without_tags = tag_re.replace_all(input, " ");
+    without_tags
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_steamcommunity_error_message(html: &str) -> Option<String> {
+    let re = Regex::new(
+        r#"(?is)<div[^>]*class=["'][^"']*\berror_ctn\b[^"']*["'][^>]*>.*?<div[^>]*id=["'][^"']*bottom[^"']*["'][^>]*>.*?<div[^>]*>\s*<h3[^>]*>(.*?)</h3>"#,
+    )
+    .expect("valid workshop error regex");
+    let captures = re.captures(html)?;
+    let message = strip_html_tags(captures.get(1)?.as_str());
+    if message.trim().is_empty() {
+        None
+    } else {
+        Some(message)
     }
 }
 
@@ -3080,6 +3157,25 @@ pub async fn fetch_workshop_html(
             return Err(err);
         }
     }
+    let wait = match reserve_workshop_html_fetch_slot() {
+        Ok(wait) => wait,
+        Err(err) => {
+            let _ = append_workshop_crawl_log_internal(
+                &state.workshop_crawl_log_path,
+                serde_json::json!({
+                    "at": started_at,
+                    "source": source,
+                    "url": url,
+                    "ok": false,
+                    "error": err,
+                }),
+            );
+            return Err(err);
+        }
+    };
+    if let Some(wait) = wait {
+        std::thread::sleep(wait);
+    }
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
@@ -3122,6 +3218,24 @@ pub async fn fetch_workshop_html(
             return Err(err);
         }
     };
+
+    if let Some(message) = extract_steamcommunity_error_message(&body) {
+        if message.to_lowercase().contains("too many request") {
+            pause_workshop_html_fetches(&message);
+        }
+        let _ = append_workshop_crawl_log_internal(
+            &state.workshop_crawl_log_path,
+            serde_json::json!({
+                "at": started_at,
+                "source": source,
+                "url": url,
+                "ok": false,
+                "status": status,
+                "error": message,
+            }),
+        );
+        return Err(message);
+    }
 
     let _ = append_workshop_crawl_log_internal(
         &state.workshop_crawl_log_path,
@@ -3819,7 +3933,10 @@ pub async fn append_workshop_crawl_log(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_background_workshop_fetch_allowed, is_background_workshop_fetch_source};
+    use super::{
+        ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
+        is_background_workshop_fetch_source,
+    };
     use serde_json::json;
     use std::fs;
 
@@ -3867,5 +3984,24 @@ mod tests {
         assert!(allowed.is_ok());
         assert!(blocked.is_err());
         assert!(manual.is_ok());
+    }
+
+    #[test]
+    fn extracts_friendly_workshop_error_message_from_html() {
+        let html = r#"
+            <div class="error_ctn">
+              <div id="error_box_bottom">
+                <div>
+                  <h3>Too many requests, please try again later.</h3>
+                </div>
+              </div>
+            </div>
+        "#;
+
+        let message = extract_steamcommunity_error_message(html);
+        assert_eq!(
+            message.as_deref(),
+            Some("Too many requests, please try again later.")
+        );
     }
 }

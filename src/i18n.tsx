@@ -383,8 +383,7 @@ const zh = {
       newestDesc: "最新发布的物品",
       viewAll: "查看全部",
       loading: "正在加载创意工坊首页...",
-      loadFailed: "无法加载首页数据，请尝试浏览模式。",
-      switchToBrowse: "切换到浏览模式"
+      loadFailed: "无法加载创意工坊首页数据。"
     },
     browse: {
       sortTrend: "最热门",
@@ -840,8 +839,7 @@ const en = {
       newestDesc: "Most recently published items",
       viewAll: "View All",
       loading: "Loading Workshop homepage...",
-      loadFailed: "Unable to load homepage data, try browse mode.",
-      switchToBrowse: "Switch to Browse Mode"
+      loadFailed: "Unable to load Workshop homepage data."
     },
     browse: {
       sortTrend: "Trending",

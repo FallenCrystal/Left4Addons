@@ -54,6 +54,8 @@ pub struct WorkshopHomeResponse {
     pub source: String,
     #[serde(default)]
     pub sections: Vec<WorkshopHomeSection>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,8 @@ pub struct WorkshopItemsResponse {
     pub source: String,
     #[serde(default)]
     pub items: Vec<Value>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -89,6 +93,8 @@ pub struct WorkshopItemResponse {
     pub source: String,
     #[serde(default)]
     pub item: Value,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -99,6 +105,8 @@ pub struct WorkshopCollectionResponse {
     pub collection: Value,
     #[serde(default)]
     pub items: Vec<Value>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

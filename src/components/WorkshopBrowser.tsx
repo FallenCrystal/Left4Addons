@@ -32,6 +32,7 @@ import {
   fetchWorkshopItem,
   fetchWorkshopItems,
   mapSteamDetailToWorkshopItem,
+  setWorkshopWarningReporter,
 } from '../services/workshopClient';
 
 // ── Browse sort options ───────────────────────────────────────────────────────
@@ -61,6 +62,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   backgroundTasks,
   syncingSteam,
   onOpenTaskCenter,
+  onWarning,
 }) => {
   const { t } = useTranslation();
   const scrollIdleTimerRef = useRef<number | null>(null);
@@ -83,6 +85,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [homepageSections, setHomepageSections] = useState<HomepageSection[]>([]);
   const [homepageLoading, setHomepageLoading] = useState(false);
+  const [homepageError, setHomepageError] = useState<string | null>(null);
   const [tagCategories, setTagCategories] = useState<TagCategory[]>([]);
 
   // Detail modal
@@ -117,6 +120,13 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   }, []);
 
   useEffect(() => {
+    setWorkshopWarningReporter(onWarning || null);
+    return () => {
+      setWorkshopWarningReporter(null);
+    };
+  }, [onWarning]);
+
+  useEffect(() => {
     return () => {
       if (scrollIdleTimerRef.current !== null) {
         window.clearTimeout(scrollIdleTimerRef.current);
@@ -128,6 +138,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   const fetchHomepage = useCallback(async () => {
     setHomepageLoading(true);
+    setHomepageError(null);
     try {
       const data = await fetchWorkshopHome();
       setHomepageSections(data.sections);
@@ -135,6 +146,9 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       setTagCategories(data.tagCategories);
     } catch (err) {
       console.error('Failed to fetch homepage:', err);
+      setHomepageSections([]);
+      setTagCategories([]);
+      setHomepageError(String(err));
     } finally {
       setHomepageLoading(false);
     }
@@ -180,6 +194,8 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     if (!query.trim()) {
       setCommittedQuery('');
       if (viewMode === 'search') {
+        setSort('trend');
+        setSection('readytouseitems');
         setViewMode('browse');
         setPage(1);
       }
@@ -189,6 +205,8 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setCreatorName(null);
     setActiveTag(null);
     setActiveTagName(null);
+    setSection('readytouseitems');
+    setSort('textsearch');
     setPage(1);
     setCommittedQuery(query.trim());
     setViewMode('search');
@@ -292,8 +310,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       return (
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '64px 0', flex: 1, color: 'var(--md-sys-color-outline)' }}>
           <p>{t('workshop.home.loadFailed')}</p>
-          <button className="btn btn-outline" onClick={enterBrowseMode} style={{ marginTop: '12px', borderRadius: '100px' }}>
-            {t('workshop.home.switchToBrowse')}
+          {homepageError && (
+            <p style={{ marginTop: '8px', fontSize: '12px', maxWidth: '520px', textAlign: 'center' }}>{homepageError}</p>
+          )}
+          <button className="btn btn-outline" onClick={fetchHomepage} style={{ marginTop: '12px', borderRadius: '100px' }}>
+            {t('workshop.browse.retry')}
           </button>
         </div>
       );

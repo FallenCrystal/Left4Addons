@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::{mpsc, Mutex, OnceLock};
@@ -12,6 +13,7 @@ use steamworks::{
 const APP_ID: u32 = 550;
 const BRIDGE_VERSION: &str = "0.1.0";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const PERSONA_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 static RUNTIME: OnceLock<Mutex<Option<BridgeRuntime>>> = OnceLock::new();
 
@@ -114,6 +116,13 @@ struct HomeSectionDef {
     sort: &'static str,
     section: &'static str,
     days: Option<u32>,
+}
+
+struct QueryExecution {
+    items: Vec<Value>,
+    child_ids: Vec<String>,
+    total_results: u32,
+    warnings: Vec<String>,
 }
 
 #[no_mangle]
@@ -283,6 +292,7 @@ fn query_home(runtime: &mut BridgeRuntime) -> Result<Value, String> {
     ];
 
     let mut mapped_sections = Vec::new();
+    let mut warnings = Vec::new();
     for section in sections {
         let query = build_query_handle(
             runtime,
@@ -297,7 +307,8 @@ fn query_home(runtime: &mut BridgeRuntime) -> Result<Value, String> {
             },
             section.days,
         )?;
-        let items = run_query(runtime, query)?;
+        let (items, section_warnings) = run_query(runtime, query)?;
+        warnings.extend(section_warnings);
         mapped_sections.push(HomeSection {
             id: section.id.to_string(),
             title_key: section.title_key.to_string(),
@@ -315,30 +326,32 @@ fn query_home(runtime: &mut BridgeRuntime) -> Result<Value, String> {
     Ok(json!({
         "source": "steam-sdk",
         "sections": mapped_sections,
+        "warnings": dedupe_warnings(warnings),
     }))
 }
 
 fn query_items(runtime: &mut BridgeRuntime, payload: QueryItemsPayload) -> Result<Value, String> {
     let query = build_query_handle(runtime, &payload, None)?;
-    let mut items = run_query(runtime, query)?;
+    let (mut items, warnings) = run_query(runtime, query)?;
     normalize_query_items(&mut items, payload.sort.as_deref());
     Ok(json!({
         "source": "steam-sdk",
         "items": items,
+        "warnings": dedupe_warnings(warnings),
     }))
 }
 
 fn query_item(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result<Value, String> {
-    let items = query_details(runtime, &[workshop_id.to_string()])?;
+    let (items, warnings) = query_details_internal(runtime, &[workshop_id.to_string()])?;
     let item = items
-        .as_array()
-        .and_then(|items| items.first())
+        .first()
         .cloned()
         .ok_or_else(|| "Workshop item not found".to_string())?;
 
     Ok(json!({
         "source": "steam-sdk",
         "item": item,
+        "warnings": dedupe_warnings(warnings),
     }))
 }
 
@@ -348,7 +361,7 @@ fn query_collection(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result<Va
         .query_item(parse_published_file_id(workshop_id)?)
         .map_err(|e| e.to_string())?;
     query = query.include_children(true).include_long_desc(true);
-    let (collection, children) = run_query_with_children(runtime, query)?;
+    let (collection, children, mut warnings) = run_query_with_children(runtime, query)?;
     let collection = collection
         .into_iter()
         .next()
@@ -356,24 +369,27 @@ fn query_collection(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result<Va
     let items = if children.is_empty() {
         Vec::new()
     } else {
-        query_details_internal(runtime, &children)?
+        let (items, child_warnings) = query_details_internal(runtime, &children)?;
+        warnings.extend(child_warnings);
+        items
     };
 
     Ok(json!({
         "source": "steam-sdk",
         "collection": collection,
         "items": items,
+        "warnings": dedupe_warnings(warnings),
     }))
 }
 
 fn query_details(runtime: &mut BridgeRuntime, workshop_ids: &[String]) -> Result<Value, String> {
-    Ok(Value::Array(query_details_internal(runtime, workshop_ids)?))
+    Ok(Value::Array(query_details_internal(runtime, workshop_ids)?.0))
 }
 
 fn query_details_internal(
     runtime: &mut BridgeRuntime,
     workshop_ids: &[String],
-) -> Result<Vec<Value>, String> {
+) -> Result<(Vec<Value>, Vec<String>), String> {
     let ids = workshop_ids
         .iter()
         .map(|id| parse_published_file_id(id))
@@ -384,8 +400,8 @@ fn query_details_internal(
         .include_children(true)
         .include_long_desc(true)
         .include_metadata(true);
-    let (items, _) = run_query_with_children(runtime, query)?;
-    Ok(items)
+    let (items, _, warnings) = run_query_with_children(runtime, query)?;
+    Ok((items, warnings))
 }
 
 fn request_download(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result<Value, String> {
@@ -489,13 +505,13 @@ fn get_favorited_collections(runtime: &mut BridgeRuntime) -> Result<Value, Strin
             .include_children(true)
             .include_metadata(true);
 
-        let (page_items, _, page_total_results) = run_query_with_children_page(runtime, query)?;
-        if page_items.is_empty() {
+        let execution = run_query_with_children_page(runtime, query)?;
+        if execution.items.is_empty() {
             break;
         }
 
-        items.extend(page_items);
-        let expected_total = *total_results.get_or_insert(page_total_results);
+        items.extend(execution.items);
+        let expected_total = *total_results.get_or_insert(execution.total_results);
         if expected_total == 0 || items.len() as u32 >= expected_total {
             break;
         }
@@ -572,23 +588,23 @@ fn build_query_handle(
 fn run_query(
     runtime: &mut BridgeRuntime,
     query: steamworks::QueryHandle,
-) -> Result<Vec<Value>, String> {
-    let (items, _) = run_query_with_children(runtime, query)?;
-    Ok(items)
+) -> Result<(Vec<Value>, Vec<String>), String> {
+    let execution = run_query_with_children_page(runtime, query)?;
+    Ok((execution.items, execution.warnings))
 }
 
 fn run_query_with_children(
     runtime: &mut BridgeRuntime,
     query: steamworks::QueryHandle,
-) -> Result<(Vec<Value>, Vec<String>), String> {
-    let (items, child_ids, _) = run_query_with_children_page(runtime, query)?;
-    Ok((items, child_ids))
+) -> Result<(Vec<Value>, Vec<String>, Vec<String>), String> {
+    let execution = run_query_with_children_page(runtime, query)?;
+    Ok((execution.items, execution.child_ids, execution.warnings))
 }
 
 fn run_query_with_children_page(
     runtime: &mut BridgeRuntime,
     query: steamworks::QueryHandle,
-) -> Result<(Vec<Value>, Vec<String>, u32), String> {
+) -> Result<QueryExecution, String> {
     let (tx, rx) = mpsc::channel();
     query.fetch(move |result| {
         let payload = result.map_err(|err| err.to_string()).and_then(|results| {
@@ -596,14 +612,19 @@ fn run_query_with_children_page(
             let mut child_ids = Vec::new();
             for index in 0..results.returned_results() {
                 if let Some(item) = results.get(index) {
-                    if let Some(children) = results.get_children(index) {
-                        child_ids.extend(children.into_iter().map(|child| child.0.to_string()));
-                    }
+                    let children = results
+                        .get_children(index)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|child| child.0.to_string())
+                        .collect::<Vec<_>>();
+                    child_ids.extend(children.iter().cloned());
                     items.push(query_result_to_json(
                         &results,
                         index,
                         &item,
                         results.preview_url(index),
+                        &children,
                     ));
                 }
             }
@@ -616,7 +637,16 @@ fn run_query_with_children_page(
     loop {
         runtime.client.run_callbacks();
         match rx.try_recv() {
-            Ok(result) => return result,
+            Ok(result) => {
+                let (mut items, child_ids, total_results) = result?;
+                let warnings = fill_creator_persona_names(runtime, &mut items);
+                return Ok(QueryExecution {
+                    items,
+                    child_ids,
+                    total_results,
+                    warnings,
+                });
+            }
             Err(mpsc::TryRecvError::Empty) => {
                 if started_at.elapsed() > QUERY_TIMEOUT {
                     return Err("Steam workshop query timed out".to_string());
@@ -630,11 +660,121 @@ fn run_query_with_children_page(
     }
 }
 
+fn fill_creator_persona_names(runtime: &mut BridgeRuntime, items: &mut [Value]) -> Vec<String> {
+    let mut unique_ids = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for item in items.iter() {
+        let Some(steam_id) = item.get("creator_steam_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let trimmed = steam_id.trim();
+        if trimmed.is_empty() || !seen_ids.insert(trimmed.to_string()) {
+            continue;
+        }
+        unique_ids.push(trimmed.to_string());
+    }
+
+    if unique_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let friends = runtime.client.friends();
+    let mut pending = Vec::new();
+    let mut names = HashMap::new();
+
+    for steam_id in &unique_ids {
+        let id = match steam_id.parse::<u64>() {
+            Ok(raw) => SteamId::from_raw(raw),
+            Err(_) => continue,
+        };
+        let friend = friends.get_friend(id);
+        let name = friend.name();
+        if is_usable_persona_name(&name) {
+            names.insert(steam_id.clone(), name);
+            continue;
+        }
+
+        let _ = friends.request_user_information(id, true);
+        pending.push((steam_id.clone(), id));
+    }
+
+    if !pending.is_empty() {
+        let started_at = Instant::now();
+        while started_at.elapsed() <= PERSONA_LOOKUP_TIMEOUT {
+            runtime.client.run_callbacks();
+            let mut unresolved = Vec::new();
+
+            for (steam_id, id) in pending.into_iter() {
+                let name = friends.get_friend(id).name();
+                if is_usable_persona_name(&name) {
+                    names.insert(steam_id, name);
+                } else {
+                    unresolved.push((steam_id, id));
+                }
+            }
+
+            if unresolved.is_empty() {
+                pending = unresolved;
+                break;
+            }
+
+            pending = unresolved;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    for item in items.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(steam_id) = obj.get("creator_steam_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(name) = names.get(steam_id) {
+            obj.insert("creator_name".to_string(), Value::String(name.clone()));
+        }
+    }
+
+    if pending.is_empty() {
+        return Vec::new();
+    }
+
+    let sample_ids = pending
+        .iter()
+        .take(5)
+        .map(|(steam_id, _)| steam_id.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![format!(
+        "Steamworks SDK creator persona lookup failed for {} author(s): {}",
+        pending.len(),
+        sample_ids
+    )]
+}
+
+fn is_usable_persona_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty() && trimmed != "[unknown]"
+}
+
+fn dedupe_warnings(warnings: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    warnings
+        .into_iter()
+        .filter(|warning| {
+            let trimmed = warning.trim();
+            !trimmed.is_empty() && seen.insert(trimmed.to_string())
+        })
+        .collect()
+}
+
 fn query_result_to_json(
     results: &steamworks::QueryResults<'_>,
     index: u32,
     item: &steamworks::QueryResult,
     preview_url: Option<String>,
+    child_ids: &[String],
 ) -> Value {
     let owner_id = item.owner.raw().to_string();
     let account_id = item.owner.account_id().raw().to_string();
@@ -652,8 +792,8 @@ fn query_result_to_json(
         "description": item.description,
         "short_description": item.description,
         "preview_url": preview_url.unwrap_or_default(),
-        "creator": account_id,
-        "creator_name": owner_id,
+        "creator": owner_id,
+        "creator_name": "",
         "creator_steam_id": owner_id,
         "creator_account_id": account_id,
         "tags": item.tags.iter().map(|tag| json!({ "tag": tag })).collect::<Vec<_>>(),
@@ -661,6 +801,7 @@ fn query_result_to_json(
         "time_created": item.time_created,
         "time_updated": item.time_updated,
         "num_children": item.num_children,
+        "child_item_ids": child_ids,
         "subscriptions": subscriptions,
         "favorited": favorites,
         "favorites": favorites,

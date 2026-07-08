@@ -48,6 +48,7 @@ function App() {
     sortBy,
     setSortBy,
     toasts,
+    addToast,
     syncingSteam,
     autoGrouping,
     selectedIds,
@@ -217,6 +218,9 @@ function App() {
             backgroundTasks={backgroundTasks}
             syncingSteam={syncingSteam}
             onOpenTaskCenter={() => setTaskCenterOpen(true)}
+            onWarning={(message) => {
+              addToast(message, 'error');
+            }}
           />
         ) : currentFilterTab === 'workshop-browser' ? (
           <WorkshopBrowser

@@ -17,6 +17,7 @@ import {
 
 interface WorkshopHomeResponse {
   source: string;
+  warnings?: string[];
   sections: Array<{
     id: string;
     titleKey: string;
@@ -33,16 +34,19 @@ interface WorkshopHomeResponse {
 
 interface WorkshopItemsResponse {
   source: string;
+  warnings?: string[];
   items: any[];
 }
 
 interface WorkshopItemResponse {
   source: string;
+  warnings?: string[];
   item: any;
 }
 
 interface WorkshopCollectionResponse {
   source: string;
+  warnings?: string[];
   collection: any;
   items: any[];
 }
@@ -59,13 +63,134 @@ export interface FetchWorkshopItemsInput {
 
 let capabilitiesPromise: Promise<WorkshopCapabilities> | null = null;
 let steamworksSdkDisabled = false;
+let workshopWarningReporter: ((message: string) => void) | null = null;
 
 export function setSteamworksSdkDisabled(disabled: boolean) {
   steamworksSdkDisabled = disabled;
 }
 
+export function setWorkshopWarningReporter(reporter: ((message: string) => void) | null) {
+  workshopWarningReporter = reporter;
+}
+
 function shouldUseSteamworksSdk() {
   return !steamworksSdkDisabled;
+}
+
+function resolveBrowseSort(input: FetchWorkshopItemsInput): string | undefined {
+  if (input.query?.trim()) {
+    return input.sort || 'textsearch';
+  }
+  return input.sort || undefined;
+}
+
+function reportWorkshopWarnings(warnings?: string[]) {
+  if (!Array.isArray(warnings) || warnings.length === 0) {
+    return;
+  }
+
+  const uniqueWarnings = [...new Set(warnings.map((warning) => normalizeText(warning)).filter(Boolean))];
+  for (const warning of uniqueWarnings) {
+    if (workshopWarningReporter) {
+      workshopWarningReporter(warning);
+    } else {
+      console.error('Workshop warning:', warning);
+    }
+  }
+}
+
+function normalizeText(value: unknown): string {
+  return String(value || '').trim();
+}
+
+function isPlaceholderAuthorName(name: unknown, ids: string[]): boolean {
+  const normalized = normalizeText(name);
+  if (!normalized) return true;
+  const lowered = normalized.toLowerCase();
+  return ids.some((id) => lowered === normalizeText(id).toLowerCase());
+}
+
+function toNumericOrUndefined(value: unknown): number | undefined {
+  const normalized = normalizeText(value);
+  if (!normalized) return undefined;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function clampStars(value: number): number {
+  return Math.max(0, Math.min(5, value));
+}
+
+function mapSteamScoreToStars(detail: any): number {
+  const explicitStars = toNumericOrUndefined(detail.star_rating ?? detail.ratingStars);
+  if (explicitStars !== undefined) {
+    return clampStars(explicitStars);
+  }
+
+  const score = toNumericOrUndefined(detail.score);
+  if (score === undefined) {
+    return 0;
+  }
+
+  if (score <= 1) {
+    return clampStars(Math.round(score * 5));
+  }
+
+  return clampStars(Math.round(score));
+}
+
+function needsHtmlAuthorEnrichment(item: WorkshopItem): boolean {
+  return !normalizeText(item.authorName) || !normalizeText(item.authorUrl);
+}
+
+function enrichWorkshopItems(primary: WorkshopItem[], fallback: WorkshopItem[]): WorkshopItem[] {
+  const fallbackMap = new Map(fallback.map((item) => [item.workshopId, item]));
+
+  return primary.map((item) => {
+    const fallbackItem = fallbackMap.get(item.workshopId);
+    if (!fallbackItem) {
+      return item;
+    }
+
+    return {
+      ...item,
+      authorName: normalizeText(item.authorName) || fallbackItem.authorName,
+      authorId: item.authorId || fallbackItem.authorId,
+      authorUrl: normalizeText(item.authorUrl) || fallbackItem.authorUrl,
+      authorSteamId: item.authorSteamId || fallbackItem.authorSteamId,
+      authorVanityId: item.authorVanityId || fallbackItem.authorVanityId,
+      authorAccountId: item.authorAccountId || fallbackItem.authorAccountId,
+      ownerSteamId: item.ownerSteamId || fallbackItem.ownerSteamId,
+      ownerAccountId: item.ownerAccountId || fallbackItem.ownerAccountId,
+      stars: item.stars > 0 ? item.stars : fallbackItem.stars,
+      imagePath: item.imagePath || fallbackItem.imagePath,
+      shortDescription: item.shortDescription || fallbackItem.shortDescription,
+    };
+  });
+}
+
+function enrichHomepageSections(primary: HomepageSection[], fallback: HomepageSection[]) {
+  const primaryMap = new Map(primary.map((section) => [section.id, section]));
+  const merged: HomepageSection[] = [];
+
+  for (const section of fallback) {
+    const primarySection = primaryMap.get(section.id);
+    if (primarySection) {
+      merged.push({
+        ...primarySection,
+        items: enrichWorkshopItems(primarySection.items, section.items),
+      });
+      primaryMap.delete(section.id);
+      continue;
+    }
+    merged.push(section);
+  }
+
+  for (const section of primaryMap.values()) {
+    merged.push(section);
+  }
+
+  return merged;
 }
 
 export async function getWorkshopCapabilities(): Promise<WorkshopCapabilities> {
@@ -86,6 +211,7 @@ export async function fetchWorkshopHome() {
   if (capabilities?.canQueryHome) {
     try {
       const data = await invoke<WorkshopHomeResponse>('query_workshop_home');
+      reportWorkshopWarnings(data.warnings);
       sdkSections = data.sections.map((section) => ({
         id: section.id,
         title: section.titleKey,
@@ -102,17 +228,16 @@ export async function fetchWorkshopHome() {
     }
   }
 
-  const html = await invoke<string>('fetch_workshop_html', {
-    url: 'https://steamcommunity.com/app/550/workshop/',
-    source: 'workshop-home',
-  });
-  const htmlSections = parseHomepageSections(html).map((section) => ({
-    ...section,
-    items: rememberWorkshopItems(section.items),
-  }));
-  const tagCategories = parseTagCategories(html);
-
   if (sdkSections.length === 0) {
+    const html = await invoke<string>('fetch_workshop_html', {
+      url: 'https://steamcommunity.com/app/550/workshop/',
+      source: 'workshop-home',
+    });
+    const htmlSections = parseHomepageSections(html).map((section) => ({
+      ...section,
+      items: rememberWorkshopItems(section.items),
+    }));
+    const tagCategories = parseTagCategories(html);
     return {
       source: 'web-fallback',
       sections: htmlSections,
@@ -120,9 +245,25 @@ export async function fetchWorkshopHome() {
     };
   }
 
+  let tagCategories = [];
+  let htmlSections: HomepageSection[] = [];
+  try {
+    const html = await invoke<string>('fetch_workshop_html', {
+      url: 'https://steamcommunity.com/app/550/workshop/',
+      source: 'workshop-home',
+    });
+    htmlSections = parseHomepageSections(html).map((section) => ({
+      ...section,
+      items: rememberWorkshopItems(section.items),
+    }));
+    tagCategories = parseTagCategories(html);
+  } catch (err) {
+    console.warn('Workshop home HTML enrichment failed:', err);
+  }
+
   return {
-    source: source === 'steam-sdk' ? 'hybrid' : source,
-    sections: mergeHomepageSections(sdkSections, htmlSections),
+    source: htmlSections.length > 0 && source === 'steam-sdk' ? 'hybrid' : source,
+    sections: enrichHomepageSections(sdkSections, htmlSections),
     tagCategories,
   };
 }
@@ -131,6 +272,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
   const capabilities = shouldUseSteamworksSdk()
     ? await getWorkshopCapabilities().catch(() => null)
     : null;
+  const resolvedSort = resolveBrowseSort(input);
   if (capabilities?.canQueryItems) {
     const creatorId = input.creatorId?.trim();
     const creatorNumeric = !creatorId || /^\d+$/.test(creatorId);
@@ -139,7 +281,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
         const data = await invoke<WorkshopItemsResponse>('query_workshop_items', {
           query: {
             query: input.query || undefined,
-            sort: input.sort || undefined,
+            sort: resolvedSort,
             section: input.section || undefined,
             page: input.page || 1,
             creatorId: creatorId || undefined,
@@ -147,11 +289,22 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
             activeTagName: input.activeTagName || undefined,
           },
         });
+        reportWorkshopWarnings(data.warnings);
+        let items = data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source));
+        if (items.some(needsHtmlAuthorEnrichment)) {
+          try {
+            const html: string = await invoke('fetch_workshop_html', {
+              url: buildBrowseUrl(input),
+              source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+            });
+            items = enrichWorkshopItems(items, parseSSRItems(html, 'workshop_query'));
+          } catch (err) {
+            console.warn('Steam SDK browse HTML enrichment failed:', err);
+          }
+        }
         return {
           source: data.source,
-          items: rememberWorkshopItems(
-            data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
-          ),
+          items: rememberWorkshopItems(items),
         };
       } catch (err) {
         console.warn('Steam SDK browse query failed, falling back to HTML:', err);
@@ -177,6 +330,7 @@ export async function fetchWorkshopItem(workshopId: string) {
   if (capabilities?.canQueryItems) {
     try {
       const data = await invoke<WorkshopItemResponse>('query_workshop_item', { workshopId });
+      reportWorkshopWarnings(data.warnings);
       return {
         source: data.source,
         item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.item, data.source)])[0],
@@ -200,6 +354,7 @@ export async function fetchWorkshopCollection(workshopId: string) {
   if (capabilities?.canQueryItems) {
     try {
       const data = await invoke<WorkshopCollectionResponse>('query_workshop_collection', { workshopId });
+      reportWorkshopWarnings(data.warnings);
       const resolvedCollection = rememberWorkshopItems([
         mapSteamDetailToWorkshopItem(data.collection, data.source),
       ])[0];
@@ -269,10 +424,11 @@ function buildBrowseUrl(input: FetchWorkshopItemsInput) {
   if (input.creatorId) {
     url += `&browsesort=myfiles&creatorid=${input.creatorId}&p=${input.page || 1}`;
   } else {
+    const resolvedSort = resolveBrowseSort(input) || 'trend';
     if (input.query) {
       url += `&searchtext=${encodeURIComponent(input.query)}`;
     }
-    url += `&browsesort=${input.sort || 'trend'}&section=${input.section || 'readytouseitems'}&p=${input.page || 1}`;
+    url += `&browsesort=${resolvedSort}&section=${input.section || 'readytouseitems'}&p=${input.page || 1}`;
     if (input.activeTag) {
       url += `&requiredtags[]=${encodeURIComponent(input.activeTagName || input.activeTag)}`;
     }
@@ -280,42 +436,29 @@ function buildBrowseUrl(input: FetchWorkshopItemsInput) {
   return url;
 }
 
-function mergeHomepageSections(primary: HomepageSection[], fallback: HomepageSection[]) {
-  const primaryMap = new Map(primary.map((section) => [section.id, section]));
-  const merged: HomepageSection[] = [];
-
-  for (const section of fallback) {
-    merged.push(primaryMap.get(section.id) || section);
-    primaryMap.delete(section.id);
-  }
-
-  for (const section of primaryMap.values()) {
-    merged.push(section);
-  }
-
-  return merged;
-}
-
 export function mapSteamDetailToWorkshopItem(detail: any, source = 'steam-sdk'): WorkshopItem {
-  const ownerSteamId = String(
+  const ownerSteamId = normalizeText(
     detail.creator_steam_id ||
     detail.creatorSteamId ||
     detail.owner_steam_id ||
     detail.ownerSteamId ||
+    (detail.creator && /^\d{17,20}$/.test(String(detail.creator)) ? detail.creator : '') ||
     '',
   );
-  const ownerAccountId = String(
+  const ownerAccountId = normalizeText(
     detail.creator_account_id ||
     detail.creatorAccountId ||
-    detail.creator ||
     detail.owner_account_id ||
     detail.ownerAccountId ||
     '',
   );
   const authorSteamId = ownerSteamId || undefined;
   const authorAccountId = ownerAccountId || undefined;
-  const authorId = ownerAccountId || ownerSteamId || String(detail.creator || '');
-  const authorName = String(detail.creator_name || detail.creatorName || detail.authorName || authorId || '');
+  const authorId = ownerSteamId || ownerAccountId || normalizeText(detail.creator);
+  const rawAuthorName = normalizeText(detail.creator_name || detail.creatorName || detail.authorName);
+  const authorName = isPlaceholderAuthorName(rawAuthorName, [ownerSteamId, ownerAccountId, normalizeText(detail.creator)])
+    ? ''
+    : rawAuthorName;
   const authorUrl = authorSteamId
     ? `https://steamcommunity.com/profiles/${authorSteamId}`
     : '';
@@ -331,7 +474,7 @@ export function mapSteamDetailToWorkshopItem(detail: any, source = 'steam-sdk'):
     authorAccountId,
     ownerSteamId: authorSteamId,
     ownerAccountId: authorAccountId,
-    stars: Number(detail.star_rating ?? detail.score ?? 0),
+    stars: mapSteamScoreToStars(detail),
     shortDescription: detail.short_description || detail.shortDescription || detail.description || '',
     fileSize: detail.file_size
       ? `${(parseInt(String(detail.file_size), 10) / 1024 / 1024).toFixed(1)} MB`

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, BackgroundTask, DatabasePayload } from '../types/addon';
-import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../services/workshopClient';
+import { fetchWorkshopItem, fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../services/workshopClient';
 
 const DOWNLOAD_CONCURRENCY = 3;
-const WORKSHOP_CRAWL_COOLDOWN_MS = 5000;
+const WORKSHOP_CRAWL_COOLDOWN_MS = 6000;
 const WORKSHOP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface UseBackgroundTasksArgs {
@@ -200,8 +200,11 @@ export function useBackgroundTasks({
 
     try {
       lastCrawlAtRef.current = Date.now();
-      const details = await fetchWorkshopPageDetails(workshopId, task.source || 'background-refresh');
-      const data = await persistWorkshopPageDetails(workshopId, details, task.source || 'background-refresh') as DatabasePayload;
+      const itemResult = await fetchWorkshopItem(workshopId);
+      const data = await invoke<DatabasePayload>('record_workshop_items_seen', {
+        items: [itemResult.item],
+        source: task.source || 'background-refresh',
+      });
       if (isDatabasePayload(data)) {
         updateLocalState(data);
       }
@@ -308,10 +311,16 @@ export function useBackgroundTasks({
         });
 
         const staleIds = [...candidateIds].filter((id) => {
-          const lastFetched = cache?.[id]?.lastPageFetchedAt;
+          const lastFetched = cache?.[id]?.lastSeenAt || cache?.[id]?.lastPageFetchedAt;
           if (!lastFetched) return true;
           const timestamp = Date.parse(lastFetched);
           return Number.isNaN(timestamp) || Date.now() - timestamp > WORKSHOP_CACHE_TTL_MS;
+        }).sort((left, right) => {
+          const leftValue = Date.parse(cache?.[left]?.lastSeenAt || cache?.[left]?.lastPageFetchedAt || '');
+          const rightValue = Date.parse(cache?.[right]?.lastSeenAt || cache?.[right]?.lastPageFetchedAt || '');
+          const leftTime = Number.isNaN(leftValue) ? Number.MIN_SAFE_INTEGER : leftValue;
+          const rightTime = Number.isNaN(rightValue) ? Number.MIN_SAFE_INTEGER : rightValue;
+          return leftTime - rightTime;
         });
 
         enqueueWorkshopCrawl(staleIds, 'startup-auto');

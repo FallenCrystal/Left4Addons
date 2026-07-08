@@ -103,6 +103,7 @@ export interface WorkshopBrowserProps {
   backgroundTasks: import('../../types/addon').BackgroundTask[];
   syncingSteam: boolean;
   onOpenTaskCenter: () => void;
+  onWarning?: (message: string) => void;
 }
 
 export interface WorkshopCapabilities {
