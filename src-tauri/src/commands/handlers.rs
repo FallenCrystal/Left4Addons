@@ -3814,6 +3814,25 @@ pub async fn open_url(url: String) -> Result<(), String> {
 pub async fn get_workshop_capabilities(
     state: State<'_, crate::AppState>,
 ) -> Result<WorkshopCapabilities, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Ok(WorkshopCapabilities {
+            bridge_available: false,
+            bridge_loaded: false,
+            bridge_initialized: false,
+            provider: "web-fallback".to_string(),
+            bridge_version: None,
+            last_error: Some("Steamworks SDK workshop source is disabled by settings".to_string()),
+            current_user_steam_id: None,
+            current_user_account_id: None,
+            can_query_items: false,
+            can_query_home: false,
+            can_download: false,
+            can_enumerate_installed: false,
+            can_enumerate_subscribed: false,
+        });
+    }
+    drop(db);
     Ok(state.workshop_service.capabilities())
 }
 
@@ -4217,9 +4236,12 @@ pub async fn fetch_workshop_html(
     let (allow_html, sdk_query_available) = {
         let db = state.db.lock().await;
         let source_policy = SourcePolicy::from_settings(&db.settings);
-        let capabilities = state.workshop_service.capabilities();
-        let sdk_query_available = source_policy.allow_bridge()
-            && (capabilities.can_query_items || capabilities.can_query_home);
+        let sdk_query_available = if source_policy.allow_bridge() {
+            let capabilities = state.workshop_service.capabilities();
+            capabilities.can_query_items || capabilities.can_query_home
+        } else {
+            false
+        };
         (
             source_policy.allow_html(sdk_query_available),
             sdk_query_available,

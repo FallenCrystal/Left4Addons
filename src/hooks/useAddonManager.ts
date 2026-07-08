@@ -256,6 +256,20 @@ export function useAddonManager() {
   }, [settings.disableSteamworksSdk, settings.workshopSourceSettings]);
 
   useEffect(() => {
+    if (loading) {
+      return;
+    }
+
+    const shouldProbeCapabilities = !settings.disableSteamworksSdk
+      && (settings.workshopSourceSettings?.allowSteamworksSdk ?? true);
+
+    if (!shouldProbeCapabilities) {
+      setWorkshopCapabilities(null);
+      setWorkshopCapabilitiesError(null);
+      setWorkshopCapabilitiesCheckedAt(null);
+      return;
+    }
+
     let cancelled = false;
 
     void invoke<WorkshopCapabilities>('get_workshop_capabilities')
@@ -275,7 +289,7 @@ export function useAddonManager() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loading, settings.disableSteamworksSdk, settings.workshopSourceSettings?.allowSteamworksSdk]);
 
   const steamworksUnavailableTask: BackgroundTask | null = (() => {
     if (loading || settings.suppressSdkUnavailableWarning || settings.disableSteamworksSdk) {

@@ -607,6 +607,59 @@ describe('useAddonManager', () => {
     expect(result.current.backgroundTasks).toHaveLength(0);
   });
 
+  test('should not probe Steamworks capabilities when SDK source is disabled in source settings', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: mockGroups,
+          settings: {
+            ...mockSettings,
+            workshopSourceSettings: {
+              preset: 'conservative',
+              allowSteamworksSdk: false,
+              allowSteamWebApi: true,
+              allowSteamCommunityHtml: true,
+              allowSdkHtmlHybrid: false,
+              sourceOrder: ['steam-web-api', 'steamcommunity-html', 'steamworks-sdk'],
+              cacheRetention: 'keep',
+            },
+          },
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(mockInvoke).not.toHaveBeenCalledWith('get_workshop_capabilities', undefined);
+    expect(result.current.backgroundTasks).toHaveLength(0);
+  });
+
   test('should request backend download cancellation when cancelling a running download task', async () => {
     let resolveDownload: ((value: DatabasePayload) => void) | undefined;
     const downloadPromise = new Promise<DatabasePayload>((resolve) => {

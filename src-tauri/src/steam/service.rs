@@ -5,77 +5,111 @@ use super::types::{
     WorkshopItemsResponse,
 };
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-#[derive(Clone, Default)]
-pub struct WorkshopService {
+#[derive(Default)]
+struct WorkshopServiceState {
     bridge: Option<WorkshopBridge>,
     bridge_error: Option<String>,
+    load_attempted: bool,
+}
+
+#[derive(Default)]
+pub struct WorkshopService {
+    exe_dir: PathBuf,
+    state: Mutex<WorkshopServiceState>,
 }
 
 impl WorkshopService {
     pub fn new(exe_dir: &Path) -> Self {
-        match WorkshopBridge::load_near(exe_dir) {
-            Ok(bridge) => Self {
-                bridge: Some(bridge),
-                bridge_error: None,
-            },
-            Err(err) => Self {
-                bridge: None,
-                bridge_error: Some(err),
-            },
+        Self {
+            exe_dir: exe_dir.to_path_buf(),
+            state: Mutex::new(WorkshopServiceState::default()),
         }
     }
 
-    pub fn capabilities(&self) -> WorkshopCapabilities {
-        if let Some(bridge) = &self.bridge {
-            bridge.capabilities()
-        } else {
-            WorkshopCapabilities {
-                bridge_available: false,
-                bridge_loaded: false,
-                bridge_initialized: false,
-                provider: "web-fallback".to_string(),
-                bridge_version: None,
-                last_error: self.bridge_error.clone(),
-                current_user_steam_id: None,
-                current_user_account_id: None,
-                can_query_items: false,
-                can_query_home: false,
-                can_download: false,
-                can_enumerate_installed: false,
-                can_enumerate_subscribed: false,
+    fn unavailable_capabilities(last_error: Option<String>) -> WorkshopCapabilities {
+        WorkshopCapabilities {
+            bridge_available: false,
+            bridge_loaded: false,
+            bridge_initialized: false,
+            provider: "web-fallback".to_string(),
+            bridge_version: None,
+            last_error,
+            current_user_steam_id: None,
+            current_user_account_id: None,
+            can_query_items: false,
+            can_query_home: false,
+            can_download: false,
+            can_enumerate_installed: false,
+            can_enumerate_subscribed: false,
+        }
+    }
+
+    fn ensure_bridge(&self) -> Result<WorkshopBridge, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Steam bridge state mutex poisoned".to_string())?;
+
+        if let Some(bridge) = &state.bridge {
+            return Ok(bridge.clone());
+        }
+
+        if state.load_attempted {
+            return Err(state
+                .bridge_error
+                .clone()
+                .unwrap_or_else(|| "Steam bridge unavailable".to_string()));
+        }
+
+        match WorkshopBridge::load_near(&self.exe_dir) {
+            Ok(bridge) => {
+                state.bridge = Some(bridge.clone());
+                state.bridge_error = None;
+                state.load_attempted = true;
+                Ok(bridge)
+            }
+            Err(err) => {
+                state.bridge = None;
+                state.bridge_error = Some(err.clone());
+                state.load_attempted = true;
+                Err(err)
             }
         }
     }
 
+    pub fn capabilities(&self) -> WorkshopCapabilities {
+        match self.ensure_bridge() {
+            Ok(bridge) => bridge.capabilities(),
+            Err(err) => Self::unavailable_capabilities(Some(err)),
+        }
+    }
+
     pub fn has_bridge(&self) -> bool {
-        self.bridge.is_some()
+        self.ensure_bridge().is_ok()
     }
 
     pub fn shutdown(&self) {
-        if let Some(bridge) = &self.bridge {
-            bridge.shutdown();
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(bridge) = state.bridge.take() {
+                bridge.shutdown();
+            }
+            state.bridge_error = None;
+            state.load_attempted = false;
         }
     }
 
     pub fn bridge_fetch_details(&self, workshop_ids: &[String]) -> Result<Vec<Value>, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("get_details", &json!({ "ids": workshop_ids }))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 
     pub fn bridge_query_home(&self) -> Result<WorkshopHomeResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("query_home", &json!({}))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
@@ -85,22 +119,14 @@ impl WorkshopService {
         &self,
         query: &WorkshopBrowseQuery,
     ) -> Result<WorkshopItemsResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("query_items", query)?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 
     pub fn bridge_query_item(&self, workshop_id: &str) -> Result<WorkshopItemResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("query_item", &json!({ "workshopId": workshop_id }))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
@@ -110,22 +136,14 @@ impl WorkshopService {
         &self,
         workshop_id: &str,
     ) -> Result<WorkshopCollectionResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("query_collection", &json!({ "workshopId": workshop_id }))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 
     pub fn bridge_request_download(&self, workshop_id: &str) -> Result<(), String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("request_download", &json!({ "workshopId": workshop_id }))?;
         let accepted = payload
@@ -148,33 +166,21 @@ impl WorkshopService {
         &self,
         workshop_id: &str,
     ) -> Result<BridgeDownloadStatus, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("get_download_status", &json!({ "workshopId": workshop_id }))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 
     pub fn bridge_get_subscribed_items(&self) -> Result<SubscribedWorkshopItemsResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("get_subscribed_items", &json!({}))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 
     pub fn bridge_get_favorited_collections(&self) -> Result<WorkshopItemsResponse, String> {
-        let bridge = self.bridge.as_ref().ok_or_else(|| {
-            self.bridge_error
-                .clone()
-                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
-        })?;
+        let bridge = self.ensure_bridge()?;
 
         let payload = bridge.call("get_favorited_collections", &json!({}))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
