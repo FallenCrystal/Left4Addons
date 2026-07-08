@@ -7,16 +7,34 @@ use std::process::Command;
 fn main() {
     tauri_build::build();
 
-    if let Err(err) = stage_windows_steam_bridge() {
+    if let Err(err) = stage_steam_bridge() {
         println!("cargo:warning=failed to stage Steam bridge runtime files: {err}");
     }
 }
 
-fn stage_windows_steam_bridge() -> Result<(), String> {
+fn stage_steam_bridge() -> Result<(), String> {
     let target = env::var("TARGET").map_err(|e| e.to_string())?;
-    if !target.contains("windows") {
+    let artifacts = if target.contains("windows") {
+        SteamBridgeArtifacts {
+            bridge_source_name: "l4a_steam_bridge.dll",
+            bridge_staged_name: "l4a-steam-bridge.dll",
+            steam_api_name: "steam_api64.dll",
+        }
+    } else if target.contains("linux") {
+        SteamBridgeArtifacts {
+            bridge_source_name: "libl4a_steam_bridge.so",
+            bridge_staged_name: "libl4a-steam-bridge.so",
+            steam_api_name: "libsteam_api.so",
+        }
+    } else if target.contains("darwin") {
+        SteamBridgeArtifacts {
+            bridge_source_name: "libl4a_steam_bridge.dylib",
+            bridge_staged_name: "libl4a-steam-bridge.dylib",
+            steam_api_name: "libsteam_api.dylib",
+        }
+    } else {
         return Ok(());
-    }
+    };
 
     println!("cargo:rerun-if-env-changed=STEAM_SDK_LOCATION");
     println!("cargo:rerun-if-changed=../steam-bridge/Cargo.toml");
@@ -38,8 +56,7 @@ fn stage_windows_steam_bridge() -> Result<(), String> {
         .arg(&bridge_manifest)
         .arg("--target")
         .arg(&target)
-        .arg("--profile")
-        .arg(&profile)
+        .args(cargo_profile_args(&profile))
         .arg("--target-dir")
         .arg(&bridge_target_dir)
         .status()
@@ -60,18 +77,26 @@ fn stage_windows_steam_bridge() -> Result<(), String> {
 
     let bridge_output_dir = bridge_target_dir.join(&target).join(&profile);
     copy_if_newer(
-        &bridge_output_dir.join("l4a_steam_bridge.dll"),
-        &steam_dir.join("l4a-steam-bridge.dll"),
+        &bridge_output_dir.join(artifacts.bridge_source_name),
+        &steam_dir.join(artifacts.bridge_staged_name),
     )?;
 
-    let steam_api = find_file_named(&bridge_output_dir.join("build"), "steam_api64.dll")
-        .ok_or_else(|| {
-            "failed to locate steam_api64.dll in steam bridge build output; set STEAM_SDK_LOCATION to your Steamworks SDK root if needed".to_string()
-        })?;
-    copy_if_newer(&steam_api, &steam_dir.join("steam_api64.dll"))?;
+    let steam_api =
+        find_file_named(&bridge_output_dir.join("build"), artifacts.steam_api_name).ok_or_else(
+            || {
+                format!(
+                    "failed to locate {} in steam bridge build output; set STEAM_SDK_LOCATION to your Steamworks SDK root if needed",
+                    artifacts.steam_api_name
+                )
+            },
+        )?;
+    copy_if_newer(&steam_api, &steam_dir.join(artifacts.steam_api_name))?;
 
     if target.contains("windows-gnu") {
-        for dll_name in gnu_runtime_dlls(&target, &bridge_output_dir.join("l4a_steam_bridge.dll")) {
+        for dll_name in gnu_runtime_dlls(
+            &target,
+            &bridge_output_dir.join(artifacts.bridge_source_name),
+        ) {
             if let Some(runtime_dll) = locate_linker_runtime_dll(&target, &dll_name) {
                 copy_if_newer(&runtime_dll, &steam_dir.join(&dll_name))?;
             }
@@ -79,6 +104,20 @@ fn stage_windows_steam_bridge() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+struct SteamBridgeArtifacts {
+    bridge_source_name: &'static str,
+    bridge_staged_name: &'static str,
+    steam_api_name: &'static str,
+}
+
+fn cargo_profile_args(profile: &str) -> Vec<&str> {
+    match profile {
+        "debug" => Vec::new(),
+        "release" => vec!["--release"],
+        _ => vec!["--profile", profile],
+    }
 }
 
 fn find_profile_dir() -> Result<PathBuf, String> {

@@ -13,6 +13,7 @@ type FreeStringFn = unsafe extern "C" fn(*mut c_char);
 type ShutdownFn = unsafe extern "C" fn();
 
 struct BridgeApi {
+    _dependencies: Vec<Library>,
     _library: Library,
     init: InitFn,
     request_json: RequestFn,
@@ -37,18 +38,20 @@ pub struct WorkshopBridge {
 
 impl WorkshopBridge {
     pub fn load_near(exe_dir: &Path) -> Result<Self, String> {
-        let mut last_error = None;
-        for candidate in candidate_library_paths(exe_dir) {
-            match unsafe { Self::load_from_path(&candidate) } {
-                Ok(bridge) => return Ok(bridge),
-                Err(err) => last_error = Some(format!("{}: {}", candidate.display(), err)),
-            }
+        let bridge_path = bridge_library_path(exe_dir);
+        if !bridge_path.exists() {
+            return Err(format!(
+                "Steam bridge library not found at {}",
+                bridge_path.display()
+            ));
         }
 
-        Err(last_error.unwrap_or_else(|| "Steam bridge DLL not found".to_string()))
+        unsafe { Self::load_from_path(&bridge_path) }
+            .map_err(|err| format!("failed to load {}: {}", bridge_path.display(), err))
     }
 
     unsafe fn load_from_path(path: &Path) -> Result<Self, String> {
+        let dependencies = load_support_libraries(path)?;
         let library = load_library(path)?;
         let init = *library
             .get::<InitFn>(b"l4a_steam_bridge_init\0")
@@ -64,6 +67,7 @@ impl WorkshopBridge {
             .map_err(|e| e.to_string())?;
 
         let api = Arc::new(BridgeApi {
+            _dependencies: dependencies,
             _library: library,
             init,
             request_json,
@@ -83,12 +87,12 @@ impl WorkshopBridge {
         let capabilities = WorkshopCapabilities {
             bridge_available: true,
             bridge_loaded: true,
-            bridge_initialized: false,
+            bridge_initialized: true,
             provider: "steam-sdk".to_string(),
             bridge_version: init_response.version.clone(),
             last_error: None,
-            current_user_steam_id: None,
-            current_user_account_id: None,
+            current_user_steam_id: init_response.current_user_steam_id.clone(),
+            current_user_account_id: init_response.current_user_account_id.clone(),
             can_query_items: true,
             can_query_home: true,
             can_download: true,
@@ -177,21 +181,58 @@ fn format_windows_load_error(path: &Path, source: &str) -> String {
     )
 }
 
-fn candidate_library_paths(exe_dir: &Path) -> Vec<PathBuf> {
-    let names = if cfg!(target_os = "windows") {
-        vec!["l4a-steam-bridge.dll"]
-    } else if cfg!(target_os = "macos") {
-        vec!["libl4a-steam-bridge.dylib"]
-    } else {
-        vec!["libl4a-steam-bridge.so", "l4a-steam-bridge.dll"]
-    };
+fn bridge_library_path(exe_dir: &Path) -> PathBuf {
+    exe_dir.join("steam").join(bridge_library_name())
+}
 
-    let mut paths = Vec::new();
-    for name in names {
-        paths.push(exe_dir.join(name));
-        paths.push(exe_dir.join("steam").join(name));
+fn bridge_library_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "l4a-steam-bridge.dll"
+    } else if cfg!(target_os = "macos") {
+        "libl4a-steam-bridge.dylib"
+    } else {
+        "libl4a-steam-bridge.so"
     }
-    paths
+}
+
+fn steam_api_library_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "steam_api64.dll"
+    } else if cfg!(target_os = "macos") {
+        "libsteam_api.dylib"
+    } else {
+        "libsteam_api.so"
+    }
+}
+
+unsafe fn load_support_libraries(path: &Path) -> Result<Vec<Library>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("failed to resolve parent directory for {}", path.display()))?;
+        let steam_api_path = parent.join(steam_api_library_name());
+        if !steam_api_path.exists() {
+            return Err(format!(
+                "required Steamworks runtime not found at {}",
+                steam_api_path.display()
+            ));
+        }
+
+        let steam_api = UnixLibrary::open(Some(&steam_api_path), RTLD_NOW | RTLD_GLOBAL)
+            .map(Library::from)
+            .map_err(|e| format!("failed to preload {}: {}", steam_api_path.display(), e))?;
+
+        Ok(vec![steam_api])
+    }
 }
 
 fn invoke_raw_string(api: &BridgeApi, request: Option<&str>) -> Result<String, String> {

@@ -26,6 +26,12 @@ struct BridgeRuntime {
 struct InitResponse {
     ok: bool,
     version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_user_steam_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_user_account_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -127,10 +133,37 @@ struct QueryExecution {
 
 #[no_mangle]
 pub extern "C" fn l4a_steam_bridge_init() -> *mut c_char {
-    into_c_string(&InitResponse {
-        ok: true,
-        version: BRIDGE_VERSION.to_string(),
-    })
+    let response = match ensure_runtime() {
+        Ok(runtime) => {
+            let user = runtime.as_ref().map(|runtime| runtime.client.user());
+            let Some(user) = user else {
+                return into_c_string(&InitResponse {
+                    ok: false,
+                    version: BRIDGE_VERSION.to_string(),
+                    error: Some("Steam bridge runtime unavailable".to_string()),
+                    current_user_steam_id: None,
+                    current_user_account_id: None,
+                });
+            };
+            let steam_id = user.steam_id();
+            InitResponse {
+                ok: true,
+                version: BRIDGE_VERSION.to_string(),
+                error: None,
+                current_user_steam_id: Some(steam_id.raw().to_string()),
+                current_user_account_id: Some(steam_id.account_id().raw().to_string()),
+            }
+        }
+        Err(err) => InitResponse {
+            ok: false,
+            version: BRIDGE_VERSION.to_string(),
+            error: Some(err),
+            current_user_steam_id: None,
+            current_user_account_id: None,
+        },
+    };
+
+    into_c_string(&response)
 }
 
 #[no_mangle]
@@ -383,7 +416,9 @@ fn query_collection(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result<Va
 }
 
 fn query_details(runtime: &mut BridgeRuntime, workshop_ids: &[String]) -> Result<Value, String> {
-    Ok(Value::Array(query_details_internal(runtime, workshop_ids)?.0))
+    Ok(Value::Array(
+        query_details_internal(runtime, workshop_ids)?.0,
+    ))
 }
 
 fn query_details_internal(
