@@ -46,10 +46,7 @@ fn stage_windows_steam_bridge() -> Result<(), String> {
         .map_err(|e| format!("failed to invoke cargo for steam bridge: {e}"))?;
 
     if !status.success() {
-        return Err(format!(
-            "steam bridge build failed with status {}",
-            status
-        ));
+        return Err(format!("steam bridge build failed with status {}", status));
     }
 
     let app_profile_dir = find_profile_dir()?;
@@ -114,13 +111,8 @@ fn copy_if_newer(src: &Path, dst: &Path) -> Result<(), String> {
     };
 
     if should_copy {
-        fs::copy(src, dst).map_err(|e| {
-            format!(
-                "failed to copy {} -> {}: {e}",
-                src.display(),
-                dst.display()
-            )
-        })?;
+        fs::copy(src, dst)
+            .map_err(|e| format!("failed to copy {} -> {}: {e}", src.display(), dst.display()))?;
     }
 
     Ok(())
@@ -176,7 +168,11 @@ fn gnu_runtime_dlls(target: &str, bridge_dll: &Path) -> Vec<String> {
 
 fn imported_dlls_from_objdump(target: &str, bridge_dll: &Path) -> Option<Vec<String>> {
     let objdump = objdump_command_for_target(target)?;
-    let output = Command::new(objdump).arg("-p").arg(bridge_dll).output().ok()?;
+    let output = Command::new(objdump)
+        .arg("-p")
+        .arg(bridge_dll)
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }

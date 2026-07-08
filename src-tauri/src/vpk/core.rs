@@ -84,12 +84,11 @@ pub fn parse_vpk<P: AsRef<Path>>(
                 let _terminator = u16::from_le_bytes(entry_slice[16..18].try_into().unwrap());
 
                 let mut preload_data = Vec::new();
-                if preload_bytes > 0
-                    && offset + preload_bytes as usize <= tree_buf.len() {
-                        preload_data
-                            .extend_from_slice(&tree_buf[offset..offset + preload_bytes as usize]);
-                        offset += preload_bytes as usize;
-                    }
+                if preload_bytes > 0 && offset + preload_bytes as usize <= tree_buf.len() {
+                    preload_data
+                        .extend_from_slice(&tree_buf[offset..offset + preload_bytes as usize]);
+                    offset += preload_bytes as usize;
+                }
 
                 let norm_path = path_str.trim();
                 let full_path = if norm_path.is_empty() {

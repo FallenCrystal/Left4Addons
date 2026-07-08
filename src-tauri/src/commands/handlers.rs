@@ -951,9 +951,10 @@ pub async fn scan_addons_internal(
             });
 
         let has_capitalized_keys = cached.as_ref().is_some_and(|addon| {
-            addon.addon_info.as_object().is_some_and(|obj| {
-                obj.keys().any(|k| k.chars().any(|c| c.is_uppercase()))
-            })
+            addon
+                .addon_info
+                .as_object()
+                .is_some_and(|obj| obj.keys().any(|k| k.chars().any(|c| c.is_uppercase())))
         });
 
         let needs_metadata = match &cached {
@@ -3146,7 +3147,8 @@ pub async fn add_known_addon(
     let mut db = state.db.lock().await;
 
     let details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
+        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id))
+            .await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }
