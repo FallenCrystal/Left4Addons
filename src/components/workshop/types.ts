@@ -12,6 +12,8 @@ export interface WorkshopItem {
   authorSteamId?: string;
   authorVanityId?: string;
   authorAccountId?: string;
+  ownerSteamId?: string;
+  ownerAccountId?: string;
   stars: number;
   shortDescription?: string;
   fileSize?: string;
@@ -29,6 +31,10 @@ export interface WorkshopItem {
   previewCount?: number;
   childItemIds?: string[];
   galleryPreviewUrls?: string[];
+  source?: string;
+  isSubscribed?: boolean;
+  isInstalled?: boolean;
+  installState?: string[];
 }
 
 export interface CollectionData {
@@ -94,4 +100,19 @@ export interface WorkshopBrowserProps {
   onDatabaseUpdate?: (data: DatabasePayload) => void;
   isSubmitting: boolean;
   groups?: import('../../types/addon').Group[];
+}
+
+export interface WorkshopCapabilities {
+  bridgeAvailable: boolean;
+  bridgeLoaded: boolean;
+  bridgeInitialized: boolean;
+  provider: string;
+  bridgeVersion?: string;
+  lastError?: string;
+  currentUserSteamId?: string;
+  currentUserAccountId?: string;
+  canQueryItems: boolean;
+  canQueryHome: boolean;
+  canDownload: boolean;
+  canEnumerateInstalled: boolean;
 }

@@ -7,7 +7,6 @@
  */
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import {
   Search, ChevronLeft, ChevronRight, Loader2,
@@ -20,15 +19,17 @@ import {
   TagCategory,
   WorkshopBrowserProps,
 } from './workshop/types';
-import {
-  parseSSRItems,
-  parseHomepageSections,
-  parseTagCategories,
-} from './workshop/ssrParser';
 import { ItemCard } from './workshop/ItemCard';
 import { TagBrowserModal } from './workshop/TagBrowserModal';
 import { SectionCarousel } from './workshop/SectionCarousel';
 import { WorkshopDetailModal } from './workshop/WorkshopDetailModal';
+import {
+  fetchWorkshopCollection,
+  fetchWorkshopHome,
+  fetchWorkshopItem,
+  fetchWorkshopItems,
+  mapSteamDetailToWorkshopItem,
+} from '../services/workshopClient';
 
 // ── Browse sort options ───────────────────────────────────────────────────────
 
@@ -117,14 +118,10 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const fetchHomepage = useCallback(async () => {
     setHomepageLoading(true);
     try {
-      const html: string = await invoke('fetch_workshop_html', {
-        url: 'https://steamcommunity.com/app/550/workshop/',
-        source: 'workshop-home',
-      });
-      const sections = parseHomepageSections(html);
-      setHomepageSections(sections);
-      onRecordSeenItems?.(sections.flatMap((sec) => sec.items), 'workshop-home');
-      setTagCategories(parseTagCategories(html));
+      const data = await fetchWorkshopHome();
+      setHomepageSections(data.sections);
+      onRecordSeenItems?.(data.sections.flatMap((sec) => sec.items), 'workshop-home');
+      setTagCategories(data.tagCategories);
     } catch (err) {
       console.error('Failed to fetch homepage:', err);
     } finally {
@@ -142,22 +139,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setLoading(true);
     setError(null);
     try {
-      let url = 'https://steamcommunity.com/workshop/browse/?appid=550';
-      if (creatorId) {
-        url += `&browsesort=myfiles&creatorid=${creatorId}&p=${page}`;
-      } else {
-        if (committedQuery) {
-          url += `&searchtext=${encodeURIComponent(committedQuery)}`;
-        }
-        url += `&browsesort=${sort}&section=${section}&p=${page}`;
-        if (activeTag) {
-          url += `&requiredtags[]=${encodeURIComponent(activeTagName || activeTag)}`;
-        }
-      }
-      const html: string = await invoke('fetch_workshop_html', { url, source: creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse' });
-      const parsedItems = parseSSRItems(html, 'workshop_query');
-      setItems(parsedItems);
-      onRecordSeenItems?.(parsedItems, creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse');
+      const data = await fetchWorkshopItems({
+        query: committedQuery,
+        sort,
+        section,
+        page,
+        creatorId,
+        activeTag,
+        activeTagName,
+      });
+      setItems(data.items);
+      onRecordSeenItems?.(data.items, creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse');
     } catch (err) {
       console.error(err);
       setError(`${t('common.error')}: ${err}`);
@@ -222,31 +214,12 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   // ── Detail helpers ─────────────────────────────────────────────────────────
 
-  /** Map raw Steam API detail → WorkshopItem for the modal */
-  const mapSteamDetailToItem = (d: any): WorkshopItem => ({
-    workshopId: d.publishedfileid || '',
-    title: (d.title || '').trim(),
-    imagePath: d.preview_url || '',
-    authorName: d.creator_name || '',
-    authorId: d.creator || '',
-    authorUrl: d.creator ? `https://steamcommunity.com/profiles/${d.creator}` : '',
-    stars: d.star_rating ?? 0,
-    shortDescription: d.short_description || d.description || '',
-    fileSize: d.file_size ? `${(parseInt(d.file_size) / 1024 / 1024).toFixed(1)} MB` : undefined,
-    tags: d.tags ? d.tags.map((t: any) => t.display_name || t.tag || '') : [],
-    subscriptions: d.subscriptions ? parseInt(d.subscriptions) : undefined,
-    timeCreated: d.time_created ? parseInt(d.time_created) : undefined,
-    timeUpdated: d.time_updated ? parseInt(d.time_updated) : undefined,
-    childCount: d.num_children !== undefined ? parseInt(d.num_children) : undefined,
-  });
-
   const viewItemDetails = async (workshopId: string) => {
     setLoadingDetailId(workshopId);
     try {
-      const data: any = await invoke('fetch_collection', { collectionId: workshopId });
-      const raw = data.collection;
-      if (raw && raw.publishedfileid) {
-        const item = mapSteamDetailToItem(raw);
+      const data = await fetchWorkshopItem(workshopId);
+      if (data.item && data.item.workshopId) {
+        const item = data.item;
         setSelectedItem(item);
         onRecordSeenItems?.([item], 'workshop-item-detail');
         setSelectedCollection(null);
@@ -261,11 +234,10 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const viewCollectionDetails = async (collectionId: string) => {
     setLoadingDetailId(collectionId);
     try {
-      const data: any = await invoke('fetch_collection', { collectionId });
+      const data = await fetchWorkshopCollection(collectionId);
       const raw = data.collection;
-      const rawItems: any[] = data.items || [];
+      const collectionItems = data.items;
       if (raw && raw.publishedfileid) {
-        const collectionItems = rawItems.map(mapSteamDetailToItem);
         setSelectedCollection({
           title: (raw.title || '').trim(),
           description: raw.description || '',
@@ -275,7 +247,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           items: collectionItems,
           workshopId: raw.publishedfileid,
         });
-        onRecordSeenItems?.([mapSteamDetailToItem(raw), ...collectionItems], 'workshop-collection');
+        onRecordSeenItems?.([mapSteamDetailToWorkshopItem(raw, data.source), ...collectionItems], 'workshop-collection');
         setSelectedItem(null);
       }
     } catch (err) {

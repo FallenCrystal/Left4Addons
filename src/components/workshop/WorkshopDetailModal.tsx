@@ -3,11 +3,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { X, Download, ExternalLink, PlusCircle, FolderPlus, Loader2, FileText, CheckCircle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem, WorkshopBrowserProps, WorkshopPageDetails } from './types';
-import { parseWorkshopPageDetails } from './ssrParser';
 import { CacheImage } from '../CacheImage';
 import { DatabasePayload, Group } from '../../types/addon';
 import { Gallery } from '../Gallery';
 import { RequiredItems, ParentCollections } from '../WorkshopCommon';
+import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../../services/workshopClient';
 
 interface WorkshopDetailModalProps {
   open: boolean;
@@ -66,15 +66,9 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     setPageDetailsLoading(true);
     setPageDetails(null);
     try {
-      const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
-      const html: string = await invoke('fetch_workshop_html', { url, source: 'workshop-detail' });
-      const details = parseWorkshopPageDetails(html);
+      const details = await fetchWorkshopPageDetails(workshopId, 'workshop-detail');
       setPageDetails(details);
-      const data: DatabasePayload = await invoke('persist_workshop_page_details', {
-        workshopId,
-        details,
-        source: 'workshop-detail',
-      });
+      const data: DatabasePayload = await persistWorkshopPageDetails(workshopId, details, 'workshop-detail') as DatabasePayload;
       onDatabaseUpdate?.(data);
     } catch (err) {
       console.error('Failed to fetch workshop page details:', err);

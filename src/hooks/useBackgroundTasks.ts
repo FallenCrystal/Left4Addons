@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, BackgroundTask, DatabasePayload } from '../types/addon';
-import { parseWorkshopPageDetails } from '../components/workshop/ssrParser';
+import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../services/workshopClient';
 
 const DOWNLOAD_CONCURRENCY = 3;
 const WORKSHOP_CRAWL_COOLDOWN_MS = 5000;
@@ -161,18 +161,9 @@ export function useBackgroundTasks({
     }
 
     try {
-      const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
       lastCrawlAtRef.current = Date.now();
-      const html = await invoke<string>('fetch_workshop_html', {
-        url,
-        source: task.source || 'background-refresh',
-      });
-      const details = parseWorkshopPageDetails(html);
-      const data = await invoke<DatabasePayload>('persist_workshop_page_details', {
-        workshopId,
-        details,
-        source: task.source || 'background-refresh',
-      });
+      const details = await fetchWorkshopPageDetails(workshopId, task.source || 'background-refresh');
+      const data = await persistWorkshopPageDetails(workshopId, details, task.source || 'background-refresh') as DatabasePayload;
       if (isDatabasePayload(data)) {
         updateLocalState(data);
       }

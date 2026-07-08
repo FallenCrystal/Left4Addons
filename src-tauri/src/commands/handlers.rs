@@ -1,6 +1,12 @@
+use crate::steam::{
+    fetch_collection_children_web, fetch_steam_details_web, BridgeDownloadStatus,
+    WorkshopBrowseQuery, WorkshopCapabilities, WorkshopCollectionResponse, WorkshopHomeResponse,
+    WorkshopItemResponse, WorkshopItemsResponse, WorkshopService,
+};
 use crate::vpk::{extract_addon_metadata, generate_dummy_vpk};
 use regex::Regex;
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -673,43 +679,117 @@ fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Da
 }
 
 async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::Value>, String> {
+    fetch_steam_details_web(workshop_ids).await
+}
+
+async fn fetch_steam_details_hybrid(
+    workshop_service: &WorkshopService,
+    workshop_ids: &[String],
+) -> Result<Vec<Value>, String> {
     if workshop_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let url = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/";
-    let mut params = Vec::new();
-    params.push(("itemcount".to_string(), workshop_ids.len().to_string()));
-    for (index, id) in workshop_ids.iter().enumerate() {
-        params.push((format!("publishedfileids[{}]", index), id.clone()));
+    match workshop_service.bridge_fetch_details(workshop_ids) {
+        Ok(details) if !details.is_empty() => Ok(details),
+        Ok(_) | Err(_) => fetch_steam_details(workshop_ids).await,
+    }
+}
+
+async fn fetch_collection_children_hybrid(
+    workshop_service: &WorkshopService,
+    collection_id: &str,
+) -> Result<Vec<String>, String> {
+    if let Ok(payload) = workshop_service.bridge_query_collection(collection_id) {
+        let mut ids = Vec::new();
+        for item in payload.items {
+            if let Some(id) = item.get("publishedfileid").and_then(|v| v.as_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let res = client
-        .post(url)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send Steam API request: {}", e))?;
+    fetch_collection_children_web(collection_id).await
+}
 
-    if !res.status().is_success() {
-        return Err(format!("Steam API responded with status {}", res.status()));
+async fn attempt_bridge_download(
+    workshop_service: &WorkshopService,
+    workshop_id: &str,
+    workshop_dir: &Path,
+    app_handle: &AppHandle,
+) -> Result<bool, String> {
+    if !workshop_service.has_bridge() {
+        return Ok(false);
     }
 
-    let json: serde_json::Value = res
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse Steam API response: {}", e))?;
+    workshop_service.bridge_request_download(workshop_id)?;
 
-    let details = json["response"]["publishedfiledetails"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    #[derive(Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
+    struct DownloadProgress {
+        workshop_id: String,
+        percent: u32,
+        downloaded: u64,
+        total: u64,
+        source: String,
+        phase: String,
+    }
 
-    Ok(details)
+    let expected_path = workshop_dir.join(format!("{}.vpk", workshop_id));
+    let expected_disabled_path = workshop_dir.join(format!("{}.vpk.disabled", workshop_id));
+
+    for _ in 0..40 {
+        let status: BridgeDownloadStatus =
+            match workshop_service.bridge_download_status(workshop_id) {
+                Ok(status) => status,
+                Err(err) => return Err(err),
+            };
+
+        if let (Some(downloaded), Some(total)) = (status.downloaded, status.total) {
+            let percent = if total > 0 {
+                ((downloaded as f64 / total as f64) * 100.0) as u32
+            } else {
+                0
+            };
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgress {
+                    workshop_id: workshop_id.to_string(),
+                    percent,
+                    downloaded,
+                    total,
+                    source: "steam-sdk".to_string(),
+                    phase: "download".to_string(),
+                },
+            );
+        }
+
+        if expected_path.exists() || expected_disabled_path.exists() {
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgress {
+                    workshop_id: workshop_id.to_string(),
+                    percent: 100,
+                    downloaded: status.total.unwrap_or(0),
+                    total: status.total.unwrap_or(0),
+                    source: "steam-sdk".to_string(),
+                    phase: "download".to_string(),
+                },
+            );
+            return Ok(true);
+        }
+
+        if status.installed && expected_path.exists() {
+            return Ok(true);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    Ok(false)
 }
 
 pub async fn scan_addons_internal(
@@ -718,6 +798,7 @@ pub async fn scan_addons_internal(
     groups_path: &Path,
     known_addons_path: &Path,
     cache_dir: &Path,
+    workshop_service: &WorkshopService,
 ) -> Result<(), String> {
     let workshop_dir = Path::new(&db.settings.workshop_dir);
     let loading_dir = Path::new(&db.settings.loading_dir);
@@ -991,7 +1072,9 @@ pub async fn scan_addons_internal(
     if !new_workshop_ids.is_empty() {
         let ids_array: Vec<String> = new_workshop_ids.into_iter().collect();
         println!("Syncing Steam details for {} items...", ids_array.len());
-        if let Ok(steam_details_list) = fetch_steam_details(&ids_array).await {
+        if let Ok(steam_details_list) =
+            fetch_steam_details_hybrid(workshop_service, &ids_array).await
+        {
             for details in steam_details_list {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
                     for addon in active_addons.values_mut() {
@@ -1062,7 +1145,9 @@ pub async fn scan_addons_internal(
         ids_to_sync.sort();
         ids_to_sync.dedup();
         println!("Syncing Steam details for {} items...", ids_to_sync.len());
-        if let Ok(steam_details_list) = fetch_steam_details(&ids_to_sync).await {
+        if let Ok(steam_details_list) =
+            fetch_steam_details_hybrid(workshop_service, &ids_to_sync).await
+        {
             for details in steam_details_list {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
                     // Update installed addons
@@ -1389,6 +1474,7 @@ pub async fn save_settings(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1406,6 +1492,7 @@ pub async fn get_addons(state: State<'_, crate::AppState>) -> Result<Database, S
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1528,6 +1615,7 @@ pub async fn move_addons(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1602,6 +1690,7 @@ pub async fn toggle_addons(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1693,6 +1782,7 @@ pub async fn rename_addon(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1828,6 +1918,7 @@ pub async fn rename_addons(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -1904,7 +1995,9 @@ pub async fn group_action(
             }
             // Fetch Steam details for newly added workshop items
             if !new_workshop_ids.is_empty() {
-                if let Ok(steam_details_list) = fetch_steam_details(&new_workshop_ids).await {
+                if let Ok(steam_details_list) =
+                    fetch_steam_details_hybrid(&state.workshop_service, &new_workshop_ids).await
+                {
                     for details in steam_details_list {
                         let wid = details["publishedfileid"].as_str().unwrap_or("");
                         if let Some(addon) = db.known_uninstalled_addons.get_mut(wid) {
@@ -2389,6 +2482,7 @@ pub async fn group_action(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -2415,6 +2509,44 @@ pub async fn open_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn get_workshop_capabilities(
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopCapabilities, String> {
+    Ok(state.workshop_service.capabilities())
+}
+
+#[tauri::command]
+pub async fn query_workshop_home(
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopHomeResponse, String> {
+    state.workshop_service.bridge_query_home()
+}
+
+#[tauri::command]
+pub async fn query_workshop_items(
+    query: WorkshopBrowseQuery,
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopItemsResponse, String> {
+    state.workshop_service.bridge_query_items(&query)
+}
+
+#[tauri::command]
+pub async fn query_workshop_item(
+    workshop_id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopItemResponse, String> {
+    state.workshop_service.bridge_query_item(&workshop_id)
+}
+
+#[tauri::command]
+pub async fn query_workshop_collection(
+    workshop_id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopCollectionResponse, String> {
+    state.workshop_service.bridge_query_collection(&workshop_id)
+}
+
+#[tauri::command]
 pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, String> {
     let ids = {
         let mut db = state.db.lock().await;
@@ -2426,6 +2558,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
             &state.groups_path,
             &state.known_addons_path,
             &state.cache_dir,
+            &state.workshop_service,
         )
         .await?;
 
@@ -2454,7 +2587,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
     };
 
     println!("Syncing Steam details manually for {} items...", ids.len());
-    let steam_details_list = fetch_steam_details(&ids).await?;
+    let steam_details_list = fetch_steam_details_hybrid(&state.workshop_service, &ids).await?;
 
     let mut db = state.db.lock().await;
     for details in steam_details_list {
@@ -2518,6 +2651,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -2677,6 +2811,7 @@ pub async fn delete_addons(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -2691,19 +2826,12 @@ pub async fn download_addon(
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
-    let details_list = fetch_steam_details(&[workshop_id.clone()]).await?;
+    let details_list =
+        fetch_steam_details_hybrid(&state.workshop_service, &[workshop_id.clone()]).await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }
     let details = details_list[0].clone();
-
-    let file_url = details
-        .get("file_url")
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            "Workshop item has no download URL (might be hidden or deleted)".to_string()
-        })?;
 
     let title = details
         .get("title")
@@ -2738,6 +2866,40 @@ pub async fn download_addon(
             .map_err(|e| format!("Failed to remove stale download file: {}", e))?;
     }
 
+    if let Ok(downloaded_via_bridge) = attempt_bridge_download(
+        &state.workshop_service,
+        &workshop_id,
+        &workshop_dir,
+        &app_handle,
+    )
+    .await
+    {
+        if downloaded_via_bridge {
+            let mut db = state.db.lock().await;
+            scan_addons_internal(
+                &mut db,
+                &state.settings_path,
+                &state.groups_path,
+                &state.known_addons_path,
+                &state.cache_dir,
+                &state.workshop_service,
+            )
+            .await?;
+            return Ok(database_with_workshop_cache(
+                &db,
+                &state.workshop_cache_path,
+            ));
+        }
+    }
+
+    let file_url = details
+        .get("file_url")
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            "Workshop item has no download URL (SDK did not install it and Web API has no direct file URL)".to_string()
+        })?;
+
     println!("Downloading: {} (URL: {})", title, file_url);
     let client = reqwest::Client::new();
     let mut response = client
@@ -2764,6 +2926,8 @@ pub async fn download_addon(
         percent: u32,
         downloaded: u64,
         total: u64,
+        source: String,
+        phase: String,
     }
 
     while let Some(chunk) = response
@@ -2789,6 +2953,8 @@ pub async fn download_addon(
                 percent,
                 downloaded,
                 total: total_size,
+                source: "web-fallback".to_string(),
+                phase: "fallback-download".to_string(),
             },
         );
     }
@@ -2833,6 +2999,7 @@ pub async fn download_addon(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(
@@ -2841,60 +3008,28 @@ pub async fn download_addon(
     ))
 }
 
-async fn fetch_collection_details_internal(collection_id: &str) -> Result<Vec<String>, String> {
-    let url = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/";
-    let mut params = Vec::new();
-    params.push(("collectioncount".to_string(), "1".to_string()));
-    params.push(("publishedfileids[0]".to_string(), collection_id.to_string()));
-
-    let client = reqwest::Client::new();
-    let res = client
-        .post(url)
-        .form(&params)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to query collection details: {}", e))?;
-
-    if !res.status().is_success() {
-        return Err(format!(
-            "Steam Collection API responded with status {}",
-            res.status()
-        ));
-    }
-
-    let json: serde_json::Value = res
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse collection JSON: {}", e))?;
-
-    let details_list = json["response"]["collectiondetails"]
-        .as_array()
-        .ok_or_else(|| "Invalid collectiondetails format".to_string())?;
-
-    if details_list.is_empty() {
-        return Err("Collection not found".to_string());
-    }
-
-    let mut ids = Vec::new();
-    if let Some(children) = details_list[0]["children"].as_array() {
-        for child in children {
-            if let Some(id) = child["publishedfileid"].as_str() {
-                ids.push(id.to_string());
-            }
-        }
-    }
-
-    Ok(ids)
-}
-
 #[tauri::command]
-pub async fn fetch_collection(collection_id: String) -> Result<serde_json::Value, String> {
-    let child_ids = fetch_collection_details_internal(&collection_id).await?;
+pub async fn fetch_collection(
+    collection_id: String,
+    state: State<'_, crate::AppState>,
+) -> Result<serde_json::Value, String> {
+    if let Ok(payload) = state
+        .workshop_service
+        .bridge_query_collection(&collection_id)
+    {
+        return Ok(serde_json::json!({
+            "collection": payload.collection,
+            "items": payload.items,
+        }));
+    }
+
+    let child_ids =
+        fetch_collection_children_hybrid(&state.workshop_service, &collection_id).await?;
 
     let mut query_ids = vec![collection_id.clone()];
     query_ids.extend(child_ids.clone());
 
-    let details = fetch_steam_details(&query_ids).await?;
+    let details = fetch_steam_details_hybrid(&state.workshop_service, &query_ids).await?;
 
     let mut collection_details = serde_json::Value::Null;
     let mut items = Vec::new();
@@ -2922,7 +3057,8 @@ pub async fn add_known_addon(
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
 
-    let details_list = fetch_steam_details(&[workshop_id.clone()]).await?;
+    let details_list =
+        fetch_steam_details_hybrid(&state.workshop_service, &[workshop_id.clone()]).await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }
@@ -2962,6 +3098,7 @@ pub async fn add_known_addon(
         &state.groups_path,
         &state.known_addons_path,
         &state.cache_dir,
+        &state.workshop_service,
     )
     .await?;
     Ok(database_with_workshop_cache(

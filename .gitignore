@@ -23,6 +23,7 @@ WebView2Loader.dll
 
 # Rust/Tauri Target
 src-tauri/target/
+steam-bridge/target/
 
 # Editor directories and files
 .vscode/*

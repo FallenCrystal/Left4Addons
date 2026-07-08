@@ -3,6 +3,7 @@ use tauri::async_runtime::Mutex;
 use tauri::Manager;
 
 pub mod commands;
+pub mod steam;
 pub mod vpk;
 
 pub struct AppState {
@@ -13,6 +14,7 @@ pub struct AppState {
     pub workshop_crawl_log_path: PathBuf,
     pub background_tasks_path: PathBuf,
     pub cache_dir: PathBuf,
+    pub workshop_service: steam::WorkshopService,
     pub db: Mutex<commands::Database>,
 }
 
@@ -65,6 +67,10 @@ pub fn run() {
             let workshop_cache_path = cache_root_dir.join("workshop_cache.json");
             let workshop_crawl_log_path = cache_root_dir.join("workshop_crawl_log.jsonl");
             let background_tasks_path = cache_root_dir.join("background_tasks.json");
+            let bridge_base_dir = std::env::current_exe()
+                .ok()
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| host_runtime_dir.clone());
             let db = commands::load_db(
                 &settings_path,
                 &groups_path,
@@ -81,6 +87,7 @@ pub fn run() {
                 workshop_crawl_log_path,
                 background_tasks_path,
                 cache_dir,
+                workshop_service: steam::WorkshopService::new(&bridge_base_dir),
                 db: Mutex::new(db),
             });
 
@@ -106,6 +113,11 @@ pub fn run() {
             commands::handlers::open_workshop,
             commands::handlers::open_url,
             commands::handlers::steam_sync,
+            commands::handlers::get_workshop_capabilities,
+            commands::handlers::query_workshop_home,
+            commands::handlers::query_workshop_items,
+            commands::handlers::query_workshop_item,
+            commands::handlers::query_workshop_collection,
             commands::handlers::fetch_workshop_html,
             commands::handlers::delete_addons,
             commands::handlers::download_addon,
