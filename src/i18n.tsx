@@ -283,6 +283,8 @@ const zh = {
   toasts: {
     autoMoveFailed: "自动移动附件失败: {{err}}",
     dbRefreshSuccess: "数据库刷新成功",
+    autoRefreshSuccess: "检测到外部组件变更，已自动刷新",
+    autoRefreshFailed: "自动刷新失败: {{err}}",
     dataLoadFailed: "数据加载失败: {{err}}",
     addonEnabled: "附加组件已启用",
     addonDisabled: "附加组件已禁用",
@@ -700,6 +702,8 @@ const en = {
   toasts: {
     autoMoveFailed: "Auto move failed: {{err}}",
     dbRefreshSuccess: "Database refreshed successfully",
+    autoRefreshSuccess: "External addon changes detected and refreshed automatically",
+    autoRefreshFailed: "Automatic refresh failed: {{err}}",
     dataLoadFailed: "Data load failed: {{err}}",
     addonEnabled: "Addon enabled",
     addonDisabled: "Addon disabled",
@@ -851,4 +855,3 @@ i18n
   });
 
 export default i18n;
-

@@ -1,15 +1,24 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useAddonManager } from './useAddonManager';
-import { Addon, Group, Settings } from '../types/addon';
+import { Addon, DatabasePayload, Group, Settings } from '../types/addon';
 
 // Mock Tauri invoke function
 const mockInvoke = vi.fn();
+const mockListen = vi.fn();
+const eventListeners = new Map<string, (event: { payload: any }) => void>();
+
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
 }));
 vi.mock('@tauri-apps/api/event', () => ({
-  listen: vi.fn().mockResolvedValue(() => {}),
+  listen: (eventName: string, callback: (event: { payload: any }) => void) => {
+    mockListen(eventName, callback);
+    eventListeners.set(eventName, callback);
+    return Promise.resolve(() => {
+      eventListeners.delete(eventName);
+    });
+  },
 }));
 
 describe('useAddonManager', () => {
@@ -46,6 +55,7 @@ describe('useAddonManager', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sessionStorage.clear();
+    eventListeners.clear();
     
     // Default mock response for get_addons
     mockInvoke.mockImplementation((cmd) => {
@@ -55,6 +65,14 @@ describe('useAddonManager', () => {
           groups: mockGroups,
           settings: mockSettings,
         });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
       }
       return Promise.resolve({});
     });
@@ -275,5 +293,90 @@ describe('useAddonManager', () => {
 
     // isSubmitting should reset to false
     expect(result.current.isSubmitting).toBe(false);
+  });
+
+  test('should apply watcher database updates and show toast for external changes', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    const nextPayload: DatabasePayload = {
+      addons: {
+        ...mockAddons,
+        'addon3.vpk': {
+          id: 'addon3.vpk',
+          vpkName: 'addon3.vpk',
+          dirType: 'loading',
+          isEnabled: true,
+          fileSize: 123,
+          filesCount: 1,
+          addonInfo: { addontitle: 'Addon Three' },
+        },
+      },
+      knownUninstalledAddons: {},
+      groups: mockGroups,
+      masterCollections: [],
+      settings: mockSettings,
+    };
+
+    await act(async () => {
+      eventListeners.get('addons-db-updated')?.({
+        payload: { data: nextPayload, external: true },
+      });
+    });
+
+    expect(result.current.addons['addon3.vpk']).toBeDefined();
+    expect(result.current.toasts.some((toast) => toast.message.includes('自动刷新'))).toBe(true);
+  });
+
+  test('should apply internal watcher refreshes without success toast', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    const nextPayload: DatabasePayload = {
+      addons: {
+        'addon2.vpk': mockAddons['addon2.vpk'],
+      },
+      knownUninstalledAddons: {},
+      groups: mockGroups,
+      masterCollections: [],
+      settings: mockSettings,
+    };
+
+    act(() => {
+      result.current.handleSelectToggle('addon1.vpk');
+    });
+
+    await act(async () => {
+      eventListeners.get('addons-db-updated')?.({
+        payload: { data: nextPayload, external: false },
+      });
+    });
+
+    expect(result.current.addons['addon1.vpk']).toBeUndefined();
+    expect(result.current.knownUninstalledAddons['addon1.vpk']).toBeUndefined();
+    expect(result.current.selectedIds).toEqual([]);
+    expect(result.current.toasts.some((toast) => toast.message.includes('自动刷新'))).toBe(false);
+  });
+
+  test('should surface watcher errors through toast notifications', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    await act(async () => {
+      eventListeners.get('addons-watch-error')?.({
+        payload: { message: 'watcher failed' },
+      });
+    });
+
+    expect(result.current.toasts.some((toast) => toast.message.includes('watcher failed'))).toBe(true);
   });
 });

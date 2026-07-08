@@ -678,6 +678,24 @@ fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Da
     response
 }
 
+pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<Database, String> {
+    let state = app_handle.state::<crate::AppState>();
+    let mut db = state.db.lock().await;
+    scan_addons_internal(
+        &mut db,
+        &state.settings_path,
+        &state.groups_path,
+        &state.known_addons_path,
+        &state.cache_dir,
+        &state.workshop_service,
+    )
+    .await?;
+    Ok(database_with_workshop_cache(
+        &db,
+        &state.workshop_cache_path,
+    ))
+}
+
 async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::Value>, String> {
     fetch_steam_details_web(workshop_ids).await
 }
@@ -1453,9 +1471,10 @@ pub async fn save_settings(
     loading_dir: String,
     enable_dummy_bypass: bool,
     state: State<'_, crate::AppState>,
+    app_handle: AppHandle,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
-    let loading_path = Path::new(&loading_dir);
+    let loading_path = PathBuf::from(&loading_dir);
     let workshop_dir = loading_path.join("workshop").to_string_lossy().to_string();
 
     db.settings.workshop_dir = workshop_dir;
@@ -1477,6 +1496,9 @@ pub async fn save_settings(
         &state.workshop_service,
     )
     .await?;
+    if let Err(err) = crate::watcher::rebind_addon_watcher(&app_handle, &loading_path) {
+        crate::watcher::emit_watch_error(&app_handle, &err);
+    }
     Ok(database_with_workshop_cache(
         &db,
         &state.workshop_cache_path,
@@ -1585,6 +1607,7 @@ pub async fn move_addons(
         return Err(errors.join("\n"));
     }
 
+    crate::watcher::suppress_internal_refresh(&state);
     for plan in plans {
         if target_dir_type == "workshop" && plan.dest_path.exists() && is_dummy_vpk(&plan.dest_path)
         {
@@ -1679,6 +1702,7 @@ pub async fn toggle_addons(
         return Err(errors.join("\n"));
     }
 
+    crate::watcher::suppress_internal_refresh(&state);
     for (id, current_path, dest_path) in plans {
         fs::rename(&current_path, &dest_path)
             .map_err(|e| format!("Failed to toggle {}: {}", id, e))?;
@@ -1722,6 +1746,7 @@ pub async fn rename_addon(
     if let Some(addon) = db.addons.get(&id).cloned() {
         let current_path = PathBuf::from(&addon.current_path);
         if current_path.exists() {
+            crate::watcher::suppress_internal_refresh(&state);
             let dir = current_path.parent().unwrap();
             let new_filename = if addon.is_enabled {
                 sanitized.clone()
@@ -1872,6 +1897,7 @@ pub async fn rename_addons(
         return Err(errors.join("\n"));
     }
 
+    crate::watcher::suppress_internal_refresh(&state);
     for plan in plans {
         fs::rename(&plan.current_path, &plan.dest_path)
             .map_err(|e| format!("Failed to rename {}: {}", plan.id, e))?;
@@ -2773,6 +2799,7 @@ pub async fn delete_addons(
     let mut db = state.db.lock().await;
 
     if delete_file {
+        crate::watcher::suppress_internal_refresh(&state);
         for id in &ids {
             if let Some(addon) = db.addons.get(id) {
                 let path = PathBuf::from(&addon.current_path);
@@ -2875,6 +2902,7 @@ pub async fn download_addon(
     .await
     {
         if downloaded_via_bridge {
+            crate::watcher::suppress_internal_refresh(&state);
             let mut db = state.db.lock().await;
             scan_addons_internal(
                 &mut db,
@@ -2961,6 +2989,7 @@ pub async fn download_addon(
     file.flush()
         .map_err(|e| format!("Failed to flush downloaded file: {}", e))?;
     drop(file);
+    crate::watcher::suppress_internal_refresh(&state);
     fs::rename(&tmp_path, &dest_path)
         .map_err(|e| format!("Failed to finalize downloaded file: {}", e))?;
 

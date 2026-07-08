@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex as StdMutex;
 use tauri::async_runtime::Mutex;
 use tauri::Manager;
 
 pub mod commands;
 pub mod steam;
 pub mod vpk;
+pub mod watcher;
 
 pub struct AppState {
     pub settings_path: PathBuf,
@@ -16,6 +18,7 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub workshop_service: steam::WorkshopService,
     pub db: Mutex<commands::Database>,
+    pub addon_watcher: StdMutex<watcher::AddonWatcherController>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -78,6 +81,7 @@ pub fn run() {
                 &runtime_dir,
                 app.handle(),
             );
+            let initial_loading_dir = db.settings.loading_dir.clone();
 
             app.manage(AppState {
                 settings_path,
@@ -89,7 +93,14 @@ pub fn run() {
                 cache_dir,
                 workshop_service: steam::WorkshopService::new(&bridge_base_dir),
                 db: Mutex::new(db),
+                addon_watcher: StdMutex::new(watcher::AddonWatcherController::default()),
             });
+
+            if let Err(err) =
+                watcher::rebind_addon_watcher(app.handle(), Path::new(&initial_loading_dir))
+            {
+                watcher::emit_watch_error(app.handle(), &err);
+            }
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(

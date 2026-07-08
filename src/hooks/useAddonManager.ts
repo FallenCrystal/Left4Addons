@@ -10,6 +10,15 @@ export type RenderedItem =
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
   | { type: 'addon'; id: string; data: Addon };
 
+interface AddonsDbUpdatedEvent {
+  data: DatabasePayload;
+  external: boolean;
+}
+
+interface AddonsWatchErrorEvent {
+  message: string;
+}
+
 export function useAddonManager() {
   const { t } = useTranslation();
   const [addons, setAddons] = useState<Record<string, Addon>>({});
@@ -53,11 +62,43 @@ export function useAddonManager() {
     }, 4000);
   }, []);
 
-  // Listen to download progress
+  // Update local states from DatabasePayload
+  const updateLocalState = useCallback((data: DatabasePayload) => {
+    const nextAddons = data.addons || {};
+    const nextKnownUninstalledAddons = data.knownUninstalledAddons || {};
+    const nextGroups = data.groups || [];
+    const nextMasterCollections = data.masterCollections || [];
+
+    setAddons(nextAddons);
+    setGroups(nextGroups);
+    setKnownUninstalledAddons(nextKnownUninstalledAddons);
+    setMasterCollections(nextMasterCollections);
+    if (data.settings) {
+      setSettings(data.settings);
+    }
+
+    setSelectedIds((prev) => prev.filter((id) => nextAddons[id] || nextKnownUninstalledAddons[id]));
+    setSelectedGroupIds((prev) => prev.filter((id) => nextGroups.some((group) => group.id === id)));
+    setDetailModal((prev) => {
+      if (!prev.open || !prev.addon) {
+        return prev;
+      }
+
+      const nextAddon = nextAddons[prev.addon.id] || nextKnownUninstalledAddons[prev.addon.id];
+      return nextAddon
+        ? { ...prev, addon: nextAddon }
+        : { open: false, addon: null };
+    });
+  }, []);
+
+  // Listen to backend events
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    const setupListener = async () => {
-      unlisten = await listen<{ workshopId: string; percent: number }>('download-progress', (event) => {
+    let unlistenDownload: (() => void) | undefined;
+    let unlistenDbUpdate: (() => void) | undefined;
+    let unlistenWatchError: (() => void) | undefined;
+
+    const setupListeners = async () => {
+      unlistenDownload = await listen<{ workshopId: string; percent: number }>('download-progress', (event) => {
         setDownloadProgress((prev) => ({
           ...prev,
           [event.payload.workshopId]: event.payload.percent,
@@ -72,23 +113,27 @@ export function useAddonManager() {
           }, 3000);
         }
       });
-    };
-    setupListener();
-    return () => {
-      if (unlisten) unlisten();
-    };
-  }, []);
 
-  // Update local states from DatabasePayload
-  const updateLocalState = useCallback((data: DatabasePayload) => {
-    setAddons(data.addons || {});
-    setGroups(data.groups || []);
-    setKnownUninstalledAddons(data.knownUninstalledAddons || {});
-    setMasterCollections(data.masterCollections || []);
-    if (data.settings) {
-      setSettings(data.settings);
-    }
-  }, []);
+      unlistenDbUpdate = await listen<AddonsDbUpdatedEvent>('addons-db-updated', (event) => {
+        updateLocalState(event.payload.data);
+        if (event.payload.external) {
+          addToast(t('toasts.autoRefreshSuccess'), 'success');
+        }
+      });
+
+      unlistenWatchError = await listen<AddonsWatchErrorEvent>('addons-watch-error', (event) => {
+        addToast(t('toasts.autoRefreshFailed', { err: event.payload.message }), 'error');
+      });
+    };
+
+    setupListeners();
+
+    return () => {
+      if (unlistenDownload) unlistenDownload();
+      if (unlistenDbUpdate) unlistenDbUpdate();
+      if (unlistenWatchError) unlistenWatchError();
+    };
+  }, [addToast, t, updateLocalState]);
 
   const {
     backgroundTasks,
