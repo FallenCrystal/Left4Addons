@@ -1,4 +1,4 @@
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind as EventType, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -191,14 +191,16 @@ fn spawn_refresh_loop(
 
         loop {
             match crate::commands::handlers::rescan_database_snapshot(&app_handle).await {
-                Ok(data) => {
-                    let _ = app_handle.emit(
-                        DB_UPDATED_EVENT,
-                        AddonsDbUpdatedEvent {
-                            data,
-                            external: next_external,
-                        },
-                    );
+                Ok((data, changed)) => {
+                    if changed {
+                        let _ = app_handle.emit(
+                            DB_UPDATED_EVENT,
+                            AddonsDbUpdatedEvent {
+                                data,
+                                external: next_external,
+                            },
+                        );
+                    }
                 }
                 Err(message) => emit_watch_error(&app_handle, &message),
             }
@@ -249,7 +251,7 @@ pub fn emit_watch_error(app_handle: &AppHandle, message: &str) {
 
 fn is_relevant_event(event: &Event, watched_paths: &[PathBuf]) -> bool {
     match event.kind {
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any => {}
+        EventType::Create(_) | EventType::Modify(_) | EventType::Remove(_) | EventType::Any => {}
         _ => return false,
     }
 
@@ -285,7 +287,7 @@ mod tests {
         is_relevant_addon_path, watched_paths_from_loading_dir, AddonWatcherController,
         INTERNAL_REFRESH_SUPPRESS_MS,
     };
-    use notify::{event::ModifyKind, Event, EventKind};
+    use notify::{event::ModifyKind, Event, EventKind as EventType};
     use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::Duration;
@@ -325,7 +327,7 @@ mod tests {
         ));
 
         let event = Event {
-            kind: EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+            kind: EventType::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
             paths: vec![PathBuf::from("/tmp/l4a-loading/test.vpk")],
             attrs: Default::default(),
         };

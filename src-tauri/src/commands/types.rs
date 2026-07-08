@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Settings {
     #[serde(rename = "workshopDir")]
     pub workshop_dir: String,
@@ -11,7 +11,7 @@ pub struct Settings {
     pub enable_dummy_bypass: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Group {
     #[serde(default)]
     pub id: String,
@@ -26,7 +26,7 @@ pub struct Group {
     pub source: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct MasterCollection {
     #[serde(default)]
     pub id: String,
@@ -41,7 +41,7 @@ pub struct MasterCollection {
     pub icon: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Addon {
     #[serde(default)]
     pub id: String,
@@ -178,7 +178,7 @@ pub struct SettingsStore {
     pub master_collections: Vec<MasterCollection>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Database {
     pub settings: Settings,
     pub addons: HashMap<String, Addon>,

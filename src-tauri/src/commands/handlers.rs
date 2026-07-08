@@ -706,9 +706,10 @@ fn database_with_workshop_cache(db: &Database, workshop_cache_path: &Path) -> Da
     response
 }
 
-pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<Database, String> {
+pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<(Database, bool), String> {
     let state = app_handle.state::<crate::AppState>();
     let mut db = state.db.lock().await;
+    let before = database_with_workshop_cache(&db, &state.workshop_cache_path);
     scan_addons_internal(
         &mut db,
         &state.settings_path,
@@ -718,10 +719,9 @@ pub async fn rescan_database_snapshot(app_handle: &AppHandle) -> Result<Database
         &state.workshop_service,
     )
     .await?;
-    Ok(database_with_workshop_cache(
-        &db,
-        &state.workshop_cache_path,
-    ))
+    let after = database_with_workshop_cache(&db, &state.workshop_cache_path);
+    let changed = after != before;
+    Ok((after, changed))
 }
 
 async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::Value>, String> {
