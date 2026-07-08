@@ -108,7 +108,7 @@ export interface Addon {
 
 export interface BackgroundTask {
   id: string;
-  kind: 'download' | 'workshop-crawl';
+  kind: 'download' | 'workshop-crawl' | 'warning';
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   source?: string;
   targetIds: string[];
@@ -144,6 +144,7 @@ export interface Settings {
   workshopDir: string;
   loadingDir: string;
   enableDummyBypass: boolean;
+  suppressSdkUnavailableWarning: boolean;
 }
 
 export interface DatabasePayload {

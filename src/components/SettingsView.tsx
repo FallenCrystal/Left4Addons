@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check } from 'lucide-react';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu } from 'lucide-react';
 import { Settings } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from './TransHTML';
@@ -7,7 +7,11 @@ import { TransHTML } from './TransHTML';
 interface SettingsViewProps {
   settings: Settings;
   isSubmitting: boolean;
-  onConfirm: (loadingDir: string, enableDummyBypass: boolean) => Promise<void>;
+  onConfirm: (
+    loadingDir: string,
+    enableDummyBypass: boolean,
+    suppressSdkUnavailableWarning: boolean,
+  ) => Promise<void>;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -16,19 +20,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onConfirm,
 }) => {
   const { t, i18n } = useTranslation();
-  const [activeTab, setActiveTab] = useState<'path' | 'language' | 'experimental' | 'about'>('path');
+  const [activeTab, setActiveTab] = useState<'path' | 'language' | 'experimental' | 'sdk' | 'about'>('path');
   const [loadingDir, setLoadingDir] = useState('');
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
+  const [suppressSdkUnavailableWarning, setSuppressSdkUnavailableWarning] = useState(false);
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
     setEnableDummyBypass(settings.enableDummyBypass || false);
+    setSuppressSdkUnavailableWarning(settings.suppressSdkUnavailableWarning || false);
   }, [settings]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!loadingDir.trim() || isSubmitting) return;
-    await onConfirm(loadingDir.trim(), enableDummyBypass);
+    await onConfirm(
+      loadingDir.trim(),
+      enableDummyBypass,
+      suppressSdkUnavailableWarning,
+    );
   };
 
   const changeLanguage = (lng: string) => {
@@ -65,6 +75,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         >
           <FlaskConical size={18} />
           <span>{t('settings.experimental')}</span>
+        </button>
+        <button
+          className={`settings-nav-item ${activeTab === 'sdk' ? 'active' : ''}`}
+          onClick={() => setActiveTab('sdk')}
+          type="button"
+        >
+          <Cpu size={18} />
+          <span>{t('settings.sdk')}</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'about' ? 'active' : ''}`}
@@ -246,6 +264,56 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 {t('settings.licenseDesc')}
               </p>
             </div>
+          </div>
+        )}
+
+        {activeTab === 'sdk' && (
+          <div>
+            <h2 className="settings-title">{t('settings.sdkTitle')}</h2>
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
+              {t('settings.sdkDesc')}
+            </p>
+            <form onSubmit={handleSubmit}>
+              <div className="settings-section">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
+                  <div style={{ paddingRight: '20px' }}>
+                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                      {t('settings.suppressSdkWarningTitle')}
+                    </label>
+                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      {t('settings.suppressSdkWarningDesc')}
+                    </div>
+                  </div>
+                  <label className="switch" style={{ flexShrink: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={suppressSdkUnavailableWarning}
+                      onChange={(e) => setSuppressSdkUnavailableWarning(e.target.checked)}
+                      disabled={isSubmitting}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-start', marginTop: '32px' }}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={isSubmitting || !loadingDir.trim()}
+                  style={{ minWidth: '160px', height: '42px' }}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <RefreshCw className="animate-spin" size={16} />
+                      <span>{t('settings.savingAndScanning')}</span>
+                    </>
+                  ) : (
+                    <span>{t('settings.saveAndRescan')}</span>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         )}
       </div>

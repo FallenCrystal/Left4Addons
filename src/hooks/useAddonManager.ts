@@ -5,6 +5,8 @@ import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection } from
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { useBackgroundTasks } from './useBackgroundTasks';
+import type { BackgroundTask } from '../types/addon';
+import type { WorkshopCapabilities } from '../components/workshop/types';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
@@ -30,7 +32,12 @@ export function useAddonManager() {
   const [knownUninstalledAddons, setKnownUninstalledAddons] = useState<Record<string, Addon>>({});
   const [groups, setGroups] = useState<Group[]>([]);
   const [masterCollections, setMasterCollections] = useState<MasterCollection[]>([]);
-  const [settings, setSettings] = useState<Settings>({ workshopDir: '', loadingDir: '', enableDummyBypass: false });
+  const [settings, setSettings] = useState<Settings>({
+    workshopDir: '',
+    loadingDir: '',
+    enableDummyBypass: false,
+    suppressSdkUnavailableWarning: false,
+  });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [currentFilterTab, setCurrentFilterTab] = useState('all'); // all, workshop, loading, disabled, groups, known-uninstalled, workshop-browser, master-collection
@@ -46,6 +53,9 @@ export function useAddonManager() {
   const [isSelectMode, setIsSelectMode] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
+  const [workshopCapabilities, setWorkshopCapabilities] = useState<WorkshopCapabilities | null>(null);
+  const [workshopCapabilitiesCheckedAt, setWorkshopCapabilitiesCheckedAt] = useState<string | null>(null);
+  const [workshopCapabilitiesError, setWorkshopCapabilitiesError] = useState<string | null>(null);
 
   const clearDownloadProgress = useCallback((workshopId: string) => {
     setDownloadProgress((prev) => {
@@ -151,7 +161,7 @@ export function useAddonManager() {
   }, [addToast, clearDownloadProgress, t, updateLocalState]);
 
   const {
-    backgroundTasks,
+    backgroundTasks: managedBackgroundTasks,
     enqueueDownloads,
     enqueueWorkshopCrawl,
     recordSeenItems,
@@ -228,6 +238,56 @@ export function useAddonManager() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void invoke<WorkshopCapabilities>('get_workshop_capabilities')
+      .then((capabilities) => {
+        if (cancelled) return;
+        setWorkshopCapabilities(capabilities);
+        setWorkshopCapabilitiesError(null);
+        setWorkshopCapabilitiesCheckedAt(new Date().toISOString());
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setWorkshopCapabilities(null);
+        setWorkshopCapabilitiesError(String(err));
+        setWorkshopCapabilitiesCheckedAt(new Date().toISOString());
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const steamworksUnavailableTask: BackgroundTask | null = (() => {
+    if (loading || settings.suppressSdkUnavailableWarning) {
+      return null;
+    }
+    const bridgeUnavailable = workshopCapabilities !== null && !workshopCapabilities.bridgeAvailable;
+    if (!bridgeUnavailable && !workshopCapabilitiesError) {
+      return null;
+    }
+
+    const detail = workshopCapabilities?.lastError || workshopCapabilitiesError || '';
+
+    return {
+      id: 'steamworks-sdk-unavailable',
+      kind: 'warning',
+      status: 'failed',
+      source: 'frontend-warning',
+      targetIds: [],
+      progress: 100,
+      createdAt: workshopCapabilitiesCheckedAt || new Date().toISOString(),
+      title: t('taskCenter.steamworksUnavailableTitle'),
+      error: detail || undefined,
+    };
+  })();
+
+  const backgroundTasks = steamworksUnavailableTask
+    ? [steamworksUnavailableTask, ...managedBackgroundTasks]
+    : managedBackgroundTasks;
 
   const handleOpenLink = async (url: string) => {
     if (!url) return;
@@ -358,13 +418,18 @@ export function useAddonManager() {
   };
 
   // Save Settings
-  const saveSettings = async (loadingDir: string, enableDummyBypass: boolean) => {
+  const saveSettings = async (
+    loadingDir: string,
+    enableDummyBypass: boolean,
+    suppressSdkUnavailableWarning: boolean,
+  ) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('save_settings', {
         loadingDir,
-        enableDummyBypass
+        enableDummyBypass,
+        suppressSdkUnavailableWarning,
       });
       updateLocalState(data);
       setSettingsModal({ open: false, loadingDir: '' });

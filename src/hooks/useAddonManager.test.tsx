@@ -50,6 +50,7 @@ describe('useAddonManager', () => {
     workshopDir: '/path/to/workshop',
     loadingDir: '/path/to/loading',
     enableDummyBypass: false,
+    suppressSdkUnavailableWarning: false,
   };
 
   beforeEach(() => {
@@ -73,6 +74,18 @@ describe('useAddonManager', () => {
       }
       if (cmd === 'get_background_tasks') {
         return Promise.resolve([]);
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
       }
       return Promise.resolve({});
     });
@@ -169,6 +182,18 @@ describe('useAddonManager', () => {
       if (cmd === 'get_addons') {
         return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
       }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
       if (cmd === 'move_addons') {
         return Promise.resolve({});
       }
@@ -205,6 +230,18 @@ describe('useAddonManager', () => {
     mockInvoke.mockImplementation((cmd, args) => {
       if (cmd === 'get_addons') {
         return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
       }
       if (cmd === 'group_action') {
         if (args?.action === 'create') {
@@ -258,11 +295,36 @@ describe('useAddonManager', () => {
       resolvePromise = resolve;
     });
 
-    mockInvoke.mockImplementation((cmd) => {
+    mockInvoke.mockImplementation((cmd, args) => {
       if (cmd === 'get_addons') {
         return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
       }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
+      }
       if (cmd === 'save_settings') {
+        expect(args).toEqual({
+          loadingDir: '/new/loading/dir',
+          enableDummyBypass: false,
+          suppressSdkUnavailableWarning: false,
+        });
         return tauriPromise;
       }
       return Promise.resolve({});
@@ -279,7 +341,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir', false);
+      savePromise = result.current.saveSettings('/new/loading/dir', false, false);
     });
 
     // isSubmitting should be true immediately after invoking
@@ -403,6 +465,101 @@ describe('useAddonManager', () => {
     expect(result.current.downloadProgress['12345']).toBe(50);
   });
 
+  test('should add a frontend warning task when Steamworks SDK is unavailable', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: mockGroups,
+          settings: mockSettings,
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: false,
+          bridgeLoaded: false,
+          bridgeInitialized: false,
+          provider: 'web-fallback',
+          lastError: 'Steam bridge DLL not found',
+          canQueryItems: false,
+          canQueryHome: false,
+          canDownload: false,
+          canEnumerateInstalled: false,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+      expect(result.current.backgroundTasks).toHaveLength(1);
+    });
+
+    expect(result.current.backgroundTasks[0]).toMatchObject({
+      id: 'steamworks-sdk-unavailable',
+      kind: 'warning',
+      status: 'failed',
+      source: 'frontend-warning',
+      title: 'Steamworks SDK 不可用',
+    });
+    expect(result.current.backgroundTasks[0].error).toContain('Steam bridge DLL not found');
+  });
+
+  test('should suppress the frontend SDK warning task when the setting is enabled', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: mockGroups,
+          settings: {
+            ...mockSettings,
+            suppressSdkUnavailableWarning: true,
+          },
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: false,
+          bridgeLoaded: false,
+          bridgeInitialized: false,
+          provider: 'web-fallback',
+          lastError: 'Steam bridge DLL not found',
+          canQueryItems: false,
+          canQueryHome: false,
+          canDownload: false,
+          canEnumerateInstalled: false,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.backgroundTasks).toHaveLength(0);
+  });
+
   test('should request backend download cancellation when cancelling a running download task', async () => {
     let resolveDownload: ((value: DatabasePayload) => void) | undefined;
     const downloadPromise = new Promise<DatabasePayload>((resolve) => {
@@ -415,6 +572,18 @@ describe('useAddonManager', () => {
           addons: mockAddons,
           groups: mockGroups,
           settings: mockSettings,
+        });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
         });
       }
       if (cmd === 'get_workshop_cache') {

@@ -48,7 +48,7 @@ impl WorkshopBridge {
     }
 
     unsafe fn load_from_path(path: &Path) -> Result<Self, String> {
-        let library = Library::new(path).map_err(|e| e.to_string())?;
+        let library = load_library(path)?;
         let init = *library
             .get::<InitFn>(b"l4a_steam_bridge_init\0")
             .map_err(|e| e.to_string())?;
@@ -117,6 +117,44 @@ impl WorkshopBridge {
                 .unwrap_or_else(|| format!("Steam bridge call {} failed", method)))
         }
     }
+}
+
+unsafe fn load_library(path: &Path) -> Result<Library, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use libloading::os::windows::{
+            Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        };
+
+        let flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+        let library = WindowsLibrary::load_with_flags(path, flags)
+            .map(Library::from)
+            .map_err(|e| format_windows_load_error(path, &e.to_string()))?;
+        return Ok(library);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Library::new(path).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn format_windows_load_error(path: &Path, source: &str) -> String {
+    let hint = if path
+        .parent()
+        .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "steam"))
+    {
+        " The bridge DLL was found, but one of its dependent DLLs could not be loaded from the same directory."
+    } else {
+        ""
+    };
+
+    format!(
+        "{}. This usually means a dependent DLL is missing or the DLL architecture does not match. Required runtime files include steam_api64.dll, and GNU builds may also require MinGW runtime DLLs such as libgcc_s_seh-1.dll and libwinpthread-1.dll.{}",
+        source, hint
+    )
 }
 
 fn candidate_library_paths(exe_dir: &Path) -> Vec<PathBuf> {

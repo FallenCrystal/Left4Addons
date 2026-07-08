@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "tauri:build:win-gnu": "npm run build && cargo build --release --target x86_64-pc-windows-gnu --manifest-path src-tauri/Cargo.toml",
     "lint": "oxlint",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",

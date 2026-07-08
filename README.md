@@ -93,6 +93,24 @@ npm run tauri:build
 
 构建完成后，你可以在 `src-tauri/target/release/` 下找到生成的可执行文件。
 
+### Linux 上交叉构建 Windows 版本
+
+如果你当前在 Linux 上开发，推荐先使用 `x86_64-pc-windows-gnu` 目标：
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+npm run tauri:build:win-gnu
+```
+
+构建完成后，Windows 产物位于 `src-tauri/target/x86_64-pc-windows-gnu/release/`。
+
+其中 Steamworks bridge 运行时文件会自动放到 `src-tauri/target/x86_64-pc-windows-gnu/release/steam/`：
+
+- `l4a-steam-bridge.dll`
+- `steam_api64.dll`
+
+这样无需再手动复制 Steam bridge 相关 DLL。
+
 ---
 
 ## 许可证

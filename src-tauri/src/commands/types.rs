@@ -9,6 +9,8 @@ pub struct Settings {
     pub loading_dir: String,
     #[serde(rename = "enableDummyBypass", default)]
     pub enable_dummy_bypass: bool,
+    #[serde(rename = "suppressSdkUnavailableWarning", default)]
+    pub suppress_sdk_unavailable_warning: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

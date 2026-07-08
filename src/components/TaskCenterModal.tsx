@@ -313,6 +313,12 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 {failedTasks.map((task) => {
                   const workshopId = task.targetIds[0];
+                  const isWarningTask = task.kind === 'warning';
+                  const taskTitle = task.title || (
+                    isWarningTask
+                      ? t('taskCenter.steamworksUnavailableTitle', 'Steamworks SDK 不可用')
+                      : `Workshop Item ${workshopId}`
+                  );
                   return (
                     <div
                       key={task.id}
@@ -338,48 +344,54 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                               whiteSpace: 'nowrap',
                             }}
                           >
-                            {task.title || `Workshop Item ${workshopId}`}
+                            {taskTitle}
                           </div>
                           <div style={{ fontSize: '11px', color: 'var(--md-sys-color-error)', marginTop: '2px' }}>
-                            {task.kind === 'download' ? t('taskCenter.downloadFailed', '下载失败') : t('taskCenter.syncFailed', '同步元数据失败')}
+                            {isWarningTask
+                              ? t('taskCenter.warningTitle', '功能受限警告')
+                              : task.kind === 'download'
+                                ? t('taskCenter.downloadFailed', '下载失败')
+                                : t('taskCenter.syncFailed', '同步元数据失败')}
                           </div>
                         </div>
 
                         {/* Actions */}
-                        <div style={{ display: 'flex', gap: '4px' }}>
-                          <button
-                            className="btn btn-secondary"
-                            onClick={() => onRetryTask(task.id)}
-                            title={t('taskCenter.retry', '重新尝试')}
-                            style={{
-                              width: '32px',
-                              height: '32px',
-                              borderRadius: '8px',
-                              padding: 0,
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                          >
-                            <RotateCw size={14} />
-                          </button>
-                          <button
-                            className="btn btn-secondary"
-                            onClick={() => onCancelTask(task.id)}
-                            title={t('taskCenter.clear', '移除通知')}
-                            style={{
-                              width: '32px',
-                              height: '32px',
-                              borderRadius: '8px',
-                              padding: 0,
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                            }}
-                          >
-                            <X size={14} />
-                          </button>
-                        </div>
+                        {!isWarningTask && (
+                          <div style={{ display: 'flex', gap: '4px' }}>
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => onRetryTask(task.id)}
+                              title={t('taskCenter.retry', '重新尝试')}
+                              style={{
+                                width: '32px',
+                                height: '32px',
+                                borderRadius: '8px',
+                                padding: 0,
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                              }}
+                            >
+                              <RotateCw size={14} />
+                            </button>
+                            <button
+                              className="btn btn-secondary"
+                              onClick={() => onCancelTask(task.id)}
+                              title={t('taskCenter.clear', '移除通知')}
+                              style={{
+                                width: '32px',
+                                height: '32px',
+                                borderRadius: '8px',
+                                padding: 0,
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                              }}
+                            >
+                              <X size={14} />
+                            </button>
+                          </div>
+                        )}
                       </div>
 
                       {/* Error details */}

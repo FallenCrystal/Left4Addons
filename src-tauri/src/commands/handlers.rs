@@ -285,6 +285,7 @@ pub fn load_db(
             workshop_dir: default_workshop,
             loading_dir: default_loading,
             enable_dummy_bypass: false,
+            suppress_sdk_unavailable_warning: false,
         },
         addons: HashMap::new(),
         groups: Vec::new(),
@@ -1503,6 +1504,7 @@ pub async fn get_settings(state: State<'_, crate::AppState>) -> Result<Settings,
 pub async fn save_settings(
     loading_dir: String,
     enable_dummy_bypass: bool,
+    suppress_sdk_unavailable_warning: bool,
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
@@ -1513,6 +1515,7 @@ pub async fn save_settings(
     db.settings.workshop_dir = workshop_dir;
     db.settings.loading_dir = loading_dir;
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
+    db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
     save_db_internal(
         &state.settings_path,
         &state.groups_path,
