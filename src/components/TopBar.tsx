@@ -1,6 +1,7 @@
 import React from 'react';
 import { Search, RefreshCw, CheckSquare, X } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { CustomSelect } from './CustomSelect';
 
 interface TopBarProps {
   searchQuery: string;
@@ -44,39 +45,37 @@ export const TopBar: React.FC<TopBarProps> = ({
         />
       </div>
 
+      <div className="categories-container">
+        {categoriesList.map(cat => (
+          <button
+            key={cat}
+            onClick={() => onCategoryChange(cat)}
+            className="btn"
+            style={{
+              padding: '6px 12px',
+              fontSize: '11px',
+              borderRadius: '8px',
+              backgroundColor: selectedCategory === cat ? 'var(--md-sys-color-primary)' : 'var(--md-sys-surface-container-high)',
+              color: selectedCategory === cat ? 'var(--md-sys-color-on-primary)' : 'var(--md-sys-color-on-surface)',
+              border: '1px solid var(--md-sys-color-outline-variant)'
+            }}
+          >
+            {t(`categories.${cat}`, cat)}
+          </button>
+        ))}
+      </div>
+
       <div className="top-bar-actions">
-        <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
-          {categoriesList.map(cat => (
-            <button
-              key={cat}
-              onClick={() => onCategoryChange(cat)}
-              className="btn"
-              style={{
-                padding: '6px 12px',
-                fontSize: '11px',
-                borderRadius: '8px',
-                backgroundColor: selectedCategory === cat ? 'var(--md-sys-color-primary)' : 'var(--md-sys-surface-container-high)',
-                color: selectedCategory === cat ? 'var(--md-sys-color-on-primary)' : 'var(--md-sys-color-on-surface)',
-                border: '1px solid var(--md-sys-color-outline-variant)'
-              }}
-            >
-              {t(`categories.${cat}`, cat)}
-            </button>
-          ))}
-        </div>
-
-        <div style={{ width: '1px', height: '24px', backgroundColor: 'var(--md-sys-color-outline-variant)', flexShrink: 0 }}></div>
-
-        <select 
-          className="form-input" 
-          style={{ padding: '6px 12px', borderRadius: '100px', fontSize: '12px', minWidth: '120px' }}
+        <CustomSelect
+          options={[
+            { value: 'title', label: t('topbar.sortByTitle') },
+            { value: 'size', label: t('topbar.sortBySize') },
+            { value: 'id', label: t('topbar.sortById') },
+          ]}
           value={sortBy}
-          onChange={(e) => onSortByChange(e.target.value)}
-        >
-          <option value="title">{t('topbar.sortByTitle')}</option>
-          <option value="size">{t('topbar.sortBySize')}</option>
-          <option value="id">{t('topbar.sortById')}</option>
-        </select>
+          onChange={onSortByChange}
+          minWidth="120px"
+        />
 
         <button
           className={`btn ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}

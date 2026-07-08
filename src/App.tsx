@@ -25,6 +25,7 @@ import { WorkshopBrowser } from './components/WorkshopBrowser';
 import { MasterCollectionModal } from './components/MasterCollectionModal';
 import { MasterCollectionHeader } from './components/MasterCollectionHeader';
 import { AddToGroupModal } from './components/AddToGroupModal';
+import { PromptModal } from './components/PromptModal';
 import { useState } from 'react';
 
 function App() {
@@ -130,6 +131,11 @@ function App() {
   const [masterCollectionModal, setMasterCollectionModal] = useState(false);
   const [addToGroupModal, setAddToGroupModal] = useState(false);
   const [addToMcModal, setAddToMcModal] = useState(false);
+  const [renameCollectionModal, setRenameCollectionModal] = useState<{ open: boolean; collectionId: string; currentName: string }>({
+    open: false,
+    collectionId: '',
+    currentName: ''
+  });
 
   // Available categories list
   const categoriesList = [
@@ -248,10 +254,11 @@ function App() {
                   currentMasterCollection={currentMasterCollection}
                   groupsInCollection={groupsInMasterCollection}
                   onRenameCollection={() => {
-                    const newName = prompt(t('masterCollections.renameCollection'), currentMasterCollection.name);
-                    if (newName && newName.trim()) {
-                      handleRenameMasterCollection(currentMasterCollection.id, newName.trim());
-                    }
+                    setRenameCollectionModal({
+                      open: true,
+                      collectionId: currentMasterCollection.id,
+                      currentName: currentMasterCollection.name
+                    });
                   }}
                   onDeleteCollection={() => handleDeleteMasterCollection(currentMasterCollection.id)}
                 />
@@ -510,6 +517,21 @@ function App() {
         onConfirm={async (name) => {
           await handleCreateMasterCollection(name);
           setMasterCollectionModal(false);
+        }}
+      />
+
+      {/* Rename Master Collection Prompt Modal */}
+      <PromptModal
+        open={renameCollectionModal.open}
+        title={t('masterCollections.renameCollection')}
+        defaultValue={renameCollectionModal.currentName}
+        placeholder={t('masterCollections.collectionNamePlaceholder')}
+        onCancel={() => setRenameCollectionModal({ open: false, collectionId: '', currentName: '' })}
+        onConfirm={async (newName) => {
+          if (newName.trim()) {
+            await handleRenameMasterCollection(renameCollectionModal.collectionId, newName.trim());
+          }
+          setRenameCollectionModal({ open: false, collectionId: '', currentName: '' });
         }}
       />
 

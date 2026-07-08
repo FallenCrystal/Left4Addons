@@ -1,9 +1,10 @@
 /** Workshop item/collection detail drawer */
 
-import React from 'react';
+import React, { useState } from 'react';
 import { Download, Globe, FolderPlus, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { CollectionData } from './types';
+import { AlertModal } from '../AlertModal';
 
 interface DetailDrawerProps {
   selectedItem: any | null;
@@ -37,20 +38,33 @@ export const DetailDrawer: React.FC<DetailDrawerProps> = ({
   onImportCollection,
 }) => {
   const { t } = useTranslation();
+  const [alertInfo, setAlertInfo] = useState<{ open: boolean; title: string; message: string }>({
+    open: false,
+    title: '',
+    message: '',
+  });
 
   const handleImportCollectionGroup = () => {
     if (!selectedCollection) return;
     const name = selectedCollection.collection.title || t('workshop.detail.defaultCollectionName');
     const itemIds = selectedCollection.items.map((item) => item.publishedfileid);
     onImportCollection(name, itemIds);
-    alert(t('workshop.detail.importSuccess', { count: itemIds.length, name }));
+    setAlertInfo({
+      open: true,
+      title: t('common.success') || '成功',
+      message: t('workshop.detail.importSuccess', { count: itemIds.length, name }),
+    });
   };
 
   const handleDownloadAllCollection = () => {
     if (!selectedCollection) return;
     const itemIds = selectedCollection.items.map((item) => item.publishedfileid);
     itemIds.forEach((id) => onDownload(id));
-    alert(t('workshop.detail.downloadAllSuccess', { count: itemIds.length }));
+    setAlertInfo({
+      open: true,
+      title: t('common.success') || '成功',
+      message: t('workshop.detail.downloadAllSuccess', { count: itemIds.length }),
+    });
   };
 
   if (!selectedItem && !selectedCollection && !selectedItemLoading && !selectedCollectionLoading) {
@@ -58,8 +72,9 @@ export const DetailDrawer: React.FC<DetailDrawerProps> = ({
   }
 
   return (
-    <div
-      style={{
+    <>
+      <div
+        style={{
         width: '380px',
         display: 'flex',
         flexDirection: 'column',
@@ -520,6 +535,12 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
           </button>
         </div>
       </div>
-    </div>
+      <AlertModal
+        open={alertInfo.open}
+        title={alertInfo.title}
+        message={alertInfo.message}
+        onClose={() => setAlertInfo({ open: false, title: '', message: '' })}
+      />
+    </>
   );
 };

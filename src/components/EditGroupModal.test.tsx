@@ -120,9 +120,8 @@ describe('EditGroupModal', () => {
     }
   });
 
-  test('prompts confirmation when collection ID changes and submits only on confirm', () => {
+  test('prompts confirmation when collection ID changes and submits only on confirm', async () => {
     const onConfirm = vi.fn();
-    confirmMock.mockReturnValue(false);
 
     render(
       <EditGroupModal
@@ -146,13 +145,24 @@ describe('EditGroupModal', () => {
     const form = colInput.closest('form');
     if (form) {
       fireEvent.submit(form);
-      expect(confirmMock).toHaveBeenCalledTimes(1);
       expect(onConfirm).not.toHaveBeenCalled();
 
-      // Rerender with confirmMock returning true
-      confirmMock.mockReturnValue(true);
-      fireEvent.submit(form);
-      expect(confirmMock).toHaveBeenCalledTimes(2);
+      // The confirm screen is showing
+      expect(await screen.findByText('确认修改')).toBeDefined();
+
+      // Click cancel should go back
+      const cancelButton = screen.getByText('取消');
+      fireEvent.click(cancelButton);
+      expect(screen.queryByText('确认修改')).toBeNull();
+
+      // Submit again to show confirmation
+      const saveButton = screen.getByText('保存');
+      fireEvent.click(saveButton);
+      expect(await screen.findByText('确认修改')).toBeDefined();
+
+      // Click confirm should call onConfirm
+      const confirmButton = screen.getByText('确认');
+      fireEvent.click(confirmButton);
       expect(onConfirm).toHaveBeenCalledWith('g1', 'My Group', [], '999');
     }
   });

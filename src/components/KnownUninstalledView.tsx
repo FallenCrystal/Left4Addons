@@ -69,7 +69,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
 
       {/* Search */}
       <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', alignItems: 'center', flexWrap: 'wrap' }}>
-        <div style={{ position: 'relative', flex: 1, minWidth: '240px' }}>
+        <div style={{ position: 'relative', flex: 1, minWidth: '320px' }}>
           <Search size={18} style={{ position: 'absolute', left: '16px', top: '50%', transform: 'translateY(-50%)', color: 'var(--md-sys-color-outline)' }} />
           <input
             type="text"

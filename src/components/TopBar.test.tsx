@@ -29,7 +29,7 @@ describe('TopBar', () => {
     );
 
     // Search query input
-    const searchInput = screen.getByPlaceholderText('搜索组件名称, 描述, 作者或创意工坊 ID...') as HTMLInputElement;
+    const searchInput = screen.getByPlaceholderText('名称, 描述, 作者或创意工坊ID') as HTMLInputElement;
     expect(searchInput.value).toBe('tank');
 
     // Search query input change
@@ -45,12 +45,16 @@ describe('TopBar', () => {
     fireEvent.click(screen.getByText('战役'));
     expect(onCategoryChange).toHaveBeenCalledWith('Campaign');
 
-    // Sort select
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
-    expect(select.value).toBe('size');
+    // Sort select trigger
+    const selectTrigger = screen.getByText('大小');
+    expect(selectTrigger).toBeDefined();
 
-    // Select change
-    fireEvent.change(select, { target: { value: 'title' } });
+    // Open dropdown
+    fireEvent.click(selectTrigger);
+
+    // Click option
+    const titleOption = screen.getByText('名称');
+    fireEvent.click(titleOption);
     expect(onSortByChange).toHaveBeenCalledWith('title');
 
     // Batch Manage button

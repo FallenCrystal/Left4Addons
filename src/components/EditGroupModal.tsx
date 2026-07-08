@@ -31,14 +31,16 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
   const [name, setName] = useState('');
   const [tagsInput, setTagsInput] = useState('');
   const [collectionId, setCollectionId] = useState('');
+  const [showConfirmSave, setShowConfirmSave] = useState(false);
 
   useEffect(() => {
     if (open) {
       setName(currentName);
       setTagsInput(currentTags.join(', '));
       setCollectionId(currentCollectionId);
+      setShowConfirmSave(false);
     }
-  }, [open, currentName, currentTags, currentCollectionId]);
+  }, [open, groupId]);
 
   if (!open) return null;
 
@@ -54,25 +56,65 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
     e.preventDefault();
     if (!name.trim() || isSubmitting) return;
 
+    const targetCollectionId = collectionId.trim() || undefined;
+
+    // If collection ID was added/changed, we prompt
+    if (targetCollectionId !== (currentCollectionId || '') && targetCollectionId) {
+      setShowConfirmSave(true);
+      return;
+    }
+
     const tags = tagsInput
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
 
-    const targetCollectionId = collectionId.trim() || undefined;
-
-    // If collection ID was added/changed, we can prompt or alert
-    if (targetCollectionId !== (currentCollectionId || '') && targetCollectionId) {
-      const confirmSync = window.confirm(
-        '设置创意工坊合集后，保存时将自动从 Steam 创意工坊拉取该合集内的所有组件，并丢弃当前分组的所有其它自定义分类组件。确认继续吗？'
-      );
-      if (!confirmSync) return;
-    }
-
     onConfirm(groupId, name.trim(), tags, targetCollectionId);
   };
 
   const isCollectionChanged = collectionId.trim() !== (currentCollectionId || '');
+
+  if (showConfirmSave) {
+    return (
+      <div className="modal-overlay" onClick={onCancel} style={{ zIndex: 1100 }}>
+        <div className="modal-content" style={{ maxWidth: '440px', borderRadius: '28px', padding: '24px' }} onClick={(e) => e.stopPropagation()}>
+          <h2 className="modal-title" style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#ffb300' }}>
+            <AlertTriangle size={24} />
+            <span>确认修改</span>
+          </h2>
+          <div style={{ whiteSpace: 'pre-wrap', marginTop: '16px', marginBottom: '24px', color: '#e2e2e9', fontSize: '14px', lineHeight: '1.6' }}>
+            设置创意工坊合集后，保存时将自动从 Steam 创意工坊拉取该合集内的所有组件，并丢弃当前分组的所有其它自定义分类组件。确认继续吗？
+          </div>
+          <div className="modal-actions" style={{ marginTop: 0 }}>
+            <button 
+              type="button" 
+              className="btn btn-secondary" 
+              onClick={() => setShowConfirmSave(false)}
+              style={{ borderRadius: '12px' }}
+            >
+              取消
+            </button>
+            <button 
+              type="button" 
+              className="btn btn-primary"
+              onClick={() => {
+                const tags = tagsInput
+                  .split(',')
+                  .map(s => s.trim())
+                  .filter(Boolean);
+                const targetCollectionId = collectionId.trim() || undefined;
+                onConfirm(groupId, name.trim(), tags, targetCollectionId);
+                setShowConfirmSave(false);
+              }}
+              style={{ borderRadius: '12px' }}
+            >
+              确认
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="modal-overlay" onClick={onCancel}>

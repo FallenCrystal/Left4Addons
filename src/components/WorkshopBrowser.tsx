@@ -23,6 +23,8 @@ import { ItemCard } from './workshop/ItemCard';
 import { TagBrowserModal } from './workshop/TagBrowserModal';
 import { SectionCarousel } from './workshop/SectionCarousel';
 import { WorkshopDetailModal } from './workshop/WorkshopDetailModal';
+import { AlertModal } from './AlertModal';
+import { CustomSelect } from './CustomSelect';
 import {
   fetchWorkshopCollection,
   fetchWorkshopHome,
@@ -92,6 +94,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   } | null>(null);
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
+  const [alertInfo, setAlertInfo] = useState<{ open: boolean; title: string; message: string }>({
+    open: false,
+    title: '',
+    message: '',
+  });
   const [isScrollInteracting, setIsScrollInteracting] = useState(false);
 
   const markScrollInteraction = useCallback(() => {
@@ -225,7 +232,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         setSelectedCollection(null);
       }
     } catch (err) {
-      alert(t('workshop.detail.fetchFailed', { err: String(err) }));
+      setAlertInfo({
+        open: true,
+        title: t('common.error') || '错误',
+        message: t('workshop.detail.fetchFailed', { err: String(err) }),
+      });
     } finally {
       setLoadingDetailId(null);
     }
@@ -252,7 +263,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         setSelectedItem(null);
       }
     } catch (err) {
-      alert(t('workshop.detail.fetchFailed', { err: String(err) }));
+      setAlertInfo({
+        open: true,
+        title: t('common.error') || '错误',
+        message: t('workshop.detail.fetchFailed', { err: String(err) }),
+      });
     } finally {
       setLoadingDetailId(null);
     }
@@ -420,15 +435,16 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
         {(viewMode === 'browse' || viewMode === 'search') && !creatorId && (
           <>
-            <select
+            <CustomSelect
+              options={SORT_OPTIONS.map((opt) => ({
+                value: opt.value,
+                label: t(opt.labelKey),
+              }))}
               value={sort}
-              onChange={(e) => { setSort(e.target.value); setPage(1); }}
-              style={{ padding: '8px 14px', borderRadius: '100px', border: '1px solid var(--md-sys-color-outline-variant)', backgroundColor: 'var(--md-sys-color-surface-container-low)', color: 'var(--md-sys-color-on-surface)', outline: 'none', fontSize: '12px' }}
-            >
-              {SORT_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>{t(opt.labelKey)}</option>
-              ))}
-            </select>
+              onChange={(val) => { setSort(val); setPage(1); }}
+              minWidth="140px"
+              style={{ height: '36px' }}
+            />
             <div style={{ display: 'flex', borderRadius: '100px', backgroundColor: 'var(--md-sys-color-surface-container-high)', padding: '3px' }}>
               <button
                 className={`btn ${section === 'readytouseitems' ? 'btn-primary' : ''}`}
@@ -498,6 +514,14 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         activeTag={activeTag}
         onClose={() => setTagModalOpen(false)}
         onTagClick={handleTagClick}
+      />
+
+      {/* Alert modal */}
+      <AlertModal
+        open={alertInfo.open}
+        title={alertInfo.title}
+        message={alertInfo.message}
+        onClose={() => setAlertInfo({ open: false, title: '', message: '' })}
       />
     </div>
   );
