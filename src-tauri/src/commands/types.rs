@@ -13,6 +13,61 @@ pub struct Settings {
     pub suppress_sdk_unavailable_warning: bool,
     #[serde(rename = "disableSteamworksSdk", default)]
     pub disable_steamworks_sdk: bool,
+    #[serde(rename = "workshopSourceSettings", default)]
+    pub workshop_source_settings: WorkshopSourceSettings,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkshopSourceSettings {
+    #[serde(default = "default_workshop_source_preset")]
+    pub preset: String,
+    #[serde(default = "default_true")]
+    pub allow_steamworks_sdk: bool,
+    #[serde(default = "default_true")]
+    pub allow_steam_web_api: bool,
+    #[serde(default = "default_true")]
+    pub allow_steam_community_html: bool,
+    #[serde(default)]
+    pub allow_sdk_html_hybrid: bool,
+    #[serde(default = "default_source_order")]
+    pub source_order: Vec<String>,
+    #[serde(default = "default_cache_retention")]
+    pub cache_retention: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_workshop_source_preset() -> String {
+    "conservative".to_string()
+}
+
+fn default_source_order() -> Vec<String> {
+    vec![
+        "steamworks-sdk".to_string(),
+        "steam-web-api".to_string(),
+        "steamcommunity-html".to_string(),
+    ]
+}
+
+fn default_cache_retention() -> String {
+    "keep".to_string()
+}
+
+impl Default for WorkshopSourceSettings {
+    fn default() -> Self {
+        Self {
+            preset: default_workshop_source_preset(),
+            allow_steamworks_sdk: true,
+            allow_steam_web_api: true,
+            allow_steam_community_html: true,
+            allow_sdk_html_hybrid: false,
+            source_order: default_source_order(),
+            cache_retention: default_cache_retention(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

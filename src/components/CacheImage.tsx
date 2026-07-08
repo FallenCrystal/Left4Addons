@@ -21,6 +21,30 @@ export const CacheImage: React.FC<CacheImageProps> = ({ srcPath, fallback, onErr
       return () => {};
     }
 
+    if (srcPath.startsWith('http://') || srcPath.startsWith('https://')) {
+      const cacheRemoteImage = async () => {
+        try {
+          const cachedPath = await invoke<string>('cache_remote_image', { url: srcPath });
+          const bytes = await invoke<number[]>('get_cache_image', { imagePath: cachedPath });
+          if (!cancelled) {
+            const blob = new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' });
+            objectUrl = URL.createObjectURL(blob);
+            setResolvedSrc(objectUrl);
+          }
+        } catch (err) {
+          console.warn('Failed to cache remote image, using original URL:', err);
+          if (!cancelled) {
+            setResolvedSrc(srcPath);
+          }
+        }
+      };
+
+      cacheRemoteImage();
+      return () => {
+        cancelled = true;
+      };
+    }
+
     if (!srcPath.startsWith('/cache/')) {
       setResolvedSrc(srcPath);
       return () => {};
@@ -95,4 +119,3 @@ export const CacheImage: React.FC<CacheImageProps> = ({ srcPath, fallback, onErr
 
   return <img src={resolvedSrc} onError={handleError} {...props} />;
 };
-

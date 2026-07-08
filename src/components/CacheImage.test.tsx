@@ -15,6 +15,7 @@ URL.revokeObjectURL = vi.fn();
 describe('CacheImage', () => {
   beforeEach(() => {
     mockInvoke.mockClear();
+    mockInvoke.mockImplementation(async () => [255, 216, 255, 217]);
     vi.mocked(URL.createObjectURL).mockClear();
     vi.mocked(URL.revokeObjectURL).mockClear();
   });
@@ -36,7 +37,14 @@ describe('CacheImage', () => {
     expect(img.src).toBe('blob:cache-image-url');
   });
 
-  test('renders remote image directly', async () => {
+  test('caches remote image before rendering', async () => {
+    vi.mocked(URL.createObjectURL).mockReturnValueOnce('blob:remote-cache-image-url');
+    mockInvoke.mockImplementation(async (cmd) => {
+      if (cmd === 'cache_remote_image') return '/cache/remote.jpg';
+      if (cmd === 'get_cache_image') return [255, 216, 255, 217];
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
     render(
       <CacheImage
         srcPath="https://example.com/image.jpg"
@@ -46,8 +54,9 @@ describe('CacheImage', () => {
     );
 
     const img = await screen.findByAltText('Remote Image') as HTMLImageElement;
-    expect(img.src).toBe('https://example.com/image.jpg');
-    expect(mockInvoke).not.toHaveBeenCalledWith('get_cache_image', expect.anything());
+    expect(img.src).toBe('blob:remote-cache-image-url');
+    expect(mockInvoke).toHaveBeenCalledWith('cache_remote_image', { url: 'https://example.com/image.jpg' });
+    expect(mockInvoke).toHaveBeenCalledWith('get_cache_image', { imagePath: '/cache/remote.jpg' });
   });
 
   test('renders fallback when srcPath is empty', () => {

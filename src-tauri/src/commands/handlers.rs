@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::types::{
     is_dummy_addon_info, Addon, Database, Group, KnownAddonEntry, MasterCollection, RenameItem,
-    Settings, SettingsStore, WorkshopSeenItem,
+    Settings, SettingsStore, WorkshopSeenItem, WorkshopSourceSettings,
 };
 
 const DOWNLOAD_CANCELLED_ERR: &str = "Download cancelled";
@@ -32,6 +32,88 @@ struct WorkshopHtmlFetchGate {
 }
 
 static WORKSHOP_HTML_FETCH_GATE: OnceLock<Mutex<WorkshopHtmlFetchGate>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct SourcePolicy {
+    preset: String,
+    allow_steamworks_sdk: bool,
+    allow_steam_web_api: bool,
+    allow_steam_community_html: bool,
+    allow_sdk_html_hybrid: bool,
+    source_order: Vec<String>,
+}
+
+impl SourcePolicy {
+    fn from_settings(settings: &Settings) -> Self {
+        let configured = &settings.workshop_source_settings;
+        let preset = configured.preset.trim().to_string();
+        let disable_sdk = settings.disable_steamworks_sdk;
+
+        match preset.as_str() {
+            "offline" => Self {
+                preset,
+                allow_steamworks_sdk: false,
+                allow_steam_web_api: false,
+                allow_steam_community_html: false,
+                allow_sdk_html_hybrid: false,
+                source_order: configured.source_order.clone(),
+            },
+            "sdk-only" | "sdkOnly" => Self {
+                preset: "sdk-only".to_string(),
+                allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
+                allow_steam_web_api: false,
+                allow_steam_community_html: false,
+                allow_sdk_html_hybrid: false,
+                source_order: configured.source_order.clone(),
+            },
+            "hybrid" => Self {
+                preset,
+                allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
+                allow_steam_web_api: configured.allow_steam_web_api,
+                allow_steam_community_html: configured.allow_steam_community_html,
+                allow_sdk_html_hybrid: true,
+                source_order: configured.source_order.clone(),
+            },
+            _ => Self {
+                preset: "conservative".to_string(),
+                allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
+                allow_steam_web_api: configured.allow_steam_web_api,
+                allow_steam_community_html: configured.allow_steam_community_html,
+                allow_sdk_html_hybrid: configured.allow_sdk_html_hybrid,
+                source_order: configured.source_order.clone(),
+            },
+        }
+    }
+
+    fn allow_bridge(&self) -> bool {
+        self.allow_steamworks_sdk
+    }
+
+    fn allow_web_api(&self) -> bool {
+        self.allow_steam_web_api
+    }
+
+    fn source_order(&self) -> &[String] {
+        &self.source_order
+    }
+
+    fn allow_html(&self, sdk_query_available: bool) -> bool {
+        if !self.allow_steam_community_html {
+            return false;
+        }
+        if self.preset == "hybrid" || self.allow_sdk_html_hybrid {
+            return true;
+        }
+        !sdk_query_available
+    }
+}
+
+fn source_position(source_order: &[String], source: &str, fallback: usize) -> usize {
+    source_order
+        .iter()
+        .position(|item| item == source)
+        .unwrap_or(fallback)
+}
 
 fn resolve_cache_file(cache_dir: &Path, image_path: &str) -> Result<PathBuf, String> {
     let filename = image_path.strip_prefix("/cache/").unwrap_or(image_path);
@@ -78,6 +160,24 @@ fn validate_steamcommunity_url(url: &str) -> Result<reqwest::Url, String> {
     } else {
         Err("Only steamcommunity.com URLs are allowed".to_string())
     }
+}
+
+fn cache_image_extension(content_type: Option<&str>, url: &reqwest::Url) -> &'static str {
+    if let Some(content_type) = content_type {
+        if content_type.contains("png") {
+            return "png";
+        }
+        if content_type.contains("webp") {
+            return "webp";
+        }
+    }
+    if url.path().to_lowercase().ends_with(".png") {
+        return "png";
+    }
+    if url.path().to_lowercase().ends_with(".webp") {
+        return "webp";
+    }
+    "jpg"
 }
 
 fn workshop_html_fetch_gate() -> &'static Mutex<WorkshopHtmlFetchGate> {
@@ -364,6 +464,7 @@ pub fn load_db(
             enable_dummy_bypass: false,
             suppress_sdk_unavailable_warning: false,
             disable_steamworks_sdk: false,
+            workshop_source_settings: WorkshopSourceSettings::default(),
         },
         addons: HashMap::new(),
         groups: Vec::new(),
@@ -584,7 +685,10 @@ fn save_workshop_cache(
         fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create cache directory: {}", e))?;
     }
-    let json = serde_json::to_string_pretty(cache)
+    let json = serde_json::to_string_pretty(&serde_json::json!({
+        "schemaVersion": 2,
+        "items": cache,
+    }))
         .map_err(|e| format!("Failed to serialize workshop cache: {}", e))?;
     fs::write(cache_path, json).map_err(|e| format!("Failed to write workshop cache: {}", e))
 }
@@ -811,18 +915,37 @@ async fn fetch_steam_details_hybrid(
     workshop_service: &WorkshopService,
     workshop_ids: &[String],
     allow_bridge: bool,
+    allow_web_api: bool,
+    source_order: &[String],
 ) -> Result<Vec<Value>, String> {
     if workshop_ids.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if !allow_bridge && !allow_web_api {
+        return Err("All remote workshop metadata sources are disabled".to_string());
     }
 
     if !allow_bridge {
         return fetch_steam_details(workshop_ids).await;
     }
 
+    let web_first = source_position(source_order, "steam-web-api", 1)
+        < source_position(source_order, "steamworks-sdk", 0);
+    if web_first && allow_web_api {
+        match fetch_steam_details(workshop_ids).await {
+            Ok(details) if !details.is_empty() => return Ok(details),
+            Ok(_) | Err(_) => {}
+        }
+    }
+
     match workshop_service.bridge_fetch_details(workshop_ids) {
         Ok(details) if !details.is_empty() => Ok(details),
-        Ok(_) | Err(_) => fetch_steam_details(workshop_ids).await,
+        Ok(_) | Err(_) if allow_web_api => fetch_steam_details(workshop_ids).await,
+        Ok(_) | Err(_) => Err(
+            "Steamworks SDK did not return workshop details and Steam Web API is disabled"
+                .to_string(),
+        ),
     }
 }
 
@@ -830,9 +953,24 @@ async fn fetch_collection_children_hybrid(
     workshop_service: &WorkshopService,
     collection_id: &str,
     allow_bridge: bool,
+    allow_web_api: bool,
+    source_order: &[String],
 ) -> Result<Vec<String>, String> {
+    if !allow_bridge && !allow_web_api {
+        return Err("All remote workshop collection sources are disabled".to_string());
+    }
+
     if !allow_bridge {
         return fetch_collection_children_web(collection_id).await;
+    }
+
+    let web_first = source_position(source_order, "steam-web-api", 1)
+        < source_position(source_order, "steamworks-sdk", 0);
+    if web_first && allow_web_api {
+        match fetch_collection_children_web(collection_id).await {
+            Ok(ids) if !ids.is_empty() => return Ok(ids),
+            Ok(_) | Err(_) => {}
+        }
     }
 
     if let Ok(payload) = workshop_service.bridge_query_collection(collection_id) {
@@ -847,7 +985,14 @@ async fn fetch_collection_children_hybrid(
         }
     }
 
-    fetch_collection_children_web(collection_id).await
+    if allow_web_api {
+        fetch_collection_children_web(collection_id).await
+    } else {
+        Err(
+            "Steamworks SDK did not return collection children and Steam Web API is disabled"
+                .to_string(),
+        )
+    }
 }
 
 async fn attempt_bridge_download(
@@ -939,9 +1084,8 @@ pub async fn scan_addons_internal(
     groups_path: &Path,
     known_addons_path: &Path,
     cache_dir: &Path,
-    workshop_service: &WorkshopService,
+    _workshop_service: &WorkshopService,
 ) -> Result<(), String> {
-    let allow_bridge = !db.settings.disable_steamworks_sdk;
     let workshop_dir = Path::new(&db.settings.workshop_dir);
     let loading_dir = Path::new(&db.settings.loading_dir);
 
@@ -1212,31 +1356,7 @@ pub async fn scan_addons_internal(
         }
     }
 
-    if !new_workshop_ids.is_empty() {
-        let ids_array: Vec<String> = new_workshop_ids.into_iter().collect();
-        println!("Syncing Steam details for {} items...", ids_array.len());
-        if let Ok(steam_details_list) =
-            fetch_steam_details_hybrid(workshop_service, &ids_array, allow_bridge).await
-        {
-            for details in steam_details_list {
-                if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
-                    for addon in active_addons.values_mut() {
-                        if addon.workshop_id.as_deref() == Some(w_id) {
-                            addon.steam_details = Some(details.clone());
-                            if !addon.has_image {
-                                if let Some(preview_url) =
-                                    details.get("preview_url").and_then(|u| u.as_str())
-                                {
-                                    addon.image_path = Some(preview_url.to_string());
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
+    drop(new_workshop_ids);
 
     let mut uninstalled = HashMap::new();
     for (id, entry) in &known_addons {
@@ -1271,78 +1391,6 @@ pub async fn scan_addons_internal(
 
     db.addons = active_addons;
     db.known_uninstalled_addons = uninstalled;
-
-    // Sync Steam details for all addons with workshopId but no steamDetails
-    let mut ids_to_sync: Vec<String> = Vec::new();
-    for addon in db.addons.values() {
-        if addon.workshop_id.is_some() && addon.steam_details.is_none() && !addon.is_dummy {
-            ids_to_sync.push(addon.workshop_id.clone().unwrap());
-        }
-    }
-    for addon in db.known_uninstalled_addons.values() {
-        if addon.workshop_id.is_some() && addon.steam_details.is_none() {
-            ids_to_sync.push(addon.workshop_id.clone().unwrap());
-        }
-    }
-    if !ids_to_sync.is_empty() {
-        ids_to_sync.sort();
-        ids_to_sync.dedup();
-        println!("Syncing Steam details for {} items...", ids_to_sync.len());
-        if let Ok(steam_details_list) =
-            fetch_steam_details_hybrid(workshop_service, &ids_to_sync, allow_bridge).await
-        {
-            for details in steam_details_list {
-                if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
-                    // Update installed addons
-                    for addon in db.addons.values_mut() {
-                        if addon.workshop_id.as_deref() == Some(w_id) {
-                            addon.steam_details = Some(details.clone());
-                            if !addon.has_image {
-                                if let Some(preview_url) =
-                                    details.get("preview_url").and_then(|u| u.as_str())
-                                {
-                                    addon.image_path = Some(preview_url.to_string());
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    // Update uninstalled addons
-                    for addon in db.known_uninstalled_addons.values_mut() {
-                        if addon.workshop_id.as_deref() == Some(w_id) {
-                            addon.steam_details = Some(details.clone());
-                            if !addon.has_image {
-                                if let Some(preview_url) =
-                                    details.get("preview_url").and_then(|u| u.as_str())
-                                {
-                                    addon.image_path = Some(preview_url.to_string());
-                                    addon.has_image = true;
-                                }
-                            }
-                            if let Some(file_size_str) =
-                                details.get("file_size").and_then(|v| v.as_str())
-                            {
-                                if let Ok(file_size) = file_size_str.parse::<u64>() {
-                                    if file_size > 0 {
-                                        addon.file_size = file_size;
-                                    }
-                                }
-                            }
-                            // Update vpk_name to title if it's still just a workshop ID
-                            if addon.vpk_name == w_id || addon.vpk_name == format!("{}.vpk", w_id) {
-                                if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
-                                    if !title.is_empty() {
-                                        addon.vpk_name = title.to_string();
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     let mut vpk_to_id = HashMap::new();
     for addon in db.addons.values() {
@@ -1702,6 +1750,7 @@ pub async fn save_settings(
     enable_dummy_bypass: bool,
     suppress_sdk_unavailable_warning: bool,
     disable_steamworks_sdk: bool,
+    workshop_source_settings: Option<WorkshopSourceSettings>,
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
@@ -1714,6 +1763,9 @@ pub async fn save_settings(
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
     db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
     db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
+    if let Some(workshop_source_settings) = workshop_source_settings {
+        db.settings.workshop_source_settings = workshop_source_settings;
+    }
     if disable_steamworks_sdk {
         state.workshop_service.shutdown();
     }
@@ -1767,6 +1819,58 @@ pub async fn get_cache_image(
 ) -> Result<Vec<u8>, String> {
     let file_path = resolve_cache_file(&state.cache_dir, &image_path)?;
     fs::read(&file_path).map_err(|e| format!("Failed to read cache image: {}", e))
+}
+
+#[tauri::command]
+pub async fn cache_remote_image(
+    url: String,
+    state: State<'_, crate::AppState>,
+) -> Result<String, String> {
+    let parsed = validate_open_url(&url)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only HTTP(S) images can be cached".to_string());
+    }
+
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(parsed.as_str().as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let response = client
+        .get(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch remote image: {}", e))?;
+    if !response.status().is_success() {
+        return Err(format!("Remote image responded with status {}", response.status()));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let extension = cache_image_extension(content_type.as_deref(), &parsed);
+    let filename = format!("{}_remote_image.{}", hash, extension);
+    let file_path = state.cache_dir.join(&filename);
+    if file_path.exists() {
+        return Ok(format!("/cache/{}", filename));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read remote image: {}", e))?;
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create image cache directory: {}", e))?;
+    }
+    fs::write(&file_path, &bytes).map_err(|e| format!("Failed to cache remote image: {}", e))?;
+    Ok(format!("/cache/{}", filename))
 }
 
 #[tauri::command]
@@ -2257,11 +2361,13 @@ pub async fn group_action(
             }
             // Fetch Steam details for newly added workshop items
             if !new_workshop_ids.is_empty() {
-                let allow_bridge = !db.settings.disable_steamworks_sdk;
+                let source_policy = SourcePolicy::from_settings(&db.settings);
                 if let Ok(steam_details_list) = fetch_steam_details_hybrid(
                     &state.workshop_service,
                     &new_workshop_ids,
-                    allow_bridge,
+                    source_policy.allow_bridge(),
+                    source_policy.allow_web_api(),
+                    source_policy.source_order(),
                 )
                 .await
                 {
@@ -2786,6 +2892,11 @@ pub async fn get_workshop_capabilities(
 pub async fn query_workshop_home(
     state: State<'_, crate::AppState>,
 ) -> Result<WorkshopHomeResponse, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Err("Steamworks SDK workshop source is disabled".to_string());
+    }
+    drop(db);
     state.workshop_service.bridge_query_home()
 }
 
@@ -2794,6 +2905,11 @@ pub async fn query_workshop_items(
     query: WorkshopBrowseQuery,
     state: State<'_, crate::AppState>,
 ) -> Result<WorkshopItemsResponse, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Err("Steamworks SDK workshop source is disabled".to_string());
+    }
+    drop(db);
     state.workshop_service.bridge_query_items(&query)
 }
 
@@ -2802,6 +2918,11 @@ pub async fn query_workshop_item(
     workshop_id: String,
     state: State<'_, crate::AppState>,
 ) -> Result<WorkshopItemResponse, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Err("Steamworks SDK workshop source is disabled".to_string());
+    }
+    drop(db);
     state.workshop_service.bridge_query_item(&workshop_id)
 }
 
@@ -2810,12 +2931,17 @@ pub async fn query_workshop_collection(
     workshop_id: String,
     state: State<'_, crate::AppState>,
 ) -> Result<WorkshopCollectionResponse, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Err("Steamworks SDK workshop source is disabled".to_string());
+    }
+    drop(db);
     state.workshop_service.bridge_query_collection(&workshop_id)
 }
 
 #[tauri::command]
 pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, String> {
-    let (mut ids, allow_bridge, can_enumerate_subscribed) = {
+    let (mut ids, source_policy, can_enumerate_subscribed) = {
         let mut db = state.db.lock().await;
 
         // First, scan addons to populate database with any new/removed files
@@ -2842,16 +2968,14 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         }
         ids.sort();
         ids.dedup();
+        let source_policy = SourcePolicy::from_settings(&db.settings);
+        let can_enumerate_subscribed = source_policy.allow_bridge()
+            && state
+                .workshop_service
+                .capabilities()
+                .can_enumerate_subscribed;
 
-        (
-            ids,
-            !db.settings.disable_steamworks_sdk,
-            !db.settings.disable_steamworks_sdk
-                && state
-                    .workshop_service
-                    .capabilities()
-                    .can_enumerate_subscribed,
-        )
+        (ids, source_policy, can_enumerate_subscribed)
     };
 
     let mut subscribed_ids = Vec::new();
@@ -2886,9 +3010,23 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         ));
     }
 
+    if !source_policy.allow_bridge() && !source_policy.allow_web_api() {
+        let db = state.db.lock().await;
+        return Ok(database_with_workshop_cache(
+            &db,
+            &state.workshop_cache_path,
+        ));
+    }
+
     println!("Syncing Steam details manually for {} items...", ids.len());
-    let steam_details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, &ids, allow_bridge).await?;
+    let steam_details_list = fetch_steam_details_hybrid(
+        &state.workshop_service,
+        &ids,
+        source_policy.allow_bridge(),
+        source_policy.allow_web_api(),
+        source_policy.source_order(),
+    )
+    .await?;
     let mut details_by_id = HashMap::new();
     for details in steam_details_list {
         if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
@@ -2897,7 +3035,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
     }
 
     let mut favorited_collection_ids = Vec::new();
-    if allow_bridge {
+    if source_policy.allow_bridge() {
         match state.workshop_service.bridge_get_favorited_collections() {
             Ok(response) => {
                 for item in response.items {
@@ -2961,7 +3099,9 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
                 if let Ok(child_ids) = fetch_collection_children_hybrid(
                     &state.workshop_service,
                     collection_id,
-                    allow_bridge,
+                    source_policy.allow_bridge(),
+                    source_policy.allow_web_api(),
+                    source_policy.source_order(),
                 )
                 .await
                 {
@@ -2985,8 +3125,14 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         extra_detail_ids.sort();
         extra_detail_ids.dedup();
         if let Ok(extra_details) =
-            fetch_steam_details_hybrid(&state.workshop_service, &extra_detail_ids, allow_bridge)
-                .await
+            fetch_steam_details_hybrid(
+                &state.workshop_service,
+                &extra_detail_ids,
+                source_policy.allow_bridge(),
+                source_policy.allow_web_api(),
+                source_policy.source_order(),
+            )
+            .await
         {
             for details in extra_details {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
@@ -3136,6 +3282,37 @@ pub async fn fetch_workshop_html(
             return Err(err);
         }
     };
+
+    let (allow_html, sdk_query_available) = {
+        let db = state.db.lock().await;
+        let source_policy = SourcePolicy::from_settings(&db.settings);
+        let capabilities = state.workshop_service.capabilities();
+        let sdk_query_available = source_policy.allow_bridge()
+            && (capabilities.can_query_items || capabilities.can_query_home);
+        (
+            source_policy.allow_html(sdk_query_available),
+            sdk_query_available,
+        )
+    };
+    if !allow_html {
+        let err = if sdk_query_available {
+            "Steam Community HTML fetching is disabled while Steamworks SDK is available. Enable SDK + Steam Community hybrid crawling in settings to allow it.".to_string()
+        } else {
+            "Steam Community HTML fetching is disabled by source settings".to_string()
+        };
+        let _ = append_workshop_crawl_log_internal(
+            &state.workshop_crawl_log_path,
+            serde_json::json!({
+                "at": started_at,
+                "source": source,
+                "url": url,
+                "ok": false,
+                "error": err,
+            }),
+        );
+        return Err(err);
+    }
+
     if is_background_workshop_fetch_source(&source) {
         let workshop_id = extract_workshop_id_from_url(parsed.as_str())
             .ok_or_else(|| "Background workshop fetch requires a workshop item URL".to_string())?;
@@ -3319,20 +3496,21 @@ pub async fn download_addon(
     clear_download_cancellation(&state, &workshop_id)?;
 
     let result = async {
-        let (workshop_dir, allow_bridge) = {
+        let (workshop_dir, source_policy) = {
             let db = state.db.lock().await;
             (
                 PathBuf::from(&db.settings.workshop_dir),
-                !db.settings.disable_steamworks_sdk,
+                SourcePolicy::from_settings(&db.settings),
             )
         };
-        let details_list =
-            fetch_steam_details_hybrid(
-                &state.workshop_service,
-                std::slice::from_ref(&workshop_id),
-                allow_bridge,
-            )
-            .await?;
+        let details_list = fetch_steam_details_hybrid(
+            &state.workshop_service,
+            std::slice::from_ref(&workshop_id),
+            source_policy.allow_bridge(),
+            source_policy.allow_web_api(),
+            source_policy.source_order(),
+        )
+        .await?;
         if details_list.is_empty() {
             return Err("Failed to retrieve details for workshop item".to_string());
         }
@@ -3373,7 +3551,7 @@ pub async fn download_addon(
             &workshop_id,
             &workshop_dir,
             &app_handle,
-            allow_bridge,
+            source_policy.allow_bridge(),
         )
         .await
         {
@@ -3538,12 +3716,12 @@ pub async fn fetch_collection(
     collection_id: String,
     state: State<'_, crate::AppState>,
 ) -> Result<serde_json::Value, String> {
-    let allow_bridge = {
+    let source_policy = {
         let db = state.db.lock().await;
-        !db.settings.disable_steamworks_sdk
+        SourcePolicy::from_settings(&db.settings)
     };
 
-    if allow_bridge {
+    if source_policy.allow_bridge() {
         if let Ok(payload) = state
             .workshop_service
             .bridge_query_collection(&collection_id)
@@ -3555,15 +3733,26 @@ pub async fn fetch_collection(
         }
     }
 
-    let child_ids =
-        fetch_collection_children_hybrid(&state.workshop_service, &collection_id, allow_bridge)
-            .await?;
+    let child_ids = fetch_collection_children_hybrid(
+        &state.workshop_service,
+        &collection_id,
+        source_policy.allow_bridge(),
+        source_policy.allow_web_api(),
+        source_policy.source_order(),
+    )
+    .await?;
 
     let mut query_ids = vec![collection_id.clone()];
     query_ids.extend(child_ids.clone());
 
-    let details =
-        fetch_steam_details_hybrid(&state.workshop_service, &query_ids, allow_bridge).await?;
+    let details = fetch_steam_details_hybrid(
+        &state.workshop_service,
+        &query_ids,
+        source_policy.allow_bridge(),
+        source_policy.allow_web_api(),
+        source_policy.source_order(),
+    )
+    .await?;
 
     let mut collection_details = serde_json::Value::Null;
     let mut items = Vec::new();
@@ -3589,26 +3778,32 @@ pub async fn add_known_addon(
     workshop_id: String,
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
-    let mut db = state.db.lock().await;
-    let allow_bridge = !db.settings.disable_steamworks_sdk;
+    let source_policy = {
+        let db = state.db.lock().await;
+        SourcePolicy::from_settings(&db.settings)
+    };
 
-    let details_list = fetch_steam_details_hybrid(
+    let details = fetch_steam_details_hybrid(
         &state.workshop_service,
         std::slice::from_ref(&workshop_id),
-        allow_bridge,
+        source_policy.allow_bridge(),
+        source_policy.allow_web_api(),
+        source_policy.source_order(),
     )
-    .await?;
-    if details_list.is_empty() {
-        return Err("Failed to retrieve details for workshop item".to_string());
-    }
-    let details = &details_list[0];
+    .await
+    .ok()
+    .and_then(|mut details| details.drain(..).next());
 
     let mut known_addons = load_known_addons(&state.known_addons_path);
 
     let dest_filename = format!("{}.vpk", workshop_id);
-    let has_image = details.get("preview_url").is_some();
+    let has_image = details
+        .as_ref()
+        .and_then(|details| details.get("preview_url"))
+        .is_some();
     let image_path = details
-        .get("preview_url")
+        .as_ref()
+        .and_then(|details| details.get("preview_url"))
         .and_then(|u| u.as_str())
         .map(|s| s.to_string());
 
@@ -3622,7 +3817,7 @@ pub async fn add_known_addon(
             addon_info: serde_json::Value::Null,
             has_image,
             image_path,
-            steam_details: Some(details.clone()),
+            steam_details: details.clone(),
         },
     );
 
@@ -3631,6 +3826,7 @@ pub async fn add_known_addon(
         serde_json::to_string_pretty(&known_addons).unwrap_or_default(),
     );
 
+    let mut db = state.db.lock().await;
     scan_addons_internal(
         &mut db,
         &state.settings_path,

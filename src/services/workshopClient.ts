@@ -4,6 +4,7 @@ import {
   WorkshopCapabilities,
   WorkshopItem,
 } from '../components/workshop/types';
+import type { WorkshopSourceSettings } from '../types/addon';
 import {
   parseHomepageSections,
   parseSSRItems,
@@ -64,9 +65,27 @@ export interface FetchWorkshopItemsInput {
 let capabilitiesPromise: Promise<WorkshopCapabilities> | null = null;
 let steamworksSdkDisabled = false;
 let workshopWarningReporter: ((message: string) => void) | null = null;
+let workshopSourceSettings: WorkshopSourceSettings = {
+  preset: 'conservative',
+  allowSteamworksSdk: true,
+  allowSteamWebApi: true,
+  allowSteamCommunityHtml: true,
+  allowSdkHtmlHybrid: false,
+  sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
+  cacheRetention: 'keep',
+};
 
 export function setSteamworksSdkDisabled(disabled: boolean) {
   steamworksSdkDisabled = disabled;
+}
+
+export function setWorkshopSourceSettings(settings: WorkshopSourceSettings | undefined) {
+  workshopSourceSettings = {
+    ...workshopSourceSettings,
+    ...(settings || {}),
+    sourceOrder: settings?.sourceOrder?.length ? settings.sourceOrder : workshopSourceSettings.sourceOrder,
+    cacheRetention: 'keep',
+  };
 }
 
 export function setWorkshopWarningReporter(reporter: ((message: string) => void) | null) {
@@ -74,7 +93,62 @@ export function setWorkshopWarningReporter(reporter: ((message: string) => void)
 }
 
 function shouldUseSteamworksSdk() {
-  return !steamworksSdkDisabled;
+  return !steamworksSdkDisabled &&
+    workshopSourceSettings.preset !== 'offline' &&
+    workshopSourceSettings.allowSteamworksSdk;
+}
+
+function shouldUseSteamCommunityHtml(capabilities: WorkshopCapabilities | null) {
+  if (workshopSourceSettings.preset === 'offline' || !workshopSourceSettings.allowSteamCommunityHtml) {
+    return false;
+  }
+  const sdkAvailable = shouldUseSteamworksSdk() && !!(capabilities?.canQueryHome || capabilities?.canQueryItems);
+  if (workshopSourceSettings.preset === 'hybrid' || workshopSourceSettings.allowSdkHtmlHybrid) {
+    return true;
+  }
+  return !sdkAvailable;
+}
+
+function listCacheKey(kind: string, input: unknown) {
+  return `l4a.workshop.${kind}.${JSON.stringify(input)}`;
+}
+
+function readListCache<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) as T : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeListCache(key: string, value: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ savedAt: new Date().toISOString(), value }));
+  } catch (err) {
+    console.warn('Failed to save workshop list cache:', err);
+  }
+}
+
+function readCachedValue<T>(key: string): T | null {
+  const cached = readListCache<{ value: T }>(key);
+  return cached?.value || null;
+}
+
+async function readWorkshopItemCache(): Promise<Record<string, any>> {
+  return invoke<Record<string, any>>('get_workshop_cache').catch(() => ({}));
+}
+
+function cachedDetailToWorkshopItem(workshopId: string, detail: any): WorkshopItem {
+  return mapSteamDetailToWorkshopItem({
+    ...detail,
+    publishedfileid: detail?.publishedfileid || detail?.workshopId || workshopId,
+    preview_url: detail?.preview_url || detail?.previewUrl || detail?.imagePath,
+    creator_name: detail?.creator_name || detail?.creatorName || detail?.authorName,
+    creator: detail?.creator || detail?.creatorId || detail?.authorId,
+    creator_steam_id: detail?.creator_steam_id || detail?.creatorSteamId,
+    creator_account_id: detail?.creator_account_id || detail?.creatorAccountId,
+  }, detail?.lastSeenSource || detail?.lastPageSource || 'cache');
 }
 
 function resolveBrowseSort(input: FetchWorkshopItemsInput): string | undefined {
@@ -205,6 +279,7 @@ export async function fetchWorkshopHome() {
   const capabilities = shouldUseSteamworksSdk()
     ? await getWorkshopCapabilities().catch(() => null)
     : null;
+  const cacheKey = listCacheKey('home', { version: 1 });
   let sdkSections: HomepageSection[] = [];
   let source = 'web-fallback';
 
@@ -228,7 +303,18 @@ export async function fetchWorkshopHome() {
     }
   }
 
+  const allowHtml = shouldUseSteamCommunityHtml(capabilities);
+
   if (sdkSections.length === 0) {
+    if (!allowHtml) {
+      const cached = readCachedValue<any>(cacheKey);
+      if (cached) return { ...cached, source: 'cache' };
+      return {
+        source: 'cache',
+        sections: [],
+        tagCategories: [],
+      };
+    }
     const html = await invoke<string>('fetch_workshop_html', {
       url: 'https://steamcommunity.com/app/550/workshop/',
       source: 'workshop-home',
@@ -238,16 +324,18 @@ export async function fetchWorkshopHome() {
       items: rememberWorkshopItems(section.items),
     }));
     const tagCategories = parseTagCategories(html);
-    return {
+    const result = {
       source: 'web-fallback',
       sections: htmlSections,
       tagCategories,
     };
+    writeListCache(cacheKey, result);
+    return result;
   }
 
   let tagCategories = [];
   let htmlSections: HomepageSection[] = [];
-  try {
+  if (allowHtml) try {
     const html = await invoke<string>('fetch_workshop_html', {
       url: 'https://steamcommunity.com/app/550/workshop/',
       source: 'workshop-home',
@@ -261,11 +349,13 @@ export async function fetchWorkshopHome() {
     console.warn('Workshop home HTML enrichment failed:', err);
   }
 
-  return {
+  const result = {
     source: htmlSections.length > 0 && source === 'steam-sdk' ? 'hybrid' : source,
     sections: enrichHomepageSections(sdkSections, htmlSections),
     tagCategories,
   };
+  writeListCache(cacheKey, result);
+  return result;
 }
 
 export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
@@ -273,6 +363,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
     ? await getWorkshopCapabilities().catch(() => null)
     : null;
   const resolvedSort = resolveBrowseSort(input);
+  const cacheKey = listCacheKey('items', { ...input, sort: resolvedSort || '' });
   if (capabilities?.canQueryItems) {
     const creatorId = input.creatorId?.trim();
     const creatorNumeric = !creatorId || /^\d+$/.test(creatorId);
@@ -291,7 +382,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
         });
         reportWorkshopWarnings(data.warnings);
         let items = data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source));
-        if (items.some(needsHtmlAuthorEnrichment)) {
+        if (items.some(needsHtmlAuthorEnrichment) && shouldUseSteamCommunityHtml(capabilities)) {
           try {
             const html: string = await invoke('fetch_workshop_html', {
               url: buildBrowseUrl(input),
@@ -302,25 +393,41 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
             console.warn('Steam SDK browse HTML enrichment failed:', err);
           }
         }
-        return {
+        const result = {
           source: data.source,
           items: rememberWorkshopItems(items),
         };
+        writeListCache(cacheKey, result);
+        return result;
       } catch (err) {
         console.warn('Steam SDK browse query failed, falling back to HTML:', err);
       }
     }
   }
 
+  if (!shouldUseSteamCommunityHtml(capabilities)) {
+    const cached = readCachedValue<any>(cacheKey);
+    if (cached) return { ...cached, source: 'cache' };
+    return { source: 'cache', items: [] };
+  }
+
   const url = buildBrowseUrl(input);
-  const html: string = await invoke('fetch_workshop_html', {
-    url,
-    source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
-  });
-  return {
-    source: 'web-fallback',
-    items: rememberWorkshopItems(parseSSRItems(html, 'workshop_query')),
-  };
+  try {
+    const html: string = await invoke('fetch_workshop_html', {
+      url,
+      source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+    });
+    const result = {
+      source: 'web-fallback',
+      items: rememberWorkshopItems(parseSSRItems(html, 'workshop_query')),
+    };
+    writeListCache(cacheKey, result);
+    return result;
+  } catch (err) {
+    const cached = readCachedValue<any>(cacheKey);
+    if (cached) return { ...cached, source: 'cache' };
+    throw err;
+  }
 }
 
 export async function fetchWorkshopItem(workshopId: string) {
@@ -340,11 +447,22 @@ export async function fetchWorkshopItem(workshopId: string) {
     }
   }
 
-  const data: any = await invoke('fetch_collection', { collectionId: workshopId });
-  return {
-    source: 'web-fallback',
-    item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.collection, 'web-fallback')])[0],
-  };
+  try {
+    const data: any = await invoke('fetch_collection', { collectionId: workshopId });
+    return {
+      source: 'web-fallback',
+      item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.collection, 'web-fallback')])[0],
+    };
+  } catch (err) {
+    const cache = await readWorkshopItemCache();
+    if (cache[workshopId]) {
+      return {
+        source: 'cache',
+        item: rememberWorkshopItems([cachedDetailToWorkshopItem(workshopId, cache[workshopId])])[0],
+      };
+    }
+    throw err;
+  }
 }
 
 export async function fetchWorkshopCollection(workshopId: string) {
@@ -378,25 +496,53 @@ export async function fetchWorkshopCollection(workshopId: string) {
     }
   }
 
-  const data: any = await invoke('fetch_collection', { collectionId: workshopId });
-  const resolvedCollection = rememberWorkshopItems([
-    mapSteamDetailToWorkshopItem(data.collection, 'web-fallback'),
-  ])[0];
-  return {
-    source: 'web-fallback',
-    collection: {
-      ...data.collection,
-      title: resolvedCollection.title,
-      preview_url: resolvedCollection.imagePath,
-      creator_name: resolvedCollection.authorName,
-      creator: resolvedCollection.authorId,
-      creator_steam_id: resolvedCollection.authorSteamId,
-      creator_account_id: resolvedCollection.authorAccountId,
-    },
-    items: rememberWorkshopItems(
-      (data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback')),
-    ),
-  };
+  try {
+    const data: any = await invoke('fetch_collection', { collectionId: workshopId });
+    const resolvedCollection = rememberWorkshopItems([
+      mapSteamDetailToWorkshopItem(data.collection, 'web-fallback'),
+    ])[0];
+    return {
+      source: 'web-fallback',
+      collection: {
+        ...data.collection,
+        title: resolvedCollection.title,
+        preview_url: resolvedCollection.imagePath,
+        creator_name: resolvedCollection.authorName,
+        creator: resolvedCollection.authorId,
+        creator_steam_id: resolvedCollection.authorSteamId,
+        creator_account_id: resolvedCollection.authorAccountId,
+      },
+      items: rememberWorkshopItems(
+        (data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback')),
+      ),
+    };
+  } catch (err) {
+    const cache = await readWorkshopItemCache();
+    const collection = cache[workshopId];
+    if (collection) {
+      const resolvedCollection = cachedDetailToWorkshopItem(workshopId, collection);
+      const childIds = collection.childItemIds || [];
+      return {
+        source: 'cache',
+        collection: {
+          ...collection,
+          publishedfileid: workshopId,
+          title: resolvedCollection.title,
+          preview_url: resolvedCollection.imagePath,
+          creator_name: resolvedCollection.authorName,
+          creator: resolvedCollection.authorId,
+          creator_steam_id: resolvedCollection.authorSteamId,
+          creator_account_id: resolvedCollection.authorAccountId,
+        },
+        items: rememberWorkshopItems(
+          childIds
+            .map((childId: string) => cache[childId] ? cachedDetailToWorkshopItem(childId, cache[childId]) : null)
+            .filter(Boolean),
+        ),
+      };
+    }
+    throw err;
+  }
 }
 
 export async function fetchWorkshopHtml(url: string, source: string) {

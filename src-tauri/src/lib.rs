@@ -125,6 +125,7 @@ pub fn run() {
             commands::handlers::save_settings,
             commands::handlers::get_addons,
             commands::handlers::get_cache_image,
+            commands::handlers::cache_remote_image,
             commands::handlers::move_addons,
             commands::handlers::toggle_addons,
             commands::handlers::rename_addon,

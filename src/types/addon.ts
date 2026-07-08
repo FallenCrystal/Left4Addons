@@ -146,6 +146,17 @@ export interface Settings {
   enableDummyBypass: boolean;
   suppressSdkUnavailableWarning: boolean;
   disableSteamworksSdk: boolean;
+  workshopSourceSettings?: WorkshopSourceSettings;
+}
+
+export interface WorkshopSourceSettings {
+  preset: 'conservative' | 'sdk-only' | 'offline' | 'hybrid';
+  allowSteamworksSdk: boolean;
+  allowSteamWebApi: boolean;
+  allowSteamCommunityHtml: boolean;
+  allowSdkHtmlHybrid: boolean;
+  sourceOrder: string[];
+  cacheRetention: 'keep';
 }
 
 export interface DatabasePayload {

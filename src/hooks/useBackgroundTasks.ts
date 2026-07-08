@@ -5,7 +5,6 @@ import { fetchWorkshopItem, fetchWorkshopPageDetails, persistWorkshopPageDetails
 
 const DOWNLOAD_CONCURRENCY = 3;
 const WORKSHOP_CRAWL_COOLDOWN_MS = 6000;
-const WORKSHOP_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface UseBackgroundTasksArgs {
   enabled: boolean;
@@ -52,7 +51,6 @@ export function useBackgroundTasks({
   const activeDownloadsRef = useRef(0);
   const crawlRunningRef = useRef(false);
   const lastCrawlAtRef = useRef(0);
-  const startupQueuedRef = useRef(false);
   const processDownloadQueueRef = useRef<() => void>(() => {});
   const processCrawlQueueRef = useRef<() => void>(() => {});
 
@@ -296,39 +294,6 @@ export function useBackgroundTasks({
       console.error('Failed to record seen workshop items:', err);
     }
   }, [updateLocalState]);
-
-  useEffect(() => {
-    if (!enabled || startupQueuedRef.current) return;
-    startupQueuedRef.current = true;
-
-    void (async () => {
-      try {
-        const cache = await invoke<Record<string, any>>('get_workshop_cache');
-        const candidateIds = new Set<string>();
-
-        [...Object.values(addons), ...Object.values(knownUninstalledAddons)].forEach((addon) => {
-          if (addon.workshopId) candidateIds.add(addon.workshopId);
-        });
-
-        const staleIds = [...candidateIds].filter((id) => {
-          const lastFetched = cache?.[id]?.lastSeenAt || cache?.[id]?.lastPageFetchedAt;
-          if (!lastFetched) return true;
-          const timestamp = Date.parse(lastFetched);
-          return Number.isNaN(timestamp) || Date.now() - timestamp > WORKSHOP_CACHE_TTL_MS;
-        }).sort((left, right) => {
-          const leftValue = Date.parse(cache?.[left]?.lastSeenAt || cache?.[left]?.lastPageFetchedAt || '');
-          const rightValue = Date.parse(cache?.[right]?.lastSeenAt || cache?.[right]?.lastPageFetchedAt || '');
-          const leftTime = Number.isNaN(leftValue) ? Number.MIN_SAFE_INTEGER : leftValue;
-          const rightTime = Number.isNaN(rightValue) ? Number.MIN_SAFE_INTEGER : rightValue;
-          return leftTime - rightTime;
-        });
-
-        enqueueWorkshopCrawl(staleIds, 'startup-auto');
-      } catch (err) {
-        console.error('Failed to enqueue startup workshop crawl:', err);
-      }
-    })();
-  }, [addons, enabled, enqueueWorkshopCrawl, knownUninstalledAddons]);
 
   const cancelTask = useCallback((id: string) => {
     const task = tasksRef.current.find((t) => t.id === id);

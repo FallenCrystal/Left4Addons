@@ -1,13 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection } from '../types/addon';
+import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection, WorkshopSourceSettings } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { useBackgroundTasks } from './useBackgroundTasks';
 import type { BackgroundTask } from '../types/addon';
 import type { WorkshopCapabilities } from '../components/workshop/types';
-import { setSteamworksSdkDisabled } from '../services/workshopClient';
+import { setSteamworksSdkDisabled, setWorkshopSourceSettings } from '../services/workshopClient';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
@@ -39,6 +39,15 @@ export function useAddonManager() {
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
+    workshopSourceSettings: {
+      preset: 'conservative',
+      allowSteamworksSdk: true,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: true,
+      allowSdkHtmlHybrid: false,
+      sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
+      cacheRetention: 'keep',
+    },
   });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -243,7 +252,8 @@ export function useAddonManager() {
 
   useEffect(() => {
     setSteamworksSdkDisabled(settings.disableSteamworksSdk);
-  }, [settings.disableSteamworksSdk]);
+    setWorkshopSourceSettings(settings.workshopSourceSettings);
+  }, [settings.disableSteamworksSdk, settings.workshopSourceSettings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -429,6 +439,7 @@ export function useAddonManager() {
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
+    workshopSourceSettings?: WorkshopSourceSettings,
   ) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
@@ -438,6 +449,7 @@ export function useAddonManager() {
         enableDummyBypass,
         suppressSdkUnavailableWarning,
         disableSteamworksSdk,
+        workshopSourceSettings,
       });
       updateLocalState(data);
       setSettingsModal({ open: false, loadingDir: '' });

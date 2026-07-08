@@ -10,6 +10,15 @@ describe('SettingsView', () => {
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
+    workshopSourceSettings: {
+      preset: 'conservative',
+      allowSteamworksSdk: true,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: true,
+      allowSdkHtmlHybrid: false,
+      sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
+      cacheRetention: 'keep',
+    },
   };
 
   test('submits the Steamworks SDK disable toggle from the SDK tab', async () => {
@@ -36,6 +45,7 @@ describe('SettingsView', () => {
       false,
       false,
       true,
+      baseSettings.workshopSourceSettings,
     );
   });
 });
