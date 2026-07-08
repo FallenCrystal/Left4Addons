@@ -11,6 +11,10 @@ import {
   parseTagCategories,
   parseWorkshopPageDetails,
 } from '../components/workshop/ssrParser';
+import {
+  rememberWorkshopItems,
+  rememberWorkshopPageDetails,
+} from '../components/workshop/authorDirectory';
 
 interface WorkshopHomeResponse {
   source: string;
@@ -77,7 +81,9 @@ export async function fetchWorkshopHome() {
         title: section.titleKey,
         subtitle: section.subtitleKey,
         icon: section.icon,
-        items: section.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+        items: rememberWorkshopItems(
+          section.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+        ),
         browseParams: section.browseParams,
       }));
       source = data.source;
@@ -90,7 +96,10 @@ export async function fetchWorkshopHome() {
     url: 'https://steamcommunity.com/app/550/workshop/',
     source: 'workshop-home',
   });
-  const htmlSections = parseHomepageSections(html);
+  const htmlSections = parseHomepageSections(html).map((section) => ({
+    ...section,
+    items: rememberWorkshopItems(section.items),
+  }));
   const tagCategories = parseTagCategories(html);
 
   if (sdkSections.length === 0) {
@@ -128,7 +137,9 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
         });
         return {
           source: data.source,
-          items: data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+          items: rememberWorkshopItems(
+            data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+          ),
         };
       } catch (err) {
         console.warn('Steam SDK browse query failed, falling back to HTML:', err);
@@ -143,7 +154,7 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
   });
   return {
     source: 'web-fallback',
-    items: parseSSRItems(html, 'workshop_query'),
+    items: rememberWorkshopItems(parseSSRItems(html, 'workshop_query')),
   };
 }
 
@@ -154,7 +165,7 @@ export async function fetchWorkshopItem(workshopId: string) {
       const data = await invoke<WorkshopItemResponse>('query_workshop_item', { workshopId });
       return {
         source: data.source,
-        item: mapSteamDetailToWorkshopItem(data.item, data.source),
+        item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.item, data.source)])[0],
       };
     } catch (err) {
       console.warn('Steam SDK item query failed, falling back to existing collection command:', err);
@@ -164,7 +175,7 @@ export async function fetchWorkshopItem(workshopId: string) {
   const data: any = await invoke('fetch_collection', { collectionId: workshopId });
   return {
     source: 'web-fallback',
-    item: mapSteamDetailToWorkshopItem(data.collection, 'web-fallback'),
+    item: rememberWorkshopItems([mapSteamDetailToWorkshopItem(data.collection, 'web-fallback')])[0],
   };
 }
 
@@ -173,10 +184,23 @@ export async function fetchWorkshopCollection(workshopId: string) {
   if (capabilities?.canQueryItems) {
     try {
       const data = await invoke<WorkshopCollectionResponse>('query_workshop_collection', { workshopId });
+      const resolvedCollection = rememberWorkshopItems([
+        mapSteamDetailToWorkshopItem(data.collection, data.source),
+      ])[0];
       return {
         source: data.source,
-        collection: data.collection,
-        items: data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+        collection: {
+          ...data.collection,
+          title: resolvedCollection.title,
+          preview_url: resolvedCollection.imagePath,
+          creator_name: resolvedCollection.authorName,
+          creator: resolvedCollection.authorId,
+          creator_steam_id: resolvedCollection.authorSteamId,
+          creator_account_id: resolvedCollection.authorAccountId,
+        },
+        items: rememberWorkshopItems(
+          data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source)),
+        ),
       };
     } catch (err) {
       console.warn('Steam SDK collection query failed, falling back to existing collection command:', err);
@@ -184,10 +208,23 @@ export async function fetchWorkshopCollection(workshopId: string) {
   }
 
   const data: any = await invoke('fetch_collection', { collectionId: workshopId });
+  const resolvedCollection = rememberWorkshopItems([
+    mapSteamDetailToWorkshopItem(data.collection, 'web-fallback'),
+  ])[0];
   return {
     source: 'web-fallback',
-    collection: data.collection,
-    items: (data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback')),
+    collection: {
+      ...data.collection,
+      title: resolvedCollection.title,
+      preview_url: resolvedCollection.imagePath,
+      creator_name: resolvedCollection.authorName,
+      creator: resolvedCollection.authorId,
+      creator_steam_id: resolvedCollection.authorSteamId,
+      creator_account_id: resolvedCollection.authorAccountId,
+    },
+    items: rememberWorkshopItems(
+      (data.items || []).map((item: any) => mapSteamDetailToWorkshopItem(item, 'web-fallback')),
+    ),
   };
 }
 
@@ -198,7 +235,9 @@ export async function fetchWorkshopHtml(url: string, source: string) {
 export async function fetchWorkshopPageDetails(workshopId: string, source: string) {
   const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
   const html = await fetchWorkshopHtml(url, source);
-  return parseWorkshopPageDetails(html);
+  const details = parseWorkshopPageDetails(html);
+  rememberWorkshopPageDetails(details);
+  return details;
 }
 
 export async function persistWorkshopPageDetails(workshopId: string, details: any, source: string) {

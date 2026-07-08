@@ -8,6 +8,7 @@ import { DatabasePayload, Group } from '../../types/addon';
 import { Gallery } from '../Gallery';
 import { RequiredItems, ParentCollections } from '../WorkshopCommon';
 import { fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../../services/workshopClient';
+import { resolveWorkshopItemAuthor } from './authorDirectory';
 
 interface WorkshopDetailModalProps {
   open: boolean;
@@ -98,6 +99,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     const collectionId = collection.workshopId || allWorkshopIds[0];
     // Use the large background image from the scraped page if available
     const heroImage = pageDetails?.backgroundImageUrl || collection.imagePath;
+    const collectionCreatorName = pageDetails?.creatorName || collection.creatorName;
 
     return (
       <div className="modal-overlay" onClick={onClose}>
@@ -129,7 +131,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
               <div className="detail-meta-list">
                 <div className="detail-meta-item">
                   <span className="detail-meta-label">{t('workshop.detail.collectionAuthor')}</span>
-                  <span className="detail-meta-value">{collection.creatorName}</span>
+                  <span className="detail-meta-value">{collectionCreatorName}</span>
                 </div>
                 <div className="detail-meta-item">
                   <span className="detail-meta-label">{t('workshop.detail.collectionItems')}</span>
@@ -243,6 +245,9 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   const isDownloaded = !!addons[vpkKey];
   const downloading = downloadProgress[item.workshopId] !== undefined;
   const progress = downloadProgress[item.workshopId];
+  const resolvedItem = resolveWorkshopItemAuthor(item);
+  const displayAuthorName = pageDetails?.creatorName || resolvedItem.authorName;
+  const displayAuthorUrl = pageDetails?.creatorProfileUrl || resolvedItem.authorUrl;
 
   // Find group this addon belongs to
   const itemGroup = groups?.find(g => g.addons.includes(vpkKey));
@@ -317,13 +322,16 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
           {/* Right: title, author, tags, description, required items, parent collections */}
           <div className="detail-right">
-            <h3 style={{ margin: 0, fontSize: '20px', color: '#fff' }}>{item.title}</h3>
+              <h3 style={{ margin: 0, fontSize: '20px', color: '#fff' }}>{item.title}</h3>
 
             <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>
-              {item.authorName && (
-                <a href="#" onClick={(e) => { e.preventDefault(); onOpenLink(item.authorUrl); }} style={{ fontSize: '13px', color: 'var(--md-sys-color-primary)', textDecoration: 'underline', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
-                  {item.authorName}
+              {displayAuthorName && displayAuthorUrl && (
+                <a href="#" onClick={(e) => { e.preventDefault(); onOpenLink(displayAuthorUrl); }} style={{ fontSize: '13px', color: 'var(--md-sys-color-primary)', textDecoration: 'underline', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  {displayAuthorName}
                 </a>
+              )}
+              {displayAuthorName && !displayAuthorUrl && (
+                <span style={{ fontSize: '13px', color: 'var(--md-sys-color-primary)' }}>{displayAuthorName}</span>
               )}
             </div>
 

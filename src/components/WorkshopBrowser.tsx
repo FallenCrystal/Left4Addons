@@ -238,16 +238,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const raw = data.collection;
       const collectionItems = data.items;
       if (raw && raw.publishedfileid) {
+        const collectionItem = mapSteamDetailToWorkshopItem(raw, data.source);
         setSelectedCollection({
-          title: (raw.title || '').trim(),
+          title: collectionItem.title,
           description: raw.description || '',
-          imagePath: raw.preview_url || '',
-          creatorName: raw.creator_name || '',
-          creatorId: raw.creator || '',
+          imagePath: collectionItem.imagePath,
+          creatorName: collectionItem.authorName,
+          creatorId: collectionItem.authorId,
           items: collectionItems,
           workshopId: raw.publishedfileid,
         });
-        onRecordSeenItems?.([mapSteamDetailToWorkshopItem(raw, data.source), ...collectionItems], 'workshop-collection');
+        onRecordSeenItems?.([collectionItem, ...collectionItems], 'workshop-collection');
         setSelectedItem(null);
       }
     } catch (err) {
