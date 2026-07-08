@@ -99,7 +99,16 @@ export const GroupCard: React.FC<GroupCardProps> = ({
       >
         <div className="addon-card-image-wrapper">
           {imagePath ? (
-            <CacheImage srcPath={imagePath} alt={group.name} className="addon-card-image" />
+            <CacheImage
+              srcPath={imagePath}
+              alt={group.name}
+              className="addon-card-image"
+              fallback={
+                <div className="addon-placeholder-icon">
+                  <Folder size={48} />
+                </div>
+              }
+            />
           ) : (
             <div className="addon-placeholder-icon">
               <Folder size={48} />

@@ -1,7 +1,8 @@
 /** Workshop item card component */
 
 import React from 'react';
-import { Star, Loader2, Package } from 'lucide-react';
+import { Star, Loader2, Package, FileText } from 'lucide-react';
+import { CacheImage } from '../CacheImage';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem } from './types';
 
@@ -35,7 +36,18 @@ export const ItemCard: React.FC<ItemCardProps> = ({
       )}
       <div className="addon-card-clickable-area">
         <div className="addon-card-image-wrapper">
-          <img className="addon-card-image" src={item.imagePath} alt={item.title} loading="lazy" decoding="async" />
+          <CacheImage
+            className="addon-card-image"
+            srcPath={item.imagePath}
+            alt={item.title}
+            loading="lazy"
+            decoding="async"
+            fallback={
+              <div className="addon-placeholder-icon">
+                <FileText size={48} />
+              </div>
+            }
+          />
         </div>
         <div className="addon-card-badges">
           {isDownloaded && (

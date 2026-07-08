@@ -1,7 +1,8 @@
 /** Workshop item/collection detail drawer */
 
 import React, { useState } from 'react';
-import { Download, Globe, FolderPlus, Loader2 } from 'lucide-react';
+import { Download, Globe, FolderPlus, Loader2, FileText } from 'lucide-react';
+import { CacheImage } from '../CacheImage';
 import { useTranslation } from 'react-i18next';
 import { CollectionData } from './types';
 import { AlertModal } from '../AlertModal';
@@ -166,8 +167,8 @@ const ItemDetail: React.FC<ItemDetailProps> = ({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <img
-        src={item.preview_url}
+      <CacheImage
+        srcPath={item.preview_url}
         alt={item.title}
         style={{
           width: '100%',
@@ -177,6 +178,23 @@ const ItemDetail: React.FC<ItemDetailProps> = ({
           marginBottom: '16px',
           backgroundColor: '#111',
         }}
+        fallback={
+          <div
+            style={{
+              width: '100%',
+              height: '200px',
+              borderRadius: '12px',
+              marginBottom: '16px',
+              backgroundColor: 'var(--md-sys-color-surface-container-high)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--md-sys-color-outline)',
+            }}
+          >
+            <FileText size={48} />
+          </div>
+        }
       />
       <h2
         style={{
@@ -352,8 +370,8 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <img
-        src={collection.collection.preview_url}
+      <CacheImage
+        srcPath={collection.collection.preview_url}
         alt={collection.collection.title}
         style={{
           width: '100%',
@@ -363,6 +381,23 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
           marginBottom: '16px',
           backgroundColor: '#111',
         }}
+        fallback={
+          <div
+            style={{
+              width: '100%',
+              height: '180px',
+              borderRadius: '12px',
+              marginBottom: '16px',
+              backgroundColor: 'var(--md-sys-color-surface-container-high)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              color: 'var(--md-sys-color-outline)',
+            }}
+          >
+            <FolderPlus size={48} />
+          </div>
+        }
       />
       <h2
         style={{
@@ -431,8 +466,8 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
                 backgroundColor: 'var(--md-sys-color-surface-container-low)',
               }}
             >
-              <img
-                src={item.preview_url}
+              <CacheImage
+                srcPath={item.preview_url}
                 alt=""
                 style={{
                   width: '40px',
@@ -441,6 +476,22 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
                   borderRadius: '4px',
                   backgroundColor: '#111',
                 }}
+                fallback={
+                  <div
+                    style={{
+                      width: '40px',
+                      height: '40px',
+                      borderRadius: '4px',
+                      backgroundColor: 'var(--md-sys-color-surface-container-high)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      color: 'var(--md-sys-color-outline)',
+                    }}
+                  >
+                    <FileText size={20} />
+                  </div>
+                }
               />
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div
