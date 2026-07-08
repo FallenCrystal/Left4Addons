@@ -1,7 +1,8 @@
 use super::bridge::WorkshopBridge;
 use super::types::{
-    BridgeDownloadStatus, WorkshopBrowseQuery, WorkshopCapabilities, WorkshopCollectionResponse,
-    WorkshopHomeResponse, WorkshopItemResponse, WorkshopItemsResponse,
+    BridgeDownloadStatus, SubscribedWorkshopItemsResponse, WorkshopBrowseQuery,
+    WorkshopCapabilities, WorkshopCollectionResponse, WorkshopHomeResponse, WorkshopItemResponse,
+    WorkshopItemsResponse,
 };
 use serde_json::{json, Value};
 use std::path::Path;
@@ -43,6 +44,7 @@ impl WorkshopService {
                 can_query_home: false,
                 can_download: false,
                 can_enumerate_installed: false,
+                can_enumerate_subscribed: false,
             }
         }
     }
@@ -153,6 +155,28 @@ impl WorkshopService {
         })?;
 
         let payload = bridge.call("get_download_status", &json!({ "workshopId": workshop_id }))?;
+        serde_json::from_value(payload).map_err(|e| e.to_string())
+    }
+
+    pub fn bridge_get_subscribed_items(&self) -> Result<SubscribedWorkshopItemsResponse, String> {
+        let bridge = self.bridge.as_ref().ok_or_else(|| {
+            self.bridge_error
+                .clone()
+                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
+        })?;
+
+        let payload = bridge.call("get_subscribed_items", &json!({}))?;
+        serde_json::from_value(payload).map_err(|e| e.to_string())
+    }
+
+    pub fn bridge_get_favorited_collections(&self) -> Result<WorkshopItemsResponse, String> {
+        let bridge = self.bridge.as_ref().ok_or_else(|| {
+            self.bridge_error
+                .clone()
+                .unwrap_or_else(|| "Steam bridge unavailable".to_string())
+        })?;
+
+        let payload = bridge.call("get_favorited_collections", &json!({}))?;
         serde_json::from_value(payload).map_err(|e| e.to_string())
     }
 }

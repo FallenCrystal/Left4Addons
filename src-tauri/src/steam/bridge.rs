@@ -93,6 +93,7 @@ impl WorkshopBridge {
             can_query_home: true,
             can_download: true,
             can_enumerate_installed: true,
+            can_enumerate_subscribed: true,
         };
 
         Ok(Self {

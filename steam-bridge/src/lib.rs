@@ -74,6 +74,17 @@ struct WorkshopIdPayload {
     workshop_id: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribedItemPayload {
+    workshop_id: String,
+    item_state: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_folder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_on_disk: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct HomeSection {
@@ -193,6 +204,8 @@ fn handle_request(request: *const c_char) -> Result<Value, String> {
                 serde_json::from_value(parsed.payload).map_err(|e| e.to_string())?;
             get_download_status(runtime, &payload.workshop_id)
         }
+        "get_subscribed_items" => get_subscribed_items(runtime),
+        "get_favorited_collections" => get_favorited_collections(runtime),
         method => Err(format!("Unsupported Steam bridge method: {}", method)),
     })
 }
@@ -427,6 +440,74 @@ fn get_download_status(runtime: &mut BridgeRuntime, workshop_id: &str) -> Result
     }))
 }
 
+fn get_subscribed_items(runtime: &mut BridgeRuntime) -> Result<Value, String> {
+    let ugc = runtime.client.ugc();
+    let mut items = Vec::new();
+
+    for published_file_id in ugc.subscribed_items(true) {
+        let state = ugc.item_state(published_file_id);
+        let install_info = ugc.item_install_info(published_file_id);
+        items.push(SubscribedItemPayload {
+            workshop_id: published_file_id.0.to_string(),
+            item_state: item_state_strings(state),
+            install_folder: install_info.as_ref().map(|info| info.folder.clone()),
+            size_on_disk: install_info.as_ref().map(|info| info.size_on_disk),
+        });
+    }
+
+    Ok(json!({
+        "source": "steam-sdk",
+        "items": items,
+    }))
+}
+
+fn get_favorited_collections(runtime: &mut BridgeRuntime) -> Result<Value, String> {
+    let ugc = runtime.client.ugc();
+    let current_user = runtime.client.user().steam_id().account_id();
+    let app_ids = AppIDs::Both {
+        creator: AppId(APP_ID),
+        consumer: AppId(APP_ID),
+    };
+
+    let mut page = 1;
+    let mut items = Vec::new();
+    let mut total_results = None;
+
+    loop {
+        let mut query = ugc
+            .query_user(
+                current_user,
+                UserList::Favorited,
+                UGCType::Collections,
+                UserListOrder::LastUpdatedDesc,
+                app_ids,
+                page,
+            )
+            .map_err(|e| e.to_string())?;
+        query = query
+            .include_long_desc(true)
+            .include_children(true)
+            .include_metadata(true);
+
+        let (page_items, _, page_total_results) = run_query_with_children_page(runtime, query)?;
+        if page_items.is_empty() {
+            break;
+        }
+
+        items.extend(page_items);
+        let expected_total = *total_results.get_or_insert(page_total_results);
+        if expected_total == 0 || items.len() as u32 >= expected_total {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(json!({
+        "source": "steam-sdk",
+        "items": items,
+    }))
+}
+
 fn build_query_handle(
     runtime: &mut BridgeRuntime,
     payload: &QueryItemsPayload,
@@ -500,6 +581,14 @@ fn run_query_with_children(
     runtime: &mut BridgeRuntime,
     query: steamworks::QueryHandle,
 ) -> Result<(Vec<Value>, Vec<String>), String> {
+    let (items, child_ids, _) = run_query_with_children_page(runtime, query)?;
+    Ok((items, child_ids))
+}
+
+fn run_query_with_children_page(
+    runtime: &mut BridgeRuntime,
+    query: steamworks::QueryHandle,
+) -> Result<(Vec<Value>, Vec<String>, u32), String> {
     let (tx, rx) = mpsc::channel();
     query.fetch(move |result| {
         let payload = result.map_err(|err| err.to_string()).and_then(|results| {
@@ -518,7 +607,7 @@ fn run_query_with_children(
                     ));
                 }
             }
-            Ok((items, child_ids))
+            Ok((items, child_ids, results.total_results()))
         });
         let _ = tx.send(payload);
     });

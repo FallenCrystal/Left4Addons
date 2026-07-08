@@ -24,6 +24,8 @@ pub struct WorkshopCapabilities {
     pub can_download: bool,
     #[serde(default)]
     pub can_enumerate_installed: bool,
+    #[serde(default)]
+    pub can_enumerate_subscribed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,4 +148,24 @@ pub struct BridgeDownloadStatus {
     pub install_folder: Option<String>,
     #[serde(default)]
     pub item_state: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribedWorkshopItem {
+    pub workshop_id: String,
+    #[serde(default)]
+    pub item_state: Vec<String>,
+    #[serde(default)]
+    pub install_folder: Option<String>,
+    #[serde(default)]
+    pub size_on_disk: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribedWorkshopItemsResponse {
+    pub source: String,
+    #[serde(default)]
+    pub items: Vec<SubscribedWorkshopItem>,
 }

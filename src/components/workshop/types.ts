@@ -118,4 +118,5 @@ export interface WorkshopCapabilities {
   canQueryHome: boolean;
   canDownload: boolean;
   canEnumerateInstalled: boolean;
+  canEnumerateSubscribed: boolean;
 }

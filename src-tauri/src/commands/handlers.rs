@@ -1349,6 +1349,111 @@ fn clean_group_name(name: &str) -> String {
     s
 }
 
+fn is_collection_detail(details: &Value) -> bool {
+    details
+        .get("file_type")
+        .and_then(|v| v.as_str())
+        .map(|v| v.eq_ignore_ascii_case("collection"))
+        .unwrap_or_else(|| {
+            details
+                .get("file_type")
+                .and_then(|v| v.as_u64())
+                .map(|v| v == 2)
+                .unwrap_or(false)
+        })
+}
+
+fn upsert_known_addon_entry(
+    known_addons: &mut HashMap<String, KnownAddonEntry>,
+    workshop_id: &str,
+    details: Option<&Value>,
+) {
+    let workshop_id = workshop_id.trim();
+    if workshop_id.is_empty() {
+        return;
+    }
+
+    let legacy_key = format!("{}.vpk", workshop_id);
+    let existing = known_addons
+        .get(workshop_id)
+        .cloned()
+        .or_else(|| known_addons.get(&legacy_key).cloned());
+
+    known_addons.remove(&legacy_key);
+
+    let preview_url = details
+        .and_then(|value| value.get("preview_url"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.to_string())
+        .or_else(|| existing.as_ref().and_then(|entry| entry.image_path.clone()));
+
+    let addon_info = existing
+        .as_ref()
+        .map(|entry| entry.addon_info.clone())
+        .unwrap_or(serde_json::Value::Null);
+    let vpk_name = existing
+        .as_ref()
+        .map(|entry| entry.vpk_name.clone())
+        .unwrap_or_else(|| format!("{}.vpk", workshop_id));
+
+    known_addons.insert(
+        workshop_id.to_string(),
+        KnownAddonEntry {
+            id: workshop_id.to_string(),
+            vpk_name,
+            workshop_id: Some(workshop_id.to_string()),
+            addon_info,
+            has_image: preview_url.is_some()
+                || existing
+                    .as_ref()
+                    .map(|entry| entry.has_image)
+                    .unwrap_or(false),
+            image_path: preview_url,
+            steam_details: details
+                .cloned()
+                .or_else(|| existing.and_then(|entry| entry.steam_details)),
+        },
+    );
+}
+
+fn ensure_workshop_import_master_collection(db: &mut Database) -> String {
+    if let Some(existing) = db
+        .master_collections
+        .iter()
+        .find(|mc| mc.name_key.as_deref() == Some("masterCollections.systemWorkshopImport"))
+    {
+        return existing.id.clone();
+    }
+
+    let mc_id = format!(
+        "mc_system_ws_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    db.master_collections.push(MasterCollection {
+        id: mc_id.clone(),
+        name: "从创意工坊导入".to_string(),
+        name_key: Some("masterCollections.systemWorkshopImport".to_string()),
+        group_ids: Vec::new(),
+        is_system: true,
+        icon: Some("Globe".to_string()),
+    });
+    mc_id
+}
+
+fn ensure_group_in_master_collection(group: &mut Group, mc_id: &str) {
+    if let Some(ref mut ids) = group.master_collection_ids {
+        if !ids.iter().any(|id| id == mc_id) {
+            ids.push(mc_id.to_string());
+        }
+    } else {
+        group.master_collection_ids = Some(vec![mc_id.to_string()]);
+    }
+}
+
 fn auto_group_internal(db: &mut Database) {
     let mut grouped_vpks = HashSet::new();
     for g in &db.groups {
@@ -2076,13 +2181,12 @@ pub async fn group_action(
             // Fetch Steam details for newly added workshop items
             if !new_workshop_ids.is_empty() {
                 let allow_bridge = !db.settings.disable_steamworks_sdk;
-                if let Ok(steam_details_list) =
-                    fetch_steam_details_hybrid(
-                        &state.workshop_service,
-                        &new_workshop_ids,
-                        allow_bridge,
-                    )
-                    .await
+                if let Ok(steam_details_list) = fetch_steam_details_hybrid(
+                    &state.workshop_service,
+                    &new_workshop_ids,
+                    allow_bridge,
+                )
+                .await
                 {
                     for details in steam_details_list {
                         let wid = details["publishedfileid"].as_str().unwrap_or("");
@@ -2634,7 +2738,7 @@ pub async fn query_workshop_collection(
 
 #[tauri::command]
 pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, String> {
-    let (ids, allow_bridge) = {
+    let (mut ids, allow_bridge, can_enumerate_subscribed) = {
         let mut db = state.db.lock().await;
 
         // First, scan addons to populate database with any new/removed files
@@ -2662,67 +2766,251 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
         ids.sort();
         ids.dedup();
 
-        if ids.is_empty() {
-            return Ok(database_with_workshop_cache(
-                &db,
-                &state.workshop_cache_path,
-            ));
-        }
-
-        (ids, !db.settings.disable_steamworks_sdk)
+        (
+            ids,
+            !db.settings.disable_steamworks_sdk,
+            !db.settings.disable_steamworks_sdk
+                && state
+                    .workshop_service
+                    .capabilities()
+                    .can_enumerate_subscribed,
+        )
     };
+
+    let mut subscribed_ids = Vec::new();
+    if can_enumerate_subscribed {
+        match state.workshop_service.bridge_get_subscribed_items() {
+            Ok(response) => {
+                subscribed_ids = response
+                    .items
+                    .into_iter()
+                    .map(|item| item.workshop_id)
+                    .filter(|id| !id.trim().is_empty())
+                    .collect();
+            }
+            Err(err) => {
+                eprintln!(
+                    "Failed to enumerate subscribed workshop items via Steam SDK: {}",
+                    err
+                );
+            }
+        }
+    }
+
+    ids.extend(subscribed_ids.iter().cloned());
+    ids.sort();
+    ids.dedup();
+
+    if ids.is_empty() {
+        let db = state.db.lock().await;
+        return Ok(database_with_workshop_cache(
+            &db,
+            &state.workshop_cache_path,
+        ));
+    }
 
     println!("Syncing Steam details manually for {} items...", ids.len());
     let steam_details_list =
         fetch_steam_details_hybrid(&state.workshop_service, &ids, allow_bridge).await?;
-
-    let mut db = state.db.lock().await;
+    let mut details_by_id = HashMap::new();
     for details in steam_details_list {
         if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
-            // Update installed addons
-            for addon in db.addons.values_mut() {
-                if addon.workshop_id.as_deref() == Some(w_id) {
-                    addon.steam_details = Some(details.clone());
-                    if !addon.has_image {
-                        if let Some(preview_url) =
-                            details.get("preview_url").and_then(|u| u.as_str())
-                        {
-                            addon.image_path = Some(preview_url.to_string());
-                        }
+            details_by_id.insert(w_id.to_string(), details);
+        }
+    }
+
+    let mut favorited_collection_ids = Vec::new();
+    if allow_bridge {
+        match state.workshop_service.bridge_get_favorited_collections() {
+            Ok(response) => {
+                for item in response.items {
+                    if let Some(collection_id) =
+                        item.get("publishedfileid").and_then(|id| id.as_str())
+                    {
+                        favorited_collection_ids.push(collection_id.to_string());
+                        details_by_id
+                            .entry(collection_id.to_string())
+                            .or_insert(item);
                     }
-                    break;
                 }
             }
-            // Update uninstalled addons
-            for addon in db.known_uninstalled_addons.values_mut() {
-                if addon.workshop_id.as_deref() == Some(w_id) {
-                    addon.steam_details = Some(details.clone());
-                    if !addon.has_image {
-                        if let Some(preview_url) =
-                            details.get("preview_url").and_then(|u| u.as_str())
-                        {
-                            addon.image_path = Some(preview_url.to_string());
-                            addon.has_image = true;
+            Err(err) => {
+                eprintln!(
+                    "Failed to enumerate favorited workshop collections via Steam SDK: {}",
+                    err
+                );
+            }
+        }
+    }
+    favorited_collection_ids.sort();
+    favorited_collection_ids.dedup();
+
+    let mut collection_children: HashMap<String, Vec<String>> = HashMap::new();
+    let mut extra_detail_ids = Vec::new();
+    for collection_id in &favorited_collection_ids {
+        match state
+            .workshop_service
+            .bridge_query_collection(collection_id)
+        {
+            Ok(payload) => {
+                if let Some(w_id) = payload
+                    .collection
+                    .get("publishedfileid")
+                    .and_then(|id| id.as_str())
+                {
+                    details_by_id.insert(w_id.to_string(), payload.collection.clone());
+                }
+                let mut child_ids = Vec::new();
+                for item in payload.items {
+                    if let Some(child_id) = item.get("publishedfileid").and_then(|id| id.as_str()) {
+                        child_ids.push(child_id.to_string());
+                        if !details_by_id.contains_key(child_id) {
+                            extra_detail_ids.push(child_id.to_string());
                         }
+                        details_by_id.insert(child_id.to_string(), item);
                     }
-                    if let Some(file_size_str) = details.get("file_size").and_then(|v| v.as_str()) {
-                        if let Ok(file_size) = file_size_str.parse::<u64>() {
-                            if file_size > 0 {
-                                addon.file_size = file_size;
-                            }
-                        }
-                    }
-                    // Update vpk_name to title if it's still just a workshop ID
-                    if addon.vpk_name == w_id || addon.vpk_name == format!("{}.vpk", w_id) {
-                        if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
-                            if !title.is_empty() {
-                                addon.vpk_name = title.to_string();
-                            }
-                        }
-                    }
-                    break;
+                }
+                child_ids.sort();
+                child_ids.dedup();
+                if !child_ids.is_empty() {
+                    collection_children.insert(collection_id.clone(), child_ids);
                 }
             }
+            Err(err) => {
+                eprintln!(
+                    "Failed to query favorited collection {} via Steam SDK: {}",
+                    collection_id, err
+                );
+                if let Ok(child_ids) = fetch_collection_children_hybrid(
+                    &state.workshop_service,
+                    collection_id,
+                    allow_bridge,
+                )
+                .await
+                {
+                    let mut child_ids = child_ids;
+                    child_ids.sort();
+                    child_ids.dedup();
+                    for child_id in &child_ids {
+                        if !details_by_id.contains_key(child_id) {
+                            extra_detail_ids.push(child_id.clone());
+                        }
+                    }
+                    if !child_ids.is_empty() {
+                        collection_children.insert(collection_id.clone(), child_ids);
+                    }
+                }
+            }
+        }
+    }
+
+    if !extra_detail_ids.is_empty() {
+        extra_detail_ids.sort();
+        extra_detail_ids.dedup();
+        if let Ok(extra_details) =
+            fetch_steam_details_hybrid(&state.workshop_service, &extra_detail_ids, allow_bridge)
+                .await
+        {
+            for details in extra_details {
+                if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
+                    details_by_id.insert(w_id.to_string(), details);
+                }
+            }
+        }
+    }
+
+    let mut db = state.db.lock().await;
+    let mut known_addons = load_known_addons(&state.known_addons_path);
+    for (workshop_id, details) in &details_by_id {
+        if !is_collection_detail(details) {
+            upsert_known_addon_entry(&mut known_addons, workshop_id, Some(details));
+        }
+    }
+    for workshop_id in &subscribed_ids {
+        if details_by_id
+            .get(workshop_id)
+            .is_none_or(|details| !is_collection_detail(details))
+        {
+            upsert_known_addon_entry(
+                &mut known_addons,
+                workshop_id,
+                details_by_id.get(workshop_id),
+            );
+        }
+    }
+    for child_ids in collection_children.values() {
+        for workshop_id in child_ids {
+            upsert_known_addon_entry(
+                &mut known_addons,
+                workshop_id,
+                details_by_id.get(workshop_id),
+            );
+        }
+    }
+
+    fs::write(
+        &state.known_addons_path,
+        serde_json::to_string_pretty(&known_addons).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    if !collection_children.is_empty() {
+        let ws_mc_id = ensure_workshop_import_master_collection(&mut db);
+        for (collection_id, child_ids) in collection_children {
+            let title = details_by_id
+                .get(&collection_id)
+                .and_then(|details| details.get("title"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("Workshop Collection")
+                .to_string();
+
+            if let Some(group) = db.groups.iter_mut().find(|group| {
+                group.workshop_collection_id.as_deref() == Some(collection_id.as_str())
+            }) {
+                group.addons = child_ids.clone();
+                if !title.is_empty() {
+                    group.name = title.clone();
+                }
+                group.workshop_collection_id = Some(collection_id.clone());
+                ensure_group_in_master_collection(group, &ws_mc_id);
+            } else {
+                let group_id = format!(
+                    "group_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                );
+                db.groups.push(Group {
+                    id: group_id,
+                    name: title,
+                    addons: child_ids,
+                    tags: None,
+                    workshop_collection_id: Some(collection_id),
+                    master_collection_ids: Some(vec![ws_mc_id.clone()]),
+                    source: Some("workshop-import".to_string()),
+                });
+            }
+        }
+
+        let ws_group_ids: Vec<String> = db
+            .groups
+            .iter()
+            .filter(|group| {
+                group
+                    .master_collection_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.iter().any(|id| id == &ws_mc_id))
+            })
+            .map(|group| group.id.clone())
+            .collect();
+        if let Some(master_collection) = db
+            .master_collections
+            .iter_mut()
+            .find(|mc| mc.id == ws_mc_id)
+        {
+            master_collection.group_ids = ws_group_ids;
         }
     }
 
@@ -3153,12 +3441,9 @@ pub async fn fetch_collection(
         }
     }
 
-    let child_ids = fetch_collection_children_hybrid(
-        &state.workshop_service,
-        &collection_id,
-        allow_bridge,
-    )
-    .await?;
+    let child_ids =
+        fetch_collection_children_hybrid(&state.workshop_service, &collection_id, allow_bridge)
+            .await?;
 
     let mut query_ids = vec![collection_id.clone()];
     query_ids.extend(child_ids.clone());
@@ -3193,13 +3478,12 @@ pub async fn add_known_addon(
     let mut db = state.db.lock().await;
     let allow_bridge = !db.settings.disable_steamworks_sdk;
 
-    let details_list =
-        fetch_steam_details_hybrid(
-            &state.workshop_service,
-            std::slice::from_ref(&workshop_id),
-            allow_bridge,
-        )
-        .await?;
+    let details_list = fetch_steam_details_hybrid(
+        &state.workshop_service,
+        std::slice::from_ref(&workshop_id),
+        allow_bridge,
+    )
+    .await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }
