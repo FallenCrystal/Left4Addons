@@ -51,6 +51,13 @@
   - 游戏内的附加内容会看到两份相同的附件   
     一份是创意工坊名 一份是附件内 `addoninfo.txt` 的名  
     尽管创意工坊侧的 Dummy 附件不添加任何游戏内容.
+- Steamworks SDK 集成:
+  - 使用 Steamworks SDK 会让 Left 4 Addons 伪造成“求生之路”游戏, 以通过 Steam 访问其创意工坊内容.
+  - Left 4 Addons 使用 Steamworks SDK 时, 启动《求生之路》会导致游戏本体不被 VAC 信任.
+  - 该项是为了避免只有 Steam 才能访问创意工坊而设计的, 具体取决于你使用的加速器.
+  - 如果你的网络环境随时能访问网页版创意工坊, 建议前往设置禁用 Steamworks SDK.
+  - 如果 Left 4 Addons 在本次启动后已经调用过一次 Steamworks SDK, 那么即使随后在设置中禁用 Steamworks SDK, Steam 侧“正在游玩 L4D2”的状态也不保证会立即消失; 某些情况下需要完全关闭 Left 4 Addons 才会解除.
+  - 如果 Steam 侧“正在游玩 L4D2”的状态是由 Left 4 Addons 拉起的, 那么从 Steam 客户端停止它会导致 Left 4 Addons 应用程序一并退出.
 
 ---
 

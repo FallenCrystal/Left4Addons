@@ -51,6 +51,7 @@ describe('useAddonManager', () => {
     loadingDir: '/path/to/loading',
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
+    disableSteamworksSdk: false,
   };
 
   beforeEach(() => {
@@ -324,6 +325,7 @@ describe('useAddonManager', () => {
           loadingDir: '/new/loading/dir',
           enableDummyBypass: false,
           suppressSdkUnavailableWarning: false,
+          disableSteamworksSdk: false,
         });
         return tauriPromise;
       }
@@ -341,7 +343,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir', false, false);
+      savePromise = result.current.saveSettings('/new/loading/dir', false, false, false);
     });
 
     // isSubmitting should be true immediately after invoking
@@ -524,6 +526,51 @@ describe('useAddonManager', () => {
           settings: {
             ...mockSettings,
             suppressSdkUnavailableWarning: true,
+          },
+        });
+      }
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '12345': { lastPageFetchedAt: new Date().toISOString() },
+        });
+      }
+      if (cmd === 'get_background_tasks') {
+        return Promise.resolve([]);
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: false,
+          bridgeLoaded: false,
+          bridgeInitialized: false,
+          provider: 'web-fallback',
+          lastError: 'Steam bridge DLL not found',
+          canQueryItems: false,
+          canQueryHome: false,
+          canDownload: false,
+          canEnumerateInstalled: false,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.backgroundTasks).toHaveLength(0);
+  });
+
+  test('should suppress the frontend SDK warning task when Steamworks SDK is manually disabled', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: mockGroups,
+          settings: {
+            ...mockSettings,
+            disableSteamworksSdk: true,
           },
         });
       }

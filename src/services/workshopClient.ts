@@ -58,6 +58,15 @@ export interface FetchWorkshopItemsInput {
 }
 
 let capabilitiesPromise: Promise<WorkshopCapabilities> | null = null;
+let steamworksSdkDisabled = false;
+
+export function setSteamworksSdkDisabled(disabled: boolean) {
+  steamworksSdkDisabled = disabled;
+}
+
+function shouldUseSteamworksSdk() {
+  return !steamworksSdkDisabled;
+}
 
 export async function getWorkshopCapabilities(): Promise<WorkshopCapabilities> {
   capabilitiesPromise ??= invoke<WorkshopCapabilities>('get_workshop_capabilities').catch((err) => {
@@ -68,7 +77,9 @@ export async function getWorkshopCapabilities(): Promise<WorkshopCapabilities> {
 }
 
 export async function fetchWorkshopHome() {
-  const capabilities = await getWorkshopCapabilities().catch(() => null);
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
   let sdkSections: HomepageSection[] = [];
   let source = 'web-fallback';
 
@@ -117,7 +128,9 @@ export async function fetchWorkshopHome() {
 }
 
 export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
-  const capabilities = await getWorkshopCapabilities().catch(() => null);
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
   if (capabilities?.canQueryItems) {
     const creatorId = input.creatorId?.trim();
     const creatorNumeric = !creatorId || /^\d+$/.test(creatorId);
@@ -158,7 +171,9 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
 }
 
 export async function fetchWorkshopItem(workshopId: string) {
-  const capabilities = await getWorkshopCapabilities().catch(() => null);
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
   if (capabilities?.canQueryItems) {
     try {
       const data = await invoke<WorkshopItemResponse>('query_workshop_item', { workshopId });
@@ -179,7 +194,9 @@ export async function fetchWorkshopItem(workshopId: string) {
 }
 
 export async function fetchWorkshopCollection(workshopId: string) {
-  const capabilities = await getWorkshopCapabilities().catch(() => null);
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
   if (capabilities?.canQueryItems) {
     try {
       const data = await invoke<WorkshopCollectionResponse>('query_workshop_collection', { workshopId });

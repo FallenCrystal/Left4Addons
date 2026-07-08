@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { useBackgroundTasks } from './useBackgroundTasks';
 import type { BackgroundTask } from '../types/addon';
 import type { WorkshopCapabilities } from '../components/workshop/types';
+import { setSteamworksSdkDisabled } from '../services/workshopClient';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
@@ -37,6 +38,7 @@ export function useAddonManager() {
     loadingDir: '',
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
+    disableSteamworksSdk: false,
   });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -240,6 +242,10 @@ export function useAddonManager() {
   }, [fetchData]);
 
   useEffect(() => {
+    setSteamworksSdkDisabled(settings.disableSteamworksSdk);
+  }, [settings.disableSteamworksSdk]);
+
+  useEffect(() => {
     let cancelled = false;
 
     void invoke<WorkshopCapabilities>('get_workshop_capabilities')
@@ -262,7 +268,7 @@ export function useAddonManager() {
   }, []);
 
   const steamworksUnavailableTask: BackgroundTask | null = (() => {
-    if (loading || settings.suppressSdkUnavailableWarning) {
+    if (loading || settings.suppressSdkUnavailableWarning || settings.disableSteamworksSdk) {
       return null;
     }
     const bridgeUnavailable = workshopCapabilities !== null && !workshopCapabilities.bridgeAvailable;
@@ -422,6 +428,7 @@ export function useAddonManager() {
     loadingDir: string,
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
+    disableSteamworksSdk: boolean,
   ) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
@@ -430,6 +437,7 @@ export function useAddonManager() {
         loadingDir,
         enableDummyBypass,
         suppressSdkUnavailableWarning,
+        disableSteamworksSdk,
       });
       updateLocalState(data);
       setSettingsModal({ open: false, loadingDir: '' });

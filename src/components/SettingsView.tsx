@@ -11,6 +11,7 @@ interface SettingsViewProps {
     loadingDir: string,
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
+    disableSteamworksSdk: boolean,
   ) => Promise<void>;
 }
 
@@ -24,11 +25,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [loadingDir, setLoadingDir] = useState('');
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
   const [suppressSdkUnavailableWarning, setSuppressSdkUnavailableWarning] = useState(false);
+  const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
     setEnableDummyBypass(settings.enableDummyBypass || false);
     setSuppressSdkUnavailableWarning(settings.suppressSdkUnavailableWarning || false);
+    setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
   }, [settings]);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -38,6 +41,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       loadingDir.trim(),
       enableDummyBypass,
       suppressSdkUnavailableWarning,
+      disableSteamworksSdk,
     );
   };
 
@@ -275,6 +279,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </p>
             <form onSubmit={handleSubmit}>
               <div className="settings-section">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                  <div style={{ paddingRight: '20px' }}>
+                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                      {t('settings.disableSteamworksSdkTitle')}
+                    </label>
+                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      {t('settings.disableSteamworksSdkDesc')}
+                    </div>
+                  </div>
+                  <label className="switch" style={{ flexShrink: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={disableSteamworksSdk}
+                      onChange={(e) => setDisableSteamworksSdk(e.target.checked)}
+                      disabled={isSubmitting}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
                   <div style={{ paddingRight: '20px' }}>
                     <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>

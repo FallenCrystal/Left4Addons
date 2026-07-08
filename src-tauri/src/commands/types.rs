@@ -11,6 +11,8 @@ pub struct Settings {
     pub enable_dummy_bypass: bool,
     #[serde(rename = "suppressSdkUnavailableWarning", default)]
     pub suppress_sdk_unavailable_warning: bool,
+    #[serde(rename = "disableSteamworksSdk", default)]
+    pub disable_steamworks_sdk: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

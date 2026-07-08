@@ -286,6 +286,7 @@ pub fn load_db(
             loading_dir: default_loading,
             enable_dummy_bypass: false,
             suppress_sdk_unavailable_warning: false,
+            disable_steamworks_sdk: false,
         },
         addons: HashMap::new(),
         groups: Vec::new(),
@@ -732,9 +733,14 @@ async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::
 async fn fetch_steam_details_hybrid(
     workshop_service: &WorkshopService,
     workshop_ids: &[String],
+    allow_bridge: bool,
 ) -> Result<Vec<Value>, String> {
     if workshop_ids.is_empty() {
         return Ok(Vec::new());
+    }
+
+    if !allow_bridge {
+        return fetch_steam_details(workshop_ids).await;
     }
 
     match workshop_service.bridge_fetch_details(workshop_ids) {
@@ -746,7 +752,12 @@ async fn fetch_steam_details_hybrid(
 async fn fetch_collection_children_hybrid(
     workshop_service: &WorkshopService,
     collection_id: &str,
+    allow_bridge: bool,
 ) -> Result<Vec<String>, String> {
+    if !allow_bridge {
+        return fetch_collection_children_web(collection_id).await;
+    }
+
     if let Ok(payload) = workshop_service.bridge_query_collection(collection_id) {
         let mut ids = Vec::new();
         for item in payload.items {
@@ -768,8 +779,9 @@ async fn attempt_bridge_download(
     workshop_id: &str,
     workshop_dir: &Path,
     app_handle: &AppHandle,
+    allow_bridge: bool,
 ) -> Result<bool, String> {
-    if !workshop_service.has_bridge() {
+    if !allow_bridge || !workshop_service.has_bridge() {
         return Ok(false);
     }
 
@@ -852,6 +864,7 @@ pub async fn scan_addons_internal(
     cache_dir: &Path,
     workshop_service: &WorkshopService,
 ) -> Result<(), String> {
+    let allow_bridge = !db.settings.disable_steamworks_sdk;
     let workshop_dir = Path::new(&db.settings.workshop_dir);
     let loading_dir = Path::new(&db.settings.loading_dir);
 
@@ -1126,7 +1139,7 @@ pub async fn scan_addons_internal(
         let ids_array: Vec<String> = new_workshop_ids.into_iter().collect();
         println!("Syncing Steam details for {} items...", ids_array.len());
         if let Ok(steam_details_list) =
-            fetch_steam_details_hybrid(workshop_service, &ids_array).await
+            fetch_steam_details_hybrid(workshop_service, &ids_array, allow_bridge).await
         {
             for details in steam_details_list {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
@@ -1199,7 +1212,7 @@ pub async fn scan_addons_internal(
         ids_to_sync.dedup();
         println!("Syncing Steam details for {} items...", ids_to_sync.len());
         if let Ok(steam_details_list) =
-            fetch_steam_details_hybrid(workshop_service, &ids_to_sync).await
+            fetch_steam_details_hybrid(workshop_service, &ids_to_sync, allow_bridge).await
         {
             for details in steam_details_list {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
@@ -1506,6 +1519,7 @@ pub async fn save_settings(
     loading_dir: String,
     enable_dummy_bypass: bool,
     suppress_sdk_unavailable_warning: bool,
+    disable_steamworks_sdk: bool,
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
@@ -1517,6 +1531,10 @@ pub async fn save_settings(
     db.settings.loading_dir = loading_dir;
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
     db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
+    db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
+    if disable_steamworks_sdk {
+        state.workshop_service.shutdown();
+    }
     save_db_internal(
         &state.settings_path,
         &state.groups_path,
@@ -2057,8 +2075,14 @@ pub async fn group_action(
             }
             // Fetch Steam details for newly added workshop items
             if !new_workshop_ids.is_empty() {
+                let allow_bridge = !db.settings.disable_steamworks_sdk;
                 if let Ok(steam_details_list) =
-                    fetch_steam_details_hybrid(&state.workshop_service, &new_workshop_ids).await
+                    fetch_steam_details_hybrid(
+                        &state.workshop_service,
+                        &new_workshop_ids,
+                        allow_bridge,
+                    )
+                    .await
                 {
                     for details in steam_details_list {
                         let wid = details["publishedfileid"].as_str().unwrap_or("");
@@ -2610,7 +2634,7 @@ pub async fn query_workshop_collection(
 
 #[tauri::command]
 pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, String> {
-    let ids = {
+    let (ids, allow_bridge) = {
         let mut db = state.db.lock().await;
 
         // First, scan addons to populate database with any new/removed files
@@ -2645,11 +2669,12 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
             ));
         }
 
-        ids
+        (ids, !db.settings.disable_steamworks_sdk)
     };
 
     println!("Syncing Steam details manually for {} items...", ids.len());
-    let steam_details_list = fetch_steam_details_hybrid(&state.workshop_service, &ids).await?;
+    let steam_details_list =
+        fetch_steam_details_hybrid(&state.workshop_service, &ids, allow_bridge).await?;
 
     let mut db = state.db.lock().await;
     for details in steam_details_list {
@@ -2892,8 +2917,20 @@ pub async fn download_addon(
     clear_download_cancellation(&state, &workshop_id)?;
 
     let result = async {
+        let (workshop_dir, allow_bridge) = {
+            let db = state.db.lock().await;
+            (
+                PathBuf::from(&db.settings.workshop_dir),
+                !db.settings.disable_steamworks_sdk,
+            )
+        };
         let details_list =
-            fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
+            fetch_steam_details_hybrid(
+                &state.workshop_service,
+                std::slice::from_ref(&workshop_id),
+                allow_bridge,
+            )
+            .await?;
         if details_list.is_empty() {
             return Err("Failed to retrieve details for workshop item".to_string());
         }
@@ -2904,10 +2941,6 @@ pub async fn download_addon(
             .and_then(|t| t.as_str())
             .unwrap_or("Workshop Item");
 
-        let workshop_dir = {
-            let db = state.db.lock().await;
-            PathBuf::from(&db.settings.workshop_dir)
-        };
         if !workshop_dir.exists() {
             fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
         }
@@ -2938,6 +2971,7 @@ pub async fn download_addon(
             &workshop_id,
             &workshop_dir,
             &app_handle,
+            allow_bridge,
         )
         .await
         {
@@ -3102,23 +3136,35 @@ pub async fn fetch_collection(
     collection_id: String,
     state: State<'_, crate::AppState>,
 ) -> Result<serde_json::Value, String> {
-    if let Ok(payload) = state
-        .workshop_service
-        .bridge_query_collection(&collection_id)
-    {
-        return Ok(serde_json::json!({
-            "collection": payload.collection,
-            "items": payload.items,
-        }));
+    let allow_bridge = {
+        let db = state.db.lock().await;
+        !db.settings.disable_steamworks_sdk
+    };
+
+    if allow_bridge {
+        if let Ok(payload) = state
+            .workshop_service
+            .bridge_query_collection(&collection_id)
+        {
+            return Ok(serde_json::json!({
+                "collection": payload.collection,
+                "items": payload.items,
+            }));
+        }
     }
 
-    let child_ids =
-        fetch_collection_children_hybrid(&state.workshop_service, &collection_id).await?;
+    let child_ids = fetch_collection_children_hybrid(
+        &state.workshop_service,
+        &collection_id,
+        allow_bridge,
+    )
+    .await?;
 
     let mut query_ids = vec![collection_id.clone()];
     query_ids.extend(child_ids.clone());
 
-    let details = fetch_steam_details_hybrid(&state.workshop_service, &query_ids).await?;
+    let details =
+        fetch_steam_details_hybrid(&state.workshop_service, &query_ids, allow_bridge).await?;
 
     let mut collection_details = serde_json::Value::Null;
     let mut items = Vec::new();
@@ -3145,10 +3191,15 @@ pub async fn add_known_addon(
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
+    let allow_bridge = !db.settings.disable_steamworks_sdk;
 
     let details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id))
-            .await?;
+        fetch_steam_details_hybrid(
+            &state.workshop_service,
+            std::slice::from_ref(&workshop_id),
+            allow_bridge,
+        )
+        .await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }

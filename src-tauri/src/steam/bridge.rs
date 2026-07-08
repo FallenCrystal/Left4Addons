@@ -5,11 +5,7 @@ use serde_json::Value;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-const IDLE_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
 
 type InitFn = unsafe extern "C" fn() -> *mut c_char;
 type RequestFn = unsafe extern "C" fn(*const c_char) -> *mut c_char;
@@ -36,7 +32,6 @@ impl Drop for BridgeApi {
 pub struct WorkshopBridge {
     api: Arc<BridgeApi>,
     invocation_gate: Arc<Mutex<()>>,
-    activity_token: Arc<AtomicU64>,
     capabilities: WorkshopCapabilities,
 }
 
@@ -103,7 +98,6 @@ impl WorkshopBridge {
         Ok(Self {
             api,
             invocation_gate: Arc::new(Mutex::new(())),
-            activity_token: Arc::new(AtomicU64::new(0)),
             capabilities,
         })
     }
@@ -125,8 +119,6 @@ impl WorkshopBridge {
                 .map_err(|_| "Steam bridge invocation mutex poisoned".to_string())?;
             invoke_raw_string(&self.api, Some(&encoded))
         }?;
-        let token = self.activity_token.fetch_add(1, Ordering::SeqCst) + 1;
-        self.schedule_idle_shutdown(token);
         let response: BridgeResponse = serde_json::from_str(&result).map_err(|e| e.to_string())?;
         if response.ok {
             Ok(response.payload)
@@ -138,30 +130,11 @@ impl WorkshopBridge {
     }
 
     pub fn shutdown(&self) {
-        self.activity_token.fetch_add(1, Ordering::SeqCst);
         if let Ok(_guard) = self.invocation_gate.lock() {
             unsafe {
                 (self.api.shutdown)();
             }
         }
-    }
-
-    fn schedule_idle_shutdown(&self, token: u64) {
-        let api = Arc::clone(&self.api);
-        let invocation_gate = Arc::clone(&self.invocation_gate);
-        let activity_token = Arc::clone(&self.activity_token);
-
-        std::thread::spawn(move || {
-            std::thread::sleep(IDLE_SHUTDOWN_DELAY);
-            let Ok(_guard) = invocation_gate.lock() else {
-                return;
-            };
-            if activity_token.load(Ordering::SeqCst) == token {
-                unsafe {
-                    (api.shutdown)();
-                }
-            }
-        });
     }
 }
 

@@ -145,6 +145,7 @@ export interface Settings {
   loadingDir: string;
   enableDummyBypass: boolean;
   suppressSdkUnavailableWarning: boolean;
+  disableSteamworksSdk: boolean;
 }
 
 export interface DatabasePayload {
