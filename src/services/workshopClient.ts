@@ -323,11 +323,15 @@ export function mapSteamDetailToWorkshopItem(detail: any, source = 'steam-sdk'):
       ? detail.tags.map((tag: any) => String(tag.display_name || tag.tag || tag.name || '')).filter(Boolean)
       : [],
     subscriptions: detail.subscriptions ? parseInt(String(detail.subscriptions), 10) : undefined,
-    favorites: detail.favorites ? parseInt(String(detail.favorites), 10) : undefined,
+    favorites: (detail.favorites ?? detail.favorited) ? parseInt(String(detail.favorites ?? detail.favorited), 10) : undefined,
     lifetimeSubscriptions: detail.lifetime_subscriptions ? parseInt(String(detail.lifetime_subscriptions), 10) : undefined,
-    lifetimeFavorites: detail.lifetime_favorites ? parseInt(String(detail.lifetime_favorites), 10) : undefined,
+    lifetimeFavorites: (detail.lifetime_favorites ?? detail.lifetime_favorited)
+      ? parseInt(String(detail.lifetime_favorites ?? detail.lifetime_favorited), 10)
+      : undefined,
     views: detail.views ? parseInt(String(detail.views), 10) : undefined,
-    comments: detail.comments ? parseInt(String(detail.comments), 10) : undefined,
+    comments: (detail.comments ?? detail.num_comments_public)
+      ? parseInt(String(detail.comments ?? detail.num_comments_public), 10)
+      : undefined,
     totalVotes: detail.total_votes ? parseInt(String(detail.total_votes), 10) : undefined,
     timeCreated: detail.time_created ? parseInt(String(detail.time_created), 10) : undefined,
     timeUpdated: detail.time_updated ? parseInt(String(detail.time_updated), 10) : undefined,

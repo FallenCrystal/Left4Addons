@@ -6,7 +6,7 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use steamworks::{
     AccountId, AppIDs, AppId, Client, FileType, ItemState, PublishedFileId, SteamId, UGCQueryType,
-    UGCType, UserList, UserListOrder,
+    UGCStatisticType, UGCType, UserList, UserListOrder,
 };
 
 const APP_ID: u32 = 550;
@@ -24,15 +24,6 @@ struct BridgeRuntime {
 struct InitResponse {
     ok: bool,
     version: String,
-    current_user_steam_id: String,
-    current_user_account_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ErrorResponse {
-    ok: bool,
-    error: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -116,26 +107,10 @@ struct HomeSectionDef {
 
 #[no_mangle]
 pub extern "C" fn l4a_steam_bridge_init() -> *mut c_char {
-    match ensure_runtime() {
-        Ok(runtime) => {
-            let user = runtime
-                .as_ref()
-                .expect("runtime should be initialized")
-                .client
-                .user();
-            let steam_id = user.steam_id();
-            into_c_string(&InitResponse {
-                ok: true,
-                version: BRIDGE_VERSION.to_string(),
-                current_user_steam_id: steam_id.raw().to_string(),
-                current_user_account_id: steam_id.account_id().raw().to_string(),
-            })
-        }
-        Err(err) => into_c_string(&ErrorResponse {
-            ok: false,
-            error: err,
-        }),
-    }
+    into_c_string(&InitResponse {
+        ok: true,
+        version: BRIDGE_VERSION.to_string(),
+    })
 }
 
 #[no_mangle]
@@ -173,6 +148,8 @@ pub extern "C" fn l4a_steam_bridge_shutdown() {
             runtime.take();
         }
     }
+    std::env::remove_var("SteamAppId");
+    std::env::remove_var("SteamGameId");
 }
 
 fn handle_request(request: *const c_char) -> Result<Value, String> {
@@ -330,7 +307,8 @@ fn query_home(runtime: &mut BridgeRuntime) -> Result<Value, String> {
 
 fn query_items(runtime: &mut BridgeRuntime, payload: QueryItemsPayload) -> Result<Value, String> {
     let query = build_query_handle(runtime, &payload, None)?;
-    let items = run_query(runtime, query)?;
+    let mut items = run_query(runtime, query)?;
+    normalize_query_items(&mut items, payload.sort.as_deref());
     Ok(json!({
         "source": "steam-sdk",
         "items": items,
@@ -532,7 +510,12 @@ fn run_query_with_children(
                     if let Some(children) = results.get_children(index) {
                         child_ids.extend(children.into_iter().map(|child| child.0.to_string()));
                     }
-                    items.push(query_result_to_json(&item, results.preview_url(index)));
+                    items.push(query_result_to_json(
+                        &results,
+                        index,
+                        &item,
+                        results.preview_url(index),
+                    ));
                 }
             }
             Ok((items, child_ids))
@@ -558,9 +541,21 @@ fn run_query_with_children(
     }
 }
 
-fn query_result_to_json(item: &steamworks::QueryResult, preview_url: Option<String>) -> Value {
+fn query_result_to_json(
+    results: &steamworks::QueryResults<'_>,
+    index: u32,
+    item: &steamworks::QueryResult,
+    preview_url: Option<String>,
+) -> Value {
     let owner_id = item.owner.raw().to_string();
     let account_id = item.owner.account_id().raw().to_string();
+    let subscriptions = results.statistic(index, UGCStatisticType::Subscriptions);
+    let favorites = results.statistic(index, UGCStatisticType::Favorites);
+    let lifetime_subscriptions = results.statistic(index, UGCStatisticType::UniqueSubscriptions);
+    let lifetime_favorites = results.statistic(index, UGCStatisticType::UniqueFavorites);
+    let views = results.statistic(index, UGCStatisticType::UniqueWebsiteViews);
+    let comments = results.statistic(index, UGCStatisticType::Comments);
+    let total_votes = item.num_upvotes as u64 + item.num_downvotes as u64;
 
     json!({
         "publishedfileid": item.published_file_id.0.to_string(),
@@ -577,14 +572,84 @@ fn query_result_to_json(item: &steamworks::QueryResult, preview_url: Option<Stri
         "time_created": item.time_created,
         "time_updated": item.time_updated,
         "num_children": item.num_children,
-        "subscriptions": item.num_upvotes as u64 + item.num_downvotes as u64,
-        "favorited": item.num_upvotes,
+        "subscriptions": subscriptions,
+        "favorited": favorites,
+        "favorites": favorites,
+        "lifetime_subscriptions": lifetime_subscriptions,
+        "lifetime_favorited": lifetime_favorites,
+        "lifetime_favorites": lifetime_favorites,
+        "views": views,
+        "num_comments_public": comments,
+        "comments": comments,
+        "total_votes": total_votes,
         "score": item.score,
         "file_type": match item.file_type {
             FileType::Collection => "collection",
             _ => "item",
         },
     })
+}
+
+fn normalize_query_items(items: &mut [Value], sort: Option<&str>) {
+    match sort.unwrap_or("trend") {
+        "mostrecent" => items.sort_by(|left, right| {
+            json_u64(right, "time_created")
+                .cmp(&json_u64(left, "time_created"))
+                .then_with(|| json_u64(right, "time_updated").cmp(&json_u64(left, "time_updated")))
+                .then_with(|| {
+                    json_string(left, "publishedfileid").cmp(json_string(right, "publishedfileid"))
+                })
+        }),
+        "lastupdated" => items.sort_by(|left, right| {
+            json_u64(right, "time_updated")
+                .cmp(&json_u64(left, "time_updated"))
+                .then_with(|| json_u64(right, "time_created").cmp(&json_u64(left, "time_created")))
+                .then_with(|| {
+                    json_string(left, "publishedfileid").cmp(json_string(right, "publishedfileid"))
+                })
+        }),
+        "totalprofiles" => items.sort_by(|left, right| {
+            json_u64(right, "lifetime_subscriptions")
+                .cmp(&json_u64(left, "lifetime_subscriptions"))
+                .then_with(|| {
+                    json_u64(right, "subscriptions").cmp(&json_u64(left, "subscriptions"))
+                })
+                .then_with(|| json_u64(right, "time_updated").cmp(&json_u64(left, "time_updated")))
+                .then_with(|| {
+                    json_string(left, "publishedfileid").cmp(json_string(right, "publishedfileid"))
+                })
+        }),
+        "toprated" => items.sort_by(|left, right| {
+            json_f64(right, "score")
+                .total_cmp(&json_f64(left, "score"))
+                .then_with(|| json_u64(right, "total_votes").cmp(&json_u64(left, "total_votes")))
+                .then_with(|| json_u64(right, "time_updated").cmp(&json_u64(left, "time_updated")))
+                .then_with(|| {
+                    json_string(left, "publishedfileid").cmp(json_string(right, "publishedfileid"))
+                })
+        }),
+        _ => {}
+    }
+}
+
+fn json_u64(value: &Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .or_else(|| value.get(key).and_then(Value::as_str)?.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn json_f64(value: &Value, key: &str) -> f64 {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .or_else(|| value.get(key).and_then(Value::as_str)?.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+fn json_string<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
 fn parse_published_file_id(workshop_id: &str) -> Result<PublishedFileId, String> {
@@ -660,4 +725,69 @@ fn into_c_string<T: Serialize>(value: &T) -> *mut c_char {
     let encoded = serde_json::to_string(value)
         .unwrap_or_else(|err| json!({ "ok": false, "error": err.to_string() }).to_string());
     CString::new(encoded).unwrap().into_raw()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_mostrecent_sorts_newest_first() {
+        let mut items = vec![
+            json!({ "publishedfileid": "1", "time_created": 10_u64, "time_updated": 50_u64 }),
+            json!({ "publishedfileid": "2", "time_created": 30_u64, "time_updated": 20_u64 }),
+            json!({ "publishedfileid": "3", "time_created": 20_u64, "time_updated": 60_u64 }),
+        ];
+
+        normalize_query_items(&mut items, Some("mostrecent"));
+
+        assert_eq!(json_string(&items[0], "publishedfileid"), "2");
+        assert_eq!(json_string(&items[1], "publishedfileid"), "3");
+        assert_eq!(json_string(&items[2], "publishedfileid"), "1");
+    }
+
+    #[test]
+    fn normalize_lastupdated_sorts_latest_update_first() {
+        let mut items = vec![
+            json!({ "publishedfileid": "1", "time_created": 10_u64, "time_updated": 50_u64 }),
+            json!({ "publishedfileid": "2", "time_created": 30_u64, "time_updated": 20_u64 }),
+            json!({ "publishedfileid": "3", "time_created": 20_u64, "time_updated": 60_u64 }),
+        ];
+
+        normalize_query_items(&mut items, Some("lastupdated"));
+
+        assert_eq!(json_string(&items[0], "publishedfileid"), "3");
+        assert_eq!(json_string(&items[1], "publishedfileid"), "1");
+        assert_eq!(json_string(&items[2], "publishedfileid"), "2");
+    }
+
+    #[test]
+    fn normalize_totalprofiles_prefers_subscription_counts() {
+        let mut items = vec![
+            json!({ "publishedfileid": "1", "subscriptions": 200_u64, "lifetime_subscriptions": 500_u64, "time_updated": 10_u64 }),
+            json!({ "publishedfileid": "2", "subscriptions": 100_u64, "lifetime_subscriptions": 900_u64, "time_updated": 20_u64 }),
+            json!({ "publishedfileid": "3", "subscriptions": 300_u64, "lifetime_subscriptions": 700_u64, "time_updated": 30_u64 }),
+        ];
+
+        normalize_query_items(&mut items, Some("totalprofiles"));
+
+        assert_eq!(json_string(&items[0], "publishedfileid"), "2");
+        assert_eq!(json_string(&items[1], "publishedfileid"), "3");
+        assert_eq!(json_string(&items[2], "publishedfileid"), "1");
+    }
+
+    #[test]
+    fn normalize_toprated_prefers_score_then_votes() {
+        let mut items = vec![
+            json!({ "publishedfileid": "1", "score": 0.90_f64, "total_votes": 100_u64, "time_updated": 10_u64 }),
+            json!({ "publishedfileid": "2", "score": 0.95_f64, "total_votes": 80_u64, "time_updated": 20_u64 }),
+            json!({ "publishedfileid": "3", "score": 0.95_f64, "total_votes": 120_u64, "time_updated": 30_u64 }),
+        ];
+
+        normalize_query_items(&mut items, Some("toprated"));
+
+        assert_eq!(json_string(&items[0], "publishedfileid"), "3");
+        assert_eq!(json_string(&items[1], "publishedfileid"), "2");
+        assert_eq!(json_string(&items[2], "publishedfileid"), "1");
+    }
 }

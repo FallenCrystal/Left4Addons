@@ -51,6 +51,12 @@ impl WorkshopService {
         self.bridge.is_some()
     }
 
+    pub fn shutdown(&self) {
+        if let Some(bridge) = &self.bridge {
+            bridge.shutdown();
+        }
+    }
+
     pub fn bridge_fetch_details(&self, workshop_ids: &[String]) -> Result<Vec<Value>, String> {
         let bridge = self.bridge.as_ref().ok_or_else(|| {
             self.bridge_error

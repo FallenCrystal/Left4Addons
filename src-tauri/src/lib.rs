@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex as StdMutex;
 use tauri::async_runtime::Mutex;
 use tauri::Manager;
@@ -23,9 +23,15 @@ pub struct AppState {
     pub cancelled_downloads: StdMutex<HashSet<String>>,
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.workshop_service.shutdown();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let mut host_runtime_dir = std::env::current_exe()
                 .ok()
@@ -145,8 +151,17 @@ pub fn run() {
             commands::handlers::cancel_download,
             commands::handlers::append_workshop_crawl_log,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+        ) {
+            app_handle.state::<AppState>().workshop_service.shutdown();
+        }
+    });
 }
 
 fn migrate_data(app_data_dir: Option<&Path>, legacy_runtime_dir: &Path, runtime_dir: &Path) {
