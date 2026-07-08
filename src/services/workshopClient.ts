@@ -182,6 +182,28 @@ function normalizeCachedRelations(value: any): { title: string; workshopId: stri
     .filter((item) => item.workshopId);
 }
 
+function normalizeCachedWorkshopItems(value: any): WorkshopItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item?.workshopId && !item?.publishedfileid) return null;
+      return {
+        workshopId: normalizeText(item.workshopId || item.publishedfileid),
+        title: normalizeText(item.title),
+        imagePath: normalizeText(item.imagePath || item.previewUrl || item.preview_url),
+        authorName: normalizeText(item.authorName || item.creatorName || item.creator_name),
+        authorId: normalizeText(item.authorId || item.creatorId || item.creator),
+        authorUrl: normalizeText(item.authorUrl || item.creatorProfileUrl),
+        authorSteamId: normalizeText(item.authorSteamId || item.creatorSteamId) || undefined,
+        authorVanityId: normalizeText(item.authorVanityId || item.creatorVanityId) || undefined,
+        authorAccountId: normalizeText(item.authorAccountId || item.creatorAccountId) || undefined,
+        stars: Number(item.stars || item.ratingStars || 0),
+        shortDescription: normalizeText(item.shortDescription || item.description) || undefined,
+      };
+    })
+    .filter(Boolean) as WorkshopItem[];
+}
+
 function mapCachedDetailToPageDetails(detail: any): WorkshopPageDetails {
   const steamDetails = detail?.steamDetails || {};
   const gallery = detail?.imageGallery || detail?.galleryUrls || detail?.galleryPreviewUrls || [];
@@ -198,6 +220,8 @@ function mapCachedDetailToPageDetails(detail: any): WorkshopPageDetails {
     imageGallery: Array.isArray(gallery) ? gallery.map(String).filter(Boolean) : [],
     tags: normalizeCachedTags(detail?.pageTags || detail?.tags || steamDetails?.tags),
     requiredItems: normalizeCachedRelations(detail?.requiredItems),
+    collectionItems: normalizeCachedWorkshopItems(detail?.collectionItems),
+    childItemIds: Array.isArray(detail?.childItemIds) ? detail.childItemIds.map(String).filter(Boolean) : undefined,
     parentCollections: normalizeCachedRelations(detail?.parentCollections),
     fileSizeDisplay: normalizeText(detail?.fileSizeDisplay || detail?.fileSize || steamDetails?.file_size) || undefined,
     postedDateText: normalizeText(detail?.postedDateText) || undefined,
@@ -220,6 +244,12 @@ function normalizePageDetails(details: Partial<WorkshopPageDetails> | null | und
     requiredItems: Array.isArray(details?.requiredItems)
       ? details.requiredItems.filter((item) => normalizeText(item?.workshopId))
       : [],
+    collectionItems: Array.isArray(details?.collectionItems)
+      ? details.collectionItems.filter((item) => normalizeText(item?.workshopId))
+      : [],
+    childItemIds: Array.isArray(details?.childItemIds)
+      ? details.childItemIds.map(String).filter(Boolean)
+      : undefined,
     parentCollections: Array.isArray(details?.parentCollections)
       ? details.parentCollections.filter((item) => normalizeText(item?.workshopId))
       : [],
@@ -285,6 +315,8 @@ export function mergeWorkshopPageDetails(
     imageGallery: chooseArray(existing.imageGallery, next.imageGallery),
     tags: chooseArray(existing.tags, next.tags),
     requiredItems: chooseArray(existing.requiredItems, next.requiredItems),
+    collectionItems: chooseArray(existing.collectionItems, next.collectionItems),
+    childItemIds: chooseArray(existing.childItemIds, next.childItemIds),
     parentCollections: chooseArray(existing.parentCollections, next.parentCollections),
     fileSizeDisplay: normalizeText(next.fileSizeDisplay) || existing.fileSizeDisplay,
     postedDateText: normalizeText(next.postedDateText) || existing.postedDateText,
@@ -308,9 +340,39 @@ function hasUsefulPageSnapshot(details: WorkshopPageDetails): boolean {
     details.description ||
     details.imageGallery.length > 0 ||
     details.requiredItems.length > 0 ||
+    (details.collectionItems?.length || 0) > 0 ||
+    (details.childItemIds?.length || 0) > 0 ||
     details.parentCollections.length > 0 ||
     details.tags.length > 0,
   );
+}
+
+function cachedCollectionResponse(workshopId: string, collection: any, cache: Record<string, any>, source: string) {
+  const resolvedCollection = cachedDetailToWorkshopItem(workshopId, collection);
+  const childIds = collection.childItemIds || [];
+  const cachedItems = collection.collectionItems || [];
+  return {
+    source,
+    collection: {
+      ...collection,
+      publishedfileid: workshopId,
+      title: resolvedCollection.title,
+      preview_url: resolvedCollection.imagePath,
+      creator_name: resolvedCollection.authorName,
+      creator: resolvedCollection.authorId,
+      creator_steam_id: resolvedCollection.authorSteamId,
+      creator_account_id: resolvedCollection.authorAccountId,
+    },
+    items: rememberWorkshopItems(
+      (cachedItems.length > 0
+        ? cachedItems.map((item: any) => ({
+          ...cachedDetailToWorkshopItem(item.workshopId || item.publishedfileid, item),
+          ...item,
+        }))
+        : childIds.map((childId: string) => cache[childId] ? cachedDetailToWorkshopItem(childId, cache[childId]) : null))
+        .filter(Boolean),
+    ),
+  };
 }
 
 async function enrichItemsFromSnapshot(items: WorkshopItem[]): Promise<WorkshopItem[]> {
@@ -687,27 +749,8 @@ export async function fetchWorkshopItem(workshopId: string) {
 export async function fetchWorkshopCollection(workshopId: string) {
   const cache = await readWorkshopItemCache();
   const cachedCollection = cache[workshopId];
-  if (cachedCollection) {
-    const resolvedCollection = cachedDetailToWorkshopItem(workshopId, cachedCollection);
-    const childIds = cachedCollection.childItemIds || [];
-    return {
-      source: 'snapshot',
-      collection: {
-        ...cachedCollection,
-        publishedfileid: workshopId,
-        title: resolvedCollection.title,
-        preview_url: resolvedCollection.imagePath,
-        creator_name: resolvedCollection.authorName,
-        creator: resolvedCollection.authorId,
-        creator_steam_id: resolvedCollection.authorSteamId,
-        creator_account_id: resolvedCollection.authorAccountId,
-      },
-      items: rememberWorkshopItems(
-        childIds
-          .map((childId: string) => cache[childId] ? cachedDetailToWorkshopItem(childId, cache[childId]) : null)
-          .filter(Boolean),
-      ),
-    };
+  if (cachedCollection && (cachedCollection.childItemIds?.length || cachedCollection.collectionItems?.length)) {
+    return cachedCollectionResponse(workshopId, cachedCollection, cache, 'snapshot');
   }
 
   const capabilities = shouldUseSteamworksSdk()
@@ -717,6 +760,9 @@ export async function fetchWorkshopCollection(workshopId: string) {
     try {
       const data = await invoke<WorkshopCollectionResponse>('query_workshop_collection', { workshopId });
       reportWorkshopWarnings(data.warnings);
+      if (!data?.collection?.publishedfileid) {
+        throw new Error('Steam SDK returned empty collection details');
+      }
       const resolvedCollection = rememberWorkshopItems([
         mapSteamDetailToWorkshopItem(data.collection, data.source),
       ])[0];
@@ -742,6 +788,9 @@ export async function fetchWorkshopCollection(workshopId: string) {
 
   try {
     const data: any = await invoke('fetch_collection', { collectionId: workshopId });
+    if (!data?.collection?.publishedfileid && cachedCollection) {
+      return cachedCollectionResponse(workshopId, cachedCollection, cache, 'cache');
+    }
     const resolvedCollection = rememberWorkshopItems([
       mapSteamDetailToWorkshopItem(data.collection, 'web-fallback'),
     ])[0];
@@ -763,26 +812,7 @@ export async function fetchWorkshopCollection(workshopId: string) {
   } catch (err) {
     const collection = cache[workshopId];
     if (collection) {
-      const resolvedCollection = cachedDetailToWorkshopItem(workshopId, collection);
-      const childIds = collection.childItemIds || [];
-      return {
-        source: 'cache',
-        collection: {
-          ...collection,
-          publishedfileid: workshopId,
-          title: resolvedCollection.title,
-          preview_url: resolvedCollection.imagePath,
-          creator_name: resolvedCollection.authorName,
-          creator: resolvedCollection.authorId,
-          creator_steam_id: resolvedCollection.authorSteamId,
-          creator_account_id: resolvedCollection.authorAccountId,
-        },
-        items: rememberWorkshopItems(
-          childIds
-            .map((childId: string) => cache[childId] ? cachedDetailToWorkshopItem(childId, cache[childId]) : null)
-            .filter(Boolean),
-        ),
-      };
+      return cachedCollectionResponse(workshopId, collection, cache, 'cache');
     }
     throw err;
   }

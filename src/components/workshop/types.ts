@@ -56,6 +56,8 @@ export interface WorkshopPageDetails {
   imageGallery: string[];
   tags: { category: string; name: string }[];
   requiredItems: { title: string; workshopId: string }[];
+  collectionItems?: WorkshopItem[];
+  childItemIds?: string[];
   parentCollections: { title: string; workshopId: string }[];
   fileSizeDisplay?: string;
   postedDateText?: string;

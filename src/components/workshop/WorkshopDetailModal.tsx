@@ -101,7 +101,10 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
   // ── Collection detail ────────────────────────────────────────────────────────
   if (collection) {
-    const allWorkshopIds = collection.items.map((i) => i.workshopId);
+    const displayCollectionItems = pageDetails?.collectionItems?.length
+      ? pageDetails.collectionItems
+      : collection.items;
+    const allWorkshopIds = displayCollectionItems.map((i) => i.workshopId);
     const collectionId = collection.workshopId || allWorkshopIds[0];
     const isKnownCollection = !!collectionId && !!groups?.some(
       (group) => group.workshopCollectionId?.trim() === collectionId,
@@ -109,6 +112,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
     // Use the large background image from the scraped page if available
     const heroImage = pageDetails?.backgroundImageUrl || collection.imagePath;
     const collectionCreatorName = pageDetails?.creatorName || collection.creatorName;
+    const collectionDescription = pageDetails?.description || collection.description;
 
     return (
       <div className="modal-overlay" onClick={onClose}>
@@ -149,7 +153,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 </div>
                 <div className="detail-meta-item">
                   <span className="detail-meta-label">{t('workshop.detail.collectionItems')}</span>
-                  <span className="detail-meta-value">{t('workshop.detail.collectionItemsCount', { count: collection.items.length })}</span>
+                  <span className="detail-meta-value">{t('workshop.detail.collectionItemsCount', { count: displayCollectionItems.length })}</span>
                 </div>
                 {collectionId && (
                   <div className="detail-meta-item">
@@ -176,10 +180,10 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
             {/* Right: description + items */}
             <div className="detail-right">
               <h3 style={{ margin: 0, fontSize: '20px', color: '#fff' }}>{collection.title}</h3>
-              {collection.description && (
+              {collectionDescription && (
                 <>
                   <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('workshop.detail.descriptionLabel')}</div>
-                  <div className="description-block" style={{ maxHeight: '120px', overflowY: 'auto' }}>{collection.description}</div>
+                  <div className="description-block" style={{ maxHeight: '120px', overflowY: 'auto' }}>{collectionDescription}</div>
                 </>
               )}
 
@@ -187,7 +191,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 {t('workshop.detail.itemsInCollection')}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px', maxHeight: '200px', overflowY: 'auto' }}>
-                {collection.items.map((ci) => {
+                {displayCollectionItems.map((ci) => {
                   const isKnown = isKnownWorkshopItem(knownUninstalledAddons, ci.workshopId);
                   const isDownloaded = isKnownWorkshopItem(addons, ci.workshopId);
                   const shouldCacheRemote = isDownloaded || isKnown;
@@ -233,7 +237,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 <FolderPlus size={14} />
                 <span>{t('workshop.detail.importAsGroup')}</span>
               </button>
-              <button className="btn btn-secondary" onClick={() => collection.items.forEach((subItem) => onDownload(subItem.workshopId, subItem.title, subItem.imagePath))} disabled={isSubmitting}>
+              <button className="btn btn-secondary" onClick={() => displayCollectionItems.forEach((subItem) => onDownload(subItem.workshopId, subItem.title, subItem.imagePath))} disabled={isSubmitting}>
                 <Download size={14} />
                 <span>{t('workshop.detail.downloadAll', { count: allWorkshopIds.length })}</span>
               </button>

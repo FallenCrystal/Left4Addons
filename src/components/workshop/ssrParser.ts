@@ -660,6 +660,40 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
       });
     }
 
+    const collectionItems: WorkshopItem[] = [];
+    all('.collectionChildren .collectionItem').forEach((node) => {
+      const itemLink = node.querySelector('a[href*="filedetails/?id="]') as HTMLAnchorElement | null;
+      const workshopId = itemLink?.href?.match(/id=(\d+)/)?.[1] || node.id?.match(/sharedfile_(\d+)/)?.[1] || '';
+      if (!workshopId) return;
+
+      const title = (node.querySelector('.workshopItemTitle')?.textContent || '').trim();
+      const imagePath = toFullSizeUrl((node.querySelector('.workshopItemPreviewImage') as HTMLImageElement | null)?.src || '');
+      const authorLink = node.querySelector('.workshopItemAuthorName a') as HTMLAnchorElement | null;
+      const authorName = (authorLink?.textContent || '').trim();
+      const authorUrl = authorLink?.href || '';
+      const authorIds = parseProfileIdentifiers(authorUrl);
+      const shortDescription = (node.querySelector('.workshopItemShortDesc')?.textContent || '').trim();
+      const ratingSrc = (node.querySelector('.fileRating') as HTMLImageElement | null)?.src || '';
+      const ratingStars = parseInt(ratingSrc.match(/(\d+)-star/)?.[1] || '0', 10) || 0;
+
+      collectionItems.push({
+        workshopId,
+        title,
+        imagePath,
+        authorName,
+        authorId: authorIds.vanityId || authorIds.steamId || '',
+        authorUrl,
+        authorSteamId: authorIds.steamId,
+        authorVanityId: authorIds.vanityId,
+        stars: ratingStars,
+        shortDescription,
+      });
+    });
+    if (collectionItems.length > 0) {
+      result.collectionItems = collectionItems;
+      result.childItemIds = collectionItems.map((item) => item.workshopId);
+    }
+
     // 4. Parent collections
     const parentCollectionsDiv = doc.querySelector('.parentCollections');
     if (parentCollectionsDiv) {
