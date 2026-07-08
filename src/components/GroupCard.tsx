@@ -101,6 +101,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
           {imagePath ? (
             <CacheImage
               srcPath={imagePath}
+              cacheRemote
               alt={group.name}
               className="addon-card-image"
               fallback={

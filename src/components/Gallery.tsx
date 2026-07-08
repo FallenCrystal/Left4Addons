@@ -7,6 +7,7 @@ interface GalleryProps {
   title: string;
   fallbackImage?: string;
   fallbackIcon?: React.ReactNode;
+  cacheRemote?: boolean;
 }
 
 export const Gallery: React.FC<GalleryProps> = ({
@@ -14,6 +15,7 @@ export const Gallery: React.FC<GalleryProps> = ({
   title,
   fallbackImage,
   fallbackIcon,
+  cacheRemote = false,
 }) => {
   const [galleryIndex, setGalleryIndex] = useState(0);
   const [fullscreenImageIndex, setFullscreenImageIndex] = useState<number | null>(null);
@@ -66,6 +68,7 @@ export const Gallery: React.FC<GalleryProps> = ({
                 >
                   <CacheImage
                     srcPath={url}
+                    cacheRemote={cacheRemote}
                     alt={title}
                     className="detail-image"
                     style={{ width: '100%', height: '100%', objectFit: 'contain' }}
@@ -140,6 +143,7 @@ export const Gallery: React.FC<GalleryProps> = ({
         ) : fallbackImage ? (
           <CacheImage
             srcPath={fallbackImage}
+            cacheRemote={cacheRemote}
             alt={title}
             className="detail-image"
             fallback={fallbackIcon || <FileText size={64} className="text-secondary" />}
@@ -166,6 +170,7 @@ export const Gallery: React.FC<GalleryProps> = ({
             <CacheImage
               key={i}
               srcPath={url}
+              cacheRemote={cacheRemote}
               alt=""
               onClick={() => setGalleryIndex(i)}
               style={{
@@ -216,6 +221,7 @@ export const Gallery: React.FC<GalleryProps> = ({
         >
           <CacheImage
             srcPath={gallery[fullscreenImageIndex]}
+            cacheRemote={cacheRemote}
             alt="Fullscreen"
             style={{ maxWidth: '90%', maxHeight: '90%', objectFit: 'contain' }}
             onClick={(e) => e.stopPropagation()}

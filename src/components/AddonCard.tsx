@@ -89,6 +89,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
           {addon.imagePath ? (
             <CacheImage
               srcPath={addon.imagePath}
+              cacheRemote
               alt={title}
               className="addon-card-image"
               fallback={

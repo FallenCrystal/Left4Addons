@@ -153,6 +153,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                     {addon.imagePath ? (
                       <CacheImage
                         srcPath={addon.imagePath}
+                        cacheRemote
                         alt={title}
                         className="addon-card-image"
                         fallback={

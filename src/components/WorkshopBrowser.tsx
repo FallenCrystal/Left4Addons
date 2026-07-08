@@ -66,6 +66,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 }) => {
   const { t } = useTranslation();
   const scrollIdleTimerRef = useRef<number | null>(null);
+  const knownCollectionIds = new Set(
+    (groups || [])
+      .map((group) => group.workshopCollectionId?.trim())
+      .filter((id): id is string => !!id),
+  );
 
   // View mode
   const [viewMode, setViewMode] = useState<'home' | 'browse' | 'search'>('home');
@@ -328,6 +333,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
             sectionType={sec.id === 'collections' ? 'collections' : 'readytouseitems'}
             addons={addons}
             knownUninstalledAddons={knownUninstalledAddons}
+            knownCollectionIds={knownCollectionIds}
             onItemClick={(item) => viewItemDetails(item.workshopId)}
             onViewAll={handleViewAllSection}
             loadingDetailId={loadingDetailId}
@@ -386,6 +392,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
                   section={section}
                   addons={addons}
                   knownUninstalledAddons={knownUninstalledAddons}
+                  knownCollectionIds={knownCollectionIds}
                   onClick={() => section === 'collections' ? viewCollectionDetails(item.workshopId) : viewItemDetails(item.workshopId)}
                   isLoading={loadingDetailId === item.workshopId}
                 />

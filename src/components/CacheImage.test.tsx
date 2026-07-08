@@ -37,7 +37,21 @@ describe('CacheImage', () => {
     expect(img.src).toBe('blob:cache-image-url');
   });
 
-  test('caches remote image before rendering', async () => {
+  test('renders remote image directly by default', async () => {
+    render(
+      <CacheImage
+        srcPath="https://example.com/image.jpg"
+        alt="Remote Image"
+        fallback={<span>Fallback content</span>}
+      />
+    );
+
+    const img = await screen.findByAltText('Remote Image') as HTMLImageElement;
+    expect(img.src).toBe('https://example.com/image.jpg');
+    expect(mockInvoke).not.toHaveBeenCalled();
+  });
+
+  test('caches remote image before rendering when cacheRemote is enabled', async () => {
     vi.mocked(URL.createObjectURL).mockReturnValueOnce('blob:remote-cache-image-url');
     mockInvoke.mockImplementation(async (cmd) => {
       if (cmd === 'cache_remote_image') return '/cache/remote.jpg';
@@ -48,6 +62,7 @@ describe('CacheImage', () => {
     render(
       <CacheImage
         srcPath="https://example.com/image.jpg"
+        cacheRemote
         alt="Remote Image"
         fallback={<span>Fallback content</span>}
       />

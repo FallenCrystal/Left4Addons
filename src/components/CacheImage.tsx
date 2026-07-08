@@ -4,9 +4,16 @@ import { invoke } from '@tauri-apps/api/core';
 interface CacheImageProps extends React.ImgHTMLAttributes<HTMLImageElement> {
   srcPath?: string;
   fallback?: React.ReactNode;
+  cacheRemote?: boolean;
 }
 
-export const CacheImage: React.FC<CacheImageProps> = ({ srcPath, fallback, onError, ...props }) => {
+export const CacheImage: React.FC<CacheImageProps> = ({
+  srcPath,
+  fallback,
+  onError,
+  cacheRemote = false,
+  ...props
+}) => {
   const [hasError, setHasError] = useState<boolean>(false);
   const [resolvedSrc, setResolvedSrc] = useState<string>('');
 
@@ -22,6 +29,13 @@ export const CacheImage: React.FC<CacheImageProps> = ({ srcPath, fallback, onErr
     }
 
     if (srcPath.startsWith('http://') || srcPath.startsWith('https://')) {
+      if (!cacheRemote) {
+        setResolvedSrc(srcPath);
+        return () => {
+          cancelled = true;
+        };
+      }
+
       const cacheRemoteImage = async () => {
         try {
           const cachedPath = await invoke<string>('cache_remote_image', { url: srcPath });
@@ -74,7 +88,7 @@ export const CacheImage: React.FC<CacheImageProps> = ({ srcPath, fallback, onErr
         URL.revokeObjectURL(objectUrl);
       }
     };
-  }, [srcPath]);
+  }, [srcPath, cacheRemote]);
 
   const handleError = (e: React.SyntheticEvent<HTMLImageElement, Event>) => {
     setHasError(true);

@@ -11,6 +11,7 @@ interface ItemCardProps {
   section: string;
   addons: Record<string, any>;
   knownUninstalledAddons: Record<string, any>;
+  knownCollectionIds?: Set<string>;
   onClick: () => void;
   isLoading?: boolean;
 }
@@ -20,12 +21,16 @@ export const ItemCard: React.FC<ItemCardProps> = ({
   section,
   addons,
   knownUninstalledAddons,
+  knownCollectionIds,
   onClick,
   isLoading,
 }) => {
   const { t } = useTranslation();
   const isDownloaded = addons[item.workshopId + '.vpk'] !== undefined;
   const isKnown = knownUninstalledAddons[item.workshopId + '.vpk'] !== undefined;
+  const isKnownCollection = section === 'collections' && !!knownCollectionIds?.has(item.workshopId);
+  const isKnownEntry = isKnown || isKnownCollection;
+  const shouldCacheRemote = isDownloaded || isKnownEntry;
 
   return (
     <div className="addon-card" style={{ cursor: isLoading ? 'wait' : 'pointer' }} onClick={isLoading ? undefined : onClick}>
@@ -39,6 +44,7 @@ export const ItemCard: React.FC<ItemCardProps> = ({
           <CacheImage
             className="addon-card-image"
             srcPath={item.imagePath}
+            cacheRemote={shouldCacheRemote}
             alt={item.title}
             loading="lazy"
             decoding="async"
@@ -53,7 +59,7 @@ export const ItemCard: React.FC<ItemCardProps> = ({
           {isDownloaded && (
             <span className="badge badge-enabled">{t('workshop.badges.downloaded')}</span>
           )}
-          {!isDownloaded && isKnown && (
+          {!isDownloaded && isKnownEntry && (
             <span
               className="badge badge-disabled"
               style={{

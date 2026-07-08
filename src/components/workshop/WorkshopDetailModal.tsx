@@ -97,6 +97,9 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   if (collection) {
     const allWorkshopIds = collection.items.map((i) => i.workshopId);
     const collectionId = collection.workshopId || allWorkshopIds[0];
+    const isKnownCollection = !!collectionId && !!groups?.some(
+      (group) => group.workshopCollectionId?.trim() === collectionId,
+    );
     // Use the large background image from the scraped page if available
     const heroImage = pageDetails?.backgroundImageUrl || collection.imagePath;
     const collectionCreatorName = pageDetails?.creatorName || collection.creatorName;
@@ -122,7 +125,12 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
             <div className="detail-left">
               <div className="detail-image-box">
                 {heroImage ? (
-                  <CacheImage srcPath={heroImage} alt={collection.title} className="detail-image" />
+                  <CacheImage
+                    srcPath={heroImage}
+                    cacheRemote={isKnownCollection}
+                    alt={collection.title}
+                    className="detail-image"
+                  />
                 ) : (
                   <FolderPlus size={64} className="text-secondary" />
                 )}
@@ -176,6 +184,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 {collection.items.map((ci) => {
                   const isKnown = !!knownUninstalledAddons[ci.workshopId + '.vpk'];
                   const isDownloaded = !!addons[ci.workshopId + '.vpk'];
+                  const shouldCacheRemote = isDownloaded || isKnown;
                   return (
                     <div
                       key={ci.workshopId}
@@ -188,6 +197,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                     >
                       {ci.imagePath ? (
                         <CacheImage srcPath={ci.imagePath} alt={ci.title}
+                          cacheRemote={shouldCacheRemote}
                           className="addon-thumb" style={{ width: 40, height: 40, borderRadius: 6, objectFit: 'cover' }} />
                       ) : (
                         <div style={{ width: 40, height: 40, borderRadius: 6, background: 'var(--md-sys-color-surface-container-high)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -245,6 +255,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   const isDownloaded = !!addons[vpkKey];
   const downloading = downloadProgress[item.workshopId] !== undefined;
   const progress = downloadProgress[item.workshopId];
+  const shouldCacheRemote = isDownloaded || isKnown;
   const resolvedItem = resolveWorkshopItemAuthor(item);
   const displayAuthorName = pageDetails?.creatorName || resolvedItem.authorName;
   const displayAuthorUrl = pageDetails?.creatorProfileUrl || resolvedItem.authorUrl;
@@ -283,6 +294,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
               gallery={gallery}
               title={item.title}
               fallbackImage={item.imagePath}
+              cacheRemote={shouldCacheRemote}
             />
 
             <div className="detail-meta-list">

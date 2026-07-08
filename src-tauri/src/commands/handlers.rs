@@ -248,7 +248,19 @@ fn is_background_workshop_fetch_source(source: &str) -> bool {
     matches!(source, "startup-auto" | "background-refresh")
 }
 
-fn is_known_workshop_id(known_addons_path: &Path, workshop_id: &str) -> bool {
+fn is_known_group_collection_id(groups_path: &Path, workshop_id: &str) -> bool {
+    let workshop_id = workshop_id.trim();
+    if workshop_id.is_empty() {
+        return false;
+    }
+
+    load_groups(groups_path)
+        .into_iter()
+        .filter_map(|group| group.workshop_collection_id)
+        .any(|collection_id| collection_id.trim() == workshop_id)
+}
+
+fn is_known_workshop_id(known_addons_path: &Path, groups_path: &Path, workshop_id: &str) -> bool {
     let workshop_id = workshop_id.trim();
     if workshop_id.is_empty() {
         return false;
@@ -258,6 +270,10 @@ fn is_known_workshop_id(known_addons_path: &Path, workshop_id: &str) -> bool {
     if known_addons.contains_key(workshop_id)
         || known_addons.contains_key(&format!("{}.vpk", workshop_id))
     {
+        return true;
+    }
+
+    if is_known_group_collection_id(groups_path, workshop_id) {
         return true;
     }
 
@@ -272,12 +288,13 @@ fn ensure_background_workshop_fetch_allowed(
     source: &str,
     workshop_id: &str,
     known_addons_path: &Path,
+    groups_path: &Path,
 ) -> Result<(), String> {
     if !is_background_workshop_fetch_source(source) {
         return Ok(());
     }
 
-    if is_known_workshop_id(known_addons_path, workshop_id) {
+    if is_known_workshop_id(known_addons_path, groups_path, workshop_id) {
         return Ok(());
     }
 
@@ -285,6 +302,206 @@ fn ensure_background_workshop_fetch_allowed(
         "Background workshop fetch blocked: workshop item {} is not present in known_addons",
         workshop_id
     ))
+}
+
+fn clear_persisted_workshop_media_and_content(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    for key in [
+        "previewUrl",
+        "imagePath",
+        "shortDescription",
+        "galleryPreviewUrls",
+        "description",
+        "descriptionHtml",
+        "imageGallery",
+        "galleryUrls",
+        "backgroundImageUrl",
+    ] {
+        obj.remove(key);
+    }
+}
+
+fn persist_seen_workshop_item_entry(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    item: &WorkshopSeenItem,
+    source: &str,
+    now: &str,
+    allow_rich_content: bool,
+) {
+    insert_non_empty_string(obj, "workshopId", &item.workshop_id);
+    insert_non_empty_string(obj, "title", &item.title);
+    insert_non_empty_string(obj, "creatorName", &item.author_name);
+    insert_non_empty_string(obj, "authorName", &item.author_name);
+    insert_non_empty_string(obj, "creatorId", &item.author_id);
+    insert_non_empty_string(obj, "authorId", &item.author_id);
+    insert_non_empty_string(obj, "creatorProfileUrl", &item.author_url);
+    insert_non_empty_string(obj, "authorUrl", &item.author_url);
+    if let Some(vanity_id) = item.author_vanity_id.as_deref() {
+        insert_non_empty_string(obj, "creatorVanityId", vanity_id);
+    }
+    if let Some(account_id) = item.author_account_id.as_deref() {
+        insert_non_empty_string(obj, "creatorAccountId", account_id);
+    }
+    if let Some(steam_id) = item.author_steam_id.as_deref() {
+        insert_non_empty_string(obj, "creatorSteamId", steam_id);
+    }
+    if item.author_id.chars().all(|c| c.is_ascii_digit()) && !item.author_id.is_empty() {
+        insert_non_empty_string(obj, "creatorSteamId", &item.author_id);
+    }
+    if item.author_url.contains("/profiles/") {
+        if let Some(id) = item
+            .author_url
+            .split("/profiles/")
+            .nth(1)
+            .and_then(|s| s.split('/').next())
+        {
+            if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
+                insert_non_empty_string(obj, "creatorSteamId", id);
+            }
+        }
+    }
+    insert_optional_value(
+        obj,
+        "fileSizeDisplay",
+        item.file_size.clone().map(serde_json::Value::String),
+    );
+    insert_optional_value(obj, "tags", item.tags.clone().map(|v| serde_json::json!(v)));
+    insert_optional_u64(obj, "subscriptions", item.subscriptions);
+    insert_optional_u64(obj, "favorites", item.favorites);
+    insert_optional_u64(obj, "lifetimeSubscriptions", item.lifetime_subscriptions);
+    insert_optional_u64(obj, "lifetimeFavorites", item.lifetime_favorites);
+    insert_optional_u64(obj, "views", item.views);
+    insert_optional_u64(obj, "comments", item.comments);
+    insert_optional_u64(obj, "totalVotes", item.total_votes);
+    insert_optional_u64(obj, "timeCreated", item.time_created);
+    insert_optional_u64(obj, "timeUpdated", item.time_updated);
+    insert_optional_u64(obj, "childCount", item.child_count);
+    insert_optional_u64(obj, "previewCount", item.preview_count);
+    insert_optional_vec_string(obj, "childItemIds", item.child_item_ids.clone());
+    insert_non_empty_string(obj, "lastSeenSource", source);
+    insert_non_empty_string(obj, "lastSeenAt", now);
+
+    if allow_rich_content {
+        insert_non_empty_string(obj, "previewUrl", &item.image_path);
+        insert_non_empty_string(obj, "imagePath", &item.image_path);
+        insert_optional_value(
+            obj,
+            "shortDescription",
+            item.short_description
+                .clone()
+                .map(serde_json::Value::String),
+        );
+        insert_optional_vec_string(obj, "galleryPreviewUrls", item.gallery_preview_urls.clone());
+    } else {
+        clear_persisted_workshop_media_and_content(obj);
+    }
+}
+
+fn persist_workshop_page_details_entry(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    workshop_id: &str,
+    details: &serde_json::Value,
+    source: &str,
+    now: &str,
+    allow_rich_content: bool,
+) {
+    insert_non_empty_string(obj, "workshopId", workshop_id);
+    insert_non_empty_string(obj, "lastPageFetchedAt", now);
+    insert_non_empty_string(obj, "lastPageSource", source);
+    if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "title", title);
+    }
+    if let Some(creator_name) = details.get("creatorName").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "creatorName", creator_name);
+        insert_non_empty_string(obj, "authorName", creator_name);
+    }
+    if let Some(profile_url) = details.get("creatorProfileUrl").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "creatorProfileUrl", profile_url);
+        insert_non_empty_string(obj, "authorUrl", profile_url);
+    }
+    if let Some(steam_id) = details.get("creatorSteamId").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "creatorSteamId", steam_id);
+        insert_non_empty_string(obj, "creatorId", steam_id);
+    }
+    if let Some(vanity_id) = details.get("creatorVanityId").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "creatorVanityId", vanity_id);
+        if obj
+            .get("creatorId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            insert_non_empty_string(obj, "creatorId", vanity_id);
+        }
+    }
+    if let Some(account_id) = details.get("creatorAccountId").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "creatorAccountId", account_id);
+    }
+    if let Some(file_size) = details.get("fileSizeDisplay").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "fileSizeDisplay", file_size);
+    }
+    if let Some(posted_text) = details.get("postedDateText").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "postedDateText", posted_text);
+    }
+    if let Some(updated_text) = details.get("updatedDateText").and_then(|v| v.as_str()) {
+        insert_non_empty_string(obj, "updatedDateText", updated_text);
+    }
+    insert_optional_value(
+        obj,
+        "changeNoteCount",
+        details.get("changeNoteCount").cloned(),
+    );
+    insert_optional_value(obj, "ratingStars", details.get("ratingStars").cloned());
+    insert_optional_value(obj, "ratingCount", details.get("ratingCount").cloned());
+    insert_optional_value(
+        obj,
+        "uniqueVisitors",
+        details.get("uniqueVisitors").cloned(),
+    );
+    insert_optional_value(
+        obj,
+        "currentSubscribers",
+        details.get("currentSubscribers").cloned(),
+    );
+    insert_optional_value(
+        obj,
+        "currentFavorites",
+        details.get("currentFavorites").cloned(),
+    );
+
+    if let Some(tags) = details.get("tags").cloned() {
+        obj.insert("pageTags".to_string(), tags);
+    }
+    if let Some(required) = details.get("requiredItems").cloned() {
+        obj.insert("requiredItems".to_string(), required);
+    }
+    if let Some(parent_collections) = details.get("parentCollections").cloned() {
+        obj.insert("parentCollections".to_string(), parent_collections);
+    }
+
+    if allow_rich_content {
+        if let Some(preview_url) = details.get("previewUrl").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "previewUrl", preview_url);
+            insert_non_empty_string(obj, "imagePath", preview_url);
+        }
+        if let Some(description) = details.get("description").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "description", description);
+        }
+        if let Some(description_html) = details.get("descriptionHtml").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "descriptionHtml", description_html);
+        }
+        if let Some(gallery) = details.get("imageGallery").cloned() {
+            obj.insert("imageGallery".to_string(), gallery.clone());
+            obj.insert("galleryUrls".to_string(), gallery);
+        }
+        if let Some(background) = details.get("backgroundImageUrl").and_then(|v| v.as_str()) {
+            insert_non_empty_string(obj, "backgroundImageUrl", background);
+        }
+    } else {
+        clear_persisted_workshop_media_and_content(obj);
+    }
 }
 
 fn request_download_cancellation(state: &crate::AppState, workshop_id: &str) -> Result<(), String> {
@@ -689,7 +906,7 @@ fn save_workshop_cache(
         "schemaVersion": 2,
         "items": cache,
     }))
-        .map_err(|e| format!("Failed to serialize workshop cache: {}", e))?;
+    .map_err(|e| format!("Failed to serialize workshop cache: {}", e))?;
     fs::write(cache_path, json).map_err(|e| format!("Failed to write workshop cache: {}", e))
 }
 
@@ -1846,7 +2063,10 @@ pub async fn cache_remote_image(
         .await
         .map_err(|e| format!("Failed to fetch remote image: {}", e))?;
     if !response.status().is_success() {
-        return Err(format!("Remote image responded with status {}", response.status()));
+        return Err(format!(
+            "Remote image responded with status {}",
+            response.status()
+        ));
     }
 
     let content_type = response
@@ -3124,15 +3344,14 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
     if !extra_detail_ids.is_empty() {
         extra_detail_ids.sort();
         extra_detail_ids.dedup();
-        if let Ok(extra_details) =
-            fetch_steam_details_hybrid(
-                &state.workshop_service,
-                &extra_detail_ids,
-                source_policy.allow_bridge(),
-                source_policy.allow_web_api(),
-                source_policy.source_order(),
-            )
-            .await
+        if let Ok(extra_details) = fetch_steam_details_hybrid(
+            &state.workshop_service,
+            &extra_detail_ids,
+            source_policy.allow_bridge(),
+            source_policy.allow_web_api(),
+            source_policy.source_order(),
+        )
+        .await
         {
             for details in extra_details {
                 if let Some(w_id) = details.get("publishedfileid").and_then(|id| id.as_str()) {
@@ -3320,6 +3539,7 @@ pub async fn fetch_workshop_html(
             &source,
             &workshop_id,
             &state.known_addons_path,
+            &state.groups_path,
         ) {
             let _ = append_workshop_crawl_log_internal(
                 &state.workshop_crawl_log_path,
@@ -3864,67 +4084,13 @@ pub async fn record_workshop_items_seen(
             continue;
         }
 
+        let allow_rich_content = is_known_workshop_id(
+            &state.known_addons_path,
+            &state.groups_path,
+            &item.workshop_id,
+        );
         let obj = cache_entry_object(&mut cache, &item.workshop_id);
-        insert_non_empty_string(obj, "workshopId", &item.workshop_id);
-        insert_non_empty_string(obj, "title", &item.title);
-        insert_non_empty_string(obj, "previewUrl", &item.image_path);
-        insert_non_empty_string(obj, "imagePath", &item.image_path);
-        insert_non_empty_string(obj, "creatorName", &item.author_name);
-        insert_non_empty_string(obj, "authorName", &item.author_name);
-        insert_non_empty_string(obj, "creatorId", &item.author_id);
-        insert_non_empty_string(obj, "authorId", &item.author_id);
-        insert_non_empty_string(obj, "creatorProfileUrl", &item.author_url);
-        insert_non_empty_string(obj, "authorUrl", &item.author_url);
-        if let Some(vanity_id) = item.author_vanity_id.as_deref() {
-            insert_non_empty_string(obj, "creatorVanityId", vanity_id);
-        }
-        if let Some(account_id) = item.author_account_id.as_deref() {
-            insert_non_empty_string(obj, "creatorAccountId", account_id);
-        }
-        if let Some(steam_id) = item.author_steam_id.as_deref() {
-            insert_non_empty_string(obj, "creatorSteamId", steam_id);
-        }
-        if item.author_id.chars().all(|c| c.is_ascii_digit()) && !item.author_id.is_empty() {
-            insert_non_empty_string(obj, "creatorSteamId", &item.author_id);
-        }
-        if item.author_url.contains("/profiles/") {
-            if let Some(id) = item
-                .author_url
-                .split("/profiles/")
-                .nth(1)
-                .and_then(|s| s.split('/').next())
-            {
-                if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-                    insert_non_empty_string(obj, "creatorSteamId", id);
-                }
-            }
-        }
-        insert_optional_value(
-            obj,
-            "shortDescription",
-            item.short_description.map(serde_json::Value::String),
-        );
-        insert_optional_value(
-            obj,
-            "fileSizeDisplay",
-            item.file_size.map(serde_json::Value::String),
-        );
-        insert_optional_value(obj, "tags", item.tags.map(|v| serde_json::json!(v)));
-        insert_optional_u64(obj, "subscriptions", item.subscriptions);
-        insert_optional_u64(obj, "favorites", item.favorites);
-        insert_optional_u64(obj, "lifetimeSubscriptions", item.lifetime_subscriptions);
-        insert_optional_u64(obj, "lifetimeFavorites", item.lifetime_favorites);
-        insert_optional_u64(obj, "views", item.views);
-        insert_optional_u64(obj, "comments", item.comments);
-        insert_optional_u64(obj, "totalVotes", item.total_votes);
-        insert_optional_u64(obj, "timeCreated", item.time_created);
-        insert_optional_u64(obj, "timeUpdated", item.time_updated);
-        insert_optional_u64(obj, "childCount", item.child_count);
-        insert_optional_u64(obj, "previewCount", item.preview_count);
-        insert_optional_vec_string(obj, "childItemIds", item.child_item_ids);
-        insert_optional_vec_string(obj, "galleryPreviewUrls", item.gallery_preview_urls);
-        insert_non_empty_string(obj, "lastSeenSource", &source);
-        insert_non_empty_string(obj, "lastSeenAt", &now);
+        persist_seen_workshop_item_entry(obj, &item, &source, &now, allow_rich_content);
     }
 
     save_workshop_cache(&state.workshop_cache_path, &cache)?;
@@ -3949,101 +4115,28 @@ pub async fn persist_workshop_page_details(
     let mut cache = load_workshop_cache(&state.workshop_cache_path);
     let now = chrono::Utc::now().to_rfc3339();
     let source = source.unwrap_or_else(|| "unknown".to_string());
-    ensure_background_workshop_fetch_allowed(&source, &workshop_id, &state.known_addons_path)?;
+    ensure_background_workshop_fetch_allowed(
+        &source,
+        &workshop_id,
+        &state.known_addons_path,
+        &state.groups_path,
+    )?;
+    let allow_rich_content = is_known_workshop_id(
+        &state.known_addons_path,
+        &state.groups_path,
+        &workshop_id,
+    );
 
     {
         let obj = cache_entry_object(&mut cache, &workshop_id);
-        insert_non_empty_string(obj, "workshopId", &workshop_id);
-        insert_non_empty_string(obj, "lastPageFetchedAt", &now);
-        insert_non_empty_string(obj, "lastPageSource", &source);
-        if let Some(title) = details.get("title").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "title", title);
-        }
-        if let Some(preview_url) = details.get("previewUrl").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "previewUrl", preview_url);
-            insert_non_empty_string(obj, "imagePath", preview_url);
-        }
-        if let Some(description) = details.get("description").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "description", description);
-        }
-        if let Some(description_html) = details.get("descriptionHtml").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "descriptionHtml", description_html);
-        }
-        if let Some(creator_name) = details.get("creatorName").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "creatorName", creator_name);
-            insert_non_empty_string(obj, "authorName", creator_name);
-        }
-        if let Some(profile_url) = details.get("creatorProfileUrl").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "creatorProfileUrl", profile_url);
-            insert_non_empty_string(obj, "authorUrl", profile_url);
-        }
-        if let Some(steam_id) = details.get("creatorSteamId").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "creatorSteamId", steam_id);
-            insert_non_empty_string(obj, "creatorId", steam_id);
-        }
-        if let Some(vanity_id) = details.get("creatorVanityId").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "creatorVanityId", vanity_id);
-            if obj
-                .get("creatorId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-            {
-                insert_non_empty_string(obj, "creatorId", vanity_id);
-            }
-        }
-        if let Some(account_id) = details.get("creatorAccountId").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "creatorAccountId", account_id);
-        }
-        if let Some(file_size) = details.get("fileSizeDisplay").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "fileSizeDisplay", file_size);
-        }
-        if let Some(posted_text) = details.get("postedDateText").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "postedDateText", posted_text);
-        }
-        if let Some(updated_text) = details.get("updatedDateText").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "updatedDateText", updated_text);
-        }
-        insert_optional_value(
+        persist_workshop_page_details_entry(
             obj,
-            "changeNoteCount",
-            details.get("changeNoteCount").cloned(),
+            &workshop_id,
+            &details,
+            &source,
+            &now,
+            allow_rich_content,
         );
-        insert_optional_value(obj, "ratingStars", details.get("ratingStars").cloned());
-        insert_optional_value(obj, "ratingCount", details.get("ratingCount").cloned());
-        insert_optional_value(
-            obj,
-            "uniqueVisitors",
-            details.get("uniqueVisitors").cloned(),
-        );
-        insert_optional_value(
-            obj,
-            "currentSubscribers",
-            details.get("currentSubscribers").cloned(),
-        );
-        insert_optional_value(
-            obj,
-            "currentFavorites",
-            details.get("currentFavorites").cloned(),
-        );
-
-        if let Some(gallery) = details.get("imageGallery").cloned() {
-            obj.insert("imageGallery".to_string(), gallery.clone());
-            obj.insert("galleryUrls".to_string(), gallery);
-        }
-        if let Some(tags) = details.get("tags").cloned() {
-            obj.insert("pageTags".to_string(), tags);
-        }
-        if let Some(required) = details.get("requiredItems").cloned() {
-            obj.insert("requiredItems".to_string(), required);
-        }
-        if let Some(parent_collections) = details.get("parentCollections").cloned() {
-            obj.insert("parentCollections".to_string(), parent_collections);
-        }
-        if let Some(background) = details.get("backgroundImageUrl").and_then(|v| v.as_str()) {
-            insert_non_empty_string(obj, "backgroundImageUrl", background);
-        }
     }
 
     if let Some(required_items) = details.get("requiredItems").and_then(|v| v.as_array()) {
@@ -4131,14 +4224,26 @@ pub async fn append_workshop_crawl_log(
 mod tests {
     use super::{
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
-        is_background_workshop_fetch_source,
+        is_background_workshop_fetch_source, persist_seen_workshop_item_entry,
+        persist_workshop_page_details_entry,
     };
+    use crate::commands::types::WorkshopSeenItem;
     use serde_json::json;
     use std::fs;
 
     fn write_known_addons_file(name: &str, value: serde_json::Value) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "left4addons-{}-{}-known_addons.json",
+            name,
+            std::process::id()
+        ));
+        fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+        path
+    }
+
+    fn write_groups_file(name: &str, value: serde_json::Value) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "left4addons-{}-{}-groups.json",
             name,
             std::process::id()
         ));
@@ -4170,16 +4275,54 @@ mod tests {
                 }
             }),
         );
+        let groups_path = write_groups_file("allowed", json!([]));
 
-        let allowed = ensure_background_workshop_fetch_allowed("startup-auto", "12345", &path);
-        let blocked = ensure_background_workshop_fetch_allowed("startup-auto", "99999", &path);
-        let manual = ensure_background_workshop_fetch_allowed("workshop-detail", "99999", &path);
+        let allowed =
+            ensure_background_workshop_fetch_allowed("startup-auto", "12345", &path, &groups_path);
+        let blocked =
+            ensure_background_workshop_fetch_allowed("startup-auto", "99999", &path, &groups_path);
+        let manual = ensure_background_workshop_fetch_allowed(
+            "workshop-detail",
+            "99999",
+            &path,
+            &groups_path,
+        );
 
         fs::remove_file(&path).ok();
+        fs::remove_file(&groups_path).ok();
 
         assert!(allowed.is_ok());
         assert!(blocked.is_err());
         assert!(manual.is_ok());
+    }
+
+    #[test]
+    fn background_fetch_allows_known_collection_ids() {
+        let known_addons_path = write_known_addons_file("collection-allowed", json!({}));
+        let groups_path = write_groups_file(
+            "collection-allowed",
+            json!([
+                {
+                    "id": "group-1",
+                    "name": "Known Collection",
+                    "addons": [],
+                    "workshopCollectionId": "54321",
+                    "source": "workshop-import"
+                }
+            ]),
+        );
+
+        let allowed = ensure_background_workshop_fetch_allowed(
+            "startup-auto",
+            "54321",
+            &known_addons_path,
+            &groups_path,
+        );
+
+        fs::remove_file(&known_addons_path).ok();
+        fs::remove_file(&groups_path).ok();
+
+        assert!(allowed.is_ok());
     }
 
     #[test]
@@ -4199,5 +4342,127 @@ mod tests {
             message.as_deref(),
             Some("Too many requests, please try again later.")
         );
+    }
+
+    #[test]
+    fn unknown_seen_items_do_not_persist_images_or_descriptions() {
+        let mut obj = json!({
+            "previewUrl": "https://example.com/old-preview.jpg",
+            "imagePath": "https://example.com/old-preview.jpg",
+            "shortDescription": "old description",
+            "galleryPreviewUrls": ["https://example.com/old-gallery.jpg"],
+            "description": "old page description"
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        persist_seen_workshop_item_entry(
+            &mut obj,
+            &WorkshopSeenItem {
+                workshop_id: "99999".to_string(),
+                title: "Unknown item".to_string(),
+                image_path: "https://example.com/preview.jpg".to_string(),
+                short_description: Some("new description".to_string()),
+                gallery_preview_urls: Some(vec!["https://example.com/gallery.jpg".to_string()]),
+                ..WorkshopSeenItem::default()
+            },
+            "workshop-browser",
+            "2026-07-09T00:00:00Z",
+            false,
+        );
+
+        assert_eq!(
+            obj.get("title").and_then(|v| v.as_str()),
+            Some("Unknown item")
+        );
+        assert!(obj.get("previewUrl").is_none());
+        assert!(obj.get("imagePath").is_none());
+        assert!(obj.get("shortDescription").is_none());
+        assert!(obj.get("galleryPreviewUrls").is_none());
+        assert!(obj.get("description").is_none());
+    }
+
+    #[test]
+    fn known_seen_items_still_persist_preview_fields() {
+        let mut obj = serde_json::Map::new();
+
+        persist_seen_workshop_item_entry(
+            &mut obj,
+            &WorkshopSeenItem {
+                workshop_id: "12345".to_string(),
+                title: "Known item".to_string(),
+                image_path: "https://example.com/preview.jpg".to_string(),
+                short_description: Some("description".to_string()),
+                gallery_preview_urls: Some(vec!["https://example.com/gallery.jpg".to_string()]),
+                ..WorkshopSeenItem::default()
+            },
+            "workshop-browser",
+            "2026-07-09T00:00:00Z",
+            true,
+        );
+
+        assert_eq!(
+            obj.get("previewUrl").and_then(|v| v.as_str()),
+            Some("https://example.com/preview.jpg")
+        );
+        assert_eq!(
+            obj.get("imagePath").and_then(|v| v.as_str()),
+            Some("https://example.com/preview.jpg")
+        );
+        assert_eq!(
+            obj.get("shortDescription").and_then(|v| v.as_str()),
+            Some("description")
+        );
+        assert_eq!(
+            obj.get("galleryPreviewUrls")
+                .and_then(|v| v.as_array())
+                .map(|v| v.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn unknown_page_details_do_not_persist_rich_content() {
+        let mut obj = json!({
+            "previewUrl": "https://example.com/old-preview.jpg",
+            "imagePath": "https://example.com/old-preview.jpg",
+            "description": "old description",
+            "descriptionHtml": "<p>old</p>",
+            "imageGallery": ["https://example.com/old-gallery.jpg"],
+            "galleryUrls": ["https://example.com/old-gallery.jpg"],
+            "backgroundImageUrl": "https://example.com/old-bg.jpg"
+        })
+        .as_object()
+        .cloned()
+        .unwrap();
+
+        persist_workshop_page_details_entry(
+            &mut obj,
+            "99999",
+            &json!({
+                "title": "Unknown detail item",
+                "previewUrl": "https://example.com/preview.jpg",
+                "description": "new description",
+                "descriptionHtml": "<p>new</p>",
+                "imageGallery": ["https://example.com/gallery.jpg"],
+                "backgroundImageUrl": "https://example.com/bg.jpg"
+            }),
+            "workshop-detail",
+            "2026-07-09T00:00:00Z",
+            false,
+        );
+
+        assert_eq!(
+            obj.get("title").and_then(|v| v.as_str()),
+            Some("Unknown detail item")
+        );
+        assert!(obj.get("previewUrl").is_none());
+        assert!(obj.get("imagePath").is_none());
+        assert!(obj.get("description").is_none());
+        assert!(obj.get("descriptionHtml").is_none());
+        assert!(obj.get("imageGallery").is_none());
+        assert!(obj.get("galleryUrls").is_none());
+        assert!(obj.get("backgroundImageUrl").is_none());
     }
 }

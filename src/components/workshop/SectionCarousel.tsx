@@ -20,6 +20,7 @@ interface SectionCarouselProps {
   sectionType: string;
   addons: Record<string, any>;
   knownUninstalledAddons: Record<string, any>;
+  knownCollectionIds?: Set<string>;
   onItemClick: (item: WorkshopItem) => void;
   onViewAll: (section: HomepageSection) => void;
   loadingDetailId?: string | null;
@@ -30,6 +31,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
   sectionType,
   addons,
   knownUninstalledAddons,
+  knownCollectionIds,
   onItemClick,
   onViewAll,
   loadingDetailId,
@@ -106,6 +108,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
             section={sectionType}
             addons={addons}
             knownUninstalledAddons={knownUninstalledAddons}
+            knownCollectionIds={knownCollectionIds}
             onClick={() => onItemClick(item)}
             isLoading={loadingDetailId === item.workshopId}
           />
