@@ -191,9 +191,10 @@ pub async fn fetch_steam_details_web(workshop_ids: &[String]) -> Result<Vec<Valu
 
 pub async fn fetch_collection_children_web(collection_id: &str) -> Result<Vec<String>, String> {
     let url = "https://api.steampowered.com/ISteamRemoteStorage/GetCollectionDetails/v1/";
-    let mut params = Vec::new();
-    params.push(("collectioncount".to_string(), "1".to_string()));
-    params.push(("publishedfileids[0]".to_string(), collection_id.to_string()));
+    let params = vec![
+        ("collectioncount".to_string(), "1".to_string()),
+        ("publishedfileids[0]".to_string(), collection_id.to_string()),
+    ];
 
     let client = reqwest::Client::new();
     let res = client

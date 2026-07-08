@@ -137,7 +137,14 @@ export const DetailDrawer: React.FC<DetailDrawerProps> = ({
         />
       ) : null}
     </div>
-  );
+    <AlertModal
+      open={alertInfo.open}
+      title={alertInfo.title}
+      message={alertInfo.message}
+      onClose={() => setAlertInfo({ open: false, title: '', message: '' })}
+    />
+  </>
+);
 };
 
 // ── Item detail sub-component ──────────────────────────────────────────────────
@@ -586,12 +593,6 @@ const CollectionDetail: React.FC<CollectionDetailProps> = ({
           </button>
         </div>
       </div>
-      <AlertModal
-        open={alertInfo.open}
-        title={alertInfo.title}
-        message={alertInfo.message}
-        onClose={() => setAlertInfo({ open: false, title: '', message: '' })}
-      />
-    </>
+    </div>
   );
 };

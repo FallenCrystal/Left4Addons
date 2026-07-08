@@ -916,8 +916,8 @@ pub async fn scan_addons_internal(
                     .cloned()
             });
 
-        let has_capitalized_keys = cached.as_ref().map_or(false, |addon| {
-            addon.addon_info.as_object().map_or(false, |obj| {
+        let has_capitalized_keys = cached.as_ref().is_some_and(|addon| {
+            addon.addon_info.as_object().is_some_and(|obj| {
                 obj.keys().any(|k| k.chars().any(|c| c.is_uppercase()))
             })
         });
@@ -1789,11 +1789,9 @@ pub async fn rename_addon(
             let old_img = state.cache_dir.join(format!("{:x}_image.jpg", old_hash));
             let new_img = state.cache_dir.join(format!("{:x}_image.jpg", new_hash));
 
-            if old_img.exists() {
-                if let Ok(_) = fs::rename(&old_img, &new_img) {
-                    if let Some(addon_ref) = db.addons.get_mut(&id) {
-                        addon_ref.image_path = Some(format!("/cache/{:x}_image.jpg", new_hash));
-                    }
+            if old_img.exists() && fs::rename(&old_img, &new_img).is_ok() {
+                if let Some(addon_ref) = db.addons.get_mut(&id) {
+                    addon_ref.image_path = Some(format!("/cache/{:x}_image.jpg", new_hash));
                 }
             }
         }
@@ -1954,6 +1952,7 @@ pub async fn rename_addons(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn group_action(
     action: String,
     name: Option<String>,
@@ -2854,7 +2853,7 @@ pub async fn download_addon(
     app_handle: AppHandle,
 ) -> Result<Database, String> {
     let details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, &[workshop_id.clone()]).await?;
+        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }
@@ -3087,7 +3086,7 @@ pub async fn add_known_addon(
     let mut db = state.db.lock().await;
 
     let details_list =
-        fetch_steam_details_hybrid(&state.workshop_service, &[workshop_id.clone()]).await?;
+        fetch_steam_details_hybrid(&state.workshop_service, std::slice::from_ref(&workshop_id)).await?;
     if details_list.is_empty() {
         return Err("Failed to retrieve details for workshop item".to_string());
     }

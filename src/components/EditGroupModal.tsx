@@ -40,7 +40,7 @@ export const EditGroupModal: React.FC<EditGroupModalProps> = ({
       setCollectionId(currentCollectionId);
       setShowConfirmSave(false);
     }
-  }, [open, groupId]);
+  }, [open, groupId, currentName, currentTags, currentCollectionId]);
 
   if (!open) return null;
 

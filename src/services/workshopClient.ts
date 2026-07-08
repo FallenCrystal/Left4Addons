@@ -1,7 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import {
   HomepageSection,
-  TagCategory,
   WorkshopCapabilities,
   WorkshopItem,
 } from '../components/workshop/types';
