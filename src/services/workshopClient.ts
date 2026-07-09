@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import {
   HomepageSection,
+  TagCategory,
   WorkshopCapabilities,
   WorkshopItem,
   WorkshopPageDetails,
@@ -717,7 +718,7 @@ export async function fetchWorkshopHome() {
     return result;
   }
 
-  let tagCategories = [];
+  let tagCategories: TagCategory[] = [];
   let htmlSections: HomepageSection[] = [];
   if (allowHtml) try {
     const html = await invoke<string>('fetch_workshop_html', {

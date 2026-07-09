@@ -147,7 +147,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     try {
       const data = await fetchWorkshopHome();
       setHomepageSections(data.sections);
-      onRecordSeenItems?.(data.sections.flatMap((sec) => sec.items), 'workshop-home');
+      onRecordSeenItems?.(data.sections.flatMap((sec: { items: WorkshopItem[] }) => sec.items), 'workshop-home');
       setTagCategories(data.tagCategories);
     } catch (err) {
       console.error('Failed to fetch homepage:', err);

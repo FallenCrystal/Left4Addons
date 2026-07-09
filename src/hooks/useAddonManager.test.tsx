@@ -49,6 +49,7 @@ describe('useAddonManager', () => {
   const mockSettings: Settings = {
     workshopDir: '/path/to/workshop',
     loadingDir: '/path/to/loading',
+    downloadConcurrency: 2,
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
@@ -324,6 +325,7 @@ describe('useAddonManager', () => {
       if (cmd === 'save_settings') {
         expect(args).toEqual({
           loadingDir: '/new/loading/dir',
+          downloadConcurrency: 2,
           enableDummyBypass: false,
           suppressSdkUnavailableWarning: false,
           disableSteamworksSdk: false,
@@ -345,7 +347,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir', false, false, false, false);
+      savePromise = result.current.saveSettings('/new/loading/dir', 2, false, false, false, false);
     });
 
     // isSubmitting should be true immediately after invoking

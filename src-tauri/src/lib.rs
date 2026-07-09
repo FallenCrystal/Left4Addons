@@ -17,6 +17,7 @@ pub struct AppState {
     pub workshop_crawl_log_path: PathBuf,
     pub background_tasks_path: PathBuf,
     pub cache_dir: PathBuf,
+    pub download_cache_dir: PathBuf,
     pub workshop_service: steam::WorkshopService,
     pub db: Mutex<commands::Database>,
     pub addon_watcher: StdMutex<watcher::AddonWatcherController>,
@@ -61,10 +62,12 @@ pub fn run() {
             let config_dir = runtime_dir.join("config");
             let cache_root_dir = runtime_dir.join("cache");
             let cache_dir = cache_root_dir.join("images");
+            let download_cache_dir = cache_root_dir.join("downloading");
 
             let _ = std::fs::create_dir_all(&config_dir);
             let _ = std::fs::create_dir_all(&cache_root_dir);
             let _ = std::fs::create_dir_all(&cache_dir);
+            let _ = std::fs::create_dir_all(&download_cache_dir);
 
             migrate_data(
                 app.path().app_data_dir().ok().as_deref(),
@@ -99,6 +102,7 @@ pub fn run() {
                 workshop_crawl_log_path,
                 background_tasks_path,
                 cache_dir,
+                download_cache_dir,
                 workshop_service: steam::WorkshopService::new(&bridge_base_dir),
                 db: Mutex::new(db),
                 addon_watcher: StdMutex::new(watcher::AddonWatcherController::default()),

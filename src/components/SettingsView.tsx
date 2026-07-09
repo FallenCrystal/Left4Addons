@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database } from 'lucide-react';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download } from 'lucide-react';
 import { Settings, WorkshopSourceSettings } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from './TransHTML';
+
+const MIN_DOWNLOAD_CONCURRENCY = 1;
+const MAX_DOWNLOAD_CONCURRENCY = 8;
 
 interface SettingsViewProps {
   settings: Settings;
   isSubmitting: boolean;
   onConfirm: (
     loadingDir: string,
+    downloadConcurrency: number,
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
@@ -33,14 +37,22 @@ const SOURCE_LABEL_KEYS: Record<string, string> = {
   'steamcommunity-html': 'settings.sourceSteamCommunityHtml',
 };
 
+function clampDownloadConcurrency(value: number) {
+  if (!Number.isFinite(value)) {
+    return 2;
+  }
+  return Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(MIN_DOWNLOAD_CONCURRENCY, Math.trunc(value)));
+}
+
 export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   isSubmitting,
   onConfirm,
 }) => {
   const { t, i18n } = useTranslation();
-  const [activeTab, setActiveTab] = useState<'path' | 'language' | 'experimental' | 'sdk' | 'sources' | 'about'>('path');
+  const [activeTab, setActiveTab] = useState<'path' | 'download' | 'language' | 'experimental' | 'sdk' | 'sources' | 'about'>('path');
   const [loadingDir, setLoadingDir] = useState('');
+  const [downloadConcurrencyInput, setDownloadConcurrencyInput] = useState('2');
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
   const [suppressSdkUnavailableWarning, setSuppressSdkUnavailableWarning] = useState(false);
   const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
@@ -49,6 +61,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
+    setDownloadConcurrencyInput(String(clampDownloadConcurrency(settings.downloadConcurrency)));
     setEnableDummyBypass(settings.enableDummyBypass || false);
     setSuppressSdkUnavailableWarning(settings.suppressSdkUnavailableWarning || false);
     setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
@@ -66,8 +79,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!loadingDir.trim() || isSubmitting) return;
+    const downloadConcurrency = clampDownloadConcurrency(Number.parseInt(downloadConcurrencyInput, 10));
+    setDownloadConcurrencyInput(String(downloadConcurrency));
     await onConfirm(
       loadingDir.trim(),
+      downloadConcurrency,
       enableDummyBypass,
       suppressSdkUnavailableWarning,
       disableSteamworksSdk,
@@ -79,6 +95,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const changeLanguage = (lng: string) => {
     i18n.changeLanguage(lng);
     localStorage.setItem('i18n_lang', lng);
+  };
+
+  const handleDownloadConcurrencyBlur = () => {
+    setDownloadConcurrencyInput(String(clampDownloadConcurrency(Number.parseInt(downloadConcurrencyInput, 10))));
   };
 
   const featuresList = t('settings.features', { returnObjects: true }) as string[];
@@ -148,6 +168,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     });
   };
 
+  const downloadCacheDir = '/l4a/cache/downloading';
+
   return (
     <div className="settings-view">
       {/* Settings Navigation Sidebar */}
@@ -159,6 +181,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         >
           <FolderOpen size={18} />
           <span>{t('settings.pathSettings')}</span>
+        </button>
+        <button
+          className={`settings-nav-item ${activeTab === 'download' ? 'active' : ''}`}
+          onClick={() => setActiveTab('download')}
+          type="button"
+        >
+          <Download size={18} />
+          <span>{t('settings.download')}</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'language' ? 'active' : ''}`}
@@ -296,6 +326,77 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
               </div>
             </div>
+          </div>
+        )}
+
+        {activeTab === 'download' && (
+          <div>
+            <h2 className="settings-title">{t('settings.downloadTitle')}</h2>
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
+              {t('settings.downloadDesc')}
+            </p>
+            <form onSubmit={handleSubmit}>
+              <div className="settings-section">
+                <div className="form-group" style={{ marginBottom: '24px' }}>
+                  <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                    {t('settings.downloadConcurrencyLabel')}
+                  </label>
+                  <input
+                    type="number"
+                    className="form-input"
+                    value={downloadConcurrencyInput}
+                    onChange={(e) => setDownloadConcurrencyInput(e.target.value)}
+                    onBlur={handleDownloadConcurrencyBlur}
+                    min={MIN_DOWNLOAD_CONCURRENCY}
+                    max={MAX_DOWNLOAD_CONCURRENCY}
+                    inputMode="numeric"
+                    disabled={isSubmitting}
+                    style={{ width: '180px' }}
+                  />
+                  <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
+                    {t('settings.downloadConcurrencyHelp', {
+                      min: MIN_DOWNLOAD_CONCURRENCY,
+                      max: MAX_DOWNLOAD_CONCURRENCY,
+                    })}
+                  </span>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                    {t('settings.downloadTempDirLabel')}
+                  </label>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={downloadCacheDir}
+                    readOnly
+                    disabled
+                    style={{ width: '100%' }}
+                  />
+                  <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px', lineHeight: '1.5' }}>
+                    {t('settings.downloadTempDirHelp')}
+                  </span>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-start', marginTop: '32px' }}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={isSubmitting || !loadingDir.trim()}
+                  style={{ minWidth: '160px', height: '42px' }}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <RefreshCw className="animate-spin" size={16} />
+                      <span>{t('settings.savingAndScanning')}</span>
+                    </>
+                  ) : (
+                    <span>{t('settings.saveAndRescan')}</span>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         )}
 

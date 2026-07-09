@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, BackgroundTask, DatabasePayload } from '../types/addon';
-import { fetchWorkshopItem, fetchWorkshopPageDetails, persistWorkshopPageDetails } from '../services/workshopClient';
+import { fetchWorkshopItem } from '../services/workshopClient';
 
-const DOWNLOAD_CONCURRENCY = 3;
 const WORKSHOP_CRAWL_COOLDOWN_MS = 6000;
 
 interface UseBackgroundTasksArgs {
   enabled: boolean;
+  downloadConcurrency: number;
   addons: Record<string, Addon>;
   knownUninstalledAddons: Record<string, Addon>;
   updateLocalState: (data: DatabasePayload) => void;
@@ -39,6 +39,7 @@ function trimTasks(tasks: BackgroundTask[]) {
 
 export function useBackgroundTasks({
   enabled,
+  downloadConcurrency,
   addons,
   knownUninstalledAddons,
   updateLocalState,
@@ -124,16 +125,21 @@ export function useBackgroundTasks({
   }, [onDownloadCancelled, onDownloadSuccess, onTaskError, patchTask, updateLocalState]);
 
   const processDownloadQueue = useCallback(() => {
-    while (activeDownloadsRef.current < DOWNLOAD_CONCURRENCY) {
+    const concurrency = Math.max(1, Math.trunc(downloadConcurrency || 1));
+    while (activeDownloadsRef.current < concurrency) {
       const next = tasksRef.current.find((task) => task.kind === 'download' && task.status === 'queued');
       if (!next) return;
       void runDownloadTask(next);
     }
-  }, [runDownloadTask]);
+  }, [downloadConcurrency, runDownloadTask]);
 
   useEffect(() => {
     processDownloadQueueRef.current = processDownloadQueue;
   }, [processDownloadQueue]);
+
+  useEffect(() => {
+    processDownloadQueueRef.current();
+  }, [downloadConcurrency]);
 
   const enqueueDownloads = useCallback((
     items: (string | { workshopId: string; title?: string; imagePath?: string })[],

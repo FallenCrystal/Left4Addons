@@ -7,6 +7,7 @@ describe('SettingsView', () => {
   const baseSettings: Settings = {
     workshopDir: '/game/addons/workshop',
     loadingDir: '/game/addons',
+    downloadConcurrency: 2,
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
@@ -43,9 +44,39 @@ describe('SettingsView', () => {
 
     expect(onConfirm).toHaveBeenCalledWith(
       '/game/addons',
+      2,
       false,
       false,
       true,
+      false,
+      baseSettings.workshopSourceSettings,
+    );
+  });
+
+  test('submits clamped download concurrency from the download tab', async () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <SettingsView
+        settings={baseSettings}
+        isSubmitting={false}
+        onConfirm={onConfirm}
+      />
+    );
+
+    fireEvent.click(screen.getByText('下载'));
+
+    const input = screen.getByRole('spinbutton') as HTMLInputElement;
+    fireEvent.change(input, { target: { value: '99' } });
+    fireEvent.blur(input);
+    fireEvent.click(screen.getByText('保存并重新扫描'));
+
+    expect(onConfirm).toHaveBeenCalledWith(
+      '/game/addons',
+      8,
+      false,
+      false,
+      false,
       false,
       baseSettings.workshopSourceSettings,
     );

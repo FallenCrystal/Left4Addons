@@ -24,6 +24,7 @@ interface KnownUninstalledViewProps {
   backgroundTasks: BackgroundTask[];
   syncingSteam: boolean;
   onOpenTaskCenter: () => void;
+  onWarning?: (message: string) => void;
 }
 
 export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({

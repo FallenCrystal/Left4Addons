@@ -7,6 +7,8 @@ pub struct Settings {
     pub workshop_dir: String,
     #[serde(rename = "loadingDir")]
     pub loading_dir: String,
+    #[serde(rename = "downloadConcurrency", default = "default_download_concurrency")]
+    pub download_concurrency: u32,
     #[serde(rename = "enableDummyBypass", default)]
     pub enable_dummy_bypass: bool,
     #[serde(rename = "suppressSdkUnavailableWarning", default)]
@@ -40,6 +42,10 @@ pub struct WorkshopSourceSettings {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_download_concurrency() -> u32 {
+    2
 }
 
 fn default_workshop_source_preset() -> String {

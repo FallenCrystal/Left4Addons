@@ -43,8 +43,12 @@ struct RefreshCoordinator {
 
 impl RefreshCoordinator {
     fn suppress_internal_refresh(&self) {
+        self.suppress_internal_refresh_for(Duration::from_millis(INTERNAL_REFRESH_SUPPRESS_MS));
+    }
+
+    fn suppress_internal_refresh_for(&self, duration: Duration) {
         if let Ok(mut guard) = self.suppress_until.lock() {
-            *guard = Some(Instant::now() + Duration::from_millis(INTERNAL_REFRESH_SUPPRESS_MS));
+            *guard = Some(Instant::now() + duration);
         }
     }
 
@@ -101,6 +105,10 @@ impl Default for AddonWatcherController {
 impl AddonWatcherController {
     pub fn suppress_internal_refresh(&self) {
         self.coordinator.suppress_internal_refresh();
+    }
+
+    pub fn suppress_internal_refresh_for(&self, duration: Duration) {
+        self.coordinator.suppress_internal_refresh_for(duration);
     }
 
     pub fn rebind(&mut self, app_handle: &AppHandle, loading_dir: &Path) -> Result<(), String> {
@@ -236,6 +244,12 @@ pub fn rebind_addon_watcher(app_handle: &AppHandle, loading_dir: &Path) -> Resul
 pub fn suppress_internal_refresh(state: &crate::AppState) {
     if let Ok(controller) = state.addon_watcher.lock() {
         controller.suppress_internal_refresh();
+    }
+}
+
+pub fn suppress_internal_refresh_for(state: &crate::AppState, duration: Duration) {
+    if let Ok(controller) = state.addon_watcher.lock() {
+        controller.suppress_internal_refresh_for(duration);
     }
 }
 

@@ -5,7 +5,7 @@ use crate::steam::{
 };
 use crate::vpk::{extract_addon_metadata, generate_dummy_vpk};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -23,6 +23,8 @@ use super::types::{
 const DOWNLOAD_CANCELLED_ERR: &str = "Download cancelled";
 const WORKSHOP_HTML_FETCH_INTERVAL: Duration = Duration::from_secs(6);
 const WORKSHOP_HTML_FETCH_PAUSE_DURATION: Duration = Duration::from_secs(10 * 60);
+const DEFAULT_DOWNLOAD_CONCURRENCY: u32 = 2;
+const DOWNLOAD_FINALIZE_SUPPRESS_MS: u64 = 30_000;
 
 #[derive(Default)]
 struct WorkshopHtmlFetchGate {
@@ -32,6 +34,17 @@ struct WorkshopHtmlFetchGate {
 }
 
 static WORKSHOP_HTML_FETCH_GATE: OnceLock<Mutex<WorkshopHtmlFetchGate>> = OnceLock::new();
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadResumeMetadata {
+    workshop_id: String,
+    target_filename: String,
+    file_url: String,
+    total_size: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 struct SourcePolicy {
@@ -224,7 +237,7 @@ fn import_sdk_workshop_file(
             e
         )
     })?;
-    fs::rename(&temp_dest_path, &dest_path).map_err(|e| {
+    move_or_copy_file(&temp_dest_path, &dest_path).map_err(|e| {
         format!(
             "Failed to finalize SDK workshop file from {} to {}: {}",
             temp_dest_path.display(),
@@ -748,6 +761,117 @@ fn load_known_addons(known_addons_path: &Path) -> HashMap<String, KnownAddonEntr
     HashMap::new()
 }
 
+fn normalized_etag(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalized_last_modified(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn partial_download_path(download_cache_dir: &Path, workshop_id: &str) -> PathBuf {
+    download_cache_dir.join(format!("{}.vpk.part", workshop_id))
+}
+
+fn partial_download_metadata_path(download_cache_dir: &Path, workshop_id: &str) -> PathBuf {
+    download_cache_dir.join(format!("{}.json", workshop_id))
+}
+
+fn cleanup_partial_download(
+    download_cache_dir: &Path,
+    workshop_id: &str,
+) -> Result<(), String> {
+    for path in [
+        partial_download_path(download_cache_dir, workshop_id),
+        partial_download_metadata_path(download_cache_dir, workshop_id),
+    ] {
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| {
+                format!(
+                    "Failed to remove partial download artifact {}: {}",
+                    path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn move_or_copy_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            fs::copy(src, dst)?;
+            fs::remove_file(src)?;
+            if dst.exists() {
+                Ok(())
+            } else {
+                Err(rename_err)
+            }
+        }
+    }
+}
+
+fn load_partial_download_metadata(metadata_path: &Path) -> Result<DownloadResumeMetadata, String> {
+    let content = fs::read_to_string(metadata_path).map_err(|e| {
+        format!(
+            "Failed to read partial download metadata {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })?;
+    serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "Failed to parse partial download metadata {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })
+}
+
+fn save_partial_download_metadata(
+    metadata_path: &Path,
+    metadata: &DownloadResumeMetadata,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(metadata).map_err(|e| {
+        format!(
+            "Failed to serialize partial download metadata {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })?;
+    fs::write(metadata_path, json).map_err(|e| {
+        format!(
+            "Failed to write partial download metadata {}: {}",
+            metadata_path.display(),
+            e
+        )
+    })
+}
+
+fn parse_content_range_start(value: &str) -> Option<(u64, u64)> {
+    let trimmed = value.trim();
+    let bytes = trimmed.strip_prefix("bytes ")?;
+    let (range, total) = bytes.split_once('/')?;
+    let total = total.trim().parse::<u64>().ok()?;
+    let (start, _) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    Some((start, total))
+}
+
 fn load_settings_store(settings_path: &Path) -> SettingsStore {
     if !settings_path.exists() {
         return SettingsStore::default();
@@ -861,6 +985,7 @@ pub fn load_db(
         settings: Settings {
             workshop_dir: default_workshop,
             loading_dir: default_loading,
+            download_concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             enable_dummy_bypass: false,
             suppress_sdk_unavailable_warning: false,
             disable_steamworks_sdk: false,
@@ -934,6 +1059,9 @@ pub fn load_db(
         || settings_store.settings.loading_dir == old_default_loading
     {
         settings_store.settings.loading_dir = default_db.settings.loading_dir.clone();
+    }
+    if settings_store.settings.download_concurrency == 0 {
+        settings_store.settings.download_concurrency = DEFAULT_DOWNLOAD_CONCURRENCY;
     }
 
     let loading_path = Path::new(&settings_store.settings.loading_dir);
@@ -2128,7 +2256,8 @@ async fn attempt_bridge_download(
                 ((downloaded as f64 / total as f64) * 100.0) as u32
             } else {
                 0
-            };
+            }
+            .min(99);
             let percent = raw_percent.max(last_reported_percent);
             last_reported_percent = percent;
             let _ = app_handle.emit(
@@ -2186,6 +2315,10 @@ async fn attempt_bridge_download(
                     workshop_id,
                     folder.display(),
                     source_path.display()
+                );
+                crate::watcher::suppress_internal_refresh_for(
+                    state,
+                    Duration::from_millis(DOWNLOAD_FINALIZE_SUPPRESS_MS),
                 );
                 import_sdk_workshop_file(&source_path, workshop_id, workshop_dir)?;
                 let final_total = status.total.unwrap_or_else(|| {
@@ -2904,6 +3037,7 @@ pub async fn get_settings(state: State<'_, crate::AppState>) -> Result<Settings,
 #[tauri::command]
 pub async fn save_settings(
     loading_dir: String,
+    download_concurrency: u32,
     enable_dummy_bypass: bool,
     suppress_sdk_unavailable_warning: bool,
     disable_steamworks_sdk: bool,
@@ -2918,6 +3052,7 @@ pub async fn save_settings(
 
     db.settings.workshop_dir = workshop_dir;
     db.settings.loading_dir = loading_dir;
+    db.settings.download_concurrency = download_concurrency.clamp(1, 8);
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
     db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
     db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
@@ -4746,8 +4881,21 @@ pub async fn download_addon(
         if !workshop_dir.exists() {
             fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
         }
+        if !state.download_cache_dir.exists() {
+            fs::create_dir_all(&state.download_cache_dir).map_err(|e| {
+                format!(
+                    "Failed to create download cache directory {}: {}",
+                    state.download_cache_dir.display(),
+                    e
+                )
+            })?;
+        }
+
         let dest_filename = format!("{}.vpk", workshop_id);
         let dest_path = workshop_dir.join(&dest_filename);
+        let partial_path = partial_download_path(&state.download_cache_dir, &workshop_id);
+        let partial_metadata_path =
+            partial_download_metadata_path(&state.download_cache_dir, &workshop_id);
         remove_dummy_workshop_targets(&dest_path)?;
         if dest_path.exists() {
             return Err(format!(
@@ -4762,11 +4910,6 @@ pub async fn download_addon(
                 disabled_dest_path.display()
             ));
         }
-        let tmp_path = workshop_dir.join(format!("{}.download", dest_filename));
-        if tmp_path.exists() {
-            fs::remove_file(&tmp_path)
-                .map_err(|e| format!("Failed to remove stale download file: {}", e))?;
-        }
 
         if prefer_sdk_download {
             match attempt_bridge_download(
@@ -4780,6 +4923,7 @@ pub async fn download_addon(
             .await
             {
                 Ok(true) => {
+                    let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
                     crate::watcher::suppress_internal_refresh(&state);
                     let mut db = state.db.lock().await;
                     scan_addons_internal(
@@ -4817,6 +4961,7 @@ pub async fn download_addon(
                 .await
                 {
                     Ok(true) => {
+                        let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
                         crate::watcher::suppress_internal_refresh(&state);
                         let mut db = state.db.lock().await;
                         scan_addons_internal(
@@ -4852,11 +4997,54 @@ pub async fn download_addon(
 
         println!("Downloading: {} (URL: {})", title, file_url);
         let client = reqwest::Client::new();
-        let mut response = client
-            .get(&file_url)
-            .send()
-            .await
-            .map_err(|e| format!("Download request failed: {}", e))?;
+
+        let mut resume_from = 0u64;
+        if partial_path.exists() || partial_metadata_path.exists() {
+            match load_partial_download_metadata(&partial_metadata_path) {
+                Ok(metadata)
+                    if metadata.workshop_id == workshop_id
+                        && metadata.target_filename == dest_filename
+                        && metadata.file_url == file_url =>
+                {
+                    resume_from = fs::metadata(&partial_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                }
+                Ok(_) | Err(_) => {
+                    cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                }
+            }
+        }
+
+        let mut response = if resume_from > 0 {
+            let resumed = client
+                .get(&file_url)
+                .header(reqwest::header::RANGE, format!("bytes={}-", resume_from))
+                .send()
+                .await
+                .map_err(|e| format!("Download request failed: {}", e))?;
+
+            match resumed.status() {
+                reqwest::StatusCode::PARTIAL_CONTENT => resumed,
+                reqwest::StatusCode::OK => {
+                    cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                    resume_from = 0;
+                    client
+                        .get(&file_url)
+                        .send()
+                        .await
+                        .map_err(|e| format!("Download request failed: {}", e))?
+                }
+                _ => resumed,
+            }
+        } else {
+            client
+                .get(&file_url)
+                .send()
+                .await
+                .map_err(|e| format!("Download request failed: {}", e))?
+        };
+
         if !response.status().is_success() {
             if !prefer_sdk_download {
                 match attempt_bridge_download(
@@ -4870,6 +5058,7 @@ pub async fn download_addon(
                 .await
                 {
                     Ok(true) => {
+                        let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
                         crate::watcher::suppress_internal_refresh(&state);
                         let mut db = state.db.lock().await;
                         scan_addons_internal(
@@ -4899,10 +5088,86 @@ pub async fn download_addon(
             ));
         }
 
-        let total_size = response.content_length().unwrap_or(0);
-        let mut file = fs::File::create(&tmp_path)
-            .map_err(|e| format!("Failed to create local file: {}", e))?;
-        let mut downloaded = 0;
+        let response_etag = normalized_etag(response.headers());
+        let response_last_modified = normalized_last_modified(response.headers());
+        let total_size = if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .ok_or_else(|| "Partial download response missing Content-Range".to_string())?;
+            let (range_start, range_total) = parse_content_range_start(content_range)
+                .ok_or_else(|| format!("Invalid Content-Range header: {}", content_range))?;
+
+            if range_start != resume_from {
+                cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                return Err(format!(
+                    "Resume offset mismatch: expected {}, got {}",
+                    resume_from, range_start
+                ));
+            }
+
+            if let Ok(existing_metadata) = load_partial_download_metadata(&partial_metadata_path) {
+                if let (Some(existing), Some(current)) =
+                    (existing_metadata.etag.as_deref(), response_etag.as_deref())
+                {
+                    if existing != current {
+                        cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                        return Err(
+                            "Remote file changed while resuming download (ETag mismatch)"
+                                .to_string(),
+                        );
+                    }
+                }
+                if let (Some(existing), Some(current)) = (
+                    existing_metadata.last_modified.as_deref(),
+                    response_last_modified.as_deref(),
+                ) {
+                    if existing != current {
+                        cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                        return Err(
+                            "Remote file changed while resuming download (Last-Modified mismatch)"
+                                .to_string(),
+                        );
+                    }
+                }
+                if let Some(existing_total) = existing_metadata.total_size {
+                    if existing_total != range_total {
+                        cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
+                        return Err(
+                            "Remote file changed while resuming download (size mismatch)"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+
+            range_total
+        } else {
+            response.content_length().unwrap_or(0)
+        };
+
+        let metadata = DownloadResumeMetadata {
+            workshop_id: workshop_id.clone(),
+            target_filename: dest_filename.clone(),
+            file_url: file_url.clone(),
+            total_size: (total_size > 0).then_some(total_size),
+            etag: response_etag,
+            last_modified: response_last_modified,
+        };
+        save_partial_download_metadata(&partial_metadata_path, &metadata)?;
+
+        let mut file = if resume_from > 0 {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&partial_path)
+                .map_err(|e| format!("Failed to reopen partial download file: {}", e))?
+        } else {
+            fs::File::create(&partial_path)
+                .map_err(|e| format!("Failed to create local file: {}", e))?
+        };
+        let mut downloaded = resume_from;
 
         #[derive(Serialize, Clone)]
         struct DownloadProgress {
@@ -4922,7 +5187,7 @@ pub async fn download_addon(
         {
             if is_download_cancelled(&state, &workshop_id)? {
                 drop(file);
-                fs::remove_file(&tmp_path).ok();
+                let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
                 return Err(DOWNLOAD_CANCELLED_ERR.to_string());
             }
 
@@ -4932,10 +5197,11 @@ pub async fn download_addon(
             downloaded += chunk.len() as u64;
 
             let percent = if total_size > 0 {
-                (downloaded as f64 / total_size as f64 * 100.0) as u32
+                ((downloaded as f64 / total_size as f64) * 100.0) as u32
             } else {
                 0
-            };
+            }
+            .min(99);
 
             let _ = app_handle.emit(
                 "download-progress",
@@ -4954,13 +5220,29 @@ pub async fn download_addon(
         drop(file);
 
         if is_download_cancelled(&state, &workshop_id)? {
-            fs::remove_file(&tmp_path).ok();
+            let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
             return Err(DOWNLOAD_CANCELLED_ERR.to_string());
         }
 
-        crate::watcher::suppress_internal_refresh(&state);
-        fs::rename(&tmp_path, &dest_path)
+        crate::watcher::suppress_internal_refresh_for(
+            &state,
+            Duration::from_millis(DOWNLOAD_FINALIZE_SUPPRESS_MS),
+        );
+        move_or_copy_file(&partial_path, &dest_path)
             .map_err(|e| format!("Failed to finalize downloaded file: {}", e))?;
+        let _ = fs::remove_file(&partial_metadata_path);
+
+        let _ = app_handle.emit(
+            "download-progress",
+            DownloadProgress {
+                workshop_id: workshop_id.clone(),
+                percent: 100,
+                downloaded: total_size,
+                total: total_size,
+                source: "web-fallback".to_string(),
+                phase: "finalize".to_string(),
+            },
+        );
 
         let mut known_addons = load_known_addons(&state.known_addons_path);
 
@@ -5356,9 +5638,10 @@ mod tests {
     use super::{
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
         is_background_workshop_fetch_source, load_workshop_cache,
-        merge_known_addon_snapshots_into_cache, persist_seen_workshop_item_entry,
-        persist_workshop_page_details_entry, propagate_author_names, remove_dummy_workshop_targets,
-        save_workshop_cache, workshop_cache_with_known_addons,
+        merge_known_addon_snapshots_into_cache, move_or_copy_file, parse_content_range_start,
+        persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
+        propagate_author_names, remove_dummy_workshop_targets, save_workshop_cache,
+        workshop_cache_with_known_addons,
     };
     use crate::commands::types::WorkshopSeenItem;
     use crate::vpk::generate_dummy_vpk;
@@ -5889,5 +6172,42 @@ mod tests {
                 .map(|v| v.len()),
             Some(1)
         );
+    }
+
+    #[test]
+    fn parse_content_range_start_extracts_start_and_total() {
+        assert_eq!(
+            parse_content_range_start("bytes 1024-2047/3492143"),
+            Some((1024, 3492143))
+        );
+        assert_eq!(parse_content_range_start("invalid"), None);
+    }
+
+    #[test]
+    fn settings_download_concurrency_defaults_to_two() {
+        let settings: crate::commands::Settings =
+            serde_json::from_value(json!({"workshopDir": "/w", "loadingDir": "/l"})).unwrap();
+        assert_eq!(settings.download_concurrency, 2);
+    }
+
+    #[test]
+    fn move_or_copy_file_falls_back_to_copy() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "left4addons-{}-{}-move-or-copy",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let src = temp_dir.join("source.tmp");
+        let dst = temp_dir.join("nested").join("target.tmp");
+
+        fs::write(&src, b"hello").unwrap();
+        move_or_copy_file(&src, &dst).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dst).unwrap(), b"hello");
+
+        fs::remove_file(&dst).ok();
+        fs::remove_dir_all(&temp_dir).ok();
     }
 }

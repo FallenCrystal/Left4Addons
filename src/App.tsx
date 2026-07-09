@@ -218,7 +218,7 @@ function App() {
             backgroundTasks={backgroundTasks}
             syncingSteam={syncingSteam}
             onOpenTaskCenter={() => setTaskCenterOpen(true)}
-            onWarning={(message) => {
+            onWarning={(message: string) => {
               addToast(message, 'error');
             }}
           />

@@ -36,6 +36,7 @@ export function useAddonManager() {
   const [settings, setSettings] = useState<Settings>({
     workshopDir: '',
     loadingDir: '',
+    downloadConcurrency: 2,
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
@@ -182,6 +183,7 @@ export function useAddonManager() {
     clearFinishedTasks,
   } = useBackgroundTasks({
     enabled: !loading,
+    downloadConcurrency: settings.downloadConcurrency || 2,
     addons,
     knownUninstalledAddons,
     updateLocalState,
@@ -451,6 +453,7 @@ export function useAddonManager() {
   // Save Settings
   const saveSettings = async (
     loadingDir: string,
+    downloadConcurrency: number,
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
@@ -462,6 +465,7 @@ export function useAddonManager() {
     try {
       const data: DatabasePayload = await invoke('save_settings', {
         loadingDir,
+        downloadConcurrency,
         enableDummyBypass,
         suppressSdkUnavailableWarning,
         disableSteamworksSdk,

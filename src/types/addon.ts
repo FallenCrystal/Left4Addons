@@ -143,6 +143,7 @@ export interface MasterCollection {
 export interface Settings {
   workshopDir: string;
   loadingDir: string;
+  downloadConcurrency: number;
   enableDummyBypass: boolean;
   suppressSdkUnavailableWarning: boolean;
   disableSteamworksSdk: boolean;
