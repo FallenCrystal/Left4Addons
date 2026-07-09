@@ -18,6 +18,7 @@ interface BatchActionBarProps {
   onBatchAddToGroup: () => void;
   onBatchAddToMasterCollection?: () => void;
   onClearSelection: () => void;
+  isSubmitting?: boolean;
 }
 
 export function BatchActionBar({
@@ -36,6 +37,7 @@ export function BatchActionBar({
   onBatchAddToGroup,
   onBatchAddToMasterCollection,
   onClearSelection,
+  isSubmitting = false,
 }: BatchActionBarProps) {
   const { t } = useTranslation();
 
@@ -68,6 +70,7 @@ export function BatchActionBar({
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
             onClick={() => onSelectAll(filteredItems)}
+            disabled={isSubmitting}
           >
             <CheckSquare size={14} />
             <span>
@@ -81,6 +84,7 @@ export function BatchActionBar({
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
             onClick={() => onSelectAllGroups(groups)}
+            disabled={isSubmitting}
           >
             <CheckSquare size={14} />
             <span>
@@ -96,7 +100,7 @@ export function BatchActionBar({
               className="btn btn-primary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={() => onBatchToggle(true)}
-              disabled={!canBatchEnable}
+              disabled={!canBatchEnable || isSubmitting}
             >
               <Unlock size={14} />
               <span>{t('batchActionBar.enable')}</span>
@@ -106,7 +110,7 @@ export function BatchActionBar({
               className="btn btn-secondary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={() => onBatchToggle(false)}
-              disabled={!canBatchDisable}
+              disabled={!canBatchDisable || isSubmitting}
             >
               <Lock size={14} />
               <span>{t('batchActionBar.disable')}</span>
@@ -117,7 +121,7 @@ export function BatchActionBar({
                 className="btn btn-secondary"
                 style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
                 onClick={onBatchMove}
-                disabled={!canBatchMove}
+                disabled={!canBatchMove || isSubmitting}
               >
                 <FolderOpen size={14} />
                 <span>{t('batchActionBar.moveToManual')}</span>
@@ -128,7 +132,7 @@ export function BatchActionBar({
               className="btn btn-secondary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={onBatchRename}
-              disabled={!canBatchRename}
+              disabled={!canBatchRename || isSubmitting}
             >
               <Edit3 size={14} />
               <span>{t('batchActionBar.autoRename')}</span>
@@ -138,7 +142,7 @@ export function BatchActionBar({
               className="btn btn-secondary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={onBatchAddToGroup}
-              disabled={selectedIds.length === 0 || groups.length === 0}
+              disabled={selectedIds.length === 0 || groups.length === 0 || isSubmitting}
             >
               <FolderPlus size={14} />
               <span>{t('batchActionBar.addToGroup')}</span>
@@ -152,7 +156,7 @@ export function BatchActionBar({
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
             onClick={onBatchAddToMasterCollection}
-            disabled={selectedGroupIds.length === 0 || masterCollections.length === 0}
+            disabled={selectedGroupIds.length === 0 || masterCollections.length === 0 || isSubmitting}
           >
             <Library size={14} />
             <span>{t('batchActionBar.addToMasterCollection')}</span>
@@ -163,6 +167,7 @@ export function BatchActionBar({
           className="btn btn-secondary"
           style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--md-sys-color-error)' }}
           onClick={onClearSelection}
+          disabled={isSubmitting}
         >
           <X size={14} />
           <span>{t('batchActionBar.exitBatch')}</span>

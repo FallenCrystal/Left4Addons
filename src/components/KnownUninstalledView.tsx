@@ -122,7 +122,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
             return (
               <div
                 key={addon.id}
-                className={`addon-card uninstalled ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}
+                className={`addon-card uninstalled ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''} ${isSubmitting ? 'submitting' : ''}`}
               >
                 {/* Checkbox Wrapper */}
                 {isSelectMode && onSelectToggle && (
@@ -130,6 +130,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
                     className={`addon-card-checkbox-wrapper ${isSelected ? 'selected' : ''}`}
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (isSubmitting) return;
                       onSelectToggle(addon.id);
                     }}
                     title={isSelected ? t('addonCard.deselect') : t('addonCard.select')}
@@ -142,8 +143,10 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
 
                 <div
                   className="addon-card-clickable-area"
-                  onClick={() => {
+                  onClick={(e) => {
+                    if (isSubmitting) return;
                     if (isSelectMode && onSelectToggle) {
+                      e.stopPropagation();
                       onSelectToggle(addon.id);
                     } else if (onDetailClick) {
                       onDetailClick(addon);

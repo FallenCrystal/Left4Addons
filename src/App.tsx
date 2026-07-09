@@ -614,6 +614,7 @@ function App() {
           onBatchAddToGroup={() => setAddToGroupModal(true)}
           onBatchAddToMasterCollection={() => setAddToMcModal(true)}
           onClearSelection={handleClearSelection}
+          isSubmitting={isSubmitting}
         />
       )}
     </div>

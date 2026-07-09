@@ -352,6 +352,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               <button 
                 className={`btn ${addon.isEnabled ? 'btn-secondary' : 'btn-primary'}`}
                 onClick={() => onToggle(addon.id, addon.isEnabled)}
+                disabled={isSubmitting}
               >
                 {addon.isEnabled ? t('detailModal.disableAddon') : t('detailModal.enableAddon')}
               </button>
@@ -361,6 +362,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               <button 
                 className="btn btn-primary"
                 onClick={() => onMove(addon)}
+                disabled={isSubmitting}
               >
                 <Move size={14} />
                 <span>{t('detailModal.moveToManual')}</span>

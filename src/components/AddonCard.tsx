@@ -58,12 +58,13 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   };
 
   return (
-    <div className={`addon-card ${isUninstalled ? 'uninstalled' : ''} ${!addon.isEnabled && !isUninstalled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''}`}>
+    <div className={`addon-card ${isUninstalled ? 'uninstalled' : ''} ${!addon.isEnabled && !isUninstalled ? 'disabled' : ''} ${isSelected ? 'card-selected' : ''} ${isSelectMode ? 'select-mode-active' : ''} ${isSubmitting ? 'submitting' : ''}`}>
       {/* Checkbox Wrapper */}
       <div
         className={`addon-card-checkbox-wrapper ${isSelected ? 'selected' : ''}`}
         onClick={(e) => {
           e.stopPropagation();
+          if (isSubmitting) return;
           onSelectToggle(addon.id);
         }}
         title={isSelected ? t('addonCard.deselect') : t('addonCard.select')}
@@ -77,6 +78,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
       <div
         className="addon-card-clickable-area"
         onClick={(e) => {
+          if (isSubmitting) return;
           if (isSelectMode) {
             e.stopPropagation();
             onSelectToggle(addon.id);
