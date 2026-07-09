@@ -1067,12 +1067,25 @@ input:checked + .slider:before {
   font-weight: 600;
   margin-right: 8px;
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .batch-action-buttons {
   display: flex;
   align-items: center;
   gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE and Edge */
+}
+
+.batch-action-buttons::-webkit-scrollbar {
+  display: none; /* Chrome, Safari and Opera */
+}
+
+.batch-action-buttons .btn {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .batch-action-bar .dropdown-content {
