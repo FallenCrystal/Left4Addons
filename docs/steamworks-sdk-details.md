@@ -87,7 +87,7 @@ SDK 里确实有 `ISteamRemoteStorage::GetPublishedFileDetails`
 虽然它看起来和网页端免鉴权的 Web API  
 即 (https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/)  
 名字几乎一样, 但 SDK 侧偏偏缺少了最核心的 `file_url` 字段,   
-导致无法在不额外请求网络 API .
+导致无法在不额外请求网络 API 的情况下得到下载链接.
 
 ## 5. 从旧README中迁移过来的已知缺点
 
