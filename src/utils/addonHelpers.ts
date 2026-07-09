@@ -149,6 +149,21 @@ export const getAddonAuthor = (addon: Addon): string => {
   return 'Unknown Author';
 };
 
+export function sortAddonsDownloadedFirst(addons: Addon[]): Addon[] {
+  const installed: Addon[] = [];
+  const uninstalled: Addon[] = [];
+
+  addons.forEach((addon) => {
+    if (addon.dirType === 'none') {
+      uninstalled.push(addon);
+    } else {
+      installed.push(addon);
+    }
+  });
+
+  return [...installed, ...uninstalled];
+}
+
 /**
  * Helper to suggest a unique VPK name for an addon, avoiding name conflicts.
  * Workshop items use the Steam title / addonInfo title.

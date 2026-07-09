@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection, WorkshopSourceSettings } from '../types/addon';
-import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue } from '../utils/addonHelpers';
+import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue, sortAddonsDownloadedFirst } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { useBackgroundTasks } from './useBackgroundTasks';
 import type { BackgroundTask } from '../types/addon';
@@ -1209,7 +1209,10 @@ export function useAddonManager() {
 
   const getRenderedItems = (filteredAddons: Addon[]): RenderedItem[] => {
     if (currentFilterTab === 'groups' || currentFilterTab === 'known-uninstalled') {
-      return filteredAddons.map(item => ({ type: 'addon' as const, id: item.id, data: item }));
+      const orderedAddons = currentFilterTab === 'groups'
+        ? sortAddonsDownloadedFirst(filteredAddons)
+        : filteredAddons;
+      return orderedAddons.map(item => ({ type: 'addon' as const, id: item.id, data: item }));
     }
 
     // For master collection view, show groups within the collection
@@ -1221,7 +1224,9 @@ export function useAddonManager() {
         for (const gid of mc.groupIds) {
           const group = groups.find(g => g.id === gid);
           if (group) {
-            const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.id));
+            const matchingAddons = sortAddonsDownloadedFirst(
+              filteredAddons.filter(item => group.addons.includes(item.id))
+            );
             if (matchingAddons.length > 0) {
               matchingAddons.forEach(item => groupedVpkNames.add(item.id));
               rendered.push({
@@ -1242,7 +1247,9 @@ export function useAddonManager() {
     const groupedVpkNames = new Set<string>();
 
     groups.forEach(group => {
-      const matchingAddons = filteredAddons.filter(item => group.addons.includes(item.id));
+      const matchingAddons = sortAddonsDownloadedFirst(
+        filteredAddons.filter(item => group.addons.includes(item.id))
+      );
       if (matchingAddons.length > 0) {
         matchingAddons.forEach(item => groupedVpkNames.add(item.id));
         rendered.push({

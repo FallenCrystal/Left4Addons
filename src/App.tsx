@@ -28,6 +28,7 @@ import { AddToGroupModal } from './components/AddToGroupModal';
 import { PromptModal } from './components/PromptModal';
 import { TaskCenterModal } from './components/TaskCenterModal';
 import { useState } from 'react';
+import { sortAddonsDownloadedFirst } from './utils/addonHelpers';
 
 function App() {
   const { t } = useTranslation();
@@ -152,9 +153,11 @@ function App() {
 
   // Get all addons (installed + uninstalled) for group rendering
   const getAllGroupAddons = (groupAddonIds: string[]) => {
-    return groupAddonIds
+    return sortAddonsDownloadedFirst(
+      groupAddonIds
       .map(id => addons[id] || knownUninstalledAddons[id])
-      .filter(Boolean);
+      .filter(Boolean)
+    );
   };
 
   // Get groups in current master collection
@@ -486,7 +489,7 @@ function App() {
         currentName={editGroupModal.name}
         currentTags={editGroupModal.tags}
         currentCollectionId={editGroupModal.workshopCollectionId}
-        addonsInGroup={currentGroup ? currentGroup.addons.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean) : []}
+        addonsInGroup={currentGroup ? getAllGroupAddons(currentGroup.addons) : []}
         isSubmitting={isSubmitting}
         onCancel={() => {
           setEditGroupModal({ open: false, groupId: '', name: '', tags: [], workshopCollectionId: '' });

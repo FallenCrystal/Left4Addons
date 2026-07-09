@@ -6,6 +6,7 @@ import {
   getAddonUrl,
   getAddonAuthor,
   getSuggestedVpkName,
+  sortAddonsDownloadedFirst,
 } from './addonHelpers';
 import { Addon } from '../types/addon';
 
@@ -257,6 +258,52 @@ describe('addonHelpers', () => {
       };
       const suggested = getSuggestedVpkName(addon, undefined, existing);
       expect(suggested).toBe('[123]Cool Map_1.vpk');
+    });
+  });
+
+  describe('sortAddonsDownloadedFirst', () => {
+    test('should move downloaded addons ahead of uninstalled ones while preserving relative order', () => {
+      const addons: Addon[] = [
+        {
+          id: 'missing-1',
+          vpkName: 'missing-1.vpk',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+        {
+          id: 'installed-1',
+          vpkName: 'installed-1.vpk',
+          dirType: 'loading',
+          isEnabled: true,
+          fileSize: 1,
+          filesCount: 1,
+        },
+        {
+          id: 'installed-2',
+          vpkName: 'installed-2.vpk',
+          dirType: 'workshop',
+          isEnabled: true,
+          fileSize: 1,
+          filesCount: 1,
+        },
+        {
+          id: 'missing-2',
+          vpkName: 'missing-2.vpk',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+      ];
+
+      expect(sortAddonsDownloadedFirst(addons).map((addon) => addon.id)).toEqual([
+        'installed-1',
+        'installed-2',
+        'missing-1',
+        'missing-2',
+      ]);
     });
   });
 });
