@@ -201,7 +201,7 @@ describe('useAddonManager', () => {
         return Promise.resolve({});
       }
       if (cmd === 'toggle_addons') {
-        expect(args).toEqual({ ids: ['addon1.vpk', 'addon2.vpk'], enabled: true });
+        expect(args).toEqual({ ids: ['addon2.vpk'], enabled: true });
         const updatedAddons = { ...mockAddons };
         updatedAddons['addon1.vpk'].isEnabled = true;
         updatedAddons['addon2.vpk'].isEnabled = true;
@@ -227,6 +227,54 @@ describe('useAddonManager', () => {
 
     expect(result.current.addons['addon2.vpk'].isEnabled).toBe(true);
     expect(result.current.isSelectMode).toBe(false); // cleared selection
+  });
+
+  test('should only move selected workshop addons during batch move', async () => {
+    mockInvoke.mockImplementation((cmd, args) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      if (cmd === 'move_addons') {
+        expect(args).toEqual({ ids: ['addon2.vpk'], targetDirType: 'loading' });
+        return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      result.current.handleSelectToggle('addon1.vpk');
+      result.current.handleSelectToggle('addon2.vpk');
+    });
+
+    await act(async () => {
+      await result.current.handleBatchMove();
+    });
+
+    await act(async () => {
+      if (result.current.confirmModal.onConfirm) {
+        await result.current.confirmModal.onConfirm();
+      }
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith('move_addons', { ids: ['addon2.vpk'], targetDirType: 'loading' });
   });
 
   test('should handle group operations: create, delete, and rename', async () => {

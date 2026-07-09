@@ -3175,6 +3175,18 @@ pub async fn cache_remote_image(
     Ok(format!("/cache/{}", filename))
 }
 
+fn move_requires_dir_change(addon: &Addon, target_dir_type: &str) -> bool {
+    addon.dir_type != target_dir_type
+}
+
+fn toggle_requires_state_change(addon: &Addon, enabled: bool) -> bool {
+    addon.is_enabled != enabled
+}
+
+fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
+    addon.vpk_name != sanitized
+}
+
 #[tauri::command]
 pub async fn move_addons(
     ids: Vec<String>,
@@ -3216,6 +3228,10 @@ pub async fn move_addons(
             errors.push(format!("Addon not found: {}", id));
             continue;
         };
+
+        if !move_requires_dir_change(addon, &target_dir_type) {
+            continue;
+        }
 
         let current_path = PathBuf::from(&addon.current_path);
         if !current_path.exists() {
@@ -3307,6 +3323,10 @@ pub async fn toggle_addons(
             errors.push(format!("Addon not found: {}", id));
             continue;
         };
+
+        if !toggle_requires_state_change(addon, enabled) {
+            continue;
+        }
 
         let current_path = PathBuf::from(&addon.current_path);
         if !current_path.exists() {
@@ -3496,6 +3516,10 @@ pub async fn rename_addons(
             errors.push(format!("Addon not found: {}", item.id));
             continue;
         };
+
+        if !rename_requires_name_change(&addon, &sanitized) {
+            continue;
+        }
 
         let current_path = PathBuf::from(&addon.current_path);
         if !current_path.exists() {
@@ -5638,12 +5662,13 @@ mod tests {
     use super::{
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
         is_background_workshop_fetch_source, load_workshop_cache,
-        merge_known_addon_snapshots_into_cache, move_or_copy_file, parse_content_range_start,
-        persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
-        propagate_author_names, remove_dummy_workshop_targets, save_workshop_cache,
-        workshop_cache_with_known_addons,
+        merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
+        parse_content_range_start, persist_seen_workshop_item_entry,
+        persist_workshop_page_details_entry, propagate_author_names,
+        remove_dummy_workshop_targets, rename_requires_name_change, save_workshop_cache,
+        toggle_requires_state_change, workshop_cache_with_known_addons,
     };
-    use crate::commands::types::WorkshopSeenItem;
+    use crate::commands::types::{Addon, WorkshopSeenItem};
     use crate::vpk::generate_dummy_vpk;
     use serde_json::json;
     use std::fs;
@@ -6188,6 +6213,84 @@ mod tests {
         let settings: crate::commands::Settings =
             serde_json::from_value(json!({"workshopDir": "/w", "loadingDir": "/l"})).unwrap();
         assert_eq!(settings.download_concurrency, 2);
+    }
+
+    #[test]
+    fn move_addons_skips_items_already_in_target_dir() {
+        let addon = Addon {
+            id: "local-addon".to_string(),
+            vpk_name: "local-addon.vpk".to_string(),
+            workshop_id: None,
+            addon_info: json!({}),
+            has_image: false,
+            image_path: None,
+            files_count: 0,
+            file_size: 0,
+            parsed_at: String::new(),
+            current_path: "/tmp/local-addon.vpk".to_string(),
+            dir_type: "loading".to_string(),
+            is_enabled: true,
+            steam_details: None,
+            workshop_details: None,
+            is_dummy: false,
+        };
+
+        assert!(!move_requires_dir_change(&addon, "loading"));
+        assert!(move_requires_dir_change(&addon, "workshop"));
+    }
+
+    #[test]
+    fn toggle_addons_skips_items_already_in_requested_state() {
+        let addon = Addon {
+            id: "enabled-addon".to_string(),
+            vpk_name: "enabled-addon.vpk".to_string(),
+            workshop_id: None,
+            addon_info: json!({}),
+            has_image: false,
+            image_path: None,
+            files_count: 0,
+            file_size: 0,
+            parsed_at: String::new(),
+            current_path: "/tmp/enabled-addon.vpk".to_string(),
+            dir_type: "workshop".to_string(),
+            is_enabled: true,
+            steam_details: None,
+            workshop_details: None,
+            is_dummy: false,
+        };
+
+        assert!(!toggle_requires_state_change(&addon, true));
+        assert!(toggle_requires_state_change(&addon, false));
+    }
+
+    #[test]
+    fn rename_addons_skips_items_already_using_requested_name() {
+        let addon = Addon {
+            id: "renamed-addon".to_string(),
+            vpk_name: "[12345]Renamed Addon.vpk".to_string(),
+            workshop_id: Some("12345".to_string()),
+            addon_info: json!({}),
+            has_image: false,
+            image_path: None,
+            files_count: 0,
+            file_size: 0,
+            parsed_at: String::new(),
+            current_path: "/tmp/[12345]Renamed Addon.vpk".to_string(),
+            dir_type: "loading".to_string(),
+            is_enabled: true,
+            steam_details: None,
+            workshop_details: None,
+            is_dummy: false,
+        };
+
+        assert!(!rename_requires_name_change(
+            &addon,
+            "[12345]Renamed Addon.vpk"
+        ));
+        assert!(rename_requires_name_change(
+            &addon,
+            "[12345]Renamed Addon_1.vpk"
+        ));
     }
 
     #[test]

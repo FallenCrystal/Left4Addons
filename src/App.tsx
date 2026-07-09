@@ -602,6 +602,7 @@ function App() {
           selectedIds={selectedIds}
           filteredItems={filteredItems}
           addons={addons}
+          knownUninstalledAddons={knownUninstalledAddons}
           groups={groups}
           masterCollections={masterCollections}
           selectedGroupIds={selectedGroupIds}

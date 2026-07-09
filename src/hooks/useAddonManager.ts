@@ -371,13 +371,13 @@ export function useAddonManager() {
   const toggleGroupAddons = async (addonsList: Addon[], enabled: boolean) => {
     if (isSubmitting) return;
     // Filter out uninstalled addons in the group
-    const installedList = addonsList.filter(ad => ad.dirType !== 'none');
-    if (installedList.length === 0) return;
+    const actionableAddons = addonsList.filter(ad => ad.dirType !== 'none' && ad.isEnabled !== enabled);
+    if (actionableAddons.length === 0) return;
     
     setIsSubmitting(true);
-    executeWithWorkshopCheck(installedList, enabled ? '批量启用组件' : '批量禁用组件', async () => {
+    executeWithWorkshopCheck(actionableAddons, enabled ? '批量启用组件' : '批量禁用组件', async () => {
       try {
-        const ids = installedList.map(ad => ad.id);
+        const ids = actionableAddons.map(ad => ad.id);
         const data: DatabasePayload = await invoke('toggle_addons', { ids, enabled });
         updateLocalState(data);
         addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
@@ -586,10 +586,14 @@ export function useAddonManager() {
       if (actionType === 'enable' || actionType === 'disable') {
         const enabled = actionType === 'enable';
         const groupAddons = group.addons.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean);
-        const installedList = groupAddons.filter(ad => ad.dirType !== 'none');
-        executeWithWorkshopCheck(installedList, enabled ? t('batchActionBar.enable') : t('batchActionBar.disable'), async () => {
+        const actionableAddons = groupAddons.filter(ad => ad.dirType !== 'none' && ad.isEnabled !== enabled);
+        if (actionableAddons.length === 0) {
+          setIsSubmitting(false);
+          return;
+        }
+        executeWithWorkshopCheck(actionableAddons, enabled ? t('batchActionBar.enable') : t('batchActionBar.disable'), async () => {
           try {
-            const ids = installedList.map(ad => ad.id);
+            const ids = actionableAddons.map(ad => ad.id);
             const data: DatabasePayload = await invoke('toggle_addons', { ids, enabled });
             updateLocalState(data);
             addToast(enabled ? t('toasts.groupEnabled') : t('toasts.groupDisabled'), 'success');
@@ -601,12 +605,18 @@ export function useAddonManager() {
         });
       } else if (actionType === 'move-load') {
         const targetDirType = 'loading';
-        const groupAddons = group.addons.map(name => addons[name]).filter(Boolean);
-        const isFromWorkshop = groupAddons.some(ad => ad.dirType === 'workshop');
+        const movableAddons = group.addons
+          .map(name => addons[name])
+          .filter((addon): addon is Addon => Boolean(addon))
+          .filter(ad => ad.dirType === 'workshop');
+        if (movableAddons.length === 0) {
+          setIsSubmitting(false);
+          return;
+        }
         
         const executeMove = async () => {
           try {
-            const ids = groupAddons.map(ad => ad.id);
+            const ids = movableAddons.map(ad => ad.id);
             const data: DatabasePayload = await invoke('move_addons', { ids, targetDirType });
             updateLocalState(data);
             addToast(t('toasts.batchMoveSuccess'), 'success');
@@ -617,19 +627,15 @@ export function useAddonManager() {
           }
         };
 
-        if (isFromWorkshop) {
-          if (settings.enableDummyBypass) {
-            await executeMove();
-          } else {
-            setConfirmModal({
-              open: true,
-              title: t('moveWarningModal.title'),
-              message: (t('confirmModal.batchMoveMsg', { count: groupAddons.filter(ad => ad.dirType === 'workshop').length }) as unknown as string[]).join('\n\n'),
-              onConfirm: executeMove
-            });
-          }
-        } else {
+        if (settings.enableDummyBypass) {
           await executeMove();
+        } else {
+          setConfirmModal({
+            open: true,
+            title: t('moveWarningModal.title'),
+            message: (t('confirmModal.batchMoveMsg', { count: movableAddons.length }) as unknown as string[]).join('\n\n'),
+            onConfirm: executeMove
+          });
         }
       }
     } catch (err) {
@@ -856,13 +862,13 @@ export function useAddonManager() {
     if (isSubmitting) return;
     
     const selectedAddonsList = selectedIds.map(name => addons[name] || knownUninstalledAddons[name]).filter(Boolean);
-    const installedList = selectedAddonsList.filter(ad => ad.dirType !== 'none');
-    if (installedList.length === 0) return;
+    const actionableAddons = selectedAddonsList.filter(ad => ad.dirType !== 'none' && ad.isEnabled !== enabled);
+    if (actionableAddons.length === 0) return;
 
     setIsSubmitting(true);
-    executeWithWorkshopCheck(installedList, enabled ? t('toasts.addonEnabled') : t('toasts.addonDisabled'), async () => {
+    executeWithWorkshopCheck(actionableAddons, enabled ? t('toasts.addonEnabled') : t('toasts.addonDisabled'), async () => {
       try {
-        const ids = installedList.map(ad => ad.id);
+        const ids = actionableAddons.map(ad => ad.id);
         const data: DatabasePayload = await invoke('toggle_addons', { 
           ids, 
           enabled 
@@ -882,16 +888,17 @@ export function useAddonManager() {
     if (selectedIds.length === 0) return;
     if (isSubmitting) return;
     
-    const selectedAddonsList = selectedIds.map(name => addons[name]).filter(Boolean);
-    const installedList = selectedAddonsList.filter(ad => ad.dirType !== 'none');
-    if (installedList.length === 0) return;
+    const movableAddons = selectedIds
+      .map(name => addons[name])
+      .filter((addon): addon is Addon => Boolean(addon))
+      .filter(ad => ad.dirType === 'workshop');
+    if (movableAddons.length === 0) return;
 
-    const workshopAddons = installedList.filter(ad => ad.dirType === 'workshop');
     setIsSubmitting(true);
     
     const executeMove = async () => {
       try {
-        const ids = installedList.map(ad => ad.id);
+        const ids = movableAddons.map(ad => ad.id);
         const data: DatabasePayload = await invoke('move_addons', { 
           ids, 
           targetDirType: 'loading' 
@@ -906,19 +913,15 @@ export function useAddonManager() {
       }
     };
 
-    if (workshopAddons.length > 0) {
-      if (settings.enableDummyBypass) {
-        await executeMove();
-      } else {
-        setConfirmModal({
-          open: true,
-          title: t('moveWarningModal.title'),
-          message: (t('confirmModal.batchMoveMsg', { count: workshopAddons.length }) as unknown as string[]).join('\n\n'),
-          onConfirm: executeMove
-        });
-      }
-    } else {
+    if (settings.enableDummyBypass) {
       await executeMove();
+    } else {
+      setConfirmModal({
+        open: true,
+        title: t('moveWarningModal.title'),
+        message: (t('confirmModal.batchMoveMsg', { count: movableAddons.length }) as unknown as string[]).join('\n\n'),
+        onConfirm: executeMove
+      });
     }
   };
 
@@ -961,8 +964,10 @@ export function useAddonManager() {
       title: t('confirmModal.batchRenameTitle'),
       message: t('confirmModal.batchRenameMsg', { count: renamesList.length }),
       onConfirm: async () => {
-        const selectedAddonsList = selectedIds.map(name => addons[name]).filter(Boolean);
-        executeWithWorkshopCheck(selectedAddonsList, t('common.rename'), async () => {
+        const renameTargetAddons = renamesList
+          .map(({ id }) => addons[id])
+          .filter((addon): addon is Addon => Boolean(addon));
+        executeWithWorkshopCheck(renameTargetAddons, t('common.rename'), async () => {
           try {
             const data: DatabasePayload = await invoke('rename_addons', { 
               renames: renamesList 

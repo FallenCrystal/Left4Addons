@@ -6,6 +6,7 @@ interface BatchActionBarProps {
   selectedIds: string[];
   filteredItems: Addon[];
   addons: Record<string, Addon>;
+  knownUninstalledAddons?: Record<string, Addon>;
   groups: Group[];
   masterCollections?: MasterCollection[];
   selectedGroupIds?: string[];
@@ -23,6 +24,7 @@ export function BatchActionBar({
   selectedIds,
   filteredItems,
   addons,
+  knownUninstalledAddons = {},
   groups,
   masterCollections = [],
   selectedGroupIds = [],
@@ -42,7 +44,14 @@ export function BatchActionBar({
   const hasGroupSelection = selectedGroupIds.length > 0;
   const totalSelected = selectedIds.length + selectedGroupIds.length;
 
-  const hasWorkshopSelected = selectedIds.some(name => addons[name]?.dirType === 'workshop');
+  const selectedAddons = selectedIds
+    .map((id) => addons[id] || knownUninstalledAddons[id])
+    .filter((addon): addon is Addon => Boolean(addon));
+  const installedSelectedAddons = selectedAddons.filter((addon) => addon.dirType !== 'none');
+  const canBatchEnable = installedSelectedAddons.some((addon) => !addon.isEnabled);
+  const canBatchDisable = installedSelectedAddons.some((addon) => addon.isEnabled);
+  const canBatchMove = installedSelectedAddons.some((addon) => addon.dirType === 'workshop');
+  const canBatchRename = installedSelectedAddons.length > 0;
 
   // Check if we're in master collection view (only groups selected)
   const isGroupOnlySelection = hasGroupSelection && !hasAddonSelection;
@@ -87,7 +96,7 @@ export function BatchActionBar({
               className="btn btn-primary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={() => onBatchToggle(true)}
-              disabled={selectedIds.length === 0}
+              disabled={!canBatchEnable}
             >
               <Unlock size={14} />
               <span>{t('batchActionBar.enable')}</span>
@@ -97,18 +106,18 @@ export function BatchActionBar({
               className="btn btn-secondary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={() => onBatchToggle(false)}
-              disabled={selectedIds.length === 0}
+              disabled={!canBatchDisable}
             >
               <Lock size={14} />
               <span>{t('batchActionBar.disable')}</span>
             </button>
 
-            {hasWorkshopSelected && (
+            {canBatchMove && (
               <button
                 className="btn btn-secondary"
                 style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
                 onClick={onBatchMove}
-                disabled={selectedIds.length === 0}
+                disabled={!canBatchMove}
               >
                 <FolderOpen size={14} />
                 <span>{t('batchActionBar.moveToManual')}</span>
@@ -119,7 +128,7 @@ export function BatchActionBar({
               className="btn btn-secondary"
               style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
               onClick={onBatchRename}
-              disabled={selectedIds.length === 0}
+              disabled={!canBatchRename}
             >
               <Edit3 size={14} />
               <span>{t('batchActionBar.autoRename')}</span>

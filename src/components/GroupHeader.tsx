@@ -24,6 +24,7 @@ export function GroupHeader({
   const { t } = useTranslation();
 
   const installedAddons = groupAddons.filter(ad => ad.dirType !== 'none');
+  const workshopInstalledAddons = installedAddons.filter(ad => ad.dirType === 'workshop');
   const uninstalledAddons = groupAddons.filter(ad => ad.dirType === 'none');
   const uninstalledWithWorkshopId = uninstalledAddons.filter(ad => ad.workshopId);
   const isAnyDownloading = uninstalledWithWorkshopId.some(ad => downloadProgress[ad.workshopId!] !== undefined);
@@ -60,10 +61,12 @@ export function GroupHeader({
               <Lock size={14} />
               <span>{t('groupHeader.disableAll')}</span>
             </button>
-            <button className="btn btn-tertiary" onClick={() => onGroupActionBatch('move-load')}>
-              <FolderOpen size={14} />
-              <span>{t('groupHeader.moveToManualAll')}</span>
-            </button>
+            {workshopInstalledAddons.length > 0 && (
+              <button className="btn btn-tertiary" onClick={() => onGroupActionBatch('move-load')}>
+                <FolderOpen size={14} />
+                <span>{t('groupHeader.moveToManualAll')}</span>
+              </button>
+            )}
           </>
         )}
         {uninstalledWithWorkshopId.length > 0 && onDownloadUninstalled && (
