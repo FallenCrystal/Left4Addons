@@ -204,6 +204,8 @@ fn import_sdk_workshop_file(
     let dest_path = workshop_dir.join(format!("{}.vpk", workshop_id));
     let temp_dest_path = workshop_dir.join(format!("{}.vpk.download", workshop_id));
 
+    remove_dummy_workshop_targets(&dest_path)?;
+
     if temp_dest_path.exists() {
         fs::remove_file(&temp_dest_path).map_err(|e| {
             format!(
@@ -711,6 +713,25 @@ fn is_dummy_vpk(path: &Path) -> bool {
         }
     }
     false
+}
+
+fn remove_dummy_workshop_targets(dest_path: &Path) -> Result<(), String> {
+    for candidate in [
+        dest_path.to_path_buf(),
+        dest_path.with_extension("vpk.disabled"),
+    ] {
+        if candidate.exists() && is_dummy_vpk(&candidate) {
+            fs::remove_file(&candidate).map_err(|e| {
+                format!(
+                    "Failed to remove dummy workshop target {}: {}",
+                    candidate.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 fn load_known_addons(known_addons_path: &Path) -> HashMap<String, KnownAddonEntry> {
@@ -4727,6 +4748,7 @@ pub async fn download_addon(
         }
         let dest_filename = format!("{}.vpk", workshop_id);
         let dest_path = workshop_dir.join(&dest_filename);
+        remove_dummy_workshop_targets(&dest_path)?;
         if dest_path.exists() {
             return Err(format!(
                 "Addon file already exists: {}",
@@ -5335,10 +5357,11 @@ mod tests {
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
         is_background_workshop_fetch_source, load_workshop_cache,
         merge_known_addon_snapshots_into_cache, persist_seen_workshop_item_entry,
-        persist_workshop_page_details_entry, propagate_author_names, save_workshop_cache,
-        workshop_cache_with_known_addons,
+        persist_workshop_page_details_entry, propagate_author_names, remove_dummy_workshop_targets,
+        save_workshop_cache, workshop_cache_with_known_addons,
     };
     use crate::commands::types::WorkshopSeenItem;
+    use crate::vpk::generate_dummy_vpk;
     use serde_json::json;
     use std::fs;
 
@@ -5362,12 +5385,71 @@ mod tests {
         path
     }
 
+    fn create_source_vpk(path: &std::path::Path) {
+        use std::io::Write;
+
+        let mut file = fs::File::create(path).unwrap();
+        let content = b"\"addoninfo\"\n{\n\"addontitle\" \"Mock Addon\"\n}";
+
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"txt\0");
+        tree.extend_from_slice(b"my_folder\0");
+        tree.extend_from_slice(b"addoninfo\0");
+        tree.extend_from_slice(&0u32.to_le_bytes());
+        tree.extend_from_slice(&0u16.to_le_bytes());
+        tree.extend_from_slice(&0x7fffu16.to_le_bytes());
+        tree.extend_from_slice(&0u32.to_le_bytes());
+        tree.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        tree.extend_from_slice(&0xffffu16.to_le_bytes());
+        tree.extend_from_slice(b"\0");
+        tree.extend_from_slice(b"\0");
+        tree.extend_from_slice(b"\0");
+
+        let tree_size = tree.len() as u32;
+
+        file.write_all(&0x55aa1234u32.to_le_bytes()).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(&tree_size.to_le_bytes()).unwrap();
+        file.write_all(&tree).unwrap();
+        file.write_all(content).unwrap();
+    }
+
     #[test]
     fn background_source_detection_is_limited_to_silent_refreshes() {
         assert!(is_background_workshop_fetch_source("startup-auto"));
         assert!(is_background_workshop_fetch_source("background-refresh"));
         assert!(!is_background_workshop_fetch_source("workshop-detail"));
         assert!(!is_background_workshop_fetch_source("workshop-home"));
+    }
+
+    #[test]
+    fn removes_only_dummy_workshop_targets() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "left4addons-{}-{}",
+            "remove-dummy-workshop-targets",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&temp_dir).ok();
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let source_vpk = temp_dir.join("source.vpk");
+        create_source_vpk(&source_vpk);
+
+        let dummy_vpk = temp_dir.join("12345.vpk");
+        let dummy_disabled_vpk = temp_dir.join("12345.vpk.disabled");
+        let real_vpk = temp_dir.join("67890.vpk");
+
+        generate_dummy_vpk(&source_vpk, &dummy_vpk).unwrap();
+        generate_dummy_vpk(&source_vpk, &dummy_disabled_vpk).unwrap();
+        fs::write(&real_vpk, b"real-addon").unwrap();
+
+        remove_dummy_workshop_targets(&dummy_vpk).unwrap();
+
+        assert!(!dummy_vpk.exists());
+        assert!(!dummy_disabled_vpk.exists());
+        assert!(real_vpk.exists());
+
+        fs::remove_dir_all(&temp_dir).ok();
     }
 
     #[test]
