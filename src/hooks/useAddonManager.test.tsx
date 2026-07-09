@@ -52,6 +52,7 @@ describe('useAddonManager', () => {
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
+    forceSteamworksSdkDownload: false,
   };
 
   beforeEach(() => {
@@ -326,6 +327,7 @@ describe('useAddonManager', () => {
           enableDummyBypass: false,
           suppressSdkUnavailableWarning: false,
           disableSteamworksSdk: false,
+          forceSteamworksSdkDownload: false,
         });
         return tauriPromise;
       }
@@ -343,7 +345,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir', false, false, false);
+      savePromise = result.current.saveSettings('/new/loading/dir', false, false, false, false);
     });
 
     // isSubmitting should be true immediately after invoking

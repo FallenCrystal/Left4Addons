@@ -10,6 +10,7 @@ describe('SettingsView', () => {
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
+    forceSteamworksSdkDownload: false,
     workshopSourceSettings: {
       preset: 'conservative',
       allowSteamworksSdk: true,
@@ -45,6 +46,7 @@ describe('SettingsView', () => {
       false,
       false,
       true,
+      false,
       baseSettings.workshopSourceSettings,
     );
   });

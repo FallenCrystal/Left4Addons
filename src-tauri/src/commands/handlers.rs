@@ -115,6 +115,125 @@ fn source_position(source_order: &[String], source: &str, fallback: usize) -> us
         .unwrap_or(fallback)
 }
 
+fn find_sdk_installed_workshop_file(install_folder: &Path) -> Result<Option<PathBuf>, String> {
+    if !install_folder.exists() {
+        return Ok(None);
+    }
+
+    if install_folder.is_file() {
+        let filename = install_folder
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if filename.ends_with(".vpk") || filename.ends_with("_legacy.bin") {
+            return Ok(Some(install_folder.to_path_buf()));
+        }
+        return Ok(None);
+    }
+
+    if !install_folder.is_dir() {
+        return Ok(None);
+    }
+
+    let mut vpk_candidates = Vec::new();
+    let mut legacy_candidates = Vec::new();
+    let mut file_candidates = Vec::new();
+
+    for entry in fs::read_dir(install_folder).map_err(|e| {
+        format!(
+            "Failed to read SDK install folder {}: {}",
+            install_folder.display(),
+            e
+        )
+    })? {
+        let entry =
+            entry.map_err(|e| format!("Failed to inspect SDK install folder entry: {}", e))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to read SDK install folder entry type: {}", e))?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        if filename.ends_with(".vpk") {
+            vpk_candidates.push(path);
+        } else if filename.ends_with("_legacy.bin") {
+            legacy_candidates.push(path);
+        } else {
+            file_candidates.push(path);
+        }
+    }
+
+    vpk_candidates.sort();
+    legacy_candidates.sort();
+    file_candidates.sort();
+
+    Ok(vpk_candidates
+        .into_iter()
+        .next()
+        .or_else(|| legacy_candidates.into_iter().next())
+        .or_else(|| {
+            if file_candidates.len() == 1 {
+                file_candidates.into_iter().next()
+            } else {
+                None
+            }
+        }))
+}
+
+fn import_sdk_workshop_file(
+    source_path: &Path,
+    workshop_id: &str,
+    workshop_dir: &Path,
+) -> Result<PathBuf, String> {
+    if !workshop_dir.exists() {
+        fs::create_dir_all(workshop_dir).map_err(|e| {
+            format!(
+                "Failed to create workshop directory {}: {}",
+                workshop_dir.display(),
+                e
+            )
+        })?;
+    }
+
+    let dest_path = workshop_dir.join(format!("{}.vpk", workshop_id));
+    let temp_dest_path = workshop_dir.join(format!("{}.vpk.download", workshop_id));
+
+    if temp_dest_path.exists() {
+        fs::remove_file(&temp_dest_path).map_err(|e| {
+            format!(
+                "Failed to remove stale SDK import temp file {}: {}",
+                temp_dest_path.display(),
+                e
+            )
+        })?;
+    }
+
+    fs::copy(source_path, &temp_dest_path).map_err(|e| {
+        format!(
+            "Failed to copy SDK workshop file from {} to {}: {}",
+            source_path.display(),
+            temp_dest_path.display(),
+            e
+        )
+    })?;
+    fs::rename(&temp_dest_path, &dest_path).map_err(|e| {
+        format!(
+            "Failed to finalize SDK workshop file from {} to {}: {}",
+            temp_dest_path.display(),
+            dest_path.display(),
+            e
+        )
+    })?;
+
+    Ok(dest_path)
+}
+
 fn resolve_cache_file(cache_dir: &Path, image_path: &str) -> Result<PathBuf, String> {
     let filename = image_path.strip_prefix("/cache/").unwrap_or(image_path);
     let rel_path = Path::new(filename);
@@ -724,6 +843,7 @@ pub fn load_db(
             enable_dummy_bypass: false,
             suppress_sdk_unavailable_warning: false,
             disable_steamworks_sdk: false,
+            force_steamworks_sdk_download: false,
             workshop_source_settings: WorkshopSourceSettings::default(),
         },
         addons: HashMap::new(),
@@ -1938,8 +2058,15 @@ async fn attempt_bridge_download(
 
     let expected_path = workshop_dir.join(format!("{}.vpk", workshop_id));
     let expected_disabled_path = workshop_dir.join(format!("{}.vpk.disabled", workshop_id));
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(120);
+    let mut saw_download_activity = false;
+    let mut saw_install_folder = false;
+    let mut last_reported_percent = 0u32;
+    let mut last_status_log = Instant::now() - Duration::from_secs(30);
+    let mut last_status_signature = String::new();
 
-    for _ in 0..40 {
+    while started_at.elapsed() < timeout {
         if is_download_cancelled(state, workshop_id)? {
             return Err(DOWNLOAD_CANCELLED_ERR.to_string());
         }
@@ -1950,12 +2077,39 @@ async fn attempt_bridge_download(
                 Err(err) => return Err(err),
             };
 
+        let item_states = status.item_state.join(",");
+        let install_folder = status.install_folder.as_deref().unwrap_or("");
+        let installed_dir = if install_folder.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(install_folder))
+        };
+        let status_signature = format!(
+            "installed={} downloaded={:?} total={:?} installFolder={} itemState={}",
+            status.installed, status.downloaded, status.total, install_folder, item_states
+        );
+        if status_signature != last_status_signature
+            || last_status_log.elapsed() >= Duration::from_secs(5)
+        {
+            println!(
+                "Steam SDK download status for {}: {}",
+                workshop_id, status_signature
+            );
+            last_status_signature = status_signature;
+            last_status_log = Instant::now();
+        }
+
         if let (Some(downloaded), Some(total)) = (status.downloaded, status.total) {
-            let percent = if total > 0 {
+            if downloaded > 0 || total > 0 {
+                saw_download_activity = true;
+            }
+            let raw_percent = if total > 0 {
                 ((downloaded as f64 / total as f64) * 100.0) as u32
             } else {
                 0
             };
+            let percent = raw_percent.max(last_reported_percent);
+            last_reported_percent = percent;
             let _ = app_handle.emit(
                 "download-progress",
                 DownloadProgress {
@@ -1964,7 +2118,26 @@ async fn attempt_bridge_download(
                     downloaded,
                     total,
                     source: "steam-sdk".to_string(),
-                    phase: "download".to_string(),
+                    phase: if status.installed {
+                        "install".to_string()
+                    } else {
+                        "download".to_string()
+                    },
+                },
+            );
+        }
+
+        if (status.installed || installed_dir.is_some()) && last_reported_percent < 99 {
+            last_reported_percent = 99;
+            let _ = app_handle.emit(
+                "download-progress",
+                DownloadProgress {
+                    workshop_id: workshop_id.to_string(),
+                    percent: 99,
+                    downloaded: status.downloaded.unwrap_or(0),
+                    total: status.total.unwrap_or(0),
+                    source: "steam-sdk".to_string(),
+                    phase: "install".to_string(),
                 },
             );
         }
@@ -1984,12 +2157,59 @@ async fn attempt_bridge_download(
             return Ok(true);
         }
 
-        if status.installed && expected_path.exists() {
-            return Ok(true);
+        if let Some(ref folder) = installed_dir {
+            saw_install_folder = true;
+            if let Some(source_path) = find_sdk_installed_workshop_file(folder)? {
+                println!(
+                    "Steam SDK install path resolved for {}: {} -> importing {}",
+                    workshop_id,
+                    folder.display(),
+                    source_path.display()
+                );
+                import_sdk_workshop_file(&source_path, workshop_id, workshop_dir)?;
+                let final_total = status.total.unwrap_or_else(|| {
+                    fs::metadata(&source_path)
+                        .map(|meta| meta.len())
+                        .unwrap_or(0)
+                });
+                let _ = app_handle.emit(
+                    "download-progress",
+                    DownloadProgress {
+                        workshop_id: workshop_id.to_string(),
+                        percent: 100,
+                        downloaded: final_total,
+                        total: final_total,
+                        source: "steam-sdk".to_string(),
+                        phase: "import".to_string(),
+                    },
+                );
+                return Ok(true);
+            } else {
+                println!(
+                    "Steam SDK install path present for {} but no importable file found yet: {}",
+                    workshop_id,
+                    folder.display()
+                );
+            }
+        }
+
+        if status.installed && !saw_install_folder {
+            eprintln!(
+                "Steam SDK marked workshop item {} installed without install folder; itemState={}, downloaded={:?}, total={:?}",
+                workshop_id, item_states, status.downloaded, status.total
+            );
         }
 
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+
+    eprintln!(
+        "Steam SDK workshop download did not complete within timeout for {}: saw_download_activity={}, saw_install_folder={}, expected_path_exists={}, item_state_polling_fell_through",
+        workshop_id,
+        saw_download_activity,
+        saw_install_folder,
+        expected_path.exists() || expected_disabled_path.exists(),
+    );
 
     Ok(false)
 }
@@ -2666,6 +2886,7 @@ pub async fn save_settings(
     enable_dummy_bypass: bool,
     suppress_sdk_unavailable_warning: bool,
     disable_steamworks_sdk: bool,
+    force_steamworks_sdk_download: bool,
     workshop_source_settings: Option<WorkshopSourceSettings>,
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
@@ -2679,6 +2900,7 @@ pub async fn save_settings(
     db.settings.enable_dummy_bypass = enable_dummy_bypass;
     db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
     db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
+    db.settings.force_steamworks_sdk_download = force_steamworks_sdk_download;
     if let Some(workshop_source_settings) = workshop_source_settings {
         db.settings.workshop_source_settings = workshop_source_settings;
     }
@@ -4469,11 +4691,12 @@ pub async fn download_addon(
     clear_download_cancellation(&state, &workshop_id)?;
 
     let result = async {
-        let (workshop_dir, source_policy) = {
+        let (workshop_dir, source_policy, force_sdk_download) = {
             let db = state.db.lock().await;
             (
                 PathBuf::from(&db.settings.workshop_dir),
                 SourcePolicy::from_settings(&db.settings),
+                db.settings.force_steamworks_sdk_download,
             )
         };
         let details_list = fetch_steam_details_hybrid(
@@ -4493,6 +4716,11 @@ pub async fn download_addon(
             .get("title")
             .and_then(|t| t.as_str())
             .unwrap_or("Workshop Item");
+        let file_url = details
+            .get("file_url")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string());
+        let prefer_sdk_download = force_sdk_download || file_url.is_none();
 
         if !workshop_dir.exists() {
             fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
@@ -4518,46 +4746,87 @@ pub async fn download_addon(
                 .map_err(|e| format!("Failed to remove stale download file: {}", e))?;
         }
 
-        match attempt_bridge_download(
-            &state,
-            &state.workshop_service,
-            &workshop_id,
-            &workshop_dir,
-            &app_handle,
-            source_policy.allow_bridge(),
-        )
-        .await
-        {
-            Ok(true) => {
-                crate::watcher::suppress_internal_refresh(&state);
-                let mut db = state.db.lock().await;
-                scan_addons_internal(
-                    &mut db,
-                    &state.settings_path,
-                    &state.groups_path,
-                    &state.known_addons_path,
-                    &state.cache_dir,
-                    &state.workshop_service,
-                )
-                .await?;
-                return Ok(database_with_workshop_cache(
-                    &db,
-                    &state.workshop_cache_path,
-                    &state.known_addons_path,
-                ));
+        if prefer_sdk_download {
+            match attempt_bridge_download(
+                &state,
+                &state.workshop_service,
+                &workshop_id,
+                &workshop_dir,
+                &app_handle,
+                source_policy.allow_bridge(),
+            )
+            .await
+            {
+                Ok(true) => {
+                    crate::watcher::suppress_internal_refresh(&state);
+                    let mut db = state.db.lock().await;
+                    scan_addons_internal(
+                        &mut db,
+                        &state.settings_path,
+                        &state.groups_path,
+                        &state.known_addons_path,
+                        &state.cache_dir,
+                        &state.workshop_service,
+                    )
+                    .await?;
+                    return Ok(database_with_workshop_cache(
+                        &db,
+                        &state.workshop_cache_path,
+                        &state.known_addons_path,
+                    ));
+                }
+                Ok(false) => {}
+                Err(err) if err == DOWNLOAD_CANCELLED_ERR => return Err(err),
+                Err(_) => {}
             }
-            Ok(false) => {}
-            Err(err) if err == DOWNLOAD_CANCELLED_ERR => return Err(err),
-            Err(_) => {}
         }
 
-        let file_url = details
-            .get("file_url")
-            .and_then(|u| u.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                "Workshop item has no download URL (SDK did not install it and Web API has no direct file URL)".to_string()
-            })?;
+        let file_url = match file_url {
+            Some(url) => url,
+            None if !prefer_sdk_download => {
+                match attempt_bridge_download(
+                    &state,
+                    &state.workshop_service,
+                    &workshop_id,
+                    &workshop_dir,
+                    &app_handle,
+                    source_policy.allow_bridge(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        crate::watcher::suppress_internal_refresh(&state);
+                        let mut db = state.db.lock().await;
+                        scan_addons_internal(
+                            &mut db,
+                            &state.settings_path,
+                            &state.groups_path,
+                            &state.known_addons_path,
+                            &state.cache_dir,
+                            &state.workshop_service,
+                        )
+                        .await?;
+                        return Ok(database_with_workshop_cache(
+                            &db,
+                            &state.workshop_cache_path,
+                            &state.known_addons_path,
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(err) if err == DOWNLOAD_CANCELLED_ERR => return Err(err),
+                    Err(_) => {}
+                }
+
+                return Err(
+                    "Workshop item has no direct download URL, and Steamworks SDK fallback did not install it".to_string()
+                );
+            }
+            None => {
+                return Err(
+                    "Workshop item has no download URL (Steamworks SDK did not install it and no direct Web API file_url is available)".to_string()
+                );
+            }
+        };
 
         println!("Downloading: {} (URL: {})", title, file_url);
         let client = reqwest::Client::new();
@@ -4567,6 +4836,41 @@ pub async fn download_addon(
             .await
             .map_err(|e| format!("Download request failed: {}", e))?;
         if !response.status().is_success() {
+            if !prefer_sdk_download {
+                match attempt_bridge_download(
+                    &state,
+                    &state.workshop_service,
+                    &workshop_id,
+                    &workshop_dir,
+                    &app_handle,
+                    source_policy.allow_bridge(),
+                )
+                .await
+                {
+                    Ok(true) => {
+                        crate::watcher::suppress_internal_refresh(&state);
+                        let mut db = state.db.lock().await;
+                        scan_addons_internal(
+                            &mut db,
+                            &state.settings_path,
+                            &state.groups_path,
+                            &state.known_addons_path,
+                            &state.cache_dir,
+                            &state.workshop_service,
+                        )
+                        .await?;
+                        return Ok(database_with_workshop_cache(
+                            &db,
+                            &state.workshop_cache_path,
+                            &state.known_addons_path,
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(err) if err == DOWNLOAD_CANCELLED_ERR => return Err(err),
+                    Err(_) => {}
+                }
+            }
+
             return Err(format!(
                 "Download server responded with status {}",
                 response.status()

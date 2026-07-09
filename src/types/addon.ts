@@ -146,6 +146,7 @@ export interface Settings {
   enableDummyBypass: boolean;
   suppressSdkUnavailableWarning: boolean;
   disableSteamworksSdk: boolean;
+  forceSteamworksSdkDownload?: boolean;
   workshopSourceSettings?: WorkshopSourceSettings;
 }
 

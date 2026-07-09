@@ -58,6 +58,7 @@
   - 如果你的网络环境随时能访问网页版创意工坊, 建议前往设置禁用 Steamworks SDK.
   - 如果 Left 4 Addons 在本次启动后已经调用过一次 Steamworks SDK, 那么即使随后在设置中禁用 Steamworks SDK, Steam 侧“正在游玩 L4D2”的状态也不保证会立即消失; 某些情况下需要完全关闭 Left 4 Addons 才会解除.
   - 如果 Steam 侧“正在游玩 L4D2”的状态是由 Left 4 Addons 拉起的, 那么从 Steam 客户端停止它会导致 Left 4 Addons 应用程序一并退出.
+  - 更完整的 SDK 搜索/下载限制与实现细节见 `docs/steamworks-sdk-details.md`.
 
 ---
 

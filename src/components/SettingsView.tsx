@@ -12,6 +12,7 @@ interface SettingsViewProps {
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
+    forceSteamworksSdkDownload: boolean,
     workshopSourceSettings: WorkshopSourceSettings,
   ) => Promise<void>;
 }
@@ -43,6 +44,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
   const [suppressSdkUnavailableWarning, setSuppressSdkUnavailableWarning] = useState(false);
   const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
+  const [forceSteamworksSdkDownload, setForceSteamworksSdkDownload] = useState(false);
   const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_SOURCE_SETTINGS);
 
   useEffect(() => {
@@ -50,6 +52,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setEnableDummyBypass(settings.enableDummyBypass || false);
     setSuppressSdkUnavailableWarning(settings.suppressSdkUnavailableWarning || false);
     setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
+    setForceSteamworksSdkDownload(settings.forceSteamworksSdkDownload || false);
     setWorkshopSourceSettings({
       ...DEFAULT_SOURCE_SETTINGS,
       ...(settings.workshopSourceSettings || {}),
@@ -68,6 +71,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       enableDummyBypass,
       suppressSdkUnavailableWarning,
       disableSteamworksSdk,
+      forceSteamworksSdkDownload,
       workshopSourceSettings,
     );
   };
@@ -392,8 +396,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <input
                       type="checkbox"
                       checked={disableSteamworksSdk}
-                      onChange={(e) => setDisableSteamworksSdk(e.target.checked)}
+                      onChange={(e) => {
+                        const checked = e.target.checked;
+                        setDisableSteamworksSdk(checked);
+                        if (checked) {
+                          setForceSteamworksSdkDownload(false);
+                        }
+                      }}
                       disabled={isSubmitting}
+                    />
+                    <span className="slider"></span>
+                  </label>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
+                  <div style={{ paddingRight: '20px' }}>
+                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                      {t('settings.forceSteamworksSdkDownloadTitle')}
+                    </label>
+                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                      {t('settings.forceSteamworksSdkDownloadDesc')}
+                    </div>
+                  </div>
+                  <label className="switch" style={{ flexShrink: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={forceSteamworksSdkDownload}
+                      onChange={(e) => setForceSteamworksSdkDownload(e.target.checked)}
+                      disabled={isSubmitting || disableSteamworksSdk}
                     />
                     <span className="slider"></span>
                   </label>

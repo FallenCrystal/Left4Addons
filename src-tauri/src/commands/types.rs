@@ -13,6 +13,8 @@ pub struct Settings {
     pub suppress_sdk_unavailable_warning: bool,
     #[serde(rename = "disableSteamworksSdk", default)]
     pub disable_steamworks_sdk: bool,
+    #[serde(rename = "forceSteamworksSdkDownload", default)]
+    pub force_steamworks_sdk_download: bool,
     #[serde(rename = "workshopSourceSettings", default)]
     pub workshop_source_settings: WorkshopSourceSettings,
 }

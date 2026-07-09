@@ -39,6 +39,7 @@ export function useAddonManager() {
     enableDummyBypass: false,
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
+    forceSteamworksSdkDownload: false,
     workshopSourceSettings: {
       preset: 'conservative',
       allowSteamworksSdk: true,
@@ -453,6 +454,7 @@ export function useAddonManager() {
     enableDummyBypass: boolean,
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
+    forceSteamworksSdkDownload: boolean,
     workshopSourceSettings?: WorkshopSourceSettings,
   ) => {
     if (isSubmitting) return;
@@ -463,6 +465,7 @@ export function useAddonManager() {
         enableDummyBypass,
         suppressSdkUnavailableWarning,
         disableSteamworksSdk,
+        forceSteamworksSdkDownload,
         workshopSourceSettings,
       });
       updateLocalState(data);

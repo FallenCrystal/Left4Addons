@@ -195,6 +195,7 @@ fn bridge_library_name() -> &'static str {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn steam_api_library_name() -> &'static str {
     if cfg!(target_os = "windows") {
         "steam_api64.dll"
