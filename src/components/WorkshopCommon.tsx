@@ -1,7 +1,36 @@
 import React from 'react';
 import { Package, Link2, CheckCircle, FolderPlus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { isKnownWorkshopItem } from '../utils/workshopKnown';
+import { findKnownWorkshopEntry, isKnownWorkshopItem } from '../utils/workshopKnown';
+
+function resolveRequiredItemTitle(
+  title: string | undefined,
+  workshopId: string,
+  addons: Record<string, any>,
+  knownUninstalledAddons: Record<string, any>,
+): string {
+  const normalizedTitle = String(title || '').trim();
+  if (normalizedTitle) {
+    return normalizedTitle;
+  }
+
+  const knownEntry = findKnownWorkshopEntry(addons, workshopId)
+    || findKnownWorkshopEntry(knownUninstalledAddons, workshopId);
+  if (knownEntry) {
+    const knownTitle = String(
+      knownEntry.workshopDetails?.title
+      || knownEntry.steamDetails?.title
+      || knownEntry.addonInfo?.addontitle
+      || knownEntry.vpkName
+      || '',
+    ).trim();
+    if (knownTitle) {
+      return knownTitle;
+    }
+  }
+
+  return workshopId;
+}
 
 interface RequiredItemsProps {
   requiredItems: { title: string; workshopId: string }[];
@@ -39,6 +68,7 @@ export const RequiredItems: React.FC<RequiredItemsProps> = ({
         {requiredItems.map((req) => {
           const reqIsKnown = isKnownWorkshopItem(knownUninstalledAddons, req.workshopId);
           const reqIsDownloaded = isKnownWorkshopItem(addons, req.workshopId);
+          const reqTitle = resolveRequiredItemTitle(req.title, req.workshopId, addons, knownUninstalledAddons);
           return (
             <div key={req.workshopId} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <a
@@ -56,7 +86,7 @@ export const RequiredItems: React.FC<RequiredItemsProps> = ({
                   gap: '4px',
                 }}
               >
-                <Link2 size={12} /> {req.title}
+                <Link2 size={12} /> {reqTitle}
               </a>
               {reqIsDownloaded && (
                 <CheckCircle size={14} className="icon-success" style={{ color: 'var(--md-sys-color-success)' }} />

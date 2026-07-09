@@ -51,6 +51,12 @@ export const DetailModal: React.FC<DetailModalProps> = ({
     const snapshot = await getWorkshopPageSnapshot(workshopId);
     if (snapshot) {
       setPageDetails(snapshot);
+      try {
+        const data: DatabasePayload = await persistWorkshopPageDetails(workshopId, snapshot, 'addon-detail') as DatabasePayload;
+        onDatabaseUpdate?.(data);
+      } catch (err) {
+        console.error('Failed to persist workshop snapshot details:', err);
+      }
     } else {
       setPageDetails(null);
     }

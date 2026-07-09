@@ -3875,6 +3875,24 @@ pub async fn query_workshop_item(
 }
 
 #[tauri::command]
+pub async fn query_workshop_details(
+    workshop_ids: Vec<String>,
+    state: State<'_, crate::AppState>,
+) -> Result<WorkshopItemsResponse, String> {
+    let db = state.db.lock().await;
+    if !SourcePolicy::from_settings(&db.settings).allow_bridge() {
+        return Err("Steamworks SDK workshop source is disabled".to_string());
+    }
+    drop(db);
+
+    Ok(WorkshopItemsResponse {
+        source: "steam-sdk".to_string(),
+        items: state.workshop_service.bridge_fetch_details(&workshop_ids)?,
+        warnings: Vec::new(),
+    })
+}
+
+#[tauri::command]
 pub async fn query_workshop_collection(
     workshop_id: String,
     state: State<'_, crate::AppState>,

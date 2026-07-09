@@ -28,6 +28,7 @@ vi.mock('../components/workshop/ssrParser', () => ({
 vi.mock('../components/workshop/authorDirectory', () => ({
   rememberWorkshopItems: (items: unknown) => mockRememberWorkshopItems(items),
   rememberWorkshopPageDetails: vi.fn(),
+  resolveWorkshopItemAuthor: (item: unknown) => item,
 }));
 
 describe('workshopClient', () => {
@@ -353,5 +354,161 @@ describe('workshopClient', () => {
     );
 
     workshopClient.setWorkshopWarningReporter(null);
+  });
+
+  test('getWorkshopPageSnapshot derives requiredItems from SDK childItemIds for non-collection items', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({});
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          canQueryItems: true,
+          canQueryHome: true,
+        });
+      }
+      if (cmd === 'query_workshop_item') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          item: {
+            publishedfileid: '100',
+            title: 'Parent Addon',
+            file_type: 'item',
+            child_item_ids: ['200', '300'],
+          },
+        });
+      }
+      if (cmd === 'query_workshop_details') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          items: [
+            { publishedfileid: '200', title: 'Child One' },
+            { publishedfileid: '300', title: 'Child Two' },
+          ],
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    const snapshot = await workshopClient.getWorkshopPageSnapshot('100');
+
+    expect(snapshot?.requiredItems).toEqual([
+      { title: 'Child One', workshopId: '200' },
+      { title: 'Child Two', workshopId: '300' },
+    ]);
+    expect(snapshot?.childItemIds).toEqual(['200', '300']);
+  });
+
+  test('getWorkshopPageSnapshot does not derive requiredItems from children for collections', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({});
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          canQueryItems: true,
+          canQueryHome: true,
+        });
+      }
+      if (cmd === 'query_workshop_item') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          item: {
+            publishedfileid: '100',
+            title: 'Collection',
+            file_type: 'collection',
+            child_item_ids: ['200', '300'],
+          },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    const snapshot = await workshopClient.getWorkshopPageSnapshot('100');
+
+    expect(snapshot?.requiredItems).toEqual([]);
+    expect(snapshot?.childItemIds).toEqual(['200', '300']);
+  });
+
+  test('getWorkshopPageSnapshot derives requiredItems from cached childItemIds when legacy cache stored an empty requiredItems array', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '100': {
+            workshopId: '100',
+            title: 'Cached Parent',
+            fileType: 'item',
+            requiredItems: [],
+            childItemIds: ['200', '300'],
+          },
+          '200': {
+            workshopId: '200',
+            title: 'Child One',
+          },
+          '300': {
+            workshopId: '300',
+            title: 'Child Two',
+          },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    const snapshot = await workshopClient.getWorkshopPageSnapshot('100');
+
+    expect(snapshot?.requiredItems).toEqual([
+      { title: 'Child One', workshopId: '200' },
+      { title: 'Child Two', workshopId: '300' },
+    ]);
+    expect(snapshot?.childItemIds).toEqual(['200', '300']);
+  });
+
+  test('getWorkshopPageSnapshot uses SDK detail enrichment to fill missing cached required item titles', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '100': {
+            workshopId: '100',
+            title: 'Cached Parent',
+            fileType: 'item',
+            requiredItems: [
+              { title: '', workshopId: '200' },
+              { title: '', workshopId: '300' },
+            ],
+            childItemIds: ['200', '300'],
+          },
+        });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          canQueryItems: true,
+          canQueryHome: true,
+        });
+      }
+      if (cmd === 'query_workshop_details') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          items: [
+            { publishedfileid: '200', title: 'Child One' },
+            { publishedfileid: '300', title: 'Child Two' },
+          ],
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    const snapshot = await workshopClient.getWorkshopPageSnapshot('100');
+
+    expect(snapshot?.requiredItems).toEqual([
+      { title: 'Child One', workshopId: '200' },
+      { title: 'Child Two', workshopId: '300' },
+    ]);
   });
 });

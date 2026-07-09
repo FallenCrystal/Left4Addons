@@ -138,6 +138,7 @@ pub fn run() {
             commands::handlers::query_workshop_home,
             commands::handlers::query_workshop_items,
             commands::handlers::query_workshop_item,
+            commands::handlers::query_workshop_details,
             commands::handlers::query_workshop_collection,
             commands::handlers::fetch_workshop_html,
             commands::handlers::delete_addons,

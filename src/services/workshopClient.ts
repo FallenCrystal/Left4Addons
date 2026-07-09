@@ -204,52 +204,111 @@ function normalizeCachedWorkshopItems(value: any): WorkshopItem[] {
     .filter(Boolean) as WorkshopItem[];
 }
 
-function mapCachedDetailToPageDetails(detail: any): WorkshopPageDetails {
-  const steamDetails = detail?.steamDetails || {};
-  const gallery = detail?.imageGallery || detail?.galleryUrls || detail?.galleryPreviewUrls || [];
+function normalizeChildItemIds(value: any): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const ids = value.map(String).filter(Boolean);
+  return ids.length > 0 ? ids : undefined;
+}
+
+function deriveRequiredItemsFromChildren(
+  childItemIds: string[] | undefined,
+  fileType: unknown,
+  cache?: Record<string, any>,
+): { title: string; workshopId: string }[] {
+  if (!Array.isArray(childItemIds) || childItemIds.length === 0) {
+    return [];
+  }
+  if (normalizeText(fileType).toLowerCase() === 'collection') {
+    return [];
+  }
+  return childItemIds.map((workshopId) => ({
+    title: normalizeText(cache?.[workshopId]?.title),
+    workshopId,
+  }));
+}
+
+function mapSteamDetailToPageDetails(detail: any, cache?: Record<string, any>): WorkshopPageDetails {
+  const childItemIds = normalizeChildItemIds(detail?.child_item_ids || detail?.childItemIds);
+  const fileType = normalizeText(detail?.file_type || detail?.fileType) || undefined;
   return {
-    title: normalizeText(detail?.title || steamDetails?.title) || undefined,
-    previewUrl: normalizeText(detail?.previewUrl || detail?.imagePath || detail?.preview_url || steamDetails?.preview_url) || undefined,
-    description: normalizeText(detail?.description || steamDetails?.description || detail?.shortDescription) || undefined,
-    descriptionHtml: normalizeText(detail?.descriptionHtml) || undefined,
-    creatorName: normalizeText(detail?.creatorName || detail?.authorName || detail?.creator_name || steamDetails?.creator_name) || undefined,
+    fileType,
+    title: normalizeText(detail?.title) || undefined,
+    previewUrl: normalizeText(detail?.preview_url || detail?.previewUrl || detail?.imagePath) || undefined,
+    description: normalizeText(detail?.description || detail?.short_description || detail?.shortDescription) || undefined,
+    creatorName: normalizeText(detail?.creator_name || detail?.creatorName || detail?.authorName) || undefined,
     creatorProfileUrl: normalizeText(detail?.creatorProfileUrl || detail?.authorUrl) || undefined,
-    creatorSteamId: normalizeText(detail?.creatorSteamId || detail?.creator_steam_id || steamDetails?.creator) || undefined,
-    creatorVanityId: normalizeText(detail?.creatorVanityId || steamDetails?.creator_vanity_id) || undefined,
-    creatorAccountId: normalizeText(detail?.creatorAccountId || detail?.creator_account_id || steamDetails?.creator_account_id) || undefined,
-    imageGallery: Array.isArray(gallery) ? gallery.map(String).filter(Boolean) : [],
-    tags: normalizeCachedTags(detail?.pageTags || detail?.tags || steamDetails?.tags),
-    requiredItems: normalizeCachedRelations(detail?.requiredItems),
+    creatorSteamId: normalizeText(detail?.creator_steam_id || detail?.creatorSteamId || detail?.creator) || undefined,
+    creatorVanityId: normalizeText(detail?.creator_vanity_id || detail?.creatorVanityId) || undefined,
+    creatorAccountId: normalizeText(detail?.creator_account_id || detail?.creatorAccountId) || undefined,
+    imageGallery: Array.isArray(detail?.galleryUrls || detail?.galleryPreviewUrls)
+      ? (detail.galleryUrls || detail.galleryPreviewUrls).map(String).filter(Boolean)
+      : [],
+    tags: normalizeCachedTags(detail?.pageTags || detail?.tags),
+    requiredItems: normalizeCachedRelations(detail?.requiredItems).length > 0
+      ? normalizeCachedRelations(detail?.requiredItems)
+      : deriveRequiredItemsFromChildren(childItemIds, fileType, cache),
     collectionItems: normalizeCachedWorkshopItems(detail?.collectionItems),
-    childItemIds: Array.isArray(detail?.childItemIds) ? detail.childItemIds.map(String).filter(Boolean) : undefined,
+    childItemIds,
     parentCollections: normalizeCachedRelations(detail?.parentCollections),
-    fileSizeDisplay: normalizeText(detail?.fileSizeDisplay || detail?.fileSize || steamDetails?.file_size) || undefined,
+    fileSizeDisplay: normalizeText(detail?.fileSizeDisplay || detail?.file_size || detail?.fileSize) || undefined,
     postedDateText: normalizeText(detail?.postedDateText) || undefined,
     updatedDateText: normalizeText(detail?.updatedDateText) || undefined,
     changeNoteCount: toNumericOrUndefined(detail?.changeNoteCount),
     ratingStars: toNumericOrUndefined(detail?.ratingStars),
     ratingCount: toNumericOrUndefined(detail?.ratingCount),
     uniqueVisitors: toNumericOrUndefined(detail?.uniqueVisitors),
-    currentSubscribers: toNumericOrUndefined(detail?.currentSubscribers),
-    currentFavorites: toNumericOrUndefined(detail?.currentFavorites),
+    currentSubscribers: toNumericOrUndefined(detail?.currentSubscribers || detail?.subscriptions),
+    currentFavorites: toNumericOrUndefined(detail?.currentFavorites || detail?.favorites || detail?.favorited),
     backgroundImageUrl: normalizeText(detail?.backgroundImageUrl) || undefined,
   };
 }
 
+function mapCachedDetailToPageDetails(detail: any, cache?: Record<string, any>): WorkshopPageDetails {
+  const steamDetails = detail?.steamDetails || {};
+  const pageDetails = mapSteamDetailToPageDetails({
+    ...steamDetails,
+    ...detail,
+    title: detail?.title || steamDetails?.title,
+    preview_url: detail?.previewUrl || detail?.imagePath || detail?.preview_url || steamDetails?.preview_url,
+    description: detail?.description || steamDetails?.description || detail?.shortDescription,
+    creator_name: detail?.creatorName || detail?.authorName || detail?.creator_name || steamDetails?.creator_name,
+    creatorProfileUrl: detail?.creatorProfileUrl || detail?.authorUrl,
+    creator_steam_id: detail?.creatorSteamId || detail?.creator_steam_id || steamDetails?.creator,
+    creator_vanity_id: detail?.creatorVanityId || steamDetails?.creator_vanity_id,
+    creator_account_id: detail?.creatorAccountId || detail?.creator_account_id || steamDetails?.creator_account_id,
+    galleryUrls: detail?.imageGallery || detail?.galleryUrls || detail?.galleryPreviewUrls,
+    pageTags: detail?.pageTags || detail?.tags || steamDetails?.tags,
+    requiredItems: detail?.requiredItems,
+    collectionItems: detail?.collectionItems,
+    childItemIds: detail?.childItemIds,
+    parentCollections: detail?.parentCollections,
+    fileSizeDisplay: detail?.fileSizeDisplay || detail?.fileSize || steamDetails?.file_size,
+    file_type: detail?.fileType || detail?.file_type || steamDetails?.file_type,
+  }, cache);
+  return {
+    ...pageDetails,
+    descriptionHtml: normalizeText(detail?.descriptionHtml) || undefined,
+  };
+}
+
 function normalizePageDetails(details: Partial<WorkshopPageDetails> | null | undefined): WorkshopPageDetails {
+  const childItemIds = normalizeChildItemIds(details?.childItemIds);
+  const cachedRequiredItems = Array.isArray(details?.requiredItems)
+    ? details.requiredItems.filter((item) => normalizeText(item?.workshopId))
+    : [];
+  const requiredItems = cachedRequiredItems.length > 0
+    ? cachedRequiredItems
+    : deriveRequiredItemsFromChildren(childItemIds, details?.fileType);
   return {
     ...details,
+    fileType: normalizeText(details?.fileType) || undefined,
     imageGallery: Array.isArray(details?.imageGallery) ? details.imageGallery.filter(Boolean) : [],
     tags: Array.isArray(details?.tags) ? details.tags.filter((tag) => normalizeText(tag?.name)) : [],
-    requiredItems: Array.isArray(details?.requiredItems)
-      ? details.requiredItems.filter((item) => normalizeText(item?.workshopId))
-      : [],
+    requiredItems,
     collectionItems: Array.isArray(details?.collectionItems)
       ? details.collectionItems.filter((item) => normalizeText(item?.workshopId))
       : [],
-    childItemIds: Array.isArray(details?.childItemIds)
-      ? details.childItemIds.map(String).filter(Boolean)
-      : undefined,
+    childItemIds,
     parentCollections: Array.isArray(details?.parentCollections)
       ? details.parentCollections.filter((item) => normalizeText(item?.workshopId))
       : [],
@@ -303,6 +362,7 @@ export function mergeWorkshopPageDetails(
   const existing = normalizePageDetails(current);
   const next = normalizePageDetails(incoming);
   const merged = resolvePageDetailsAuthor(normalizePageDetails({
+    fileType: normalizeText(next.fileType) || existing.fileType,
     title: normalizeText(next.title) || existing.title,
     previewUrl: normalizeText(next.previewUrl) || existing.previewUrl,
     description: chooseDescription(existing.description, next.description),
@@ -409,6 +469,58 @@ function reportWorkshopWarnings(warnings?: string[]) {
 
 function normalizeText(value: unknown): string {
   return String(value || '').trim();
+}
+
+function hasMissingRequiredItemTitles(details: Partial<WorkshopPageDetails> | null | undefined): boolean {
+  return Array.isArray(details?.requiredItems)
+    && details.requiredItems.some((item) => normalizeText(item?.workshopId) && !normalizeText(item?.title));
+}
+
+async function enrichRequiredItemsWithSdkDetails(
+  details: WorkshopPageDetails,
+  cache?: Record<string, any>,
+): Promise<WorkshopPageDetails> {
+  if (!shouldUseSteamworksSdk() || !hasMissingRequiredItemTitles(details)) {
+    return details;
+  }
+
+  const capabilities = await getWorkshopCapabilities().catch(() => null);
+  if (!capabilities?.canQueryItems) {
+    return details;
+  }
+
+  const missingIds = [...new Set(
+    (details.requiredItems || [])
+      .filter((item) => normalizeText(item?.workshopId) && !normalizeText(item?.title))
+      .map((item) => normalizeText(item.workshopId)),
+  )];
+  if (missingIds.length === 0) {
+    return details;
+  }
+
+  try {
+    const data = await invoke<WorkshopItemsResponse>('query_workshop_details', { workshopIds: missingIds });
+    reportWorkshopWarnings(data.warnings);
+    const titleById = new Map<string, string>();
+    for (const item of data.items || []) {
+      const workshopId = normalizeText(item?.publishedfileid || item?.workshopId);
+      if (!workshopId) continue;
+      const title = normalizeText(item?.title || cache?.[workshopId]?.title);
+      if (title) {
+        titleById.set(workshopId, title);
+      }
+    }
+
+    return mergeWorkshopPageDetails(details, {
+      requiredItems: (details.requiredItems || []).map((item) => ({
+        ...item,
+        title: normalizeText(item.title) || titleById.get(normalizeText(item.workshopId)) || item.title,
+      })),
+    });
+  } catch (err) {
+    console.warn('Steam SDK required item title enrichment failed:', err);
+    return details;
+  }
 }
 
 function accountIdToSteamId(accountId: unknown): string {
@@ -828,7 +940,7 @@ export async function fetchWorkshopPageDetails(workshopId: string, source: strin
   try {
     const html = await fetchWorkshopHtml(url, source);
     const details = mergeWorkshopPageDetails(snapshot, parseWorkshopPageDetails(html));
-    return details;
+    return enrichRequiredItemsWithSdkDetails(details);
   } catch (err) {
     if (snapshot) return snapshot;
     throw err;
@@ -838,10 +950,35 @@ export async function fetchWorkshopPageDetails(workshopId: string, source: strin
 export async function getWorkshopPageSnapshot(workshopId: string): Promise<WorkshopPageDetails | null> {
   const cache = await readWorkshopItemCache();
   const detail = cache[workshopId];
-  if (!detail) return null;
-  const snapshot = mergeWorkshopPageDetails(null, mapCachedDetailToPageDetails(detail));
-  if (!hasUsefulPageSnapshot(snapshot)) return null;
-  return snapshot;
+  if (detail) {
+    const snapshot = await enrichRequiredItemsWithSdkDetails(
+      mergeWorkshopPageDetails(null, mapCachedDetailToPageDetails(detail, cache)),
+      cache,
+    );
+    if (hasUsefulPageSnapshot(snapshot)) {
+      return snapshot;
+    }
+  }
+
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
+  if (!capabilities?.canQueryItems) {
+    return null;
+  }
+
+  try {
+    const data = await invoke<WorkshopItemResponse>('query_workshop_item', { workshopId });
+    reportWorkshopWarnings(data.warnings);
+    const snapshot = await enrichRequiredItemsWithSdkDetails(
+      mergeWorkshopPageDetails(null, mapSteamDetailToPageDetails(data.item, cache)),
+      cache,
+    );
+    return hasUsefulPageSnapshot(snapshot) ? snapshot : null;
+  } catch (err) {
+    console.warn('Steam SDK snapshot query failed:', err);
+    return null;
+  }
 }
 
 export async function persistWorkshopPageDetails(workshopId: string, details: any, source: string) {

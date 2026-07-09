@@ -44,6 +44,7 @@ export interface CollectionData {
 
 /** Extra details scraped from the Steam Community workshop page */
 export interface WorkshopPageDetails {
+  fileType?: string;
   title?: string;
   previewUrl?: string;
   description?: string;
