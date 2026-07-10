@@ -29,6 +29,7 @@ import { PromptModal } from './components/PromptModal';
 import { TaskCenterModal } from './components/TaskCenterModal';
 import { useState } from 'react';
 import { sortAddonsDownloadedFirst } from './utils/addonHelpers';
+import { findKnownWorkshopEntry } from './utils/workshopKnown';
 
 function App() {
   const { t } = useTranslation();
@@ -164,6 +165,14 @@ function App() {
   const groupsInMasterCollection = currentMasterCollection
     ? groups.filter(g => currentMasterCollection.groupIds.includes(g.id))
     : [];
+
+  const resolvedDetailModalAddon = detailModal.addon
+    ? addons[detailModal.addon.id]
+      || knownUninstalledAddons[detailModal.addon.id]
+      || findKnownWorkshopEntry(addons, detailModal.addon.workshopId)
+      || findKnownWorkshopEntry(knownUninstalledAddons, detailModal.addon.workshopId)
+      || detailModal.addon
+    : null;
 
   return (
     <div className="app-layout">
@@ -391,7 +400,7 @@ function App() {
       {/* Modals */}
       <DetailModal
         open={detailModal.open}
-        addon={detailModal.addon ? (addons[detailModal.addon.id] || knownUninstalledAddons[detailModal.addon.id] || detailModal.addon) : null}
+        addon={resolvedDetailModalAddon}
         groups={groups}
         onCancel={() => setDetailModal({ open: false, addon: null })}
         onToggle={toggleAddon}

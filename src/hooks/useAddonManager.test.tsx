@@ -482,6 +482,96 @@ describe('useAddonManager', () => {
     expect(result.current.toasts.some((toast) => toast.message.includes('自动刷新'))).toBe(false);
   });
 
+  test('should keep detail modal open for unresolved workshop placeholder entries after database updates', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      result.current.setDetailModal({
+        open: true,
+        addon: {
+          id: '99999',
+          vpkName: '99999',
+          workshopId: '99999',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+      });
+    });
+
+    const nextPayload: DatabasePayload = {
+      addons: mockAddons,
+      knownUninstalledAddons: {},
+      groups: mockGroups,
+      masterCollections: [],
+      settings: mockSettings,
+    };
+
+    act(() => {
+      result.current.applyDatabaseUpdate(nextPayload);
+    });
+
+    expect(result.current.detailModal.open).toBe(true);
+    expect(result.current.detailModal.addon?.workshopId).toBe('99999');
+  });
+
+  test('should resolve detail modal placeholder entries by workshop id after database updates', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      result.current.setDetailModal({
+        open: true,
+        addon: {
+          id: '99999',
+          vpkName: '99999',
+          workshopId: '99999',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+      });
+    });
+
+    const knownEntry: Addon = {
+      id: 'workshop_99999.vpk',
+      vpkName: 'workshop_99999.vpk',
+      workshopId: '99999',
+      dirType: 'none',
+      isEnabled: false,
+      fileSize: 123,
+      filesCount: 1,
+      workshopDetails: { title: 'Resolved Entry' },
+    };
+
+    const nextPayload: DatabasePayload = {
+      addons: mockAddons,
+      knownUninstalledAddons: {
+        [knownEntry.id]: knownEntry,
+      },
+      groups: mockGroups,
+      masterCollections: [],
+      settings: mockSettings,
+    };
+
+    act(() => {
+      result.current.applyDatabaseUpdate(nextPayload);
+    });
+
+    expect(result.current.detailModal.open).toBe(true);
+    expect(result.current.detailModal.addon?.id).toBe('workshop_99999.vpk');
+    expect(result.current.detailModal.addon?.workshopDetails?.title).toBe('Resolved Entry');
+  });
+
   test('should surface watcher errors through toast notifications', async () => {
     const { result } = renderHook(() => useAddonManager());
 

@@ -17,7 +17,7 @@ describe('GroupHeader', () => {
     },
     {
       id: 'addon2.vpk', vpkName: 'addon2.vpk',
-      dirType: 'loading', isEnabled: false, fileSize: 200, filesCount: 2,
+      dirType: 'workshop', isEnabled: false, fileSize: 200, filesCount: 2,
     },
   ];
 

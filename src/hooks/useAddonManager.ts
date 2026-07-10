@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Addon, Group, Settings, Toast, DatabasePayload, MasterCollection, WorkshopSourceSettings } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, getSuggestedVpkName, getAddonInfoValue, sortAddonsDownloadedFirst } from '../utils/addonHelpers';
+import { findKnownWorkshopEntry } from '../utils/workshopKnown';
 import { useTranslation } from 'react-i18next';
 import { useBackgroundTasks } from './useBackgroundTasks';
 import type { BackgroundTask } from '../types/addon';
@@ -70,6 +71,22 @@ export function useAddonManager() {
   const [workshopCapabilitiesCheckedAt, setWorkshopCapabilitiesCheckedAt] = useState<string | null>(null);
   const [workshopCapabilitiesError, setWorkshopCapabilitiesError] = useState<string | null>(null);
 
+  const resolveDetailModalAddon = useCallback((
+    addon: Addon | null,
+    nextAddons: Record<string, Addon>,
+    nextKnownUninstalledAddons: Record<string, Addon>,
+  ) => {
+    if (!addon) {
+      return null;
+    }
+
+    return nextAddons[addon.id]
+      || nextKnownUninstalledAddons[addon.id]
+      || findKnownWorkshopEntry(nextAddons, addon.workshopId)
+      || findKnownWorkshopEntry(nextKnownUninstalledAddons, addon.workshopId)
+      || null;
+  }, []);
+
   const clearDownloadProgress = useCallback((workshopId: string) => {
     setDownloadProgress((prev) => {
       if (prev[workshopId] === undefined) {
@@ -123,12 +140,17 @@ export function useAddonManager() {
         return prev;
       }
 
-      const nextAddon = nextAddons[prev.addon.id] || nextKnownUninstalledAddons[prev.addon.id];
-      return nextAddon
-        ? { ...prev, addon: nextAddon }
+      const nextAddon = resolveDetailModalAddon(prev.addon, nextAddons, nextKnownUninstalledAddons);
+      if (nextAddon) {
+        return { ...prev, addon: nextAddon };
+      }
+
+      const isWorkshopPlaceholder = prev.addon.id === prev.addon.workshopId;
+      return isWorkshopPlaceholder
+        ? prev
         : { open: false, addon: null };
     });
-  }, []);
+  }, [resolveDetailModalAddon]);
 
   // Listen to backend events
   useEffect(() => {

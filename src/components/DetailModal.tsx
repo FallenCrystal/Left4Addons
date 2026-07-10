@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { X, ExternalLink, Move, FolderPlus, Loader2, Download } from 'lucide-react';
 import { Addon, DatabasePayload, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
@@ -45,38 +45,54 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
   const [pageDetails, setPageDetails] = useState<WorkshopPageDetails | null>(null);
   const [pageDetailsLoading, setPageDetailsLoading] = useState(false);
+  const pageDetailsRequestRef = useRef(0);
 
   const fetchPageDetails = useCallback(async (workshopId: string) => {
+    const requestId = ++pageDetailsRequestRef.current;
     setPageDetailsLoading(true);
+    setPageDetails(null);
+
     const snapshot = await getWorkshopPageSnapshot(workshopId);
+    if (pageDetailsRequestRef.current !== requestId) return;
+
     if (snapshot) {
       setPageDetails(snapshot);
       try {
         const data: DatabasePayload = await persistWorkshopPageDetails(workshopId, snapshot, 'addon-detail') as DatabasePayload;
-        onDatabaseUpdate?.(data);
+        if (pageDetailsRequestRef.current === requestId) {
+          onDatabaseUpdate?.(data);
+        }
       } catch (err) {
         console.error('Failed to persist workshop snapshot details:', err);
       }
-    } else {
-      setPageDetails(null);
     }
+
     try {
       const details = await fetchWorkshopPageDetails(workshopId, 'addon-detail');
+      if (pageDetailsRequestRef.current !== requestId) return;
       setPageDetails(details);
       const data: DatabasePayload = await persistWorkshopPageDetails(workshopId, details, 'addon-detail') as DatabasePayload;
-      onDatabaseUpdate?.(data);
+      if (pageDetailsRequestRef.current === requestId) {
+        onDatabaseUpdate?.(data);
+      }
     } catch (err) {
-      console.error('Failed to fetch workshop page details:', err);
+      if (pageDetailsRequestRef.current === requestId) {
+        console.error('Failed to fetch workshop page details:', err);
+      }
     } finally {
-      setPageDetailsLoading(false);
+      if (pageDetailsRequestRef.current === requestId) {
+        setPageDetailsLoading(false);
+      }
     }
   }, [onDatabaseUpdate]);
 
   useEffect(() => {
     if (open && addon?.workshopId) {
-      fetchPageDetails(addon.workshopId);
+      void fetchPageDetails(addon.workshopId);
     } else {
+      pageDetailsRequestRef.current += 1;
       setPageDetails(null);
+      setPageDetailsLoading(false);
     }
   }, [open, addon?.workshopId, fetchPageDetails]);
 

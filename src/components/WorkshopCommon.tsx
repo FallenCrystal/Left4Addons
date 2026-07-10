@@ -75,6 +75,7 @@ export const RequiredItems: React.FC<RequiredItemsProps> = ({
                 href="#"
                 onClick={(e) => {
                   e.preventDefault();
+                  e.stopPropagation();
                   onItemNavigate(req.workshopId);
                 }}
                 style={{
@@ -139,6 +140,7 @@ export const ParentCollections: React.FC<ParentCollectionsProps> = ({
             href="#"
             onClick={(e) => {
               e.preventDefault();
+              e.stopPropagation();
               onCollectionNavigate(col.workshopId);
             }}
             style={{
