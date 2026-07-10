@@ -10,7 +10,16 @@ pub static RUNTIME_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorRule {
-    pub rules: String,
+    #[serde(default)]
+    pub rules: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub subdomains: Option<Vec<String>>,
+    #[serde(rename = "allow-www", default)]
+    pub allow_www: bool,
+    #[serde(default)]
+    pub regex: Option<String>,
     pub target: String,
     #[serde(rename = "keep-host", default)]
     pub keep_host: bool,
@@ -46,35 +55,90 @@ impl MirrorManager {
             });
             if let Some(host) = host_opt {
                 for rule in rules {
-                    // Quick parse of `rules`: e.g. "[store,media].steampowered.com"
-                    // We'll replace [a,b] with (a|b) and build a regex
-                    let mut regex_str = String::new();
-                    let mut in_bracket = false;
-                    let mut current_group = String::new();
+                    let mut final_regex_str = String::new();
                     
-                    for c in rule.rules.chars() {
-                        if c == '[' {
-                            in_bracket = true;
-                            regex_str.push('(');
-                        } else if c == ']' {
-                            in_bracket = false;
-                            regex_str.push_str(&current_group.replace(",", "|"));
-                            current_group.clear();
-                            regex_str.push(')');
-                        } else if in_bracket {
-                            current_group.push(c);
-                        } else if c == '*' {
-                            regex_str.push_str("(.*?)");
-                        } else {
-                            regex_str.push_str(&regex::escape(&c.to_string()));
+                    if let Some(regex_str) = &rule.regex {
+                        final_regex_str = regex_str.clone();
+                    } else if let Some(domain) = &rule.domain {
+                        let mut re = String::from("^");
+                        if rule.allow_www {
+                            re.push_str(r"(?:www\.)?");
                         }
+                        if let Some(subs) = &rule.subdomains {
+                            if subs.is_empty() {
+                                // No subdomains
+                            } else if subs.len() == 1 && subs[0] == "*" {
+                                re.push_str(r"(.*)\.");
+                            } else {
+                                let escaped_subs: Vec<String> = subs.iter().map(|s| regex::escape(s)).collect();
+                                re.push_str(&format!("({})\\.", escaped_subs.join("|")));
+                            }
+                        }
+                        re.push_str(&regex::escape(domain));
+                        re.push_str("$");
+                        final_regex_str = re;
+                    } else if let Some(rules_str) = &rule.rules {
+                        // Quick parse of `rules`: e.g. "[store,media].steampowered.com"
+                        let mut regex_str = String::new();
+                        let mut in_bracket = false;
+                        let mut current_group = String::new();
+                        let chars: Vec<char> = rules_str.chars().collect();
+                        let mut i = 0;
+                        
+                        while i < chars.len() {
+                            let c = chars[i];
+                            if c == '[' {
+                                in_bracket = true;
+                                regex_str.push('(');
+                            } else if c == ']' {
+                                in_bracket = false;
+                                // Escape each item inside the bracket properly
+                                let parts: Vec<String> = current_group.split(',')
+                                    .map(|s| regex::escape(s))
+                                    .collect();
+                                regex_str.push_str(&parts.join("|"));
+                                current_group.clear();
+                                regex_str.push(')');
+                                
+                                // Check for optional '?'
+                                if i + 1 < chars.len() && chars[i + 1] == '?' {
+                                    regex_str.push('?');
+                                    i += 1;
+                                }
+                            } else if in_bracket {
+                                current_group.push(c);
+                            } else if c == '*' {
+                                regex_str.push_str("(.*?)");
+                            } else {
+                                regex_str.push_str(&regex::escape(&c.to_string()));
+                            }
+                            i += 1;
+                        }
+                        final_regex_str = format!("^{}$", regex_str);
+                    } else {
+                        continue; // No matching rule defined
                     }
                     
-                    let final_pattern = format!("^{}$", regex_str);
-                    if let Ok(re) = Regex::new(&final_pattern) {
+                    if let Ok(re) = Regex::new(&final_regex_str) {
                         if let Some(caps) = re.captures(&host) {
-                            let matched_group = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                            let new_host = rule.target.replace("*", matched_group);
+                            let mut new_host = rule.target.clone();
+                            
+                            // Replace $1, $2, etc.
+                            for (i, mat) in caps.iter().enumerate().skip(1) {
+                                if let Some(m) = mat {
+                                    let placeholder = format!("${}", i);
+                                    if new_host.contains(&placeholder) {
+                                        new_host = new_host.replace(&placeholder, m.as_str());
+                                    }
+                                }
+                            }
+                            
+                            // Backward compatibility for '*'
+                            if new_host.contains('*') {
+                                // Find the first non-empty capture group (if any) or just the first one
+                                let matched_group = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                new_host = new_host.replace("*", matched_group);
+                            }
                             
                             let original_host = host.to_string();
                             if parsed_url.set_host(Some(&new_host)).is_ok() {

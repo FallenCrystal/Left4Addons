@@ -8,44 +8,89 @@ Left4Addons 支持配置自定义的请求镜像代理 (`mirrors.json`)。通过
 
 ## 基本语法
 
-`mirrors.json` 是一个包含多个**规则对象**的 JSON 数组。
+`mirrors.json` 是一个包含多个**规则对象**的 JSON 数组。代理匹配支持三种模式：**对象模式**、**高级正则模式**、以及**简易字符串模式**。
 
+### 字段说明 (通用)
+
+- **`target`** (`String`, 必填)
+  重定向到的目标域名。可以使用 `$1`, `$2` 等占位符来引用匹配规则中捕获的内容（例如被匹配到的子域名）。
+  - 若为了保持向后兼容，如果你使用了简易字符串模式并保留了 `*` 号，`*` 仍然会被自动替换为第一个捕获组。
+- **`keep-host`** (`Boolean`, 可选，默认 `false`)
+  如果设置为 `true`，将在发送请求时自动添加一个 `Host` 请求头，值为被代理前的原始域名。这通常用于需要验证原始域名的反向代理。
+- **`headers`** (`Object`, 可选，默认无)
+  允许在通过此镜像规则发起请求时，自动添加或覆盖特定的 HTTP 请求头。
+
+---
+
+### 模式一：对象模式 (推荐)
+通过结构化的对象定义匹配规则，清晰且易于维护。
+
+- **`domain`** (`String`, 必填)
+  需要匹配的基础域名，例如 `"steamstatic.com"`。
+- **`subdomains`** (`Array<String>`, 可选)
+  需要匹配的子域名列表。例如 `["store", "media"]`。
+  - 如果想要匹配任意子域名，可以使用 `["*"]`。
+  - 子域名将被作为**第一个捕获组** `$1`。
+- **`allow-www`** (`Boolean`, 可选，默认 `false`)
+  是否允许可选的 `www.` 前缀。如果你希望 `www.steamstatic.com` 和 `steamstatic.com` 都能被匹配到，请设为 `true`。(`www.` 不会被捕获，不影响 `$1`)
+
+**配置示例：**
 ```json
 [
   {
-    "rules": "[store,media].steampowered.com",
-    "target": "*.steam.example.com",
-    "keep-host": true,
-    "headers": {
-      "User-Agent": "MyCustomAgent/1.0",
-      "X-Custom-Auth": "SecretToken"
-    }
+    "domain": "steamstatic.com",
+    "subdomains": ["store", "media"],
+    "allow-www": true,
+    "target": "$1.mirror.example.com"
+  }
+]
+```
+*以上规则可以匹配 `store.steamstatic.com` 和 `www.media.steamstatic.com`，重定向时 `$1` 会被替换为 `store` 或 `media`。*
+
+---
+
+### 模式二：简易字符串模式 (向下兼容)
+通过一条字符串规则快速匹配，支持简单的分组和通配符。
+
+- **`rules`** (`String`, 必填)
+  - 组匹配：`[a,b].example.com`（相当于正则中的 `(a|b).example.com`），会作为捕获组 `$1`。
+  - 可选组：`[www.]?example.com`，在 `]` 后面加上 `?` 表示该组为可选，这解决了以往匹配可选前缀时语法怪异的问题。
+  - 通配符匹配：`*`，匹配并捕获任何内容。
+  - **提示**：在新版本中，建议在 `target` 中使用 `$1`, `$2` 来精确引用对应的捕获组，以避免 `[]` 组匹配意外抢占了通配符 `*` 的内容。
+
+**配置示例：**
+```json
+[
+  {
+    "rules": "[www.]?*.steamcommunity.com",
+    "target": "$2.steam.example.com",
+    "keep-host": true
+  }
+]
+```
+*上述规则中，`[www.]?` 是第一个捕获组 `$1`（无论是否匹配上），而 `*` 则是第二个捕获组 `$2`。我们在 `target` 中明确使用了 `$2`，避免了冲突。*
+
+---
+
+### 模式三：高级正则模式
+如果内置的匹配模式无法满足需求，你可以直接提供标准的正则表达式进行完全匹配控制。
+
+- **`regex`** (`String`, 必填)
+  标准正则表达式字符串。正则表达式将针对请求的完整 Host (包括端口，如果有的话) 进行匹配。
+
+**配置示例：**
+```json
+[
+  {
+    "regex": "^(?:www\\.)?(.*?)\\.steampowered\\.com$",
+    "target": "$1.proxy.my-server.com"
   }
 ]
 ```
 
-### 字段说明
+## 其它配置示例
 
-- **`rules`** (`String`, 必填)
-  用于匹配原始请求的域名的规则表达式。
-  - 支持类似 `[a,b].example.com` 的组匹配（相当于正则中的 `(a|b).example.com`）。
-  - 支持 `*` 作为通配符匹配（捕获任何内容）。
-
-- **`target`** (`String`, 必填)
-  重定向到的目标域名。
-  - 若 `rules` 中使用了 `*` 通配符或者 `[...]` 组匹配，匹配到的内容会自动替换 `target` 中的 `*`。例如：`rules: "[store,media].steampowered.com"` 匹配到了 `store.steampowered.com`，则 `target: "*.steam.example.com"` 会被替换为 `store.steam.example.com`。
-
-- **`keep-host`** (`Boolean`, 可选，默认 `false`)
-  如果设置为 `true`，将在发送请求时自动添加一个 `Host` 请求头，值为被代理前的原始域名。这通常用于需要验证原始域名的反向代理，或特定的 SNI 转发。
-
-- **`headers`** (`Object`, 可选，默认无)
-  允许在通过此镜像规则发起请求时，自动添加或覆盖特定的 HTTP 请求头（Headers）。可以用它来提供访问令牌、更改 `User-Agent` 或 `Referer` 等等。配置为标准的键值对（Key-Value）形式。
-
-## 配置示例
-
-### 1. 代理 Steam 创意工坊接口并保持 Host
-
-将创意工坊的请求指向自建的代理服务器：
+### 代理 Steam 创意工坊接口并保持 Host
 
 ```json
 [
@@ -57,16 +102,14 @@ Left4Addons 支持配置自定义的请求镜像代理 (`mirrors.json`)。通过
 ]
 ```
 
-### 2. 泛域名匹配并伪装 User-Agent
-
-为多个子域名配置通配的代理节点，并加上特殊的请求头来绕过某些验证限制：
+### 附加特定的 User-Agent
 
 ```json
 [
   {
-    "rules": "[store,cdn].steampowered.com",
-    "target": "*.proxy.my-server.com",
-    "keep-host": false,
+    "domain": "steampowered.com",
+    "subdomains": ["store", "cdn"],
+    "target": "$1.proxy.my-server.com",
     "headers": {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
       "X-Forwarded-For": "114.114.114.114"
