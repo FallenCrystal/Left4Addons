@@ -1,4 +1,4 @@
-import { CheckSquare, Square, Unlock, Lock, FolderOpen, Edit3, FolderPlus, Library, X, Download } from 'lucide-react';
+import { CheckSquare, Square, Unlock, Lock, FolderOpen, Edit3, FolderPlus, Library, X, Download, HardDrive, Globe } from 'lucide-react';
 import { Addon, Group, MasterCollection } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 
@@ -67,6 +67,10 @@ export function BatchActionBar({
   // Check if we're in master collection view (only groups selected)
   const isGroupOnlySelection = hasGroupSelection && !hasAddonSelection;
 
+  const hasDownloaded = filteredItems.some((item) => item.dirType !== 'none');
+  const hasUndownloaded = filteredItems.some((item) => item.dirType === 'none');
+  const showSelectiveSelection = selectedIds.length === 0 && hasDownloaded && hasUndownloaded;
+
   return (
     <div className="batch-action-bar">
       <div className="batch-action-info">
@@ -88,28 +92,28 @@ export function BatchActionBar({
               </span>
             </button>
 
-            {selectedIds.length === 0 && filteredItems.some(item => item.dirType !== 'none') && (
-              <button
-                className="btn btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-                onClick={() => onSelectAll(filteredItems.filter(item => item.dirType !== 'none'))}
-                disabled={isSubmitting}
-              >
-                <CheckSquare size={14} />
-                <span>{t('batchActionBar.selectDownloaded')}</span>
-              </button>
-            )}
+            {showSelectiveSelection && (
+              <>
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={() => onSelectAll(filteredItems.filter(item => item.dirType !== 'none'))}
+                  disabled={isSubmitting}
+                >
+                  <HardDrive size={14} />
+                  <span>{t('batchActionBar.selectDownloaded')}</span>
+                </button>
 
-            {selectedIds.length === 0 && filteredItems.some(item => item.dirType === 'none') && (
-              <button
-                className="btn btn-secondary"
-                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-                onClick={() => onSelectAll(filteredItems.filter(item => item.dirType === 'none'))}
-                disabled={isSubmitting}
-              >
-                <CheckSquare size={14} />
-                <span>{t('batchActionBar.selectUndownloaded')}</span>
-              </button>
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={() => onSelectAll(filteredItems.filter(item => item.dirType === 'none'))}
+                  disabled={isSubmitting}
+                >
+                  <Globe size={14} />
+                  <span>{t('batchActionBar.selectUndownloaded')}</span>
+                </button>
+              </>
             )}
           </>
         )}
