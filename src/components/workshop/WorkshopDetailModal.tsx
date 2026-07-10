@@ -268,6 +268,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   const resolvedItem = resolveWorkshopItemAuthor(item);
   const displayAuthorName = pageDetails?.creatorName || resolvedItem.authorName;
   const displayAuthorUrl = pageDetails?.creatorProfileUrl || resolvedItem.authorUrl;
+  const displayDescription = pageDetails?.description || item.shortDescription;
 
   // Find group this addon belongs to
   const itemGroup = groups?.find(g => (
@@ -378,10 +379,10 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
               </div>
             )}
 
-            {item.shortDescription && (
+            {displayDescription && (
               <>
                 <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('workshop.detail.descriptionLabel')}</div>
-                <div className="description-block">{item.shortDescription}</div>
+                <div className="description-block">{displayDescription}</div>
               </>
             )}
 

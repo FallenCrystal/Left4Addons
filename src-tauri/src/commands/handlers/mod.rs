@@ -124,15 +124,22 @@ impl SourcePolicy {
         &self.source_order
     }
 
-    fn allow_html(&self, sdk_query_available: bool) -> bool {
+    fn allow_html(&self, source: &str, sdk_query_available: bool) -> bool {
         if !self.allow_steam_community_html {
             return false;
         }
         if self.preset == "hybrid" || self.allow_sdk_html_hybrid {
             return true;
         }
+        if is_manual_detail_workshop_fetch_source(source) {
+            return true;
+        }
         !sdk_query_available
     }
+}
+
+fn is_manual_detail_workshop_fetch_source(source: &str) -> bool {
+    matches!(source, "addon-detail" | "workshop-detail")
 }
 
 fn source_position(source_order: &[String], source: &str, fallback: usize) -> usize {
@@ -2520,7 +2527,7 @@ mod tests {
         parse_content_range_start, persist_seen_workshop_item_entry,
         persist_workshop_page_details_entry, propagate_author_names,
         remove_dummy_workshop_targets, rename_requires_name_change, save_workshop_cache,
-        toggle_requires_state_change, workshop_cache_with_known_addons,
+        toggle_requires_state_change, workshop_cache_with_known_addons, SourcePolicy,
     };
     use crate::commands::types::{Addon, WorkshopSeenItem};
     use crate::vpk::generate_dummy_vpk;
@@ -2582,6 +2589,27 @@ mod tests {
         assert!(is_background_workshop_fetch_source("background-refresh"));
         assert!(!is_background_workshop_fetch_source("workshop-detail"));
         assert!(!is_background_workshop_fetch_source("workshop-home"));
+    }
+
+    #[test]
+    fn detail_sources_can_fetch_html_without_hybrid_mode() {
+        let policy = SourcePolicy {
+            preset: "conservative".to_string(),
+            allow_steamworks_sdk: true,
+            allow_steam_web_api: true,
+            allow_steam_community_html: true,
+            allow_sdk_html_hybrid: false,
+            source_order: vec![
+                "steamworks-sdk".to_string(),
+                "steam-web-api".to_string(),
+                "steamcommunity-html".to_string(),
+            ],
+        };
+
+        assert!(policy.allow_html("addon-detail", true));
+        assert!(policy.allow_html("workshop-detail", true));
+        assert!(!policy.allow_html("workshop-home", true));
+        assert!(!policy.allow_html("workshop-browse", true));
     }
 
     #[test]

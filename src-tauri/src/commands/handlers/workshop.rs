@@ -470,7 +470,7 @@ pub async fn fetch_workshop_html(
             false
         };
         (
-            source_policy.allow_html(sdk_query_available),
+            source_policy.allow_html(&source, sdk_query_available),
             sdk_query_available,
         )
     };
