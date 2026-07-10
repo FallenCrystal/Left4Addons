@@ -986,7 +986,7 @@ pub async fn group_action(
         return Err("Unknown action".to_string());
     }
 
-    db.groups.retain(|g| !g.addons.is_empty());
+    normalize_master_collection_group_refs(&mut db);
 
     save_db_internal(
         &state.settings_path,

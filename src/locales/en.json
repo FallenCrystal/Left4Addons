@@ -140,6 +140,7 @@
     "partiallyEnabled": "Partially Enabled",
     "enabled": "Enabled",
     "disabled": "Disabled",
+    "empty": "Empty",
     "groupBadge": "Group ({{count}})",
     "author": "Author: {{author}}",
     "authorMultiple": "Author: {{first}} and {{count}} others",

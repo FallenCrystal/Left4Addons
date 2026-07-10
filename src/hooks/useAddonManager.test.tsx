@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useAddonManager } from './useAddonManager';
-import { Addon, DatabasePayload, Group, Settings } from '../types/addon';
+import { Addon, DatabasePayload, Group, MasterCollection, Settings } from '../types/addon';
 
 // Mock Tauri invoke function
 const mockInvoke = vi.fn();
@@ -153,6 +153,108 @@ describe('useAddonManager', () => {
     });
     expect(result.current.filteredItems).toHaveLength(1);
     expect(result.current.filteredItems[0].vpkName).toBe('addon2.vpk');
+  });
+
+  test('should render empty groups in all view without requiring addons', async () => {
+    const emptyGroup: Group = { id: 'group-empty', name: 'Empty Group', addons: [] };
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: [...mockGroups, emptyGroup],
+          settings: mockSettings,
+        });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    expect(result.current.renderedItems).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'group', id: 'group-empty' }),
+      ])
+    );
+
+    act(() => {
+      result.current.setSearchQuery('addon one');
+    });
+
+    expect(result.current.renderedItems).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'group', id: 'group-empty' }),
+      ])
+    );
+  });
+
+  test('should render empty groups inside master collections', async () => {
+    const emptyGroup: Group = {
+      id: 'group-empty',
+      name: 'Empty Group',
+      addons: [],
+      masterCollectionIds: ['mc-1'],
+    };
+    const masterCollections: MasterCollection[] = [{
+      id: 'mc-1',
+      name: 'Master Collection',
+      groupIds: ['group-empty'],
+      isSystem: false,
+    }];
+
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: [...mockGroups, emptyGroup],
+          masterCollections,
+          settings: mockSettings,
+        });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      result.current.handleFilterTabChange('master-collection', 'mc-1');
+    });
+
+    expect(result.current.filteredItems).toHaveLength(0);
+    expect(result.current.renderedItems).toEqual([
+      expect.objectContaining({ type: 'group', id: 'group-empty' }),
+    ]);
   });
 
   test('should toggle selection correctly', async () => {
@@ -340,6 +442,59 @@ describe('useAddonManager', () => {
     expect(result.current.groups).toHaveLength(0);
   });
 
+  test('should navigate to a newly created empty group', async () => {
+    const emptyGroup: Group = { id: 'group-empty', name: 'Empty Group', addons: [] };
+    mockInvoke.mockImplementation((cmd, args) => {
+      if (cmd === 'get_addons') {
+        return Promise.resolve({ addons: mockAddons, groups: mockGroups, settings: mockSettings });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          bridgeLoaded: true,
+          bridgeInitialized: true,
+          provider: 'steam-sdk',
+          canQueryItems: true,
+          canQueryHome: true,
+          canDownload: true,
+          canEnumerateInstalled: true,
+        });
+      }
+      if (cmd === 'group_action' && args?.action === 'create') {
+        expect(args.ids).toEqual([]);
+        return Promise.resolve({
+          addons: mockAddons,
+          groups: [...mockGroups, emptyGroup],
+          settings: mockSettings,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      result.current.setSearchQuery('will be cleared');
+      result.current.setSelectedCategory('Campaign');
+      result.current.setCurrentFilterTab('workshop');
+    });
+
+    await act(async () => {
+      await result.current.handleCreateGroup('Empty Group');
+    });
+
+    expect(result.current.groups).toEqual(expect.arrayContaining([emptyGroup]));
+    expect(result.current.currentFilterTab).toBe('groups');
+    expect(result.current.selectedGroupId).toBe('group-empty');
+    expect(result.current.selectedCategory).toBe('All');
+    expect(result.current.searchQuery).toBe('');
+    expect(result.current.currentGroup).toEqual(emptyGroup);
+  });
+
   test('should set isSubmitting to true during async actions and reset to false afterwards', async () => {
     let resolvePromise: (value: unknown) => void = () => {};
     const tauriPromise = new Promise((resolve) => {
@@ -379,6 +534,8 @@ describe('useAddonManager', () => {
             suppressSdkUnavailableWarning: false,
             disableSteamworksSdk: false,
             forceSteamworksSdkDownload: false,
+            maxDownloadRetries: 3,
+            workshopSourceSettings: undefined,
           },
         });
         return tauriPromise;

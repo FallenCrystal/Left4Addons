@@ -32,6 +32,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
   downloadProgress = {},
 }) => {
   const { t } = useTranslation();
+  const isEmptyGroup = group.addons.length === 0 && addons.length === 0;
   const installedAddons = addons.filter(ad => ad.dirType !== 'none');
   const uninstalledAddons = addons.filter(ad => ad.dirType === 'none');
   const displayAddons = installedAddons.length > 0 ? installedAddons : addons;
@@ -44,7 +45,11 @@ export const GroupCard: React.FC<GroupCardProps> = ({
   let statusText = t('groupCard.partiallyEnabled');
   let badgeClass = 'badge-disabled';
   let badgeStyle: React.CSSProperties = {};
-  if (installedAddons.length === 0) {
+  if (isEmptyGroup) {
+    statusText = t('groupCard.empty');
+    badgeClass = '';
+    badgeStyle = { background: 'var(--md-sys-color-surface-container-highest)', color: 'var(--md-sys-color-on-surface-variant)' };
+  } else if (installedAddons.length === 0) {
     statusText = t('addonCard.uninstalled');
     badgeClass = '';
     badgeStyle = { background: 'var(--md-sys-color-tertiary)', color: 'var(--md-sys-color-on-tertiary)' };

@@ -74,6 +74,19 @@ describe('Sidebar', () => {
     expect(screen.getByText('暂无分组，可自动归类或手动创建。')).toBeDefined();
   });
 
+  test('renders empty manual groups', () => {
+    render(
+      <Sidebar
+        {...defaultProps}
+        groups={[{ id: 'empty-group', name: 'Empty Group', addons: [] }]}
+        knownUninstalledCount={0}
+      />
+    );
+
+    expect(screen.getByText('Empty Group')).toBeDefined();
+    expect(screen.getByText('Empty Group').closest('button')?.querySelector('.menu-item-badge')?.textContent).toBe('0');
+  });
+
   test('calls onFilterTabChange when menu items are clicked', () => {
     const onFilterTabChange = vi.fn();
 

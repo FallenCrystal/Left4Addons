@@ -12,6 +12,7 @@ describe('SettingsView', () => {
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
     forceSteamworksSdkDownload: false,
+    maxDownloadRetries: 3,
     workshopSourceSettings: {
       preset: 'conservative',
       allowSteamworksSdk: true,
@@ -49,6 +50,7 @@ describe('SettingsView', () => {
       false,
       true,
       false,
+      3,
       baseSettings.workshopSourceSettings,
     );
   });
@@ -66,7 +68,7 @@ describe('SettingsView', () => {
 
     fireEvent.click(screen.getByText('下载'));
 
-    const input = screen.getByRole('spinbutton') as HTMLInputElement;
+    const input = screen.getAllByRole('spinbutton')[0] as HTMLInputElement;
     fireEvent.change(input, { target: { value: '99' } });
     fireEvent.blur(input);
     fireEvent.click(screen.getByText('保存并重新扫描'));
@@ -78,6 +80,7 @@ describe('SettingsView', () => {
       false,
       false,
       false,
+      3,
       baseSettings.workshopSourceSettings,
     );
   });

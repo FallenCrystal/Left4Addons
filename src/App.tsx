@@ -335,7 +335,7 @@ function App() {
                   <RefreshCw className="animate-spin" size={36} />
                   <p style={{ marginTop: '16px' }}>{t('common.parsing')}</p>
                 </div>
-              ) : filteredItems.length === 0 ? (
+              ) : renderedItems.length === 0 ? (
                 <div className="empty-state">
                   <FileText className="empty-icon" size={64} />
                   <div className="empty-title">{t('common.emptyStateTitle')}</div>

@@ -149,6 +149,43 @@ fn source_position(source_order: &[String], source: &str, fallback: usize) -> us
         .unwrap_or(fallback)
 }
 
+fn normalize_master_collection_group_refs(db: &mut Database) -> bool {
+    let valid_group_ids: HashSet<String> = db.groups.iter().map(|group| group.id.clone()).collect();
+    let valid_master_collection_ids: HashSet<String> = db
+        .master_collections
+        .iter()
+        .map(|collection| collection.id.clone())
+        .collect();
+    let mut changed = false;
+
+    for collection in &mut db.master_collections {
+        let before = collection.group_ids.len();
+        let mut seen = HashSet::new();
+        collection
+            .group_ids
+            .retain(|group_id| valid_group_ids.contains(group_id) && seen.insert(group_id.clone()));
+        changed |= before != collection.group_ids.len();
+    }
+
+    for group in &mut db.groups {
+        if let Some(master_collection_ids) = &mut group.master_collection_ids {
+            let before = master_collection_ids.len();
+            let mut seen = HashSet::new();
+            master_collection_ids.retain(|collection_id| {
+                valid_master_collection_ids.contains(collection_id)
+                    && seen.insert(collection_id.clone())
+            });
+            changed |= before != master_collection_ids.len();
+            if master_collection_ids.is_empty() {
+                group.master_collection_ids = None;
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
 fn find_sdk_installed_workshop_file(install_folder: &Path) -> Result<Option<PathBuf>, String> {
     if !install_folder.exists() {
         return Ok(None);
@@ -2524,12 +2561,13 @@ mod tests {
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
         is_background_workshop_fetch_source, load_workshop_cache,
         merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
-        parse_content_range_start, persist_seen_workshop_item_entry,
-        persist_workshop_page_details_entry, propagate_author_names,
-        remove_dummy_workshop_targets, rename_requires_name_change, save_workshop_cache,
-        toggle_requires_state_change, workshop_cache_with_known_addons, SourcePolicy,
+        normalize_master_collection_group_refs, parse_content_range_start,
+        persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
+        propagate_author_names, remove_dummy_workshop_targets, rename_requires_name_change,
+        save_workshop_cache, toggle_requires_state_change, workshop_cache_with_known_addons,
+        SourcePolicy,
     };
-    use crate::commands::types::{Addon, WorkshopSeenItem};
+    use crate::commands::types::{Addon, Database, Group, MasterCollection, WorkshopSeenItem};
     use crate::vpk::generate_dummy_vpk;
     use serde_json::json;
     use std::fs;
@@ -2589,6 +2627,60 @@ mod tests {
         assert!(is_background_workshop_fetch_source("background-refresh"));
         assert!(!is_background_workshop_fetch_source("workshop-detail"));
         assert!(!is_background_workshop_fetch_source("workshop-home"));
+    }
+
+    #[test]
+    fn normalizes_master_collection_refs_without_dropping_empty_groups() {
+        let mut db = Database {
+            groups: vec![
+                Group {
+                    id: "empty-group".to_string(),
+                    name: "Empty Group".to_string(),
+                    addons: vec![],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: Some(vec![
+                        "collection-1".to_string(),
+                        "missing-collection".to_string(),
+                    ]),
+                    source: None,
+                },
+                Group {
+                    id: "filled-group".to_string(),
+                    name: "Filled Group".to_string(),
+                    addons: vec!["addon-1".to_string()],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: None,
+                    source: None,
+                },
+            ],
+            master_collections: vec![MasterCollection {
+                id: "collection-1".to_string(),
+                name: "Collection".to_string(),
+                name_key: None,
+                group_ids: vec![
+                    "empty-group".to_string(),
+                    "missing-group".to_string(),
+                    "empty-group".to_string(),
+                    "filled-group".to_string(),
+                ],
+                is_system: false,
+                icon: None,
+            }],
+            ..Database::default()
+        };
+
+        assert!(normalize_master_collection_group_refs(&mut db));
+        assert_eq!(db.groups.len(), 2);
+        assert_eq!(
+            db.master_collections[0].group_ids,
+            vec!["empty-group".to_string(), "filled-group".to_string()]
+        );
+        assert_eq!(
+            db.groups[0].master_collection_ids,
+            Some(vec!["collection-1".to_string()])
+        );
     }
 
     #[test]

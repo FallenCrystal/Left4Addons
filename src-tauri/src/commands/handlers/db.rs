@@ -132,15 +132,20 @@ pub fn load_db(
         }
     }
 
-    let db = Database {
+    let mut db = Database {
         settings: settings_store.settings,
         addons: merged_addons,
         groups,
         known_uninstalled_addons,
         master_collections: settings_store.master_collections,
     };
+    let normalized_master_collections = normalize_master_collection_group_refs(&mut db);
 
-    if !settings_existed || !groups_existed || !known_addons_existed {
+    if normalized_master_collections
+        || !settings_existed
+        || !groups_existed
+        || !known_addons_existed
+    {
         save_db_internal(settings_path, groups_path, known_addons_path, &db);
     }
 
@@ -574,7 +579,7 @@ pub async fn scan_addons_internal(
             })
             .collect();
     }
-    db.groups.retain(|g| !g.addons.is_empty());
+    normalize_master_collection_group_refs(db);
 
     save_db_internal(settings_path, groups_path, known_addons_path, db);
     Ok(())
@@ -598,4 +603,3 @@ pub async fn get_addons(state: State<'_, crate::AppState>) -> Result<Database, S
         &state.known_addons_path,
     ))
 }
-

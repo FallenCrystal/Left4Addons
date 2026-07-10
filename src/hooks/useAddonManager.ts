@@ -537,6 +537,7 @@ export function useAddonManager() {
     if (isSubmitting) return;
     setIsSubmitting(true);
     try {
+      const existingGroupIds = new Set(groups.map(group => group.id));
       const data: DatabasePayload = await invoke('group_action', {
         action: 'create',
         name,
@@ -546,6 +547,15 @@ export function useAddonManager() {
         source
       });
       updateLocalState(data);
+      const createdGroup = (data.groups || []).find(group => !existingGroupIds.has(group.id))
+        || [...(data.groups || [])].reverse().find(group => group.name === name);
+      if (createdGroup) {
+        setSearchQuery('');
+        setSelectedCategory('All');
+        setCurrentFilterTab('groups');
+        setSelectedGroupId(createdGroup.id);
+        setSelectedMasterCollectionId(null);
+      }
       setGroupModal({ open: false });
       addToast(t('toasts.createGroupSuccess'), 'success');
     } catch (err) {
@@ -1246,6 +1256,21 @@ export function useAddonManager() {
       return orderedAddons.map(item => ({ type: 'addon' as const, id: item.id, data: item }));
     }
 
+    const emptyGroupMatchesFilters = (group: Group) => {
+      if (group.addons.length > 0 || selectedCategory !== 'All') {
+        return false;
+      }
+
+      if (!searchQuery) {
+        return true;
+      }
+
+      const q = searchQuery.toLowerCase();
+      return group.name.toLowerCase().includes(q)
+        || (group.workshopCollectionId || '').includes(q)
+        || (group.tags || []).some(tag => tag.toLowerCase().includes(q));
+    };
+
     // For master collection view, show groups within the collection
     if (currentFilterTab === 'master-collection' && selectedMasterCollectionId) {
       const mc = masterCollections.find(mc => mc.id === selectedMasterCollectionId);
@@ -1258,7 +1283,7 @@ export function useAddonManager() {
             const matchingAddons = sortAddonsDownloadedFirst(
               filteredAddons.filter(item => group.addons.includes(item.id))
             );
-            if (matchingAddons.length > 0) {
+            if (matchingAddons.length > 0 || emptyGroupMatchesFilters(group)) {
               matchingAddons.forEach(item => groupedVpkNames.add(item.id));
               rendered.push({
                 type: 'group',
@@ -1281,7 +1306,7 @@ export function useAddonManager() {
       const matchingAddons = sortAddonsDownloadedFirst(
         filteredAddons.filter(item => group.addons.includes(item.id))
       );
-      if (matchingAddons.length > 0) {
+      if (matchingAddons.length > 0 || (currentFilterTab === 'all' && emptyGroupMatchesFilters(group))) {
         matchingAddons.forEach(item => groupedVpkNames.add(item.id));
         rendered.push({
           type: 'group',

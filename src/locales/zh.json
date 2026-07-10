@@ -140,6 +140,7 @@
     "partiallyEnabled": "部分启用",
     "enabled": "已启用",
     "disabled": "已禁用",
+    "empty": "空组",
     "groupBadge": "分组 ({{count}})",
     "author": "作者: {{author}}",
     "authorMultiple": "作者: {{first}} 等 {{count}} 位作者",

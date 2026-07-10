@@ -99,6 +99,21 @@ describe('GroupCard', () => {
     expect(screen.getByText('已禁用')).toBeDefined();
   });
 
+  test('renders empty group status without addons', () => {
+    render(
+      <GroupCard
+        group={{ id: 'empty-group', name: 'Empty Group', addons: [] }}
+        addons={[]}
+        onToggleGroup={vi.fn()}
+        onViewGroupDetails={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText('Empty Group')).toBeDefined();
+    expect(screen.getByText('空组')).toBeDefined();
+    expect(screen.getByText('分组 (0)')).toBeDefined();
+  });
+
   test('calls onViewGroupDetails when card is clicked and select mode is false', () => {
     const onViewGroupDetails = vi.fn();
     render(
