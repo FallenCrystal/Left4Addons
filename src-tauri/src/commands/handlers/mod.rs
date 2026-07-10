@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter};
 
 use super::types::{
     is_dummy_addon_info, Addon, Database, Group, KnownAddonEntry, MasterCollection, RenameItem,
@@ -2958,8 +2958,8 @@ mod tests {
         fs::remove_file(&cache_path).ok();
 
         assert_eq!(cache.len(), 2);
-        assert!(cache.get("items").is_none());
-        assert!(cache.get("schemaVersion").is_none());
+        assert!(!cache.contains_key("items"));
+        assert!(!cache.contains_key("schemaVersion"));
         let item = cache.get("3560883926").unwrap();
         assert_eq!(
             item.get("creatorName").and_then(|v| v.as_str()),

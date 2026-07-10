@@ -1,5 +1,18 @@
 use super::*;
-use tauri::{AppHandle, State, Manager};
+use serde::Deserialize;
+use tauri::{AppHandle, State};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSettingsPayload {
+    loading_dir: String,
+    download_concurrency: u32,
+    enable_dummy_bypass: bool,
+    suppress_sdk_unavailable_warning: bool,
+    disable_steamworks_sdk: bool,
+    force_steamworks_sdk_download: bool,
+    workshop_source_settings: Option<WorkshopSourceSettings>,
+}
 
 #[tauri::command]
 pub async fn get_settings(state: State<'_, crate::AppState>) -> Result<Settings, String> {
@@ -9,16 +22,20 @@ pub async fn get_settings(state: State<'_, crate::AppState>) -> Result<Settings,
 
 #[tauri::command]
 pub async fn save_settings(
-    loading_dir: String,
-    download_concurrency: u32,
-    enable_dummy_bypass: bool,
-    suppress_sdk_unavailable_warning: bool,
-    disable_steamworks_sdk: bool,
-    force_steamworks_sdk_download: bool,
-    workshop_source_settings: Option<WorkshopSourceSettings>,
+    payload: SaveSettingsPayload,
     state: State<'_, crate::AppState>,
     app_handle: AppHandle,
 ) -> Result<Database, String> {
+    let SaveSettingsPayload {
+        loading_dir,
+        download_concurrency,
+        enable_dummy_bypass,
+        suppress_sdk_unavailable_warning,
+        disable_steamworks_sdk,
+        force_steamworks_sdk_download,
+        workshop_source_settings,
+    } = payload;
+
     let mut db = state.db.lock().await;
     let loading_path = PathBuf::from(&loading_dir);
     let workshop_dir = loading_path.join("workshop").to_string_lossy().to_string();
@@ -61,4 +78,3 @@ pub async fn save_settings(
         &state.known_addons_path,
     ))
 }
-

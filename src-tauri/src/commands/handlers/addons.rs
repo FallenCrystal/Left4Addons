@@ -1,5 +1,5 @@
 use super::*;
-use tauri::{AppHandle, State, Manager};
+use tauri::{AppHandle, State};
 
 #[tauri::command]
 pub async fn move_addons(
@@ -1523,4 +1523,3 @@ pub async fn download_addon(
     let _ = clear_download_cancellation(&state, &workshop_id);
     result
 }
-

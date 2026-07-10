@@ -1,5 +1,5 @@
 use super::*;
-use tauri::{AppHandle, State, Manager};
+use tauri::State;
 
 #[tauri::command]
 pub async fn get_background_tasks(
@@ -43,4 +43,3 @@ pub async fn append_workshop_crawl_log(
 ) -> Result<(), String> {
     append_workshop_crawl_log_internal(&state.workshop_crawl_log_path, record)
 }
-

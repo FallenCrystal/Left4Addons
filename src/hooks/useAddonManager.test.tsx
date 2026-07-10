@@ -372,12 +372,14 @@ describe('useAddonManager', () => {
       }
       if (cmd === 'save_settings') {
         expect(args).toEqual({
-          loadingDir: '/new/loading/dir',
-          downloadConcurrency: 2,
-          enableDummyBypass: false,
-          suppressSdkUnavailableWarning: false,
-          disableSteamworksSdk: false,
-          forceSteamworksSdkDownload: false,
+          payload: {
+            loadingDir: '/new/loading/dir',
+            downloadConcurrency: 2,
+            enableDummyBypass: false,
+            suppressSdkUnavailableWarning: false,
+            disableSteamworksSdk: false,
+            forceSteamworksSdkDownload: false,
+          },
         });
         return tauriPromise;
       }

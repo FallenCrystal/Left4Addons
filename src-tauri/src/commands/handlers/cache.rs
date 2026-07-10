@@ -1,5 +1,5 @@
 use super::*;
-use tauri::{AppHandle, State, Manager};
+use tauri::State;
 
 #[tauri::command]
 pub async fn get_cache_image(
@@ -67,4 +67,3 @@ pub async fn cache_remote_image(
     fs::write(&file_path, &bytes).map_err(|e| format!("Failed to cache remote image: {}", e))?;
     Ok(format!("/cache/{}", filename))
 }
-

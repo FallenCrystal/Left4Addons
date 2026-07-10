@@ -464,13 +464,15 @@ export function useAddonManager() {
     setIsSubmitting(true);
     try {
       const data: DatabasePayload = await invoke('save_settings', {
-        loadingDir,
-        downloadConcurrency,
-        enableDummyBypass,
-        suppressSdkUnavailableWarning,
-        disableSteamworksSdk,
-        forceSteamworksSdkDownload,
-        workshopSourceSettings,
+        payload: {
+          loadingDir,
+          downloadConcurrency,
+          enableDummyBypass,
+          suppressSdkUnavailableWarning,
+          disableSteamworksSdk,
+          forceSteamworksSdkDownload,
+          workshopSourceSettings,
+        },
       });
       updateLocalState(data);
       setSettingsModal({ open: false, loadingDir: '' });

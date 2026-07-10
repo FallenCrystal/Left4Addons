@@ -1,5 +1,5 @@
 use super::*;
-use tauri::{AppHandle, State, Manager};
+use tauri::State;
 
 #[tauri::command]
 pub async fn open_workshop(workshop_id: String) -> Result<(), String> {
@@ -327,7 +327,8 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
     for workshop_id in &subscribed_ids {
         if details_by_id
             .get(workshop_id)
-            .is_none_or(|details| !is_collection_detail(details))
+            .map(|details| !is_collection_detail(details))
+            .unwrap_or(true)
         {
             upsert_known_addon_entry(
                 &mut known_addons,
@@ -904,4 +905,3 @@ pub async fn persist_workshop_page_details(
         &state.known_addons_path,
     ))
 }
-
