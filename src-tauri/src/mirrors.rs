@@ -55,10 +55,8 @@ impl MirrorManager {
             });
             if let Some(host) = host_opt {
                 for rule in rules {
-                    let mut final_regex_str = String::new();
-                    
-                    if let Some(regex_str) = &rule.regex {
-                        final_regex_str = regex_str.clone();
+                    let final_regex_str = if let Some(regex_str) = &rule.regex {
+                        regex_str.clone()
                     } else if let Some(domain) = &rule.domain {
                         let mut re = String::from("^");
                         if rule.allow_www {
@@ -76,7 +74,7 @@ impl MirrorManager {
                         }
                         re.push_str(&regex::escape(domain));
                         re.push_str("$");
-                        final_regex_str = re;
+                        re
                     } else if let Some(rules_str) = &rule.rules {
                         // Quick parse of `rules`: e.g. "[store,media].steampowered.com"
                         let mut regex_str = String::new();
@@ -84,7 +82,7 @@ impl MirrorManager {
                         let mut current_group = String::new();
                         let chars: Vec<char> = rules_str.chars().collect();
                         let mut i = 0;
-                        
+
                         while i < chars.len() {
                             let c = chars[i];
                             if c == '[' {
@@ -99,7 +97,7 @@ impl MirrorManager {
                                 regex_str.push_str(&parts.join("|"));
                                 current_group.clear();
                                 regex_str.push(')');
-                                
+
                                 // Check for optional '?'
                                 if i + 1 < chars.len() && chars[i + 1] == '?' {
                                     regex_str.push('?');
@@ -114,10 +112,10 @@ impl MirrorManager {
                             }
                             i += 1;
                         }
-                        final_regex_str = format!("^{}$", regex_str);
+                        format!("^{}$", regex_str)
                     } else {
                         continue; // No matching rule defined
-                    }
+                    };
                     
                     if let Ok(re) = Regex::new(&final_regex_str) {
                         if let Some(caps) = re.captures(&host) {
