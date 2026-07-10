@@ -8,6 +8,7 @@ pub mod commands;
 pub mod steam;
 pub mod vpk;
 pub mod watcher;
+pub mod mirrors;
 
 pub struct AppState {
     pub settings_path: PathBuf,
@@ -22,6 +23,7 @@ pub struct AppState {
     pub db: Mutex<commands::Database>,
     pub addon_watcher: StdMutex<watcher::AddonWatcherController>,
     pub cancelled_downloads: StdMutex<HashSet<String>>,
+    pub runtime_dir: PathBuf,
 }
 
 impl Drop for AppState {
@@ -59,6 +61,7 @@ pub fn run() {
             } else {
                 host_runtime_dir.join("l4a")
             };
+            crate::mirrors::RUNTIME_DIR.set(runtime_dir.clone()).ok();
             let config_dir = runtime_dir.join("config");
             let cache_root_dir = runtime_dir.join("cache");
             let cache_dir = cache_root_dir.join("images");
@@ -107,6 +110,7 @@ pub fn run() {
                 db: Mutex::new(db),
                 addon_watcher: StdMutex::new(watcher::AddonWatcherController::default()),
                 cancelled_downloads: StdMutex::new(HashSet::new()),
+                runtime_dir: runtime_dir.clone(),
             });
 
             if let Err(err) =

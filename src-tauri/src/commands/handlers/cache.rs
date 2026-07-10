@@ -1,5 +1,7 @@
 use super::*;
 use tauri::State;
+use std::time::Duration;
+use crate::mirrors::MirrorClientExt;
 
 #[tauri::command]
 pub async fn get_cache_image(
@@ -33,7 +35,7 @@ pub async fn cache_remote_image(
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     let response = client
-        .get(parsed.clone())
+        .get_mirrored(parsed.as_str())
         .send()
         .await
         .map_err(|e| format!("Failed to fetch remote image: {}", e))?;

@@ -1,5 +1,6 @@
 use super::*;
 use tauri::State;
+use crate::mirrors::MirrorClientExt;
 
 #[tauri::command]
 pub async fn open_workshop(workshop_id: String) -> Result<(), String> {
@@ -539,7 +540,7 @@ pub async fn fetch_workshop_html(
         .build()
         .map_err(|e| e.to_string())?;
 
-    let res = match client.get(parsed).send().await {
+    let res = match client.get_mirrored(parsed.as_str()).send().await {
         Ok(res) => res,
         Err(e) => {
             let err = format!("Failed to fetch URL: {}", e);

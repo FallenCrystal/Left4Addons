@@ -4,6 +4,7 @@ use super::types::{
     WorkshopCapabilities, WorkshopCollectionResponse, WorkshopHomeResponse, WorkshopItemResponse,
     WorkshopItemsResponse,
 };
+use crate::mirrors::MirrorClientExt;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -203,8 +204,7 @@ pub async fn fetch_steam_details_web(workshop_ids: &[String]) -> Result<Vec<Valu
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let res = client
-        .post(url)
+    let res = client.post_mirrored(url)
         .form(&params)
         .send()
         .await
@@ -233,8 +233,7 @@ pub async fn fetch_collection_children_web(collection_id: &str) -> Result<Vec<St
     ];
 
     let client = reqwest::Client::new();
-    let res = client
-        .post(url)
+    let res = client.post_mirrored(url)
         .form(&params)
         .send()
         .await

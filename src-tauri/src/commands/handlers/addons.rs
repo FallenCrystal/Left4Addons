@@ -1,5 +1,6 @@
 use super::*;
 use tauri::{AppHandle, State};
+use crate::mirrors::MirrorClientExt;
 
 #[tauri::command]
 pub async fn move_addons(
@@ -1227,6 +1228,7 @@ pub async fn download_addon(
 
         println!("Downloading: {} (URL: {})", title, file_url);
         let client = reqwest::Client::new();
+        let resolved_file_url = crate::mirrors::MirrorManager::resolve(&file_url).0;
 
         let mut resume_from = 0u64;
         if partial_path.exists() || partial_metadata_path.exists() {
@@ -1234,7 +1236,7 @@ pub async fn download_addon(
                 Ok(metadata)
                     if metadata.workshop_id == workshop_id
                         && metadata.target_filename == dest_filename
-                        && metadata.file_url == file_url =>
+                        && metadata.file_url == resolved_file_url =>
                 {
                     resume_from = fs::metadata(&partial_path)
                         .map(|meta| meta.len())
@@ -1247,8 +1249,7 @@ pub async fn download_addon(
         }
 
         let mut response = if resume_from > 0 {
-            let resumed = client
-                .get(&file_url)
+            let resumed = client.get_mirrored(&file_url)
                 .header(reqwest::header::RANGE, format!("bytes={}-", resume_from))
                 .send()
                 .await
@@ -1259,8 +1260,7 @@ pub async fn download_addon(
                 reqwest::StatusCode::OK => {
                     cleanup_partial_download(&state.download_cache_dir, &workshop_id)?;
                     resume_from = 0;
-                    client
-                        .get(&file_url)
+                    client.get_mirrored(&file_url)
                         .send()
                         .await
                         .map_err(|e| format!("Download request failed: {}", e))?
@@ -1268,8 +1268,7 @@ pub async fn download_addon(
                 _ => resumed,
             }
         } else {
-            client
-                .get(&file_url)
+            client.get_mirrored(&file_url)
                 .send()
                 .await
                 .map_err(|e| format!("Download request failed: {}", e))?
@@ -1380,7 +1379,7 @@ pub async fn download_addon(
         let metadata = DownloadResumeMetadata {
             workshop_id: workshop_id.clone(),
             target_filename: dest_filename.clone(),
-            file_url: file_url.clone(),
+            file_url: resolved_file_url.clone(),
             total_size: (total_size > 0).then_some(total_size),
             etag: response_etag,
             last_modified: response_last_modified,
