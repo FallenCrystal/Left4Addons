@@ -17,6 +17,7 @@ interface SettingsViewProps {
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
     forceSteamworksSdkDownload: boolean,
+    maxDownloadRetries: number,
     workshopSourceSettings: WorkshopSourceSettings,
   ) => Promise<void>;
 }
@@ -57,6 +58,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [suppressSdkUnavailableWarning, setSuppressSdkUnavailableWarning] = useState(false);
   const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
   const [forceSteamworksSdkDownload, setForceSteamworksSdkDownload] = useState(false);
+  const [maxDownloadRetriesInput, setMaxDownloadRetriesInput] = useState('3');
   const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_SOURCE_SETTINGS);
 
   useEffect(() => {
@@ -66,6 +68,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setSuppressSdkUnavailableWarning(settings.suppressSdkUnavailableWarning || false);
     setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
     setForceSteamworksSdkDownload(settings.forceSteamworksSdkDownload || false);
+    setMaxDownloadRetriesInput(String(settings.maxDownloadRetries ?? 3));
     setWorkshopSourceSettings({
       ...DEFAULT_SOURCE_SETTINGS,
       ...(settings.workshopSourceSettings || {}),
@@ -81,6 +84,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (!loadingDir.trim() || isSubmitting) return;
     const downloadConcurrency = clampDownloadConcurrency(Number.parseInt(downloadConcurrencyInput, 10));
     setDownloadConcurrencyInput(String(downloadConcurrency));
+    
+    let maxRetries = Number.parseInt(maxDownloadRetriesInput, 10);
+    if (Number.isNaN(maxRetries) || maxRetries < 0) maxRetries = 3;
+    if (maxRetries > 20) maxRetries = 20;
+    setMaxDownloadRetriesInput(String(maxRetries));
+
     await onConfirm(
       loadingDir.trim(),
       downloadConcurrency,
@@ -88,6 +97,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       suppressSdkUnavailableWarning,
       disableSteamworksSdk,
       forceSteamworksSdkDownload,
+      maxRetries,
       workshopSourceSettings,
     );
   };
@@ -99,6 +109,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleDownloadConcurrencyBlur = () => {
     setDownloadConcurrencyInput(String(clampDownloadConcurrency(Number.parseInt(downloadConcurrencyInput, 10))));
+  };
+
+  const handleMaxRetriesBlur = () => {
+    let maxRetries = Number.parseInt(maxDownloadRetriesInput, 10);
+    if (Number.isNaN(maxRetries) || maxRetries < 0) maxRetries = 3;
+    if (maxRetries > 20) maxRetries = 20;
+    setMaxDownloadRetriesInput(String(maxRetries));
   };
 
   const featuresList = t('settings.features', { returnObjects: true }) as string[];
@@ -358,6 +375,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       min: MIN_DOWNLOAD_CONCURRENCY,
                       max: MAX_DOWNLOAD_CONCURRENCY,
                     })}
+                  </span>
+                </div>
+
+                <div className="form-group" style={{ marginBottom: '24px' }}>
+                  <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                    {t('settings.maxDownloadRetriesLabel')}
+                  </label>
+                  <input
+                    type="number"
+                    className="form-input"
+                    value={maxDownloadRetriesInput}
+                    onChange={(e) => setMaxDownloadRetriesInput(e.target.value)}
+                    onBlur={handleMaxRetriesBlur}
+                    min={0}
+                    max={20}
+                    inputMode="numeric"
+                    disabled={isSubmitting}
+                    style={{ width: '180px' }}
+                  />
+                  <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
+                    {t('settings.maxDownloadRetriesHelp')}
                   </span>
                 </div>
 

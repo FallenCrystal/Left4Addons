@@ -480,6 +480,7 @@ export function useAddonManager() {
     suppressSdkUnavailableWarning: boolean,
     disableSteamworksSdk: boolean,
     forceSteamworksSdkDownload: boolean,
+    maxDownloadRetries: number,
     workshopSourceSettings?: WorkshopSourceSettings,
   ) => {
     if (isSubmitting) return;
@@ -493,6 +494,7 @@ export function useAddonManager() {
           suppressSdkUnavailableWarning,
           disableSteamworksSdk,
           forceSteamworksSdkDownload,
+          maxDownloadRetries,
           workshopSourceSettings,
         },
       });

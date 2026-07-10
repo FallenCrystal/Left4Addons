@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Addon, BackgroundTask, DatabasePayload } from '../types/addon';
+import { Addon, BackgroundTask, DatabasePayload, Settings } from '../types/addon';
 import { fetchWorkshopItem } from '../services/workshopClient';
 
 const WORKSHOP_CRAWL_COOLDOWN_MS = 6000;
@@ -18,6 +18,10 @@ interface UseBackgroundTasksArgs {
 
 const nowIso = () => new Date().toISOString();
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const isNetworkError = (msg: string) => msg.includes('error decoding body') || 
+                                        msg.includes('Download request failed') || 
+                                        msg.includes('Download chunk failed') || 
+                                        msg.includes('error sending request');
 
 const taskId = (kind: BackgroundTask['kind'], targetId: string) =>
   `${kind}_${targetId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -115,8 +119,28 @@ export function useBackgroundTasks({
       if (currentTask?.status === 'cancelled') {
         onDownloadCancelled(workshopId);
       } else {
-        patchTask(task.id, { status: 'failed', error: message, finishedAt: nowIso() });
-        onTaskError(message, workshopId);
+        let maxRetries = 3;
+        try {
+          const settings = await invoke<Settings>('get_settings');
+          maxRetries = settings.maxDownloadRetries ?? 3;
+        } catch (e) {
+          console.warn('Failed to fetch settings for retry count', e);
+        }
+        const currentRetryCount = currentTask?.retryCount || 0;
+        
+        if (isNetworkError(message) && currentRetryCount < maxRetries) {
+          patchTask(task.id, { 
+            status: 'queued', 
+            retryCount: currentRetryCount + 1,
+            error: undefined,
+            progress: 0,
+            startedAt: undefined,
+            finishedAt: undefined,
+          });
+        } else {
+          patchTask(task.id, { status: 'failed', error: message, finishedAt: nowIso() });
+          onTaskError(message, workshopId);
+        }
       }
     } finally {
       activeDownloadsRef.current = Math.max(0, activeDownloadsRef.current - 1);

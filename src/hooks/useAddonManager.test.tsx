@@ -397,7 +397,7 @@ describe('useAddonManager', () => {
     // Call saveSettings
     let savePromise: Promise<void> | null = null;
     act(() => {
-      savePromise = result.current.saveSettings('/new/loading/dir', 2, false, false, false, false);
+      savePromise = result.current.saveSettings('/new/loading/dir', 2, false, false, false, false, 3);
     });
 
     // isSubmitting should be true immediately after invoking

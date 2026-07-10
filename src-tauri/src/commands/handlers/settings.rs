@@ -11,6 +11,7 @@ pub struct SaveSettingsPayload {
     suppress_sdk_unavailable_warning: bool,
     disable_steamworks_sdk: bool,
     force_steamworks_sdk_download: bool,
+    max_download_retries: u32,
     workshop_source_settings: Option<WorkshopSourceSettings>,
 }
 
@@ -33,6 +34,7 @@ pub async fn save_settings(
         suppress_sdk_unavailable_warning,
         disable_steamworks_sdk,
         force_steamworks_sdk_download,
+        max_download_retries,
         workshop_source_settings,
     } = payload;
 
@@ -47,6 +49,7 @@ pub async fn save_settings(
     db.settings.suppress_sdk_unavailable_warning = suppress_sdk_unavailable_warning;
     db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
     db.settings.force_steamworks_sdk_download = force_steamworks_sdk_download;
+    db.settings.max_download_retries = max_download_retries;
     if let Some(workshop_source_settings) = workshop_source_settings {
         db.settings.workshop_source_settings = workshop_source_settings;
     }

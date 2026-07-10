@@ -114,6 +114,7 @@ export interface BackgroundTask {
   targetIds: string[];
   progress: number;
   error?: string;
+  retryCount?: number;
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
@@ -148,6 +149,7 @@ export interface Settings {
   suppressSdkUnavailableWarning: boolean;
   disableSteamworksSdk: boolean;
   forceSteamworksSdkDownload?: boolean;
+  maxDownloadRetries?: number;
   workshopSourceSettings?: WorkshopSourceSettings;
 }
 

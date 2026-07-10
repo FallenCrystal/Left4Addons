@@ -17,6 +17,8 @@ pub struct Settings {
     pub disable_steamworks_sdk: bool,
     #[serde(rename = "forceSteamworksSdkDownload", default)]
     pub force_steamworks_sdk_download: bool,
+    #[serde(rename = "maxDownloadRetries", default = "default_max_download_retries")]
+    pub max_download_retries: u32,
     #[serde(rename = "workshopSourceSettings", default)]
     pub workshop_source_settings: WorkshopSourceSettings,
 }
@@ -46,6 +48,10 @@ fn default_true() -> bool {
 
 fn default_download_concurrency() -> u32 {
     2
+}
+
+fn default_max_download_retries() -> u32 {
+    3
 }
 
 fn default_workshop_source_preset() -> String {

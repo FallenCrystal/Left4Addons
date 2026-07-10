@@ -53,7 +53,6 @@ export function BatchActionBar({
     .filter((addon): addon is Addon => Boolean(addon));
 
   // If any uninstalled addon is selected, certain actions shouldn't be available
-  const hasUninstalled = selectedAddons.some((addon) => addon.dirType === 'none');
   const allInstalled = selectedAddons.every((addon) => addon.dirType !== 'none');
   
   const canBatchEnable = allInstalled && selectedAddons.some((addon) => !addon.isEnabled);

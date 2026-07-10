@@ -45,6 +45,7 @@
   background-color: var(--md-sys-color-background);
   color: var(--md-sys-color-on-background);
   box-sizing: border-box;
+  color-scheme: dark;
 }
 
 body {
@@ -741,6 +742,19 @@ body {
 
 .form-input:focus {
   border-color: var(--md-sys-color-primary);
+}
+
+.form-input[type="number"]::-webkit-inner-spin-button,
+.form-input[type="number"]::-webkit-outer-spin-button {
+  height: 24px;
+  cursor: pointer;
+  opacity: 0.6;
+  transition: opacity 0.2s;
+}
+
+.form-input[type="number"]::-webkit-inner-spin-button:hover,
+.form-input[type="number"]::-webkit-outer-spin-button:hover {
+  opacity: 1;
 }
 
 .modal-actions {

@@ -26,6 +26,7 @@ pub fn load_db(
             suppress_sdk_unavailable_warning: false,
             disable_steamworks_sdk: false,
             force_steamworks_sdk_download: false,
+            max_download_retries: 3,
             workshop_source_settings: WorkshopSourceSettings::default(),
         },
         addons: HashMap::new(),
