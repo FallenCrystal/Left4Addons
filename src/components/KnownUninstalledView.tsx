@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, Globe, Trash2, Search, RefreshCw, AlertCircle, FileText } from 'lucide-react';
+import { Download, Globe, Trash2, Search, RefreshCw, AlertCircle, FileText, CheckSquare, X } from 'lucide-react';
 import { Addon, BackgroundTask } from '../types/addon';
 import { getAddonAuthor, getAddonCategories, formatBytes, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
@@ -14,6 +14,7 @@ interface KnownUninstalledViewProps {
   isSubmitting: boolean;
   onOpenLink: (url: string) => void;
   isSelectMode?: boolean;
+  onToggleSelectMode?: () => void;
   selectedIds?: string[];
   onSelectToggle?: (id: string) => void;
   onSelectAll?: (items: Addon[]) => void;
@@ -35,6 +36,7 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
   isSubmitting,
   onOpenLink,
   isSelectMode = false,
+  onToggleSelectMode,
   selectedIds = [],
   onSelectToggle,
   onSelectAll: _onSelectAll,
@@ -101,6 +103,24 @@ export const KnownUninstalledView: React.FC<KnownUninstalledViewProps> = ({
             }}
           />
         </div>
+        <button
+          className={`btn ${isSelectMode ? 'btn-primary' : 'btn-secondary'}`}
+          style={{
+            height: '42px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            borderRadius: '12px',
+            flexShrink: 0,
+            padding: '0 16px',
+            fontSize: '13px'
+          }}
+          onClick={onToggleSelectMode}
+          title={t('topbar.batchManageTooltip')}
+        >
+          {isSelectMode ? <X size={16} /> : <CheckSquare size={16} />}
+          <span>{isSelectMode ? t('topbar.exitBatch') : t('topbar.batchManage')}</span>
+        </button>
       </div>
 
       {/* Grid */}

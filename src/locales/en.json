@@ -118,8 +118,11 @@
   },
   "batchActionBar": {
     "selectedCount": "{{count}} addons selected",
+    "noneSelected": "No addons selected",
     "deselectAll": "Deselect All",
     "selectAll": "Select All",
+    "selectDownloaded": "Select Downloaded",
+    "selectUndownloaded": "Select Undownloaded",
     "enable": "Enable",
     "disable": "Disable",
     "moveToManual": "Move to Manual",
@@ -130,7 +133,8 @@
     "addToGroupDesc": "Choose a group to add the selected addons to",
     "searchGroups": "Search groups...",
     "noGroups": "No Groups",
-    "exitBatch": "Exit Batch"
+    "exitBatch": "Exit Batch",
+    "download": "Download"
   },
   "groupCard": {
     "partiallyEnabled": "Partially Enabled",

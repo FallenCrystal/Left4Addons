@@ -130,7 +130,7 @@ describe('BatchActionBar', () => {
       />
     );
 
-    expect((screen.getByText('启用').closest('button') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByText('启用')).toBeNull();
     expect((screen.getByText('禁用').closest('button') as HTMLButtonElement).disabled).toBe(false);
   });
 });

@@ -220,6 +220,13 @@ function App() {
             isSubmitting={isSubmitting}
             onOpenLink={handleOpenLink}
             isSelectMode={isSelectMode}
+            onToggleSelectMode={() => {
+              if (isSelectMode) {
+                handleClearSelection();
+              } else {
+                setIsSelectMode(true);
+              }
+            }}
             selectedIds={selectedIds}
             onSelectToggle={handleSelectToggle}
             onSelectAll={handleSelectAll}
@@ -606,7 +613,7 @@ function App() {
       />
 
       {/* Floating Batch Action Bar */}
-      {isSelectMode && currentFilterTab !== 'known-uninstalled' && (
+      {isSelectMode && (
         <BatchActionBar
           selectedIds={selectedIds}
           filteredItems={filteredItems}
@@ -622,6 +629,7 @@ function App() {
           onBatchRename={handleBatchRename}
           onBatchAddToGroup={() => setAddToGroupModal(true)}
           onBatchAddToMasterCollection={() => setAddToMcModal(true)}
+          onBatchDownload={handleBatchDownload}
           onClearSelection={handleClearSelection}
           isSubmitting={isSubmitting}
         />

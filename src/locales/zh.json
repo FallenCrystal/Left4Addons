@@ -118,8 +118,11 @@
   },
   "batchActionBar": {
     "selectedCount": "已选择 {{count}} 个组件",
+    "noneSelected": "未选择任何组件",
     "deselectAll": "取消全选",
     "selectAll": "全选",
+    "selectDownloaded": "选择已下载",
+    "selectUndownloaded": "选择未下载",
     "enable": "启用",
     "disable": "禁用",
     "moveToManual": "移动至手动安装",
@@ -130,7 +133,8 @@
     "addToGroupDesc": "选择要将选中组件加入的分组",
     "searchGroups": "搜索分组...",
     "noGroups": "无分组",
-    "exitBatch": "退出批量"
+    "exitBatch": "退出批量",
+    "download": "下载"
   },
   "groupCard": {
     "partiallyEnabled": "部分启用",
