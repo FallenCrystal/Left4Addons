@@ -258,6 +258,7 @@ function App() {
             backgroundTasks={backgroundTasks}
             syncingSteam={syncingSteam}
             onOpenTaskCenter={() => setTaskCenterOpen(true)}
+            workshopSourceSettings={settings.workshopSourceSettings}
           />
         ) : (
           <>
@@ -610,6 +611,7 @@ function App() {
         onCancelTask={cancelTask}
         onRetryTask={retryTask}
         onClearFinishedTasks={clearFinishedTasks}
+        workshopSourceSettings={settings.workshopSourceSettings}
       />
 
       {/* Floating Batch Action Bar */}

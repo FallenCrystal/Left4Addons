@@ -1,5 +1,5 @@
 import { describe, test, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { SettingsView } from './SettingsView';
 import type { Settings } from '../types/addon';
 
@@ -19,6 +19,7 @@ describe('SettingsView', () => {
       allowSteamWebApi: true,
       allowSteamCommunityHtml: true,
       allowSdkHtmlHybrid: false,
+      sdkHtmlScope: 'search',
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     },
@@ -43,16 +44,18 @@ describe('SettingsView', () => {
     fireEvent.click(disableSdkCheckbox as HTMLInputElement);
     fireEvent.click(screen.getByText('保存并重新扫描'));
 
-    expect(onConfirm).toHaveBeenCalledWith(
-      '/game/addons',
-      2,
-      false,
-      false,
-      true,
-      false,
-      3,
-      baseSettings.workshopSourceSettings,
-    );
+    await waitFor(() => {
+      expect(onConfirm).toHaveBeenCalledWith(
+        '/game/addons',
+        2,
+        false,
+        false,
+        true,
+        false,
+        3,
+        baseSettings.workshopSourceSettings,
+      );
+    });
   });
 
   test('submits clamped download concurrency from the download tab', async () => {
@@ -73,15 +76,51 @@ describe('SettingsView', () => {
     fireEvent.blur(input);
     fireEvent.click(screen.getByText('保存并重新扫描'));
 
-    expect(onConfirm).toHaveBeenCalledWith(
-      '/game/addons',
-      8,
-      false,
-      false,
-      false,
-      false,
-      3,
-      baseSettings.workshopSourceSettings,
+    await waitFor(() => {
+      expect(onConfirm).toHaveBeenCalledWith(
+        '/game/addons',
+        8,
+        false,
+        false,
+        false,
+        false,
+        3,
+        baseSettings.workshopSourceSettings,
+      );
+    });
+  });
+
+  test('submits sdkHtmlScope changes from the sources tab', async () => {
+    const onConfirm = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <SettingsView
+        settings={baseSettings}
+        isSubmitting={false}
+        onConfirm={onConfirm}
+      />
     );
+
+    fireEvent.click(screen.getByText('数据来源'));
+    fireEvent.change(screen.getByDisplayValue('创意工坊搜索'), {
+      target: { value: 'all' },
+    });
+    fireEvent.click(screen.getByText('保存并重新扫描'));
+
+    await waitFor(() => {
+      expect(onConfirm).toHaveBeenCalledWith(
+        '/game/addons',
+        2,
+        false,
+        false,
+        false,
+        false,
+        3,
+        expect.objectContaining({
+          preset: 'hybrid',
+          sdkHtmlScope: 'all',
+        }),
+      );
+    });
   });
 });

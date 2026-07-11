@@ -9,6 +9,7 @@ import { useBackgroundTasks } from './useBackgroundTasks';
 import type { BackgroundTask } from '../types/addon';
 import type { WorkshopCapabilities } from '../components/workshop/types';
 import { setSteamworksSdkDisabled, setWorkshopSourceSettings } from '../services/workshopClient';
+import { DEFAULT_WORKSHOP_SOURCE_SETTINGS, normalizeWorkshopSourceSettings } from '../utils/workshopSourceSettings';
 
 export type RenderedItem = 
   | { type: 'group'; id: string; name: string; addons: Addon[]; groupObj: Group }
@@ -28,6 +29,13 @@ interface DownloadProgressEvent {
   percent: number;
 }
 
+interface SdkDownloadWarningEvent {
+  workshopId: string;
+  title?: string;
+  reason: 'forced-sdk' | 'web-download-failed' | 'web-download-unavailable';
+  source: 'steam-sdk';
+}
+
 export function useAddonManager() {
   const { t } = useTranslation();
   const [addons, setAddons] = useState<Record<string, Addon>>({});
@@ -42,15 +50,7 @@ export function useAddonManager() {
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
     forceSteamworksSdkDownload: false,
-    workshopSourceSettings: {
-      preset: 'conservative',
-      allowSteamworksSdk: true,
-      allowSteamWebApi: true,
-      allowSteamCommunityHtml: true,
-      allowSdkHtmlHybrid: false,
-      sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
-      cacheRetention: 'keep',
-    },
+    workshopSourceSettings: DEFAULT_WORKSHOP_SOURCE_SETTINGS,
   });
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
@@ -130,7 +130,10 @@ export function useAddonManager() {
     setKnownUninstalledAddons(nextKnownUninstalledAddons);
     setMasterCollections(nextMasterCollections);
     if (data.settings) {
-      setSettings(data.settings);
+      setSettings({
+        ...data.settings,
+        workshopSourceSettings: normalizeWorkshopSourceSettings(data.settings.workshopSourceSettings),
+      });
     }
 
     setSelectedIds((prev) => prev.filter((id) => nextAddons[id] || nextKnownUninstalledAddons[id]));
@@ -152,11 +155,41 @@ export function useAddonManager() {
     });
   }, [resolveDetailModalAddon]);
 
+  const {
+    backgroundTasks: managedBackgroundTasks,
+    enqueueDownloads,
+    enqueueWorkshopCrawl,
+    recordSeenItems,
+    cancelTask,
+    retryTask,
+    clearFinishedTasks,
+    upsertWarningTask,
+  } = useBackgroundTasks({
+    enabled: !loading,
+    downloadConcurrency: settings.downloadConcurrency || 2,
+    addons,
+    knownUninstalledAddons,
+    updateLocalState,
+    onDownloadSuccess: () => {
+      addToast(t('toasts.downloadSuccess'), 'success');
+    },
+    onDownloadCancelled: (workshopId) => {
+      clearDownloadProgress(workshopId);
+    },
+    onTaskError: (message, workshopId) => {
+      if (workshopId) {
+        clearDownloadProgress(workshopId);
+      }
+      addToast(t('toasts.downloadFailed', { err: message }), 'error');
+    },
+  });
+
   // Listen to backend events
   useEffect(() => {
     let unlistenDownload: (() => void) | undefined;
     let unlistenDbUpdate: (() => void) | undefined;
     let unlistenWatchError: (() => void) | undefined;
+    let unlistenSdkDownloadWarning: (() => void) | undefined;
 
     const setupListeners = async () => {
       unlistenDownload = await listen<DownloadProgressEvent>('download-progress', (event) => {
@@ -184,6 +217,26 @@ export function useAddonManager() {
       unlistenWatchError = await listen<AddonsWatchErrorEvent>('addons-watch-error', (event) => {
         addToast(t('toasts.autoRefreshFailed', { err: event.payload.message }), 'error');
       });
+
+      unlistenSdkDownloadWarning = await listen<SdkDownloadWarningEvent>('sdk-download-warning', (event) => {
+        const workshopId = event.payload.workshopId?.trim();
+        if (!workshopId) {
+          return;
+        }
+
+        const warningKey = event.payload.reason === 'forced-sdk'
+          ? 'taskCenter.sdkDownloadWarningForced'
+          : 'taskCenter.sdkDownloadWarningFallback';
+        const title = event.payload.title?.trim();
+
+        upsertWarningTask({
+          id: `warning_steam_sdk_download_${workshopId}`,
+          source: 'steam-sdk-download-warning',
+          targetIds: [workshopId],
+          title: title && title !== workshopId ? `${title} (${workshopId})` : workshopId,
+          error: t(warningKey, { workshopId }),
+        });
+      });
     };
 
     setupListeners();
@@ -192,36 +245,9 @@ export function useAddonManager() {
       if (unlistenDownload) unlistenDownload();
       if (unlistenDbUpdate) unlistenDbUpdate();
       if (unlistenWatchError) unlistenWatchError();
+      if (unlistenSdkDownloadWarning) unlistenSdkDownloadWarning();
     };
-  }, [addToast, clearDownloadProgress, t, updateLocalState]);
-
-  const {
-    backgroundTasks: managedBackgroundTasks,
-    enqueueDownloads,
-    enqueueWorkshopCrawl,
-    recordSeenItems,
-    cancelTask,
-    retryTask,
-    clearFinishedTasks,
-  } = useBackgroundTasks({
-    enabled: !loading,
-    downloadConcurrency: settings.downloadConcurrency || 2,
-    addons,
-    knownUninstalledAddons,
-    updateLocalState,
-    onDownloadSuccess: () => {
-      addToast(t('toasts.downloadSuccess'), 'success');
-    },
-    onDownloadCancelled: (workshopId) => {
-      clearDownloadProgress(workshopId);
-    },
-    onTaskError: (message, workshopId) => {
-      if (workshopId) {
-        clearDownloadProgress(workshopId);
-      }
-      addToast(t('toasts.downloadFailed', { err: message }), 'error');
-    },
-  });
+  }, [addToast, clearDownloadProgress, t, updateLocalState, upsertWarningTask]);
 
   const executeWithWorkshopCheck = async (addonsList: Addon[], actionName: string, proceed: () => void) => {
     const workshopAddons = addonsList.filter(ad => ad.dirType === 'workshop');
@@ -277,7 +303,7 @@ export function useAddonManager() {
 
   useEffect(() => {
     setSteamworksSdkDisabled(settings.disableSteamworksSdk);
-    setWorkshopSourceSettings(settings.workshopSourceSettings);
+    setWorkshopSourceSettings(normalizeWorkshopSourceSettings(settings.workshopSourceSettings));
   }, [settings.disableSteamworksSdk, settings.workshopSourceSettings]);
 
   useEffect(() => {

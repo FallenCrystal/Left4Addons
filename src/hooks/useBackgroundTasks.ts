@@ -325,6 +325,37 @@ export function useBackgroundTasks({
     }
   }, [updateLocalState]);
 
+  const upsertWarningTask = useCallback((warning: {
+    id: string;
+    source?: string;
+    targetIds?: string[];
+    title?: string;
+    error?: string;
+    imagePath?: string;
+  }) => {
+    const existing = tasksRef.current.find((task) => task.id === warning.id);
+    const nextTask: BackgroundTask = {
+      id: warning.id,
+      kind: 'warning',
+      status: 'failed',
+      source: warning.source,
+      targetIds: warning.targetIds || [],
+      progress: 100,
+      createdAt: existing?.createdAt || nowIso(),
+      finishedAt: nowIso(),
+      title: warning.title,
+      error: warning.error,
+      imagePath: warning.imagePath,
+    };
+
+    if (existing) {
+      commitTasks(tasksRef.current.map((task) => task.id === warning.id ? nextTask : task));
+      return;
+    }
+
+    commitTasks([...tasksRef.current, nextTask]);
+  }, [commitTasks]);
+
   const cancelTask = useCallback((id: string) => {
     const task = tasksRef.current.find((t) => t.id === id);
     if (!task) return;
@@ -384,6 +415,7 @@ export function useBackgroundTasks({
     enqueueDownloads,
     enqueueWorkshopCrawl,
     recordSeenItems,
+    upsertWarningTask,
     cancelTask,
     retryTask,
     clearFinishedTasks,

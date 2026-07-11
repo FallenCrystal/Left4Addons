@@ -36,6 +36,8 @@ pub struct WorkshopSourceSettings {
     pub allow_steam_community_html: bool,
     #[serde(default)]
     pub allow_sdk_html_hybrid: bool,
+    #[serde(rename = "sdkHtmlScope", default = "default_sdk_html_scope")]
+    pub sdk_html_scope: String,
     #[serde(default = "default_source_order")]
     pub source_order: Vec<String>,
     #[serde(default = "default_cache_retention")]
@@ -66,6 +68,10 @@ fn default_source_order() -> Vec<String> {
     ]
 }
 
+fn default_sdk_html_scope() -> String {
+    "search".to_string()
+}
+
 fn default_cache_retention() -> String {
     "keep".to_string()
 }
@@ -78,6 +84,7 @@ impl Default for WorkshopSourceSettings {
             allow_steam_web_api: true,
             allow_steam_community_html: true,
             allow_sdk_html_hybrid: false,
+            sdk_html_scope: default_sdk_html_scope(),
             source_order: default_source_order(),
             cache_retention: default_cache_retention(),
         }

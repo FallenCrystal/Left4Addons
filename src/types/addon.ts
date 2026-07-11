@@ -153,12 +153,15 @@ export interface Settings {
   workshopSourceSettings?: WorkshopSourceSettings;
 }
 
+export type WorkshopSdkHtmlScope = 'disabled' | 'search' | 'navigation' | 'all';
+
 export interface WorkshopSourceSettings {
   preset: 'conservative' | 'sdk-only' | 'offline' | 'hybrid';
   allowSteamworksSdk: boolean;
   allowSteamWebApi: boolean;
   allowSteamCommunityHtml: boolean;
-  allowSdkHtmlHybrid: boolean;
+  allowSdkHtmlHybrid?: boolean;
+  sdkHtmlScope: WorkshopSdkHtmlScope;
   sourceOrder: string[];
   cacheRetention: 'keep';
 }

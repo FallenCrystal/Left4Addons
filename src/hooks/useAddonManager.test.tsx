@@ -54,6 +54,16 @@ describe('useAddonManager', () => {
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
     forceSteamworksSdkDownload: false,
+    workshopSourceSettings: {
+      preset: 'conservative',
+      allowSteamworksSdk: true,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: true,
+      allowSdkHtmlHybrid: false,
+      sdkHtmlScope: 'search',
+      sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
+      cacheRetention: 'keep',
+    },
   };
 
   beforeEach(() => {
@@ -768,6 +778,37 @@ describe('useAddonManager', () => {
     expect(result.current.downloadProgress['12345']).toBe(50);
   });
 
+  test('should add a warning task when sdk-download-warning is emitted', async () => {
+    const { result } = renderHook(() => useAddonManager());
+
+    await waitFor(() => {
+      expect(result.current.loading).toBe(false);
+    });
+
+    act(() => {
+      eventListeners.get('sdk-download-warning')?.({
+        payload: {
+          workshopId: '12345',
+          title: 'Addon Two',
+          reason: 'web-download-failed',
+          source: 'steam-sdk',
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.backgroundTasks.some((task) => task.id === 'warning_steam_sdk_download_12345')).toBe(true);
+    });
+
+    expect(result.current.backgroundTasks.find((task) => task.id === 'warning_steam_sdk_download_12345')).toMatchObject({
+      kind: 'warning',
+      status: 'failed',
+      source: 'steam-sdk-download-warning',
+      targetIds: ['12345'],
+      title: 'Addon Two (12345)',
+    });
+  });
+
   test('should add a frontend warning task when Steamworks SDK is unavailable', async () => {
     mockInvoke.mockImplementation((cmd) => {
       if (cmd === 'get_addons') {
@@ -922,6 +963,7 @@ describe('useAddonManager', () => {
               allowSteamWebApi: true,
               allowSteamCommunityHtml: true,
               allowSdkHtmlHybrid: false,
+              sdkHtmlScope: 'search',
               sourceOrder: ['steam-web-api', 'steamcommunity-html', 'steamworks-sdk'],
               cacheRetention: 'keep',
             },

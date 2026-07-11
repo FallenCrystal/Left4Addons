@@ -18,6 +18,11 @@ import {
   rememberWorkshopPageDetails,
   resolveWorkshopItemAuthor,
 } from '../components/workshop/authorDirectory';
+import {
+  DEFAULT_WORKSHOP_SOURCE_SETTINGS,
+  normalizeWorkshopSourceSettings,
+  shouldAllowSteamCommunityHtmlSource,
+} from '../utils/workshopSourceSettings';
 
 interface WorkshopHomeResponse {
   source: string;
@@ -68,27 +73,14 @@ export interface FetchWorkshopItemsInput {
 let capabilitiesPromise: Promise<WorkshopCapabilities> | null = null;
 let steamworksSdkDisabled = false;
 let workshopWarningReporter: ((message: string) => void) | null = null;
-let workshopSourceSettings: WorkshopSourceSettings = {
-  preset: 'conservative',
-  allowSteamworksSdk: true,
-  allowSteamWebApi: true,
-  allowSteamCommunityHtml: true,
-  allowSdkHtmlHybrid: false,
-  sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
-  cacheRetention: 'keep',
-};
+let workshopSourceSettings: WorkshopSourceSettings = DEFAULT_WORKSHOP_SOURCE_SETTINGS;
 
 export function setSteamworksSdkDisabled(disabled: boolean) {
   steamworksSdkDisabled = disabled;
 }
 
 export function setWorkshopSourceSettings(settings: WorkshopSourceSettings | undefined) {
-  workshopSourceSettings = {
-    ...workshopSourceSettings,
-    ...(settings || {}),
-    sourceOrder: settings?.sourceOrder?.length ? settings.sourceOrder : workshopSourceSettings.sourceOrder,
-    cacheRetention: 'keep',
-  };
+  workshopSourceSettings = normalizeWorkshopSourceSettings(settings);
 }
 
 export function setWorkshopWarningReporter(reporter: ((message: string) => void) | null) {
@@ -101,15 +93,9 @@ function shouldUseSteamworksSdk() {
     workshopSourceSettings.allowSteamworksSdk;
 }
 
-function shouldUseSteamCommunityHtml(capabilities: WorkshopCapabilities | null) {
-  if (workshopSourceSettings.preset === 'offline' || !workshopSourceSettings.allowSteamCommunityHtml) {
-    return false;
-  }
+function shouldUseSteamCommunityHtmlFor(source: string, capabilities: WorkshopCapabilities | null) {
   const sdkAvailable = shouldUseSteamworksSdk() && !!(capabilities?.canQueryHome || capabilities?.canQueryItems);
-  if (workshopSourceSettings.preset === 'hybrid' || workshopSourceSettings.allowSdkHtmlHybrid) {
-    return true;
-  }
-  return !sdkAvailable;
+  return shouldAllowSteamCommunityHtmlSource(workshopSourceSettings, source, sdkAvailable);
 }
 
 function listCacheKey(kind: string, input: unknown) {
@@ -688,7 +674,7 @@ export async function fetchWorkshopHome() {
     }
   }
 
-  const allowHtml = shouldUseSteamCommunityHtml(capabilities);
+  const allowHtml = shouldUseSteamCommunityHtmlFor('workshop-home', capabilities);
 
   if (sdkSections.length === 0) {
     if (!allowHtml) {
@@ -768,7 +754,10 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
         reportWorkshopWarnings(data.warnings);
         let items = data.items.map((item) => mapSteamDetailToWorkshopItem(item, data.source));
         items = await enrichItemsFromSnapshot(items);
-        if (items.some(needsHtmlAuthorEnrichment) && shouldUseSteamCommunityHtml(capabilities)) {
+        if (items.some(needsHtmlAuthorEnrichment) && shouldUseSteamCommunityHtmlFor(
+          input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+          capabilities,
+        )) {
           try {
             const html: string = await invoke('fetch_workshop_html', {
               url: buildBrowseUrl(input),
@@ -791,7 +780,10 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
     }
   }
 
-  if (!shouldUseSteamCommunityHtml(capabilities)) {
+  if (!shouldUseSteamCommunityHtmlFor(
+    input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+    capabilities,
+  )) {
     const cached = readCachedValue<any>(cacheKey);
     if (cached) return { ...cached, source: 'cache' };
     return { source: 'cache', items: [] };

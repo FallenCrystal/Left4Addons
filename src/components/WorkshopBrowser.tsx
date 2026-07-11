@@ -10,7 +10,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Search, ChevronLeft, ChevronRight, Loader2,
-  Home, Compass, User, Tag,
+  Home, Compass, User, Tag, AlertTriangle,
 } from 'lucide-react';
 
 import {
@@ -63,6 +63,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   syncingSteam,
   onOpenTaskCenter,
   onWarning,
+  workshopSourceSettings,
 }) => {
   const { t } = useTranslation();
   const scrollIdleTimerRef = useRef<number | null>(null);
@@ -347,6 +348,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   const renderBrowseView = () => (
     <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, minWidth: 0 }}>
+      {/* SDK Only Search Warning */}
+      {workshopSourceSettings?.allowSteamworksSdk && !workshopSourceSettings?.allowSteamCommunityHtml && (
+        <div style={{ padding: '12px 14px', borderRadius: '12px', background: 'rgba(255, 180, 171, 0.1)', border: '1px solid rgba(255, 180, 171, 0.3)', color: 'var(--md-sys-color-error)', fontSize: '13px', lineHeight: '1.5', marginBottom: '16px', display: 'flex', gap: '10px' }}>
+          <AlertTriangle size={18} style={{ flexShrink: 0 }} />
+          <div>
+            <strong>{t('workshop.browse.sdkSearchWarningTitle', '搜索与浏览功能受限')}</strong><br/>
+            {t('workshop.browse.sdkSearchWarningDesc', '当前网页抓取功能已被禁用，所有数据仅通过 SDK 获取。搜索与分类浏览将受到影响，具体限制请查阅相关文档。')}
+          </div>
+        </div>
+      )}
+
       {/* Active filter chips */}
         {(creatorName || activeTagName) && (
           <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>

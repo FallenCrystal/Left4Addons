@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download } from 'lucide-react';
-import { Settings, WorkshopSourceSettings } from '../types/addon';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle } from 'lucide-react';
+import { Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from './TransHTML';
+import { DEFAULT_WORKSHOP_SOURCE_SETTINGS, normalizeWorkshopSourceSettings } from '../utils/workshopSourceSettings';
+import { CustomSelect } from './CustomSelect';
 
 const MIN_DOWNLOAD_CONCURRENCY = 1;
 const MAX_DOWNLOAD_CONCURRENCY = 8;
@@ -22,21 +24,13 @@ interface SettingsViewProps {
   ) => Promise<void>;
 }
 
-const DEFAULT_SOURCE_SETTINGS: WorkshopSourceSettings = {
-  preset: 'conservative',
-  allowSteamworksSdk: true,
-  allowSteamWebApi: true,
-  allowSteamCommunityHtml: true,
-  allowSdkHtmlHybrid: false,
-  sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
-  cacheRetention: 'keep',
-};
-
 const SOURCE_LABEL_KEYS: Record<string, string> = {
   'steamworks-sdk': 'settings.sourceSteamworksSdk',
   'steam-web-api': 'settings.sourceSteamWebApi',
   'steamcommunity-html': 'settings.sourceSteamCommunityHtml',
 };
+
+const SCOPE_OPTIONS: WorkshopSdkHtmlScope[] = ['disabled', 'search', 'navigation', 'all'];
 
 function clampDownloadConcurrency(value: number) {
   if (!Number.isFinite(value)) {
@@ -59,7 +53,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
   const [forceSteamworksSdkDownload, setForceSteamworksSdkDownload] = useState(false);
   const [maxDownloadRetriesInput, setMaxDownloadRetriesInput] = useState('3');
-  const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_SOURCE_SETTINGS);
+  const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_WORKSHOP_SOURCE_SETTINGS);
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
@@ -69,14 +63,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
     setForceSteamworksSdkDownload(settings.forceSteamworksSdkDownload || false);
     setMaxDownloadRetriesInput(String(settings.maxDownloadRetries ?? 3));
-    setWorkshopSourceSettings({
-      ...DEFAULT_SOURCE_SETTINGS,
-      ...(settings.workshopSourceSettings || {}),
-      sourceOrder: settings.workshopSourceSettings?.sourceOrder?.length
-        ? settings.workshopSourceSettings.sourceOrder
-        : DEFAULT_SOURCE_SETTINGS.sourceOrder,
-      cacheRetention: 'keep',
-    });
+    setWorkshopSourceSettings(normalizeWorkshopSourceSettings(settings.workshopSourceSettings));
   }, [settings]);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -121,10 +108,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const featuresList = t('settings.features', { returnObjects: true }) as string[];
 
   const updateSourceSettings = (patch: Partial<WorkshopSourceSettings>) => {
-    setWorkshopSourceSettings((prev) => ({
+    setWorkshopSourceSettings((prev) => normalizeWorkshopSourceSettings({
       ...prev,
       ...patch,
-      cacheRetention: 'keep',
     }));
   };
 
@@ -138,9 +124,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       }
       [order[index], order[nextIndex]] = [order[nextIndex], order[index]];
       return {
-        ...prev,
+        ...normalizeWorkshopSourceSettings(prev),
         sourceOrder: order,
-        cacheRetention: 'keep',
       };
     });
   };
@@ -152,7 +137,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         allowSteamworksSdk: false,
         allowSteamWebApi: false,
         allowSteamCommunityHtml: false,
-        allowSdkHtmlHybrid: false,
+        sdkHtmlScope: 'disabled',
       });
       return;
     }
@@ -162,7 +147,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         allowSteamworksSdk: true,
         allowSteamWebApi: false,
         allowSteamCommunityHtml: false,
-        allowSdkHtmlHybrid: false,
+        sdkHtmlScope: 'disabled',
       });
       return;
     }
@@ -172,7 +157,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         allowSteamworksSdk: true,
         allowSteamWebApi: true,
         allowSteamCommunityHtml: true,
-        allowSdkHtmlHybrid: true,
+        sdkHtmlScope: 'all',
       });
       return;
     }
@@ -181,7 +166,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       allowSteamworksSdk: true,
       allowSteamWebApi: true,
       allowSteamCommunityHtml: true,
-      allowSdkHtmlHybrid: false,
+      sdkHtmlScope: 'search',
     });
   };
 
@@ -620,21 +605,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
                     {t('settings.sourcePresetLabel')}
                   </label>
-                  <select
-                    className="form-input"
+                  <CustomSelect
+                    options={[
+                      { value: 'conservative', label: t('settings.sourcePresetConservative') },
+                      { value: 'sdk-only', label: t('settings.sourcePresetSdkOnly') },
+                      { value: 'offline', label: t('settings.sourcePresetOffline') },
+                      { value: 'hybrid', label: t('settings.sourcePresetHybrid') },
+                    ]}
                     value={workshopSourceSettings.preset}
-                    onChange={(event) => applyPreset(event.target.value as WorkshopSourceSettings['preset'])}
-                    disabled={isSubmitting}
-                    style={{ width: '100%' }}
-                  >
-                    <option value="conservative">{t('settings.sourcePresetConservative')}</option>
-                    <option value="sdk-only">{t('settings.sourcePresetSdkOnly')}</option>
-                    <option value="offline">{t('settings.sourcePresetOffline')}</option>
-                    <option value="hybrid">{t('settings.sourcePresetHybrid')}</option>
-                  </select>
+                    onChange={(val) => applyPreset(val as WorkshopSourceSettings['preset'])}
+                    minWidth="100%"
+                    style={{ width: '100%', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                  />
                 </div>
 
-                {workshopSourceSettings.allowSdkHtmlHybrid && (
+                {workshopSourceSettings.allowSteamworksSdk && !workshopSourceSettings.allowSteamCommunityHtml && (
+                  <div style={{ padding: '12px 14px', borderRadius: '12px', background: 'rgba(255, 180, 171, 0.1)', border: '1px solid rgba(255, 180, 171, 0.3)', color: 'var(--md-sys-color-error)', fontSize: '12px', lineHeight: '1.5', marginBottom: '16px', display: 'flex', gap: '10px' }}>
+                    <AlertTriangle size={18} style={{ flexShrink: 0 }} />
+                    <div>
+                      <strong>{t('settings.sdkSearchWarningTitle', '搜索结果可能不准确')}</strong><br/>
+                      {t('settings.sdkSearchWarningDesc', '当前未启用 Steam Community 网页抓取，纯 SDK 模式下搜索功能将受限。具体限制请查阅相关文档。')}
+                    </div>
+                  </div>
+                )}
+
+                {workshopSourceSettings.allowSteamworksSdk && !workshopSourceSettings.allowSteamWebApi && (
+                  <div style={{ padding: '12px 14px', borderRadius: '12px', background: 'rgba(255, 180, 171, 0.1)', border: '1px solid rgba(255, 180, 171, 0.3)', color: 'var(--md-sys-color-error)', fontSize: '12px', lineHeight: '1.5', marginBottom: '16px', display: 'flex', gap: '10px' }}>
+                    <AlertTriangle size={18} style={{ flexShrink: 0 }} />
+                    <div>
+                      <strong>{t('settings.sdkDownloadWarningTitle', '下载可靠性受限')}</strong><br/>
+                      {t('settings.sdkDownloadWarningDesc', '当前未启用 Steam Web API，下载和详情获取将仅依赖 SDK。此下载方式极其不可靠，具体限制请查阅相关文档。')}
+                    </div>
+                  </div>
+                )}
+
+                {workshopSourceSettings.sdkHtmlScope !== 'disabled' && (
                   <div style={{ padding: '12px 14px', borderRadius: '12px', background: 'var(--md-sys-color-error-container)', color: 'var(--md-sys-color-on-error-container)', fontSize: '12px', lineHeight: '1.5', marginBottom: '16px' }}>
                     {t('settings.sourceHybridWarning')}
                   </div>
@@ -696,29 +701,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </div>
 
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '14px 0', borderBottom: 'none' }}>
-                  <div style={{ paddingRight: '20px' }}>
-                    <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
-                      {t('settings.sourceAllowHybridTitle')}
+                {workshopSourceSettings.allowSteamCommunityHtml && (
+                  <div style={{ padding: '16px 0', borderBottom: 'none' }}>
+                    <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                      {t('settings.sdkHtmlScopeTitle')}
                     </label>
-                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
-                      {t('settings.sourceAllowHybridDesc')}
+                    <CustomSelect
+                      options={SCOPE_OPTIONS.map((scope) => ({
+                        value: scope,
+                        label: t(`settings.sdkHtmlScope.${scope}.label`),
+                      }))}
+                      value={workshopSourceSettings.sdkHtmlScope}
+                      onChange={(val) => updateSourceSettings({
+                        preset: val === 'all' && workshopSourceSettings.preset === 'conservative'
+                          ? 'hybrid'
+                          : val !== 'all' && workshopSourceSettings.preset === 'hybrid'
+                            ? 'conservative'
+                            : workshopSourceSettings.preset,
+                        sdkHtmlScope: val as WorkshopSdkHtmlScope,
+                      })}
+                      minWidth="100%"
+                      style={{ width: '100%', marginBottom: '10px', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                    />
+                    <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5' }}>
+                      {t(`settings.sdkHtmlScope.${workshopSourceSettings.sdkHtmlScope}.desc`)}
                     </div>
                   </div>
-                  <label className="switch" style={{ flexShrink: 0 }}>
-                    <input
-                      type="checkbox"
-                      checked={workshopSourceSettings.allowSdkHtmlHybrid}
-                      onChange={(event) => updateSourceSettings({
-                        preset: event.target.checked ? 'hybrid' : 'conservative',
-                        allowSdkHtmlHybrid: event.target.checked,
-                        allowSteamCommunityHtml: event.target.checked || workshopSourceSettings.allowSteamCommunityHtml,
-                      })}
-                      disabled={isSubmitting}
-                    />
-                    <span className="slider"></span>
-                  </label>
-                </div>
+                )}
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-start', marginTop: '32px' }}>

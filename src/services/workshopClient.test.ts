@@ -179,6 +179,7 @@ describe('workshopClient', () => {
       allowSteamWebApi: true,
       allowSteamCommunityHtml: true,
       allowSdkHtmlHybrid: true,
+      sdkHtmlScope: 'all',
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     });
@@ -197,7 +198,7 @@ describe('workshopClient', () => {
     }));
   });
 
-  test('fetchWorkshopItems does not HTML-enrich SDK results by default when SDK is available', async () => {
+  test('fetchWorkshopHome does not HTML-enrich SDK home by default when SDK is available', async () => {
     mockInvoke.mockImplementation((cmd) => {
       if (cmd === 'get_workshop_capabilities') {
         return Promise.resolve({
@@ -206,30 +207,88 @@ describe('workshopClient', () => {
           canQueryHome: true,
         });
       }
-      if (cmd === 'query_workshop_items') {
+      if (cmd === 'query_workshop_home') {
         return Promise.resolve({
           source: 'steam-sdk',
-          items: [{
-            publishedfileid: '12345',
-            title: 'SDK Item',
-            creator: '76561198000000001',
-            creator_steam_id: '76561198000000001',
-            creator_name: '',
+          sections: [{
+            id: 'recent',
+            titleKey: 'recent',
+            subtitleKey: 'recent desc',
+            icon: 'Clock',
+            items: [],
+            browseParams: {
+              sort: 'trend',
+              section: 'readytouseitems',
+            },
           }],
         });
       }
       if (cmd === 'fetch_workshop_html') {
-        throw new Error('HTML should not be fetched by default');
+        throw new Error('Home HTML should not be fetched by default');
       }
       throw new Error(`Unexpected command: ${cmd}`);
     });
 
     const workshopClient = await import('./workshopClient');
-    const result = await workshopClient.fetchWorkshopItems({ query: 'tank' });
+    const result = await workshopClient.fetchWorkshopHome();
 
     expect(result.source).toBe('steam-sdk');
-    expect(result.items[0].authorName).toBe('');
+    expect(result.sections).toHaveLength(1);
     expect(mockInvoke).not.toHaveBeenCalledWith('fetch_workshop_html', expect.anything());
+  });
+
+  test('fetchWorkshopHome allows HTML enrichment when sdkHtmlScope is navigation', async () => {
+    mockParseHomepageSections.mockReturnValue([
+      {
+        id: 'recent',
+        title: 'recent',
+        subtitle: 'recent desc',
+        icon: null,
+        items: [],
+        browseParams: {
+          sort: 'trend',
+          section: 'readytouseitems',
+        },
+      },
+    ]);
+    mockParseTagCategories.mockReturnValue([]);
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({
+          bridgeAvailable: true,
+          canQueryItems: true,
+          canQueryHome: true,
+        });
+      }
+      if (cmd === 'query_workshop_home') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          sections: [],
+        });
+      }
+      if (cmd === 'fetch_workshop_html') {
+        return Promise.resolve('<html></html>');
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    workshopClient.setWorkshopSourceSettings({
+      preset: 'conservative',
+      allowSteamworksSdk: true,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: true,
+      sdkHtmlScope: 'navigation',
+      sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
+      cacheRetention: 'keep',
+    });
+
+    const result = await workshopClient.fetchWorkshopHome();
+
+    expect(result.source).toBe('web-fallback');
+    expect(mockInvoke).toHaveBeenCalledWith('fetch_workshop_html', expect.objectContaining({
+      source: 'workshop-home',
+    }));
   });
 
   test('fetchWorkshopItems enriches SDK placeholder author from snapshot cache', async () => {

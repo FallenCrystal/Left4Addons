@@ -107,6 +107,7 @@ export interface WorkshopBrowserProps {
   syncingSteam: boolean;
   onOpenTaskCenter: () => void;
   onWarning?: (message: string) => void;
+  workshopSourceSettings?: import('../../types/addon').WorkshopSourceSettings;
 }
 
 export interface WorkshopCapabilities {

@@ -1,7 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { X, RotateCw, Trash2, AlertTriangle, Loader2, RefreshCw, ClipboardCheck } from 'lucide-react';
-import { BackgroundTask } from '../types/addon';
+import { BackgroundTask, WorkshopSourceSettings } from '../types/addon';
 import { CacheImage } from './CacheImage';
 
 interface TaskCenterModalProps {
@@ -14,6 +14,7 @@ interface TaskCenterModalProps {
   onCancelTask: (id: string) => void;
   onRetryTask: (id: string) => void;
   onClearFinishedTasks: () => void;
+  workshopSourceSettings?: WorkshopSourceSettings;
 }
 
 export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
@@ -26,6 +27,7 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
   onCancelTask,
   onRetryTask,
   onClearFinishedTasks,
+  workshopSourceSettings,
 }) => {
   const { t } = useTranslation();
 
@@ -145,6 +147,31 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
             paddingRight: '4px',
           }}
         >
+          {/* SDK Only Download Warning */}
+          {workshopSourceSettings?.allowSteamworksSdk && !workshopSourceSettings?.allowSteamWebApi && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                padding: '12px 16px',
+                borderRadius: '16px',
+                backgroundColor: 'rgba(255, 180, 171, 0.1)',
+                border: '1px solid rgba(255, 180, 171, 0.3)',
+              }}
+            >
+              <AlertTriangle size={24} style={{ color: 'var(--md-sys-color-error)', flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontSize: '14px', fontWeight: 600, color: 'var(--md-sys-color-error)' }}>
+                  {t('taskCenter.sdkOnlyDownloadWarningTitle', '下载功能可能受限')}
+                </div>
+                <div style={{ fontSize: '12px', color: 'var(--md-sys-color-on-surface-variant)', marginTop: '2px' }}>
+                  {t('taskCenter.sdkOnlyDownloadWarningDesc', '当前仅允许通过 Steamworks SDK 下载，此下载方式极其不可靠。具体细节请查阅相关文档。')}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Steam Sync State (Separate active item if running) */}
           {syncingSteam && (
             <div

@@ -2,6 +2,32 @@ use super::*;
 use tauri::{AppHandle, State};
 use crate::mirrors::MirrorClientExt;
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SdkDownloadWarningPayload {
+    workshop_id: String,
+    title: String,
+    reason: String,
+    source: String,
+}
+
+fn emit_sdk_download_warning(
+    app_handle: &AppHandle,
+    workshop_id: &str,
+    title: &str,
+    reason: &str,
+) {
+    let _ = app_handle.emit(
+        "sdk-download-warning",
+        SdkDownloadWarningPayload {
+            workshop_id: workshop_id.to_string(),
+            title: title.to_string(),
+            reason: reason.to_string(),
+            source: "steam-sdk".to_string(),
+        },
+    );
+}
+
 #[tauri::command]
 pub async fn move_addons(
     ids: Vec<String>,
@@ -1143,6 +1169,12 @@ pub async fn download_addon(
         }
 
         if prefer_sdk_download {
+            emit_sdk_download_warning(
+                &app_handle,
+                &workshop_id,
+                title,
+                if force_sdk_download { "forced-sdk" } else { "web-download-unavailable" },
+            );
             match attempt_bridge_download(
                 &state,
                 &state.workshop_service,
@@ -1181,6 +1213,12 @@ pub async fn download_addon(
         let file_url = match file_url {
             Some(url) => url,
             None if !prefer_sdk_download => {
+                emit_sdk_download_warning(
+                    &app_handle,
+                    &workshop_id,
+                    title,
+                    "web-download-unavailable",
+                );
                 match attempt_bridge_download(
                     &state,
                     &state.workshop_service,
@@ -1276,6 +1314,12 @@ pub async fn download_addon(
 
         if !response.status().is_success() {
             if !prefer_sdk_download {
+                emit_sdk_download_warning(
+                    &app_handle,
+                    &workshop_id,
+                    title,
+                    "web-download-failed",
+                );
                 match attempt_bridge_download(
                     &state,
                     &state.workshop_service,

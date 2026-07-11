@@ -89,7 +89,9 @@
     "statusCancelled": "已取消",
     "sync": "元数据同步",
     "warningTitle": "功能受限警告",
-    "steamworksUnavailableTitle": "Steamworks SDK 不可用"
+    "steamworksUnavailableTitle": "Steamworks SDK 不可用",
+    "sdkDownloadWarningForced": "该任务按当前设置直接改走 Steamworks SDK 下载。根据 docs/steamworks-sdk-details.md 中记录的已知限制，这条链路在 L4D2 上的进度显示、重复下载、缓存清理和 Steam 管理副本都可能不稳定。",
+    "sdkDownloadWarningFallback": "该任务的 Web 直链不可用，已退化为 Steamworks SDK 下载。根据 docs/steamworks-sdk-details.md 中记录的已知限制，这条链路在 L4D2 上的进度显示、重复下载、缓存清理和 Steam 管理副本都可能不稳定。"
   },
   "addonCard": {
     "deselect": "取消选择",
@@ -291,10 +293,10 @@
     "sourcesTitle": "创意工坊数据来源",
     "sourcesDesc": "配置创意工坊元数据的来源。基础附件管理始终使用本地文件和本地缓存，不依赖远程服务。",
     "sourcePresetLabel": "来源模式",
-    "sourcePresetConservative": "保守自动：缓存优先，SDK 可用时不抓取网页",
+    "sourcePresetConservative": "保守自动：SDK 可用时仅放开搜索相关网页",
     "sourcePresetSdkOnly": "仅 Steam/SDK：不使用 Steam Web API 或网页爬取",
     "sourcePresetOffline": "离线模式：只使用本地文件和缓存",
-    "sourcePresetHybrid": "SDK + 网页混合爬取",
+    "sourcePresetHybrid": "允许所有网页抓取作用域",
     "sourceHybridWarning": "同时使用 Steamworks SDK 和 steamcommunity 网页爬取可能更容易触发 Steam 社区的 IP 请求速率限制。仅在确实需要网页补全作者、标签或页面详情时开启。",
     "sourceSteamworksSdk": "Steamworks SDK",
     "sourceSteamWebApi": "Steam Web API",
@@ -302,8 +304,25 @@
     "sourceOrderTitle": "高级来源顺序",
     "sourceMoveUp": "上移",
     "sourceMoveDown": "下移",
-    "sourceAllowHybridTitle": "允许 SDK 与 steamcommunity 同时爬取",
-    "sourceAllowHybridDesc": "开启后，即使 SDK 已接通，也允许继续抓取 steamcommunity 页面用于补全数据。",
+    "sdkHtmlScopeTitle": "SDK 可用时允许的网页抓取范围",
+    "sdkHtmlScope": {
+      "disabled": {
+        "label": "禁用",
+        "desc": "SDK 可用时，除单个物品详情页外，不再抓取 steamcommunity 页面。"
+      },
+      "search": {
+        "label": "创意工坊搜索",
+        "desc": "默认。允许关键词搜索和创作者页使用 steamcommunity 结果，以修正 SDK 搜索结果过差的问题。"
+      },
+      "navigation": {
+        "label": "创意工坊首页/导航",
+        "desc": "在搜索基础上，再允许创意工坊首页、分类浏览和标签导航使用 steamcommunity 页面。"
+      },
+      "all": {
+        "label": "允许所有",
+        "desc": "最佳体验，但风险最高。连后台静默刷新也允许抓取 steamcommunity，更容易触发速率限制。"
+      }
+    },
     "dummyBypassTitle": "创意工坊检测绕过",
     "dummyBypassDesc": [
       "开启后，将 addon 从 workshop 移出时，将在 workshop 目录下自动生成一个 dummy addon（仅保留附件图片、原始 AppID 及版本号，将标题标记为原名 (L4A Dummy) 且说明改为由 L4A 生成），以试图绕过 L4D2 创意工坊订阅同步检测。",

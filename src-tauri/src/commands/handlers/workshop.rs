@@ -477,7 +477,7 @@ pub async fn fetch_workshop_html(
     };
     if !allow_html {
         let err = if sdk_query_available {
-            "Steam Community HTML fetching is disabled while Steamworks SDK is available. Enable SDK + Steam Community hybrid crawling in settings to allow it.".to_string()
+            "Steam Community HTML fetching is disabled for this scope while Steamworks SDK is available. Adjust the allowed HTML fetch scope in settings to allow it.".to_string()
         } else {
             "Steam Community HTML fetching is disabled by source settings".to_string()
         };

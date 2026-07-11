@@ -62,11 +62,10 @@ struct DownloadResumeMetadata {
 
 #[derive(Debug, Clone)]
 struct SourcePolicy {
-    preset: String,
     allow_steamworks_sdk: bool,
     allow_steam_web_api: bool,
     allow_steam_community_html: bool,
-    allow_sdk_html_hybrid: bool,
+    sdk_html_scope: String,
     source_order: Vec<String>,
 }
 
@@ -75,38 +74,39 @@ impl SourcePolicy {
         let configured = &settings.workshop_source_settings;
         let preset = configured.preset.trim().to_string();
         let disable_sdk = settings.disable_steamworks_sdk;
+        let sdk_html_scope = resolve_sdk_html_scope(
+            &configured.sdk_html_scope,
+            &preset,
+            configured.allow_sdk_html_hybrid,
+        );
 
         match preset.as_str() {
             "offline" => Self {
-                preset,
                 allow_steamworks_sdk: false,
                 allow_steam_web_api: false,
                 allow_steam_community_html: false,
-                allow_sdk_html_hybrid: false,
+                sdk_html_scope: "disabled".to_string(),
                 source_order: configured.source_order.clone(),
             },
             "sdk-only" | "sdkOnly" => Self {
-                preset: "sdk-only".to_string(),
                 allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
                 allow_steam_web_api: false,
                 allow_steam_community_html: false,
-                allow_sdk_html_hybrid: false,
+                sdk_html_scope: "disabled".to_string(),
                 source_order: configured.source_order.clone(),
             },
             "hybrid" => Self {
-                preset,
                 allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
                 allow_steam_web_api: configured.allow_steam_web_api,
                 allow_steam_community_html: configured.allow_steam_community_html,
-                allow_sdk_html_hybrid: true,
+                sdk_html_scope: "all".to_string(),
                 source_order: configured.source_order.clone(),
             },
             _ => Self {
-                preset: "conservative".to_string(),
                 allow_steamworks_sdk: !disable_sdk && configured.allow_steamworks_sdk,
                 allow_steam_web_api: configured.allow_steam_web_api,
                 allow_steam_community_html: configured.allow_steam_community_html,
-                allow_sdk_html_hybrid: configured.allow_sdk_html_hybrid,
+                sdk_html_scope,
                 source_order: configured.source_order.clone(),
             },
         }
@@ -128,18 +128,43 @@ impl SourcePolicy {
         if !self.allow_steam_community_html {
             return false;
         }
-        if self.preset == "hybrid" || self.allow_sdk_html_hybrid {
+        if !sdk_query_available {
             return true;
         }
         if is_manual_detail_workshop_fetch_source(source) {
             return true;
         }
-        !sdk_query_available
+        if is_search_workshop_fetch_source(source) {
+            return matches!(self.sdk_html_scope.as_str(), "search" | "navigation" | "all");
+        }
+        if is_navigation_workshop_fetch_source(source) {
+            return matches!(self.sdk_html_scope.as_str(), "navigation" | "all");
+        }
+        if is_background_workshop_fetch_source(source) {
+            return self.sdk_html_scope == "all";
+        }
+        false
+    }
+}
+
+fn resolve_sdk_html_scope(configured_scope: &str, preset: &str, allow_sdk_html_hybrid: bool) -> String {
+    match configured_scope.trim() {
+        "disabled" | "search" | "navigation" | "all" => configured_scope.trim().to_string(),
+        _ if preset == "hybrid" || allow_sdk_html_hybrid => "all".to_string(),
+        _ => "search".to_string(),
     }
 }
 
 fn is_manual_detail_workshop_fetch_source(source: &str) -> bool {
     matches!(source, "addon-detail" | "workshop-detail")
+}
+
+fn is_search_workshop_fetch_source(source: &str) -> bool {
+    matches!(source, "workshop-search" | "workshop-creator")
+}
+
+fn is_navigation_workshop_fetch_source(source: &str) -> bool {
+    matches!(source, "workshop-home" | "workshop-browse")
 }
 
 fn source_position(source_order: &[String], source: &str, fallback: usize) -> usize {
@@ -2686,11 +2711,10 @@ mod tests {
     #[test]
     fn detail_sources_can_fetch_html_without_hybrid_mode() {
         let policy = SourcePolicy {
-            preset: "conservative".to_string(),
             allow_steamworks_sdk: true,
             allow_steam_web_api: true,
             allow_steam_community_html: true,
-            allow_sdk_html_hybrid: false,
+            sdk_html_scope: "disabled".to_string(),
             source_order: vec![
                 "steamworks-sdk".to_string(),
                 "steam-web-api".to_string(),
@@ -2702,6 +2726,36 @@ mod tests {
         assert!(policy.allow_html("workshop-detail", true));
         assert!(!policy.allow_html("workshop-home", true));
         assert!(!policy.allow_html("workshop-browse", true));
+    }
+
+    #[test]
+    fn sdk_html_scope_controls_search_navigation_and_background_sources() {
+        let search_policy = SourcePolicy {
+            allow_steamworks_sdk: true,
+            allow_steam_web_api: true,
+            allow_steam_community_html: true,
+            sdk_html_scope: "search".to_string(),
+            source_order: vec![],
+        };
+        assert!(search_policy.allow_html("workshop-search", true));
+        assert!(search_policy.allow_html("workshop-creator", true));
+        assert!(!search_policy.allow_html("workshop-home", true));
+        assert!(!search_policy.allow_html("background-refresh", true));
+
+        let navigation_policy = SourcePolicy {
+            sdk_html_scope: "navigation".to_string(),
+            ..search_policy.clone()
+        };
+        assert!(navigation_policy.allow_html("workshop-home", true));
+        assert!(navigation_policy.allow_html("workshop-browse", true));
+        assert!(!navigation_policy.allow_html("startup-auto", true));
+
+        let all_policy = SourcePolicy {
+            sdk_html_scope: "all".to_string(),
+            ..search_policy
+        };
+        assert!(all_policy.allow_html("startup-auto", true));
+        assert!(all_policy.allow_html("background-refresh", true));
     }
 
     #[test]
