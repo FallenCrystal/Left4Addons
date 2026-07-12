@@ -20,19 +20,18 @@ use super::types::{
     Settings, SettingsStore, WorkshopSeenItem, WorkshopSourceSettings,
 };
 
+pub mod addons;
+pub mod cache;
 pub mod db;
 pub mod settings;
-pub mod cache;
-pub mod addons;
-pub mod workshop;
 pub mod tasks;
+pub mod workshop;
+pub use addons::*;
+pub use cache::*;
 pub use db::*;
 pub use settings::*;
-pub use cache::*;
-pub use addons::*;
-pub use workshop::*;
 pub use tasks::*;
-
+pub use workshop::*;
 
 const DOWNLOAD_CANCELLED_ERR: &str = "Download cancelled";
 const WORKSHOP_HTML_FETCH_INTERVAL: Duration = Duration::from_secs(6);
@@ -135,7 +134,10 @@ impl SourcePolicy {
             return true;
         }
         if is_search_workshop_fetch_source(source) {
-            return matches!(self.sdk_html_scope.as_str(), "search" | "navigation" | "all");
+            return matches!(
+                self.sdk_html_scope.as_str(),
+                "search" | "navigation" | "all"
+            );
         }
         if is_navigation_workshop_fetch_source(source) {
             return matches!(self.sdk_html_scope.as_str(), "navigation" | "all");
@@ -147,7 +149,11 @@ impl SourcePolicy {
     }
 }
 
-fn resolve_sdk_html_scope(configured_scope: &str, preset: &str, allow_sdk_html_hybrid: bool) -> String {
+fn resolve_sdk_html_scope(
+    configured_scope: &str,
+    preset: &str,
+    allow_sdk_html_hybrid: bool,
+) -> String {
     match configured_scope.trim() {
         "disabled" | "search" | "navigation" | "all" => configured_scope.trim().to_string(),
         _ if preset == "hybrid" || allow_sdk_html_hybrid => "all".to_string(),
@@ -156,7 +162,10 @@ fn resolve_sdk_html_scope(configured_scope: &str, preset: &str, allow_sdk_html_h
 }
 
 fn is_manual_detail_workshop_fetch_source(source: &str) -> bool {
-    matches!(source, "addon-detail" | "workshop-detail" | "dependency-check")
+    matches!(
+        source,
+        "addon-detail" | "workshop-detail" | "dependency-check"
+    )
 }
 
 fn is_search_workshop_fetch_source(source: &str) -> bool {
@@ -890,10 +899,7 @@ fn partial_download_metadata_path(download_cache_dir: &Path, workshop_id: &str) 
     download_cache_dir.join(format!("{}.json", workshop_id))
 }
 
-fn cleanup_partial_download(
-    download_cache_dir: &Path,
-    workshop_id: &str,
-) -> Result<(), String> {
+fn cleanup_partial_download(download_cache_dir: &Path, workshop_id: &str) -> Result<(), String> {
     for path in [
         partial_download_path(download_cache_dir, workshop_id),
         partial_download_metadata_path(download_cache_dir, workshop_id),
@@ -1079,8 +1085,6 @@ fn load_known_addons_from_legacy_db(
 
     migrated
 }
-
-
 
 fn load_workshop_cache(cache_path: &Path) -> HashMap<String, serde_json::Value> {
     let (items, authors) = load_workshop_cache_document(cache_path);
@@ -1651,29 +1655,31 @@ fn propagate_author_names(cache: &mut HashMap<String, serde_json::Value>) {
         })
         .collect();
 
-    if learned.is_empty() {
-        return;
-    }
-
     for value in cache.values_mut() {
         let Some(obj) = value.as_object_mut() else {
             continue;
         };
         let ids = author_identity_values(obj);
-        if ids.is_empty() {
-            continue;
-        }
         let current_name = obj
             .get("creatorName")
             .or_else(|| obj.get("authorName"))
             .and_then(|v| v.as_str())
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
+        let ids_vec = ids.iter().cloned().collect::<Vec<_>>();
+        let has_placeholder_name = looks_like_placeholder_author_name(&current_name, &ids_vec);
+        if has_placeholder_name {
+            obj.remove("creatorName");
+            obj.remove("authorName");
+        }
+        if ids.is_empty() {
+            continue;
+        }
         for (name, url, learned_ids) in &learned {
             if ids.is_disjoint(learned_ids) {
                 continue;
             }
-            let ids_vec = ids.iter().cloned().collect::<Vec<_>>();
-            if looks_like_placeholder_author_name(current_name, &ids_vec) {
+            if has_placeholder_name {
                 insert_non_empty_string(obj, "creatorName", name);
                 insert_non_empty_string(obj, "authorName", name);
             }
@@ -1765,7 +1771,11 @@ fn insert_non_empty_string(
 
 fn looks_like_placeholder_author_name(name: &str, ids: &[String]) -> bool {
     let name = name.trim();
-    if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+    if name.is_empty()
+        || name.chars().all(|c| c.is_ascii_digit())
+        || name.eq_ignore_ascii_case("AUTHOR_NAME")
+        || name.eq_ignore_ascii_case("[unknown]")
+    {
         return true;
     }
 
@@ -1972,7 +1982,6 @@ fn database_with_workshop_cache(
     }
     response
 }
-
 
 async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::Value>, String> {
     fetch_steam_details_web(workshop_ids).await
@@ -2250,7 +2259,6 @@ async fn attempt_bridge_download(
     Ok(false)
 }
 
-
 fn extract_workshop_id_from_url(url: &str) -> Option<String> {
     if let Some(pos) = url.find("id=") {
         let start = pos + 3;
@@ -2408,7 +2416,155 @@ fn ensure_group_in_master_collection(group: &mut Group, mc_id: &str) {
     }
 }
 
+fn clear_auto_groups(db: &mut Database) {
+    let auto_group_ids: HashSet<String> = db
+        .groups
+        .iter()
+        .filter(|group| group.source.as_deref() == Some("auto-group"))
+        .map(|group| group.id.clone())
+        .collect();
+    if auto_group_ids.is_empty() {
+        return;
+    }
+
+    db.groups
+        .retain(|group| group.source.as_deref() != Some("auto-group"));
+    for collection in &mut db.master_collections {
+        collection
+            .group_ids
+            .retain(|group_id| !auto_group_ids.contains(group_id));
+    }
+}
+
+fn addon_info_flag(addon: &Addon, key: &str) -> bool {
+    addon
+        .addon_info
+        .as_object()
+        .and_then(|fields| {
+            fields
+                .iter()
+                .find(|(field, _)| field.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value)
+        })
+        .is_some_and(|value| {
+            value
+                .as_str()
+                .map(|value| value.trim() == "1")
+                .unwrap_or_else(|| {
+                    value.as_i64() == Some(1)
+                        || value.as_u64() == Some(1)
+                        || value.as_bool() == Some(true)
+                })
+        })
+}
+
+fn tags_indicate_campaign_or_map(details: Option<&serde_json::Value>) -> bool {
+    let Some(details) = details else {
+        return false;
+    };
+    let Some(details) = details.as_object() else {
+        return false;
+    };
+
+    ["tags", "pageTags"].iter().any(|key| {
+        details
+            .get(*key)
+            .and_then(|value| value.as_array())
+            .is_some_and(|tags| {
+                tags.iter().any(|tag| {
+                    let tag = tag
+                        .as_str()
+                        .or_else(|| tag.get("tag").and_then(|value| value.as_str()))
+                        .or_else(|| tag.get("name").and_then(|value| value.as_str()))
+                        .unwrap_or("")
+                        .to_lowercase();
+                    tag.contains("campaign") || tag.contains("map")
+                })
+            })
+    })
+}
+
+fn addon_is_campaign_or_map(addon: &Addon) -> bool {
+    addon_info_flag(addon, "addoncontent_campaign")
+        || addon_info_flag(addon, "addoncontent_map")
+        || tags_indicate_campaign_or_map(addon.steam_details.as_ref())
+        || tags_indicate_campaign_or_map(addon.workshop_details.as_ref())
+}
+
+fn normalize_group_comparison_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn addon_author_identity(addon: &Addon) -> Option<String> {
+    let addon_info_id = addon
+        .addon_info
+        .get("addonauthorsteamid")
+        .or_else(|| addon.addon_info.get("addonAuthorSteamID"))
+        .and_then(|value| value.as_str());
+    let steam_id = addon
+        .steam_details
+        .as_ref()
+        .and_then(|details| {
+            details
+                .get("creator_steam_id")
+                .or_else(|| details.get("creatorSteamId"))
+                .or_else(|| details.get("creator"))
+        })
+        .and_then(|value| value.as_str());
+    let workshop_id = addon
+        .workshop_details
+        .as_ref()
+        .and_then(|details| {
+            details
+                .get("creatorSteamId")
+                .or_else(|| details.get("creatorId"))
+                .or_else(|| details.get("authorId"))
+        })
+        .and_then(|value| value.as_str());
+
+    addon_info_id
+        .or(steam_id)
+        .or(workshop_id)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_lowercase())
+}
+
+fn addon_group_description(addon: &Addon) -> Option<String> {
+    let description = addon
+        .addon_info
+        .get("addondescription")
+        .or_else(|| addon.addon_info.get("addontagline"))
+        .or_else(|| {
+            addon
+                .steam_details
+                .as_ref()
+                .and_then(|details| details.get("description"))
+        })
+        .or_else(|| {
+            addon
+                .workshop_details
+                .as_ref()
+                .and_then(|details| details.get("description"))
+        })
+        .and_then(|value| value.as_str())?;
+    let description = normalize_group_comparison_text(description);
+    (description.len() > 10).then_some(description)
+}
+
+fn texture_group_root_title(title: &str) -> Option<String> {
+    let texture_suffix = Regex::new(r"(?i)^(.*?)\s+textures?$").ok()?;
+    let root = texture_suffix.captures(title)?.get(1)?.as_str().trim();
+    (root.len() >= 3).then(|| root.to_string())
+}
+
 fn auto_group_internal(db: &mut Database) {
+    clear_auto_groups(db);
+
     let mut grouped_vpks = HashSet::new();
     for g in &db.groups {
         for addon in &g.addons {
@@ -2426,126 +2582,110 @@ fn auto_group_internal(db: &mut Database) {
     struct Candidate {
         id: String,
         title: String,
-        description: String,
+        title_key: String,
+        author_identity: Option<String>,
+        description: Option<String>,
     }
 
     let mut candidates = Vec::new();
     for addon in ungrouped {
+        if addon.is_dummy || !addon_is_campaign_or_map(&addon) {
+            continue;
+        }
         let title = addon
-            .steam_details
-            .as_ref()
-            .and_then(|d| d.get("title").and_then(|t| t.as_str()))
-            .or_else(|| addon.addon_info.get("addontitle").and_then(|t| t.as_str()))
-            .unwrap_or(&addon.vpk_name)
-            .to_string();
-
-        let description = addon
             .addon_info
-            .get("addondescription")
-            .and_then(|t| t.as_str())
-            .or_else(|| {
-                addon
-                    .addon_info
-                    .get("addontagline")
-                    .and_then(|t| t.as_str())
-            })
+            .get("addontitle")
+            .and_then(|title| title.as_str())
+            .filter(|title| !title.trim().is_empty())
             .or_else(|| {
                 addon
                     .steam_details
                     .as_ref()
-                    .and_then(|d| d.get("description").and_then(|t| t.as_str()))
+                    .and_then(|details| details.get("title").and_then(|title| title.as_str()))
+                    .filter(|title| !title.trim().is_empty())
             })
-            .unwrap_or("")
+            .unwrap_or(&addon.vpk_name)
             .to_string();
 
         candidates.push(Candidate {
             id: addon.id.clone(),
+            title_key: normalize_group_comparison_text(&title),
             title,
-            description,
+            author_identity: addon_author_identity(&addon),
+            description: addon_group_description(&addon),
         });
     }
 
-    let mut desc_groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, c) in candidates.iter().enumerate() {
-        let desc_trim = c.description.trim();
-        if desc_trim.len() > 10 {
-            let key = desc_trim.to_lowercase();
-            desc_groups.entry(key).or_default().push(i);
-        }
-    }
-
-    let mut indices_to_remove = HashSet::new();
-
-    for (_desc, idxs) in desc_groups {
-        if idxs.len() >= 2 {
-            let mut common_prefix = candidates[idxs[0]].title.clone();
-            for &idx in &idxs[1..] {
-                let current_title = &candidates[idx].title;
-                let mut common_len = 0;
-                for (c1, c2) in common_prefix.chars().zip(current_title.chars()) {
-                    if c1 == c2 {
-                        common_len += c1.len_utf8();
-                    } else {
-                        break;
-                    }
-                }
-                common_prefix.truncate(common_len);
-            }
-
-            let mut group_name = clean_group_name(&common_prefix);
-            if group_name.is_empty() {
-                group_name = "Campaign Pack".to_string();
-            }
-
-            let group_id = format!(
-                "group_{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
-
-            let mut addons = Vec::new();
-            for &idx in &idxs {
-                addons.push(candidates[idx].id.clone());
-                indices_to_remove.insert(idx);
-            }
-
-            db.groups.push(Group {
-                id: group_id,
-                name: group_name,
-                addons,
-                tags: None,
-                workshop_collection_id: None,
-                master_collection_ids: None,
-                source: Some("auto-group".to_string()),
-            });
-        }
-    }
-
-    let mut remaining_candidates = Vec::new();
-    for (i, c) in candidates.into_iter().enumerate() {
-        if !indices_to_remove.contains(&i) {
-            remaining_candidates.push(c);
-        }
-    }
-
-    let re_part = Regex::new(r"(?i)^(.*?)\s*(?:[-#_]*\s*(?:part|pt|partie|pts)\s*(\d+|[ivxldcm]+)(?:\/\d+)?|\s+v?\d+\.\d+|\s+v\d+)$").unwrap();
-    let mut title_groups: HashMap<String, Vec<String>> = HashMap::new();
-    for c in remaining_candidates {
+    let re_part = Regex::new(r"(?i)^(.*?)\s*(?:[-#_]*\s*(?:part|pt|partie|pts|pack)\s*(\d+|[ivxldcm]+)(?:\/\d+)?|\s+v?\d+\.\d+|\s+v\d+)$").unwrap();
+    let mut title_groups: HashMap<String, (String, Vec<String>)> = HashMap::new();
+    for c in &candidates {
         if let Some(caps) = re_part.captures(&c.title) {
             let prefix = caps.get(1).unwrap().as_str().trim().to_string();
             if prefix.len() >= 3 {
                 let cleaned_prefix = clean_group_name(&prefix);
                 if cleaned_prefix.len() >= 3 {
-                    title_groups.entry(cleaned_prefix).or_default().push(c.id);
+                    let key = cleaned_prefix.to_lowercase();
+                    let entry = title_groups
+                        .entry(key)
+                        .or_insert_with(|| (cleaned_prefix.clone(), Vec::new()));
+                    if cleaned_prefix < entry.0 {
+                        entry.0 = cleaned_prefix;
+                    }
+                    entry.1.push(c.id.clone());
                 }
             }
         }
     }
 
-    for (prefix, addons) in title_groups {
+    title_groups.retain(|_, (_, addons)| {
+        let authors = addons
+            .iter()
+            .filter_map(|id| {
+                candidates
+                    .iter()
+                    .find(|candidate| &candidate.id == id)
+                    .and_then(|candidate| candidate.author_identity.as_ref())
+            })
+            .collect::<HashSet<_>>();
+        authors.len() <= 1
+    });
+
+    for (prefix, addons) in title_groups.values_mut() {
+        let prefix_key = normalize_group_comparison_text(prefix);
+        let group_author = addons.iter().find_map(|id| {
+            candidates
+                .iter()
+                .find(|candidate| &candidate.id == id)
+                .and_then(|candidate| candidate.author_identity.as_ref())
+        });
+        for candidate in &candidates {
+            let candidate_prefix_key =
+                normalize_group_comparison_text(&clean_group_name(&candidate.title));
+            let has_matching_author = group_author
+                .map(|author| {
+                    candidate
+                        .author_identity
+                        .as_ref()
+                        .map(|candidate_author| candidate_author == author)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if candidate_prefix_key == prefix_key
+                && has_matching_author
+                && !addons.contains(&candidate.id)
+            {
+                addons.push(candidate.id.clone());
+            }
+        }
+    }
+
+    let mut title_groups = title_groups.into_values().collect::<Vec<_>>();
+    title_groups.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut grouped_ids = HashSet::new();
+    for (prefix, mut addons) in title_groups {
         if addons.len() >= 2 {
+            addons.sort();
+            grouped_ids.extend(addons.iter().cloned());
             let group_id = format!(
                 "group_{}",
                 std::time::SystemTime::now()
@@ -2565,12 +2705,82 @@ fn auto_group_internal(db: &mut Database) {
             });
         }
     }
+
+    let mut identical_title_groups: HashMap<(String, String, String), (String, String, Vec<String>)> =
+        HashMap::new();
+    for candidate in &candidates {
+        if grouped_ids.contains(&candidate.id) {
+            continue;
+        }
+        let (Some(author_identity), Some(description)) =
+            (candidate.author_identity.as_ref(), candidate.description.as_ref())
+        else {
+            continue;
+        };
+        let entry = identical_title_groups
+            .entry((
+                candidate.title_key.clone(),
+                author_identity.clone(),
+                description.clone(),
+            ))
+            .or_insert_with(|| {
+                (
+                    candidate.title.clone(),
+                    author_identity.clone(),
+                    Vec::new(),
+                )
+            });
+        if candidate.title < entry.0 {
+            entry.0 = candidate.title.clone();
+        }
+        entry.2.push(candidate.id.clone());
+    }
+
+    let mut identical_title_groups = identical_title_groups.into_values().collect::<Vec<_>>();
+    identical_title_groups.sort_by(|left, right| left.0.cmp(&right.0));
+    for (mut title, author_identity, mut addons) in identical_title_groups {
+        if addons.len() < 2 {
+            continue;
+        }
+        if let Some(root_title) = texture_group_root_title(&title) {
+            let root_key = normalize_group_comparison_text(&root_title);
+            for candidate in &candidates {
+                let has_matching_author = candidate
+                    .author_identity
+                    .as_ref()
+                    .map(|candidate_author| candidate_author == &author_identity)
+                    .unwrap_or(true);
+                if !grouped_ids.contains(&candidate.id)
+                    && candidate.title_key == root_key
+                    && has_matching_author
+                    && !addons.contains(&candidate.id)
+                {
+                    addons.push(candidate.id.clone());
+                }
+            }
+            if addons.len() >= 3 {
+                title = root_title;
+            }
+        }
+        addons.sort();
+        let group_id = format!(
+            "group_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        db.groups.push(Group {
+            id: group_id,
+            name: title,
+            addons,
+            tags: None,
+            workshop_collection_id: None,
+            master_collection_ids: None,
+            source: Some("auto-group".to_string()),
+        });
+    }
 }
-
-
-
-
-
 
 fn move_requires_dir_change(addon: &Addon, target_dir_type: &str) -> bool {
     addon.dir_type != target_dir_type
@@ -2584,37 +2794,12 @@ fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
     addon.vpk_name != sanitized
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
-        is_background_workshop_fetch_source, load_known_addons, load_workshop_cache,
+        auto_group_internal, ensure_background_workshop_fetch_allowed,
+        extract_steamcommunity_error_message, is_background_workshop_fetch_source,
+        load_known_addons, load_workshop_cache, looks_like_placeholder_author_name,
         merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
         normalize_master_collection_group_refs, parse_content_range_start,
         persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
@@ -2625,7 +2810,37 @@ mod tests {
     use crate::commands::types::{Addon, Database, Group, MasterCollection, WorkshopSeenItem};
     use crate::vpk::generate_dummy_vpk;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
+
+    fn auto_group_addon(
+        id: &str,
+        title: &str,
+        addon_info: serde_json::Value,
+        tags: serde_json::Value,
+    ) -> Addon {
+        Addon {
+            id: id.to_string(),
+            vpk_name: format!("{}.vpk", id),
+            workshop_id: None,
+            workshop_id_candidate: None,
+            workshop_id_source: None,
+            workshop_id_validation_status: None,
+            workshop_id_last_attempt_at: None,
+            addon_info,
+            has_image: false,
+            image_path: None,
+            files_count: 0,
+            file_size: 0,
+            parsed_at: String::new(),
+            current_path: String::new(),
+            dir_type: "loading".to_string(),
+            is_enabled: true,
+            steam_details: Some(json!({ "title": title, "tags": tags })),
+            workshop_details: None,
+            is_dummy: false,
+        }
+    }
 
     fn write_known_addons_file(name: &str, value: serde_json::Value) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2736,6 +2951,402 @@ mod tests {
             db.groups[0].master_collection_ids,
             Some(vec!["collection-1".to_string()])
         );
+    }
+
+    #[test]
+    fn auto_group_rebuilds_campaign_parts_without_description_heuristics() {
+        let mut db = Database {
+            addons: HashMap::from([
+                (
+                    "base".to_string(),
+                    auto_group_addon(
+                        "base",
+                        "City Escape",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+                (
+                    "part-1".to_string(),
+                    auto_group_addon(
+                        "part-1",
+                        "City Escape Part 1/2",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+                (
+                    "part-2".to_string(),
+                    auto_group_addon(
+                        "part-2",
+                        "city escape PART 2/2",
+                        json!({}),
+                        json!([{ "tag": "Campaigns" }]),
+                    ),
+                ),
+                (
+                    "script".to_string(),
+                    auto_group_addon(
+                        "script",
+                        "City Escape Part 3/3",
+                        json!({
+                            "addoncontent_script": "1",
+                            "addondescription": "shared campaign description"
+                        }),
+                        json!([{ "tag": "Scripts" }]),
+                    ),
+                ),
+                (
+                    "manual-part".to_string(),
+                    auto_group_addon(
+                        "manual-part",
+                        "City Escape Part 4/4",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+            ]),
+            groups: vec![
+                Group {
+                    id: "old-auto".to_string(),
+                    name: "Campaign Pack".to_string(),
+                    addons: vec!["script".to_string()],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: None,
+                    source: Some("auto-group".to_string()),
+                },
+                Group {
+                    id: "manual".to_string(),
+                    name: "Manual Group".to_string(),
+                    addons: vec!["manual-part".to_string()],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: None,
+                    source: Some("manual".to_string()),
+                },
+            ],
+            master_collections: vec![MasterCollection {
+                id: "campaigns".to_string(),
+                name: "Campaigns".to_string(),
+                name_key: Some("masterCollections.systemCampaignAuto".to_string()),
+                group_ids: vec!["old-auto".to_string()],
+                is_system: true,
+                icon: None,
+            }],
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        let auto_groups = db
+            .groups
+            .iter()
+            .filter(|group| group.source.as_deref() == Some("auto-group"))
+            .collect::<Vec<_>>();
+        assert_eq!(auto_groups.len(), 1);
+        assert_eq!(auto_groups[0].name, "City Escape");
+        assert_eq!(auto_groups[0].addons, vec!["base", "part-1", "part-2"]);
+        assert!(db.groups.iter().any(|group| group.id == "manual"));
+        assert!(!db.groups.iter().any(|group| group.id == "old-auto"));
+        assert!(db.master_collections[0].group_ids.is_empty());
+    }
+
+    #[test]
+    fn auto_group_supports_pack_suffixes_without_including_similarly_named_content() {
+        let mut db = Database {
+            addons: HashMap::from([
+                (
+                    "base".to_string(),
+                    auto_group_addon(
+                        "base",
+                        "Harbor",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+                (
+                    "pack-1".to_string(),
+                    auto_group_addon(
+                        "pack-1",
+                        "Harbor Pack1",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+                (
+                    "pack-2".to_string(),
+                    auto_group_addon(
+                        "pack-2",
+                        "Harbor Pack 2",
+                        json!({ "addoncontent_map": "1" }),
+                        json!([]),
+                    ),
+                ),
+                (
+                    "texture".to_string(),
+                    auto_group_addon(
+                        "texture",
+                        "Harbor Texture",
+                        json!({ "addoncontent_campaign": "1" }),
+                        json!([]),
+                    ),
+                ),
+            ]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].name, "Harbor");
+        assert_eq!(db.groups[0].addons, vec!["base", "pack-1", "pack-2"]);
+    }
+
+    #[test]
+    fn auto_group_prefers_addoninfo_title_over_workshop_title() {
+        let mut first = auto_group_addon(
+            "first",
+            "Workshop Title One",
+            json!({
+                "addoncontent_campaign": "1",
+                "addontitle": "Internal Campaign Part 1"
+            }),
+            json!([]),
+        );
+        let mut second = auto_group_addon(
+            "second",
+            "Workshop Title Two",
+            json!({
+                "addoncontent_campaign": "1",
+                "addontitle": "Internal Campaign Part 2"
+            }),
+            json!([]),
+        );
+        first.steam_details = Some(json!({ "title": "Workshop Title One" }));
+        second.steam_details = Some(json!({ "title": "Workshop Title Two" }));
+        let mut db = Database {
+            addons: HashMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].name, "Internal Campaign");
+        assert_eq!(db.groups[0].addons, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn auto_group_attaches_versioned_campaign_root_to_workshop_tagged_parts() {
+        let root = auto_group_addon(
+            "root",
+            "Unrelated Workshop Title",
+            json!({
+                "addoncontent_campaign": "1",
+                "addoncontent_map": "1",
+                "addontitle": "广西-南宁 V1.15.1",
+                "addonauthorsteamid": "HerobrineAce"
+            }),
+            json!([]),
+        );
+        let part_one = auto_group_addon(
+            "part-one",
+            "Another Workshop Title",
+            json!({
+                "addoncontent_campaign": "0",
+                "addoncontent_map": "0",
+                "addontitle": "广西-南宁 V1.15.1 Part 1",
+                "addonauthorsteamid": "HerobrineAce"
+            }),
+            json!([{ "tag": "Campaigns" }]),
+        );
+        let part_two = auto_group_addon(
+            "part-two",
+            "Third Workshop Title",
+            json!({
+                "addoncontent_campaign": "0",
+                "addoncontent_map": "0",
+                "addontitle": "广西-南宁 V1.15.1 Part 2",
+                "addonauthorsteamid": "HerobrineAce"
+            }),
+            json!([{ "tag": "Campaigns" }]),
+        );
+        let mut db = Database {
+            addons: HashMap::from([
+                (root.id.clone(), root),
+                (part_one.id.clone(), part_one),
+                (part_two.id.clone(), part_two),
+            ]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].name, "广西-南宁");
+        assert_eq!(db.groups[0].addons, vec!["part-one", "part-two", "root"]);
+    }
+
+    #[test]
+    fn auto_group_rejects_part_groups_with_conflicting_known_authors() {
+        let mut first = auto_group_addon(
+            "first",
+            "Conflict Part 1",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        first.steam_details = Some(json!({
+            "title": "Conflict Part 1",
+            "creator": "76561198000000001"
+        }));
+        let mut second = auto_group_addon(
+            "second",
+            "Conflict Part 2",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        second.steam_details = Some(json!({
+            "title": "Conflict Part 2",
+            "creator": "76561198000000002"
+        }));
+        let mut db = Database {
+            addons: HashMap::from([(first.id.clone(), first), (second.id.clone(), second)]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert!(db.groups.is_empty());
+    }
+
+    #[test]
+    fn auto_group_accepts_identical_titles_only_with_matching_author_and_description() {
+        let mut first = auto_group_addon(
+            "first",
+            "Shared Campaign",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        first.steam_details = Some(json!({
+            "title": "Shared Campaign",
+            "creator": "76561198000000001",
+            "description": "Two files for the same campaign"
+        }));
+        let mut second = first.clone();
+        second.id = "second".to_string();
+        second.vpk_name = "second.vpk".to_string();
+        let mut unrelated = second.clone();
+        unrelated.id = "unrelated".to_string();
+        unrelated.vpk_name = "unrelated.vpk".to_string();
+        unrelated.steam_details = Some(json!({
+            "title": "Shared Campaign",
+            "creator": "76561198000000002",
+            "description": "Two files for the same campaign"
+        }));
+        let mut db = Database {
+            addons: HashMap::from([
+                (first.id.clone(), first),
+                (second.id.clone(), second),
+                (unrelated.id.clone(), unrelated),
+            ]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].name, "Shared Campaign");
+        assert_eq!(db.groups[0].addons, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn auto_group_attaches_campaign_root_to_identical_texture_parts() {
+        let mut root = auto_group_addon(
+            "root",
+            "Workshop Root",
+            json!({
+                "addoncontent_campaign": "1",
+                "addontitle": "Northshore"
+            }),
+            json!([]),
+        );
+        root.steam_details = Some(json!({
+            "title": "Workshop Root",
+            "creator": "76561198000000001",
+            "description": "Campaign root package"
+        }));
+
+        let mut texture_one = auto_group_addon(
+            "texture-one",
+            "Workshop Texture One",
+            json!({
+                "addoncontent_campaign": "1",
+                "addontitle": "Northshore Texture"
+            }),
+            json!([]),
+        );
+        texture_one.steam_details = Some(json!({
+            "title": "Workshop Texture One",
+            "creator": "76561198000000001",
+            "description": "Shared texture package for Northshore"
+        }));
+        let mut texture_two = texture_one.clone();
+        texture_two.id = "texture-two".to_string();
+        texture_two.vpk_name = "texture-two.vpk".to_string();
+
+        let mut foreign_root = root.clone();
+        foreign_root.id = "foreign-root".to_string();
+        foreign_root.vpk_name = "foreign-root.vpk".to_string();
+        foreign_root.steam_details = Some(json!({
+            "title": "Foreign Workshop Root",
+            "creator": "76561198000000002",
+            "description": "Another campaign with the same internal title"
+        }));
+
+        let mut db = Database {
+            addons: HashMap::from([
+                (root.id.clone(), root),
+                (texture_one.id.clone(), texture_one),
+                (texture_two.id.clone(), texture_two),
+                (foreign_root.id.clone(), foreign_root),
+            ]),
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].name, "Northshore");
+        assert_eq!(
+            db.groups[0].addons,
+            vec!["root", "texture-one", "texture-two"]
+        );
+    }
+
+    #[test]
+    fn author_name_is_treated_as_a_placeholder() {
+        assert!(looks_like_placeholder_author_name("AUTHOR_NAME", &[]));
+        assert!(looks_like_placeholder_author_name("author_name", &[]));
+        assert!(!looks_like_placeholder_author_name("Actual Author", &[]));
+    }
+
+    #[test]
+    fn author_placeholder_is_removed_from_existing_cache_entries() {
+        let mut cache = HashMap::from([(
+            "123".to_string(),
+            json!({
+                "creatorName": "AUTHOR_NAME",
+                "authorName": "AUTHOR_NAME",
+                "creatorSteamId": "76561198000000001"
+            }),
+        )]);
+
+        propagate_author_names(&mut cache);
+
+        let entry = cache.get("123").unwrap();
+        assert!(entry.get("creatorName").is_none());
+        assert!(entry.get("authorName").is_none());
     }
 
     #[test]

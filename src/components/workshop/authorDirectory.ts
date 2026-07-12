@@ -1,4 +1,5 @@
 import { WorkshopItem, WorkshopPageDetails } from './types';
+import { isPlaceholderAuthorName } from '../../utils/addonHelpers';
 
 interface AuthorDirectoryEntry {
   name?: string;
@@ -62,13 +63,7 @@ function accountIdToSteamId(accountId?: string | null): string {
 }
 
 function looksLikePlaceholderName(name?: string | null, ids: string[] = []): boolean {
-  const trimmed = normalizeValue(name);
-  if (!trimmed) return true;
-  const lowered = trimmed.toLowerCase();
-  if (ids.some((id) => lowered === normalizeValue(id).toLowerCase())) {
-    return true;
-  }
-  return /^\d+$/.test(trimmed);
+  return isPlaceholderAuthorName(name, ids);
 }
 
 function collectIdentity(input: AuthorIdentity): Required<AuthorIdentity> {
@@ -168,10 +163,6 @@ export function rememberWorkshopPageDetails(details: WorkshopPageDetails): void 
 export function resolveWorkshopItemAuthor(item: WorkshopItem): WorkshopItem {
   const normalized = collectIdentity(item);
   const known = lookupAuthor(item);
-  if (!known) {
-    return item;
-  }
-
   const candidateIds = [
     normalized.authorSteamId,
     normalized.authorAccountId,
@@ -180,13 +171,13 @@ export function resolveWorkshopItemAuthor(item: WorkshopItem): WorkshopItem {
   ].filter(Boolean);
 
   const authorName = looksLikePlaceholderName(item.authorName, candidateIds)
-    ? known.name || item.authorName
+    ? known?.name || ''
     : item.authorName;
-  const authorSteamId = item.authorSteamId || known.steamId;
-  const authorVanityId = item.authorVanityId || known.vanityId;
-  const authorAccountId = item.authorAccountId || known.accountId;
+  const authorSteamId = item.authorSteamId || known?.steamId;
+  const authorVanityId = item.authorVanityId || known?.vanityId;
+  const authorAccountId = item.authorAccountId || known?.accountId;
   const authorUrl = item.authorUrl
-    || known.url
+    || known?.url
     || (authorVanityId ? `https://steamcommunity.com/id/${authorVanityId}` : '')
     || (authorSteamId ? `https://steamcommunity.com/profiles/${authorSteamId}` : '');
   const authorId = item.authorId || authorVanityId || authorSteamId || authorAccountId || '';

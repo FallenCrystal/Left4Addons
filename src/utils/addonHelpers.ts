@@ -23,6 +23,18 @@ export function getAddonInfoValue(addon: Addon, key: string): any {
   return foundKey ? info[foundKey as keyof typeof info] : undefined;
 }
 
+export function isPlaceholderAuthorName(value: unknown, identities: string[] = []): boolean {
+  const name = typeof value === 'string' ? value.trim() : '';
+  if (!name) return true;
+
+  const normalized = name.toLowerCase();
+  if (/^\d+$/.test(name) || normalized === 'author_name' || normalized === '[unknown]') {
+    return true;
+  }
+
+  return identities.some((identity) => normalized === String(identity || '').trim().toLowerCase());
+}
+
 // Category mappings from keys
 export function getAddonCategories(addon: Addon): string[] {
   const categories = new Set<string>();
@@ -133,18 +145,20 @@ export const getAddonUrl = (addon: Addon): string | null => {
 export const getAddonAuthor = (addon: Addon): string => {
   if (!addon) return 'Unknown Author';
   const author = getAddonInfoValue(addon, 'addonauthor') || getAddonInfoValue(addon, 'author');
-  if (author && typeof author === 'string' && author.trim()) {
+  if (typeof author === 'string' && !isPlaceholderAuthorName(author)) {
     return author.trim();
   }
   const workshopAuthor = addon.workshopDetails?.creatorName || addon.workshopDetails?.authorName;
-  if (workshopAuthor && typeof workshopAuthor === 'string' && workshopAuthor.trim()) {
+  if (typeof workshopAuthor === 'string' && !isPlaceholderAuthorName(workshopAuthor)) {
     return workshopAuthor.trim();
   }
-  if (addon.steamDetails?.creator_name) {
-    return addon.steamDetails.creator_name;
+  const steamAuthor = addon.steamDetails?.creator_name;
+  if (typeof steamAuthor === 'string' && !isPlaceholderAuthorName(steamAuthor)) {
+    return steamAuthor;
   }
-  if (addon.steamDetails?.creator && addon.steamDetails.creator !== '0') {
-    return addon.steamDetails.creator;
+  const steamCreator = addon.steamDetails?.creator;
+  if (typeof steamCreator === 'string' && !isPlaceholderAuthorName(steamCreator)) {
+    return steamCreator;
   }
   return 'Unknown Author';
 };

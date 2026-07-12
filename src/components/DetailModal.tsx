@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { X, ExternalLink, Move, FolderPlus, Loader2, Download } from 'lucide-react';
 import { Addon, DatabasePayload, Group } from '../types/addon';
-import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
+import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue, isPlaceholderAuthorName } from '../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { WorkshopPageDetails } from './workshop/types';
 import { Gallery } from './Gallery';
@@ -103,10 +103,11 @@ export const DetailModal: React.FC<DetailModalProps> = ({
     || addon.steamDetails?.title
     || getAddonInfoValue(addon, 'addontitle')
     || addon.vpkName;
-  const author = pageDetails?.creatorName
-    || addon.workshopDetails?.creatorName
-    || addon.workshopDetails?.authorName
-    || getAddonAuthor(addon);
+  const author = [
+    pageDetails?.creatorName,
+    addon.workshopDetails?.creatorName,
+    addon.workshopDetails?.authorName,
+  ].find((value) => !isPlaceholderAuthorName(value)) || getAddonAuthor(addon);
   const desc = pageDetails?.description
     || addon.workshopDetails?.description
     || addon.steamDetails?.description

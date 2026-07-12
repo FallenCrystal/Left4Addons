@@ -77,6 +77,30 @@ describe('authorDirectory', () => {
     expect(resolved.authorName).toBe('Real Author');
   });
 
+  test('does not store or return AUTHOR_NAME as an author', () => {
+    const unresolved = resolveWorkshopItemAuthor(createItem({
+      authorName: 'AUTHOR_NAME',
+      authorId: '76561198000000003',
+      authorSteamId: '76561198000000003',
+    }));
+    expect(unresolved.authorName).toBe('');
+
+    rememberWorkshopItems([
+      createItem({
+        authorName: 'Real Author',
+        authorId: '76561198000000003',
+        authorSteamId: '76561198000000003',
+      }),
+    ]);
+
+    const resolved = resolveWorkshopItemAuthor(createItem({
+      authorName: 'AUTHOR_NAME',
+      authorId: '76561198000000003',
+      authorSteamId: '76561198000000003',
+    }));
+    expect(resolved.authorName).toBe('Real Author');
+  });
+
   test('learns author identity from workshop page details', () => {
     const details: WorkshopPageDetails = {
       creatorName: 'Page Author',

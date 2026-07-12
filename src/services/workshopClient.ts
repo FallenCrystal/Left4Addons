@@ -7,6 +7,7 @@ import {
   WorkshopPageDetails,
 } from '../components/workshop/types';
 import type { WorkshopSourceSettings } from '../types/addon';
+import { isPlaceholderAuthorName as isPlaceholderAuthorValue } from '../utils/addonHelpers';
 import {
   parseHomepageSections,
   parseSSRItems,
@@ -521,11 +522,7 @@ function accountIdToSteamId(accountId: unknown): string {
 }
 
 function isPlaceholderAuthorName(name: unknown, ids: string[]): boolean {
-  const normalized = normalizeText(name);
-  if (!normalized) return true;
-  const lowered = normalized.toLowerCase();
-  if (/^\d+$/.test(normalized)) return true;
-  return ids.some((id) => lowered === normalizeText(id).toLowerCase());
+  return isPlaceholderAuthorValue(name, ids);
 }
 
 function toNumericOrUndefined(value: unknown): number | undefined {

@@ -790,7 +790,9 @@ fn fill_creator_persona_names(runtime: &mut BridgeRuntime, items: &mut [Value]) 
 
 fn is_usable_persona_name(name: &str) -> bool {
     let trimmed = name.trim();
-    !trimmed.is_empty() && trimmed != "[unknown]"
+    !trimmed.is_empty()
+        && !trimmed.eq_ignore_ascii_case("[unknown]")
+        && !trimmed.eq_ignore_ascii_case("AUTHOR_NAME")
 }
 
 fn dedupe_warnings(warnings: Vec<String>) -> Vec<String> {

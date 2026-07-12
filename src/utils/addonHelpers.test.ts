@@ -194,6 +194,20 @@ describe('addonHelpers', () => {
       expect(getAddonAuthor(addon)).toBe('Creator Name');
     });
 
+    test('skips AUTHOR_NAME from addoninfo and falls back to workshop metadata', () => {
+      const addon: Addon = {
+        id: 'test.vpk', vpkName: 'test.vpk',
+        dirType: 'loading',
+        isEnabled: true,
+        fileSize: 100,
+        filesCount: 1,
+        addonInfo: { addonAuthor: 'AUTHOR_NAME' },
+        steamDetails: { creator_name: 'Actual Creator' },
+      };
+
+      expect(getAddonAuthor(addon)).toBe('Actual Creator');
+    });
+
     test('should return Unknown Author if no author info is present', () => {
       const addon: Addon = {
         id: 'test.vpk', vpkName: 'test.vpk',
