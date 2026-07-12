@@ -759,6 +759,12 @@ pub async fn record_workshop_items_seen(
     source: Option<String>,
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
+    // Browse snapshots and dependency details both replace the cache file. Keep
+    // their read-modify-write sections atomic with respect to one another.
+    let cache_write_guard = state
+        .workshop_cache_write_lock
+        .lock()
+        .map_err(|_| "Failed to acquire workshop cache write lock".to_string())?;
     let mut cache = load_workshop_cache(&state.workshop_cache_path);
     let now = chrono::Utc::now().to_rfc3339();
     let source = source.unwrap_or_else(|| "unknown".to_string());
@@ -780,6 +786,7 @@ pub async fn record_workshop_items_seen(
     merge_known_addon_snapshots_into_cache(&mut cache, &state.known_addons_path);
     propagate_author_names(&mut cache);
     save_workshop_cache(&state.workshop_cache_path, &cache)?;
+    drop(cache_write_guard);
     let db = state.db.lock().await;
     Ok(database_with_workshop_cache(
         &db,
@@ -799,6 +806,12 @@ pub async fn persist_workshop_page_details(
         return Err("Missing workshop id".to_string());
     }
 
+    // See record_workshop_items_seen: avoid a late seen-item write erasing this
+    // item's requiredItems relation.
+    let cache_write_guard = state
+        .workshop_cache_write_lock
+        .lock()
+        .map_err(|_| "Failed to acquire workshop cache write lock".to_string())?;
     let mut cache = load_workshop_cache(&state.workshop_cache_path);
     let now = chrono::Utc::now().to_rfc3339();
     let source = source.unwrap_or_else(|| "unknown".to_string());
@@ -899,6 +912,7 @@ pub async fn persist_workshop_page_details(
     merge_known_addon_snapshots_into_cache(&mut cache, &state.known_addons_path);
     propagate_author_names(&mut cache);
     save_workshop_cache(&state.workshop_cache_path, &cache)?;
+    drop(cache_write_guard);
     let db = state.db.lock().await;
     Ok(database_with_workshop_cache(
         &db,

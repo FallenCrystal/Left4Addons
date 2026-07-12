@@ -12,6 +12,8 @@ pub struct SaveSettingsPayload {
     disable_steamworks_sdk: bool,
     force_steamworks_sdk_download: bool,
     max_download_retries: u32,
+    #[serde(default = "crate::commands::types::default_dependency_missing_behavior")]
+    dependency_missing_behavior: String,
     workshop_source_settings: Option<WorkshopSourceSettings>,
 }
 
@@ -35,6 +37,7 @@ pub async fn save_settings(
         disable_steamworks_sdk,
         force_steamworks_sdk_download,
         max_download_retries,
+        dependency_missing_behavior,
         workshop_source_settings,
     } = payload;
 
@@ -50,6 +53,10 @@ pub async fn save_settings(
     db.settings.disable_steamworks_sdk = disable_steamworks_sdk;
     db.settings.force_steamworks_sdk_download = force_steamworks_sdk_download;
     db.settings.max_download_retries = max_download_retries;
+    db.settings.dependency_missing_behavior = match dependency_missing_behavior.as_str() {
+        "always" | "ask" | "ignore" => dependency_missing_behavior,
+        _ => "ask".to_string(),
+    };
     if let Some(workshop_source_settings) = workshop_source_settings {
         db.settings.workshop_source_settings = workshop_source_settings;
     }

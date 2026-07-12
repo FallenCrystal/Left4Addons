@@ -4,11 +4,17 @@ import { Search, X, AlertTriangle, Package, Check } from 'lucide-react';
 import { Addon } from '../types/addon';
 import { CacheImage } from './CacheImage';
 
+export interface DependencyDownloadItem {
+  workshopId: string;
+  title?: string;
+  imagePath?: string;
+}
+
 interface DependencyPromptModalProps {
   open: boolean;
   missingDependencies: Addon[];
   isScanning: boolean;
-  onDownload: (ids: string[]) => void;
+  onDownload: (items: DependencyDownloadItem[]) => void;
   onCancel: () => void;
   onGoToSettings: () => void;
 }
@@ -73,7 +79,15 @@ export const DependencyPromptModal: React.FC<DependencyPromptModalProps> = ({
 
   const handleDownload = () => {
     if (selectedIds.size > 0) {
-      onDownload(Array.from(selectedIds));
+      onDownload(
+        missingDependencies
+          .filter((addon) => selectedIds.has(addon.workshopId || addon.id))
+          .map((addon) => ({
+            workshopId: addon.workshopId || addon.id,
+            title: addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName,
+            imagePath: addon.imagePath || addon.workshopDetails?.previewUrl,
+          })),
+      );
     }
   };
 

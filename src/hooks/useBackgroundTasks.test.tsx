@@ -63,6 +63,11 @@ describe('useBackgroundTasks dependency checks', () => {
       const task = result.current.backgroundTasks.find((candidate) => candidate.kind === 'dependency-check');
       expect(task?.status).toBe('completed');
       expect(task?.dependencyCheck?.completedCount).toBe(3);
+      expect(task?.dependencyCheck?.discoveredDependencies).toEqual(expect.arrayContaining([
+        expect.objectContaining({ workshopId: 'B', title: 'B' }),
+        expect.objectContaining({ workshopId: 'C', title: 'C' }),
+        expect.objectContaining({ workshopId: 'A', title: 'A' }),
+      ]));
     });
 
     expect(mockFetchDependencySnapshot.mock.calls.map(([id]) => id)).toEqual(['A', 'B', 'C']);

@@ -347,6 +347,12 @@ export function useBackgroundTasks({
     const pending = [...new Set(seedIds.map((id) => id.trim()).filter(Boolean))];
     const visited = new Set<string>();
     const failedNodes: { workshopId: string; error: string }[] = [];
+    const discoveredDependencies = new Map<string, {
+      workshopId: string;
+      title?: string;
+      previewUrl?: string;
+      creatorName?: string;
+    }>();
     let completedCount = 0;
     let latestData: DatabasePayload | null = null;
     patchTask(task.id, {
@@ -361,6 +367,7 @@ export function useBackgroundTasks({
         discoveredCount: pending.length,
         completedCount: 0,
         failedNodes: [],
+        discoveredDependencies: [],
       },
     });
 
@@ -384,8 +391,25 @@ export function useBackgroundTasks({
             latestData = data;
           }
 
+          const currentItem = discoveredDependencies.get(workshopId);
+          discoveredDependencies.set(workshopId, {
+            workshopId,
+            title: details.title?.trim() || currentItem?.title,
+            previewUrl: details.previewUrl?.trim() || currentItem?.previewUrl,
+            creatorName: details.creatorName?.trim() || currentItem?.creatorName,
+          });
+
           for (const dependency of details.requiredItems || []) {
             const dependencyId = dependency.workshopId?.trim();
+            if (dependencyId) {
+              const existing = discoveredDependencies.get(dependencyId);
+              discoveredDependencies.set(dependencyId, {
+                workshopId: dependencyId,
+                title: existing?.title || dependency.title?.trim() || undefined,
+                previewUrl: existing?.previewUrl,
+                creatorName: existing?.creatorName,
+              });
+            }
             if (dependencyId && !visited.has(dependencyId) && !pending.includes(dependencyId)) {
               pending.push(dependencyId);
             }
@@ -405,6 +429,7 @@ export function useBackgroundTasks({
             discoveredCount,
             completedCount,
             failedNodes: [...failedNodes],
+            discoveredDependencies: [...discoveredDependencies.values()],
           },
         });
       }
@@ -425,6 +450,7 @@ export function useBackgroundTasks({
             discoveredCount: visited.size,
             completedCount,
             failedNodes,
+            discoveredDependencies: [...discoveredDependencies.values()],
           },
         });
       }
@@ -476,6 +502,7 @@ export function useBackgroundTasks({
         discoveredCount: newRootIds.length,
         completedCount: 0,
         failedNodes: [],
+        discoveredDependencies: [],
       },
     };
     commitTasks([...tasksRef.current, task]);
@@ -580,6 +607,7 @@ export function useBackgroundTasks({
           discoveredCount: retryIds?.length || task.dependencyCheck?.rootIds?.length || task.targetIds.length,
           completedCount: 0,
           failedNodes: [],
+          discoveredDependencies: [],
         }
         : task.dependencyCheck,
     });

@@ -19,6 +19,7 @@
     "scanning": "正在扫描...",
     "error": "错误",
     "success": "成功",
+    "unknownAuthor": "未知作者",
     "search": "搜索"
   },
   "categories": {

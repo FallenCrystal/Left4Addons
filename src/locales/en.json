@@ -19,6 +19,7 @@
     "scanning": "Scanning...",
     "error": "Error",
     "success": "Success",
+    "unknownAuthor": "Unknown author",
     "search": "Search"
   },
   "categories": {

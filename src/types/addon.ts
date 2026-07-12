@@ -126,6 +126,12 @@ export interface BackgroundTask {
     discoveredCount: number;
     completedCount: number;
     failedNodes: { workshopId: string; error: string }[];
+    discoveredDependencies?: {
+      workshopId: string;
+      title?: string;
+      previewUrl?: string;
+      creatorName?: string;
+    }[];
   };
 }
 

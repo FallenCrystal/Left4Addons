@@ -1,13 +1,17 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Addon, BackgroundTask, Settings } from '../types/addon';
-import { DependencyPromptModal } from './DependencyPromptModal';
+import { DependencyDownloadItem, DependencyPromptModal } from './DependencyPromptModal';
+
+type DiscoveredDependency = NonNullable<
+  NonNullable<BackgroundTask['dependencyCheck']>['discoveredDependencies']
+>[number];
 
 interface DependencyPromptContainerProps {
   addons: Record<string, Addon>;
   knownUninstalledAddons: Record<string, Addon>;
   backgroundTasks: BackgroundTask[];
   settings: Settings;
-  onDownload: (items: string[]) => void;
+  onDownload: (items: DependencyDownloadItem[]) => void;
   onGoToSettings: () => void;
 }
 
@@ -24,10 +28,20 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
   const [modalOpen, setModalOpen] = useState(false);
   const [missingDependencies, setMissingDependencies] = useState<Addon[]>([]);
   const [isScanning, setIsScanning] = useState(false);
+
+  const toDownloadItems = (items: Addon[]): DependencyDownloadItem[] => (
+    items.map((addon) => ({
+      workshopId: addon.workshopId || addon.id,
+      title: addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName,
+      imagePath: addon.imagePath || addon.workshopDetails?.previewUrl,
+    }))
+  );
   
   // Track previous task counts to detect completion
   const prevDownloadCountRef = useRef(0);
   const prevScanCountRef = useRef(0);
+  const pendingDependencyEvaluationRef = useRef(false);
+  const pendingDependencyCandidatesRef = useRef<Map<string, DiscoveredDependency>>(new Map());
   
   // To avoid repeatedly prompting for the same missing dependencies if user clicks "Cancel" or "Ignore",
   // we can maintain a Set of ignored workshop IDs per session.
@@ -42,7 +56,7 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
   const currentlyScanning = currentScanCount > 0;
 
   // Compute missing dependencies globally
-  const calculateMissingDependencies = () => {
+  const calculateMissingDependencies = (taskDependencies: DiscoveredDependency[] = []) => {
     const missingIds = new Set<string>();
     
     // Check requiredItems of all addons we have (installed, disabled, downloading, or in knownUninstalled)
@@ -81,13 +95,20 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
     });
 
     // Gather their required items
-    const requiredItems = new Map<string, { workshopId: string, title?: string }>();
+    const requiredItems = new Map<string, DiscoveredDependency>();
     
     ownedAddons.forEach(addon => {
       if (addon.workshopDetails?.requiredItems) {
         addon.workshopDetails.requiredItems.forEach(req => {
           requiredItems.set(req.workshopId, req);
         });
+      }
+    });
+
+    taskDependencies.forEach((dependency) => {
+      const workshopId = dependency.workshopId?.trim();
+      if (workshopId) {
+        requiredItems.set(workshopId, { ...dependency, workshopId });
       }
     });
 
@@ -117,9 +138,20 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
         fileSize: 0,
         filesCount: 0,
         workshopId: id,
+        imagePath: reqInfo?.previewUrl,
         addonInfo: {
           addontitle: reqInfo?.title || id
-        }
+        },
+        steamDetails: {
+          title: reqInfo?.title || id,
+          creator_name: reqInfo?.creatorName,
+        },
+        workshopDetails: {
+          title: reqInfo?.title || id,
+          previewUrl: reqInfo?.previewUrl,
+          creatorName: reqInfo?.creatorName,
+          authorName: reqInfo?.creatorName,
+        },
       } as Addon;
     });
   };
@@ -130,15 +162,36 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
     const scansFinished = prevScanCountRef.current > 0 && currentScanCount === 0;
     
     if (downloadsFinished || scansFinished) {
+      pendingDependencyEvaluationRef.current = true;
+      if (scansFinished) {
+        backgroundTasks
+          .filter((task) => task.kind === 'dependency-check' && task.status === 'completed')
+          .flatMap((task) => task.dependencyCheck?.discoveredDependencies || [])
+          .forEach((dependency) => {
+            const workshopId = dependency.workshopId?.trim();
+            if (workshopId) {
+              pendingDependencyCandidatesRef.current.set(workshopId, {
+                workshopId,
+                title: dependency.title,
+                previewUrl: dependency.previewUrl,
+                creatorName: dependency.creatorName,
+              });
+            }
+          });
+      }
+    }
+
+    if (pendingDependencyEvaluationRef.current) {
       if (behavior === 'ignore') {
-        // Do nothing
+        pendingDependencyEvaluationRef.current = false;
       } else {
-        const missing = calculateMissingDependencies();
+        const missing = calculateMissingDependencies([...pendingDependencyCandidatesRef.current.values()]);
         
         if (missing.length > 0) {
+          pendingDependencyEvaluationRef.current = false;
           if (behavior === 'always') {
             // Automatically download them
-            onDownload(missing.map(m => m.workshopId || m.id));
+            onDownload(toDownloadItems(missing));
           } else if (behavior === 'ask') {
             // Check if we are already showing the modal. 
             // We can update the missing dependencies list or open the modal.
@@ -147,7 +200,8 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
             setModalOpen(true);
           }
         } else if (!currentlyScanning && currentDownloadCount === 0) {
-           // Close modal if no missing deps and everything finished
+           // The dependency task can complete before its database payload reaches
+           // this component. Keep evaluating when addon state changes.
            setModalOpen(false);
         }
       }
@@ -155,7 +209,7 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
        // Update modal state dynamically if it's open (e.g. scanning state changes)
        setIsScanning(currentlyScanning);
        // We can also dynamically update the missing list if new ones are found or some started downloading
-       const missing = calculateMissingDependencies();
+       const missing = calculateMissingDependencies([...pendingDependencyCandidatesRef.current.values()]);
        if (missing.length === 0) {
          setModalOpen(false);
        } else {
@@ -167,10 +221,10 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
     prevScanCountRef.current = currentScanCount;
     
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentDownloadCount, currentScanCount, behavior]);
+  }, [currentDownloadCount, currentScanCount, behavior, addons, knownUninstalledAddons, backgroundTasks]);
 
-  const handleDownload = (ids: string[]) => {
-    onDownload(ids);
+  const handleDownload = (items: DependencyDownloadItem[]) => {
+    onDownload(items);
     setModalOpen(false);
   };
 

@@ -19,6 +19,8 @@ pub struct Settings {
     pub force_steamworks_sdk_download: bool,
     #[serde(rename = "maxDownloadRetries", default = "default_max_download_retries")]
     pub max_download_retries: u32,
+    #[serde(rename = "dependencyMissingBehavior", default = "default_dependency_missing_behavior")]
+    pub dependency_missing_behavior: String,
     #[serde(rename = "workshopSourceSettings", default)]
     pub workshop_source_settings: WorkshopSourceSettings,
 }
@@ -58,6 +60,10 @@ fn default_download_concurrency() -> u32 {
 
 fn default_max_download_retries() -> u32 {
     3
+}
+
+pub fn default_dependency_missing_behavior() -> String {
+    "ask".to_string()
 }
 
 fn default_workshop_source_preset() -> String {
@@ -102,6 +108,31 @@ impl Default for WorkshopSourceSettings {
             source_order: default_source_order(),
             cache_retention: default_cache_retention(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn dependency_missing_behavior_defaults_and_serializes() {
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "workshopDir": "workshop",
+            "loadingDir": "loading"
+        }))
+        .unwrap();
+
+        assert_eq!(settings.dependency_missing_behavior, "ask");
+
+        settings.dependency_missing_behavior = "always".to_string();
+        assert_eq!(
+            serde_json::to_value(settings)
+                .unwrap()
+                .get("dependencyMissingBehavior")
+                .and_then(|value| value.as_str()),
+            Some("always"),
+        );
     }
 }
 

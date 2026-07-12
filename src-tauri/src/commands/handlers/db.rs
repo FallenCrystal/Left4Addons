@@ -27,6 +27,7 @@ pub fn load_db(
             disable_steamworks_sdk: false,
             force_steamworks_sdk_download: false,
             max_download_retries: 3,
+            dependency_missing_behavior: "ask".to_string(),
             workshop_source_settings: WorkshopSourceSettings::default(),
         },
         addons: HashMap::new(),
