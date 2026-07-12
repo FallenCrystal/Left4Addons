@@ -1,10 +1,10 @@
+use regex::Regex;
+use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use regex::Regex;
 use std::sync::OnceLock;
-use reqwest::{Client, RequestBuilder};
-use std::collections::HashMap;
 
 pub static RUNTIME_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -31,126 +31,159 @@ pub struct MirrorManager;
 
 impl MirrorManager {
     pub fn resolve(url: &str) -> (String, Option<String>, Option<HashMap<String, String>>) {
-        let mut rules = Vec::new();
-        if let Some(runtime_dir) = RUNTIME_DIR.get() {
-            let mirrors_path = runtime_dir.join("mirrors.json");
-            if let Ok(content) = fs::read_to_string(&mirrors_path) {
-                if let Ok(parsed_rules) = serde_json::from_str::<Vec<MirrorRule>>(&content) {
-                    rules = parsed_rules;
-                }
-            }
-        }
-        
-        if rules.is_empty() {
-            return (url.to_string(), None, None);
-        }
+        let rules = RUNTIME_DIR
+            .get()
+            .and_then(|runtime_dir| fs::read_to_string(runtime_dir.join("mirrors.json")).ok())
+            .and_then(|content| serde_json::from_str::<Vec<MirrorRule>>(&content).ok())
+            .unwrap_or_default();
 
-        if let Ok(mut parsed_url) = reqwest::Url::parse(url) {
-            let host_opt = parsed_url.host_str().map(|s| {
-                if let Some(port) = parsed_url.port() {
-                    format!("{}:{}", s, port)
-                } else {
-                    s.to_string()
-                }
-            });
-            if let Some(host) = host_opt {
-                for rule in rules {
-                    let final_regex_str = if let Some(regex_str) = &rule.regex {
-                        regex_str.clone()
-                    } else if let Some(domain) = &rule.domain {
-                        let mut re = String::from("^");
-                        if rule.allow_www {
-                            re.push_str(r"(?:www\.)?");
-                        }
-                        if let Some(subs) = &rule.subdomains {
-                            if subs.is_empty() {
-                                // No subdomains
-                            } else if subs.len() == 1 && subs[0] == "*" {
-                                re.push_str(r"(.*)\.");
-                            } else {
-                                let escaped_subs: Vec<String> = subs.iter().map(|s| regex::escape(s)).collect();
-                                re.push_str(&format!("({})\\.", escaped_subs.join("|")));
-                            }
-                        }
-                        re.push_str(&regex::escape(domain));
-                        re.push('$');
-                        re
-                    } else if let Some(rules_str) = &rule.rules {
-                        // Quick parse of `rules`: e.g. "[store,media].steampowered.com"
-                        let mut regex_str = String::new();
-                        let mut in_bracket = false;
-                        let mut current_group = String::new();
-                        let chars: Vec<char> = rules_str.chars().collect();
-                        let mut i = 0;
-
-                        while i < chars.len() {
-                            let c = chars[i];
-                            if c == '[' {
-                                in_bracket = true;
-                                regex_str.push('(');
-                            } else if c == ']' {
-                                in_bracket = false;
-                                // Escape each item inside the bracket properly
-                                let parts: Vec<String> = current_group.split(',')
-                                    .map(regex::escape)
-                                    .collect();
-                                regex_str.push_str(&parts.join("|"));
-                                current_group.clear();
-                                regex_str.push(')');
-
-                                // Check for optional '?'
-                                if i + 1 < chars.len() && chars[i + 1] == '?' {
-                                    regex_str.push('?');
-                                    i += 1;
-                                }
-                            } else if in_bracket {
-                                current_group.push(c);
-                            } else if c == '*' {
-                                regex_str.push_str("(.*?)");
-                            } else {
-                                regex_str.push_str(&regex::escape(&c.to_string()));
-                            }
-                            i += 1;
-                        }
-                        format!("^{}$", regex_str)
-                    } else {
-                        continue; // No matching rule defined
-                    };
-                    
-                    if let Ok(re) = Regex::new(&final_regex_str) {
-                        if let Some(caps) = re.captures(&host) {
-                            let mut new_host = rule.target.clone();
-                            
-                            // Replace $1, $2, etc.
-                            for (i, mat) in caps.iter().enumerate().skip(1) {
-                                if let Some(m) = mat {
-                                    let placeholder = format!("${}", i);
-                                    if new_host.contains(&placeholder) {
-                                        new_host = new_host.replace(&placeholder, m.as_str());
-                                    }
-                                }
-                            }
-                            
-                            // Backward compatibility for '*'
-                            if new_host.contains('*') {
-                                // Find the first non-empty capture group (if any) or just the first one
-                                let matched_group = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-                                new_host = new_host.replace("*", matched_group);
-                            }
-                            
-                            let original_host = host.to_string();
-                            if parsed_url.set_host(Some(&new_host)).is_ok() {
-                                let new_url = parsed_url.to_string();
-                                return (new_url, if rule.keep_host { Some(original_host) } else { None }, rule.headers.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        
-        (url.to_string(), None, None)
+        resolve_with_rules(url, &rules)
     }
+}
+
+fn resolve_with_rules(
+    url: &str,
+    rules: &[MirrorRule],
+) -> (String, Option<String>, Option<HashMap<String, String>>) {
+    if rules.is_empty() {
+        return (url.to_string(), None, None);
+    }
+
+    let Ok(mut parsed_url) = reqwest::Url::parse(url) else {
+        return (url.to_string(), None, None);
+    };
+    let Some(host) = parsed_url
+        .host_str()
+        .map(|hostname| match parsed_url.port() {
+            Some(port) => format!("{hostname}:{port}"),
+            None => hostname.to_string(),
+        })
+    else {
+        return (url.to_string(), None, None);
+    };
+
+    for rule in rules {
+        let Some(pattern) = rule_pattern(rule) else {
+            continue;
+        };
+        let Ok(regex) = Regex::new(&pattern) else {
+            continue;
+        };
+        let Some(captures) = regex.captures(&host) else {
+            continue;
+        };
+
+        let target = replace_captures(&rule.target, &captures);
+        if set_target_host(&mut parsed_url, &target) {
+            return (
+                parsed_url.to_string(),
+                rule.keep_host.then(|| host.clone()),
+                rule.headers.clone(),
+            );
+        }
+    }
+
+    (url.to_string(), None, None)
+}
+
+fn rule_pattern(rule: &MirrorRule) -> Option<String> {
+    if let Some(regex) = &rule.regex {
+        return Some(regex.clone());
+    }
+
+    if let Some(domain) = &rule.domain {
+        let mut pattern = String::from("^");
+        if rule.allow_www {
+            pattern.push_str(r"(?:www\.)?");
+        }
+        if let Some(subdomains) = &rule.subdomains {
+            if subdomains.len() == 1 && subdomains[0] == "*" {
+                pattern.push_str(r"(.*)\.");
+            } else if !subdomains.is_empty() {
+                let alternatives = subdomains
+                    .iter()
+                    .map(|subdomain| regex::escape(subdomain))
+                    .collect::<Vec<_>>();
+                pattern.push_str(&format!("({})\\.", alternatives.join("|")));
+            }
+        }
+        pattern.push_str(&regex::escape(domain));
+        pattern.push('$');
+        return Some(pattern);
+    }
+
+    rule.rules.as_deref().map(string_rule_pattern)
+}
+
+fn string_rule_pattern(rule: &str) -> String {
+    let mut pattern = String::new();
+    let mut in_group = false;
+    let mut group = String::new();
+    let chars: Vec<char> = rule.chars().collect();
+    let mut index = 0;
+
+    while index < chars.len() {
+        match chars[index] {
+            '[' => {
+                in_group = true;
+                pattern.push('(');
+            }
+            ']' => {
+                in_group = false;
+                pattern.push_str(
+                    &group
+                        .split(',')
+                        .map(regex::escape)
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                );
+                group.clear();
+                pattern.push(')');
+                if chars.get(index + 1) == Some(&'?') {
+                    pattern.push('?');
+                    index += 1;
+                }
+            }
+            character if in_group => group.push(character),
+            '*' => pattern.push_str("(.*?)"),
+            character => pattern.push_str(&regex::escape(&character.to_string())),
+        }
+        index += 1;
+    }
+
+    format!("^{pattern}$")
+}
+
+fn replace_captures(target: &str, captures: &regex::Captures<'_>) -> String {
+    let mut replaced = target.to_string();
+    for (index, capture) in captures.iter().enumerate().skip(1) {
+        if let Some(capture) = capture {
+            replaced = replaced.replace(&format!("${index}"), capture.as_str());
+        }
+    }
+    if replaced.contains('*') {
+        let first_capture = captures.get(1).map_or("", |capture| capture.as_str());
+        replaced = replaced.replace('*', first_capture);
+    }
+    replaced
+}
+
+fn set_target_host(url: &mut reqwest::Url, target: &str) -> bool {
+    let Ok(target_url) = reqwest::Url::parse(&format!("http://{target}")) else {
+        return false;
+    };
+    let Some(target_host) = target_url.host_str() else {
+        return false;
+    };
+    if url.set_host(Some(target_host)).is_err() {
+        return false;
+    }
+    if let Some(port) = target_url.port() {
+        if url.set_port(Some(port)).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 pub trait MirrorClientExt {
@@ -161,29 +194,93 @@ pub trait MirrorClientExt {
 impl MirrorClientExt for Client {
     fn get_mirrored(&self, url: &str) -> RequestBuilder {
         let (resolved_url, original_host, headers) = MirrorManager::resolve(url);
-        let mut req = self.get(&resolved_url);
-        if let Some(host) = original_host {
-            req = req.header(reqwest::header::HOST, host);
-        }
-        if let Some(hdrs) = headers {
-            for (k, v) in hdrs {
-                req = req.header(&k, &v);
-            }
-        }
-        req
+        mirrored_request(self.get(resolved_url), original_host, headers)
     }
 
     fn post_mirrored(&self, url: &str) -> RequestBuilder {
         let (resolved_url, original_host, headers) = MirrorManager::resolve(url);
-        let mut req = self.post(&resolved_url);
-        if let Some(host) = original_host {
-            req = req.header(reqwest::header::HOST, host);
+        mirrored_request(self.post(resolved_url), original_host, headers)
+    }
+}
+
+fn mirrored_request(
+    request: RequestBuilder,
+    original_host: Option<String>,
+    headers: Option<HashMap<String, String>>,
+) -> RequestBuilder {
+    let mut request = request;
+    if let Some(host) = original_host {
+        request = request.header(reqwest::header::HOST, host);
+    }
+    if let Some(headers) = headers {
+        for (key, value) in headers {
+            request = request.header(key, value);
         }
-        if let Some(hdrs) = headers {
-            for (k, v) in hdrs {
-                req = req.header(&k, &v);
-            }
+    }
+    request
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(target: &str) -> MirrorRule {
+        MirrorRule {
+            rules: None,
+            domain: None,
+            subdomains: None,
+            allow_www: false,
+            regex: None,
+            target: target.to_string(),
+            keep_host: false,
+            headers: None,
         }
-        req
+    }
+
+    #[test]
+    fn object_rule_replaces_subdomain_and_preserves_headers() {
+        let mut rule = rule("$1.mirror.example.com");
+        rule.domain = Some("steamstatic.com".to_string());
+        rule.subdomains = Some(vec!["store".to_string(), "media".to_string()]);
+        rule.allow_www = true;
+        rule.keep_host = true;
+        rule.headers = Some(HashMap::from([(
+            "X-Mirror".to_string(),
+            "enabled".to_string(),
+        )]));
+
+        let (url, host, headers) =
+            resolve_with_rules("https://www.media.steamstatic.com/path?q=1", &[rule]);
+
+        assert_eq!(url, "https://media.mirror.example.com/path?q=1");
+        assert_eq!(host.as_deref(), Some("www.media.steamstatic.com"));
+        assert_eq!(
+            headers.unwrap().get("X-Mirror").map(String::as_str),
+            Some("enabled")
+        );
+    }
+
+    #[test]
+    fn string_rule_uses_capture_groups_and_target_port() {
+        let mut rule = rule("$2.proxy.example.com:8443");
+        rule.rules = Some("[www.]?*.steamcommunity.com".to_string());
+
+        let (url, host, _) = resolve_with_rules(
+            "https://www.workshop.steamcommunity.com/files?id=42",
+            &[rule],
+        );
+
+        assert_eq!(url, "https://workshop.proxy.example.com:8443/files?id=42");
+        assert_eq!(host, None);
+    }
+
+    #[test]
+    fn invalid_or_unmatched_rules_leave_url_unchanged() {
+        let mut invalid = rule("mirror.example.com");
+        invalid.regex = Some("[".to_string());
+        let source = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/";
+
+        assert_eq!(resolve_with_rules(source, &[invalid]).0, source);
+        assert_eq!(resolve_with_rules(source, &[]).0, source);
     }
 }

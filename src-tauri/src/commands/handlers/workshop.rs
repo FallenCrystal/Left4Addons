@@ -1,6 +1,6 @@
 use super::*;
-use tauri::State;
 use crate::mirrors::MirrorClientExt;
+use tauri::State;
 
 #[tauri::command]
 pub async fn open_workshop(workshop_id: String) -> Result<(), String> {

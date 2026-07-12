@@ -131,6 +131,8 @@ struct QueryExecution {
     warnings: Vec<String>,
 }
 
+type QueryItemsWithChildren = (Vec<Value>, Vec<String>, Vec<String>);
+
 #[no_mangle]
 pub extern "C" fn l4a_steam_bridge_init() -> *mut c_char {
     let response = match ensure_runtime() {
@@ -184,14 +186,17 @@ pub extern "C" fn l4a_steam_bridge_request_json(request: *const c_char) -> *mut 
 }
 
 #[no_mangle]
-pub extern "C" fn l4a_steam_bridge_free_string(ptr: *mut c_char) {
+/// # Safety
+///
+/// `ptr` must be either null or a pointer returned by this bridge's string-returning functions.
+/// A non-null pointer must be passed exactly once and must not be used after this call.
+pub unsafe extern "C" fn l4a_steam_bridge_free_string(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
 
-    unsafe {
-        drop(CString::from_raw(ptr));
-    }
+    // The caller must pass a pointer returned by `into_c_string` exactly once.
+    drop(unsafe { CString::from_raw(ptr) });
 }
 
 #[no_mangle]
@@ -631,7 +636,7 @@ fn run_query(
 fn run_query_with_children(
     runtime: &mut BridgeRuntime,
     query: steamworks::QueryHandle,
-) -> Result<(Vec<Value>, Vec<String>, Vec<String>), String> {
+) -> Result<QueryItemsWithChildren, String> {
     let execution = run_query_with_children_page(runtime, query)?;
     Ok((execution.items, execution.child_ids, execution.warnings))
 }
@@ -642,7 +647,7 @@ fn run_query_with_children_page(
 ) -> Result<QueryExecution, String> {
     let (tx, rx) = mpsc::channel();
     query.fetch(move |result| {
-        let payload = result.map_err(|err| err.to_string()).and_then(|results| {
+        let payload = result.map_err(|err| err.to_string()).map(|results| {
             let mut items = Vec::new();
             let mut child_ids = Vec::new();
             for index in 0..results.returned_results() {
@@ -663,7 +668,7 @@ fn run_query_with_children_page(
                     ));
                 }
             }
-            Ok((items, child_ids, results.total_results()))
+            (items, child_ids, results.total_results())
         });
         let _ = tx.send(payload);
     });
@@ -1056,5 +1061,33 @@ mod tests {
         assert_eq!(json_string(&items[0], "publishedfileid"), "3");
         assert_eq!(json_string(&items[1], "publishedfileid"), "2");
         assert_eq!(json_string(&items[2], "publishedfileid"), "1");
+    }
+
+    #[test]
+    fn parse_ids_trims_valid_input_and_rejects_invalid_values() {
+        assert_eq!(parse_published_file_id(" 123 ").unwrap().0, 123);
+        assert!(parse_published_file_id("not-an-id").is_err());
+        assert!(parse_account_id("not-an-id").is_err());
+    }
+
+    #[test]
+    fn warning_deduplication_trims_for_comparison_and_keeps_first_value() {
+        assert_eq!(
+            dedupe_warnings(vec![
+                "warning".to_string(),
+                "  ".to_string(),
+                " warning ".to_string(),
+                "second warning".to_string(),
+            ]),
+            vec!["warning", "second warning"]
+        );
+    }
+
+    #[test]
+    fn persona_names_reject_placeholders_and_accept_real_names() {
+        assert!(!is_usable_persona_name(""));
+        assert!(!is_usable_persona_name(" [unknown] "));
+        assert!(!is_usable_persona_name("AUTHOR_NAME"));
+        assert!(is_usable_persona_name("Bill"));
     }
 }

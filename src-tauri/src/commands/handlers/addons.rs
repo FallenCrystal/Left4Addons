@@ -1,6 +1,6 @@
 use super::*;
-use tauri::{AppHandle, State};
 use crate::mirrors::MirrorClientExt;
+use tauri::{AppHandle, State};
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -11,12 +11,7 @@ struct SdkDownloadWarningPayload {
     source: String,
 }
 
-fn emit_sdk_download_warning(
-    app_handle: &AppHandle,
-    workshop_id: &str,
-    title: &str,
-    reason: &str,
-) {
+fn emit_sdk_download_warning(app_handle: &AppHandle, workshop_id: &str, title: &str, reason: &str) {
     let _ = app_handle.emit(
         "sdk-download-warning",
         SdkDownloadWarningPayload {

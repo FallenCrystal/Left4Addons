@@ -5,10 +5,10 @@ use tauri::async_runtime::Mutex;
 use tauri::Manager;
 
 pub mod commands;
+pub mod mirrors;
 pub mod steam;
 pub mod vpk;
 pub mod watcher;
-pub mod mirrors;
 
 pub struct AppState {
     pub settings_path: PathBuf,

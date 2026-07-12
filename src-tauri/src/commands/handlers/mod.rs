@@ -38,6 +38,8 @@ const WORKSHOP_HTML_FETCH_INTERVAL: Duration = Duration::from_secs(6);
 const WORKSHOP_HTML_FETCH_PAUSE_DURATION: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_DOWNLOAD_CONCURRENCY: u32 = 2;
 const DOWNLOAD_FINALIZE_SUPPRESS_MS: u64 = 30_000;
+type IdenticalTitleGroupKey = (String, String, String);
+type IdenticalTitleGroup = (String, String, Vec<String>);
 
 #[derive(Default)]
 struct WorkshopHtmlFetchGate {
@@ -2706,15 +2708,16 @@ fn auto_group_internal(db: &mut Database) {
         }
     }
 
-    let mut identical_title_groups: HashMap<(String, String, String), (String, String, Vec<String>)> =
+    let mut identical_title_groups: HashMap<IdenticalTitleGroupKey, IdenticalTitleGroup> =
         HashMap::new();
     for candidate in &candidates {
         if grouped_ids.contains(&candidate.id) {
             continue;
         }
-        let (Some(author_identity), Some(description)) =
-            (candidate.author_identity.as_ref(), candidate.description.as_ref())
-        else {
+        let (Some(author_identity), Some(description)) = (
+            candidate.author_identity.as_ref(),
+            candidate.description.as_ref(),
+        ) else {
             continue;
         };
         let entry = identical_title_groups
@@ -2723,13 +2726,7 @@ fn auto_group_internal(db: &mut Database) {
                 author_identity.clone(),
                 description.clone(),
             ))
-            .or_insert_with(|| {
-                (
-                    candidate.title.clone(),
-                    author_identity.clone(),
-                    Vec::new(),
-                )
-            });
+            .or_insert_with(|| (candidate.title.clone(), author_identity.clone(), Vec::new()));
         if candidate.title < entry.0 {
             entry.0 = candidate.title.clone();
         }

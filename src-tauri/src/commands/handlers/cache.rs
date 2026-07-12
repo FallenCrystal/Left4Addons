@@ -1,7 +1,7 @@
 use super::*;
-use tauri::State;
-use std::time::Duration;
 use crate::mirrors::MirrorClientExt;
+use std::time::Duration;
+use tauri::State;
 
 #[tauri::command]
 pub async fn get_cache_image(

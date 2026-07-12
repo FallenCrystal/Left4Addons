@@ -4,6 +4,10 @@ import { describe, expect, test, vi } from 'vitest';
 import { DependencyPromptContainer } from './DependencyPromptContainer';
 import type { BackgroundTask, Settings } from '../types/addon';
 
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+}));
+
 const settings: Settings = {
   workshopDir: '',
   loadingDir: '',
