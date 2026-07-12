@@ -46,28 +46,46 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
     const missingIds = new Set<string>();
     
     // Check requiredItems of all addons we have (installed, disabled, downloading, or in knownUninstalled)
-    // Actually, maybe we only care about installed addons (dirType !== 'none') or addons currently being downloaded.
-    // Let's gather all addons that user "owns" or is trying to own.
-    const ownedIds = new Set<string>();
+    const ownedAddons = new Set<Addon>();
     
     // 1. Addons that are installed
     Object.values(addons).forEach(addon => {
       if (addon.dirType !== 'none') {
-        ownedIds.add(addon.workshopId || addon.id);
+        ownedAddons.add(addon);
       }
     });
     
+    // Helper to find addon by workshopId
+    const findAddon = (id: string) => {
+      const normalizedId = String(id || '').trim();
+      if (!normalizedId) return undefined;
+      
+      const direct = addons[normalizedId] || addons[`${normalizedId}.vpk`] ||
+                     knownUninstalledAddons[normalizedId] || knownUninstalledAddons[`${normalizedId}.vpk`];
+      if (direct) return direct;
+
+      return Object.values(addons).find(a => 
+        a.workshopId === normalizedId || a.id === normalizedId || a.id === `${normalizedId}.vpk` || a.vpkName === `${normalizedId}.vpk`
+      ) || Object.values(knownUninstalledAddons).find(a => 
+        a.workshopId === normalizedId || a.id === normalizedId || a.id === `${normalizedId}.vpk` || a.vpkName === `${normalizedId}.vpk`
+      );
+    };
+
     // 2. Addons that are in download queue
     activeDownloadTasks.forEach(task => {
-      task.targetIds.forEach(id => ownedIds.add(id));
+      task.targetIds.forEach(id => {
+        const addon = findAddon(id);
+        if (addon) {
+          ownedAddons.add(addon);
+        }
+      });
     });
 
     // Gather their required items
     const requiredItems = new Map<string, { workshopId: string, title?: string }>();
     
-    ownedIds.forEach(id => {
-      const addon = addons[id] || knownUninstalledAddons[id];
-      if (addon && addon.workshopDetails?.requiredItems) {
+    ownedAddons.forEach(addon => {
+      if (addon.workshopDetails?.requiredItems) {
         addon.workshopDetails.requiredItems.forEach(req => {
           requiredItems.set(req.workshopId, req);
         });
@@ -87,7 +105,7 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
 
     // Map ids back to full Addon objects for the UI
     return Array.from(missingIds).map(id => {
-      const existing = addons[id] || knownUninstalledAddons[id];
+      const existing = findAddon(id);
       if (existing) return existing;
       
       // Fallback if not found in db yet
