@@ -1240,7 +1240,9 @@ pub async fn download_addon(
         };
 
         println!("Downloading: {} (URL: {})", title, file_url);
-        let client = reqwest::Client::new();
+        let client = crate::mirrors::MirrorManager::client_builder_for(&file_url)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let resolved_file_url = crate::mirrors::MirrorManager::resolve(&file_url).0;
 
         let mut resume_from = 0u64;

@@ -536,7 +536,7 @@ pub async fn fetch_workshop_html(
     if let Some(wait) = wait {
         std::thread::sleep(wait);
     }
-    let client = reqwest::Client::builder()
+    let client = crate::mirrors::MirrorManager::client_builder_for(parsed.as_str())
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .build()
         .map_err(|e| e.to_string())?;

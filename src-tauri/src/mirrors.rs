@@ -23,6 +23,8 @@ pub struct MirrorRule {
     pub target: String,
     #[serde(rename = "keep-host", default)]
     pub keep_host: bool,
+    #[serde(rename = "insecure-tls", default)]
+    pub insecure_tls: bool,
     #[serde(default)]
     pub headers: Option<HashMap<String, String>>,
 }
@@ -30,15 +32,42 @@ pub struct MirrorRule {
 pub struct MirrorManager;
 
 impl MirrorManager {
+    pub fn client_builder_for(url: &str) -> reqwest::ClientBuilder {
+        let rules = load_rules();
+        let insecure_tls = matching_rule(url, &rules).is_some_and(|rule| rule.insecure_tls);
+
+        reqwest::Client::builder().danger_accept_invalid_certs(insecure_tls)
+    }
+
     pub fn resolve(url: &str) -> (String, Option<String>, Option<HashMap<String, String>>) {
-        let rules = RUNTIME_DIR
-            .get()
-            .and_then(|runtime_dir| fs::read_to_string(runtime_dir.join("mirrors.json")).ok())
-            .and_then(|content| serde_json::from_str::<Vec<MirrorRule>>(&content).ok())
-            .unwrap_or_default();
+        let rules = load_rules();
 
         resolve_with_rules(url, &rules)
     }
+}
+
+fn load_rules() -> Vec<MirrorRule> {
+    RUNTIME_DIR
+        .get()
+        .and_then(|runtime_dir| fs::read_to_string(runtime_dir.join("mirrors.json")).ok())
+        .and_then(|content| serde_json::from_str::<Vec<MirrorRule>>(&content).ok())
+        .unwrap_or_default()
+}
+
+fn matching_rule<'a>(url: &str, rules: &'a [MirrorRule]) -> Option<&'a MirrorRule> {
+    let parsed_url = reqwest::Url::parse(url).ok()?;
+    let host = parsed_url
+        .host_str()
+        .map(|hostname| match parsed_url.port() {
+            Some(port) => format!("{hostname}:{port}"),
+            None => hostname.to_string(),
+        })?;
+
+    rules.iter().find(|rule| {
+        rule_pattern(rule)
+            .and_then(|pattern| Regex::new(&pattern).ok())
+            .is_some_and(|regex| regex.is_match(&host))
+    })
 }
 
 fn resolve_with_rules(
@@ -116,6 +145,21 @@ fn rule_pattern(rule: &MirrorRule) -> Option<String> {
 }
 
 fn string_rule_pattern(rule: &str) -> String {
+    let patterns = rule
+        .split(';')
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty())
+        .map(string_rule_pattern_fragment)
+        .collect::<Vec<_>>();
+
+    match patterns.as_slice() {
+        [] => "(?!)".to_string(),
+        [pattern] => format!("^{pattern}$"),
+        _ => format!("^(?:{})$", patterns.join("|")),
+    }
+}
+
+fn string_rule_pattern_fragment(rule: &str) -> String {
     let mut pattern = String::new();
     let mut in_group = false;
     let mut group = String::new();
@@ -151,7 +195,7 @@ fn string_rule_pattern(rule: &str) -> String {
         index += 1;
     }
 
-    format!("^{pattern}$")
+    pattern
 }
 
 fn replace_captures(target: &str, captures: &regex::Captures<'_>) -> String {
@@ -233,6 +277,7 @@ mod tests {
             regex: None,
             target: target.to_string(),
             keep_host: false,
+            insecure_tls: false,
             headers: None,
         }
     }
@@ -282,5 +327,16 @@ mod tests {
 
         assert_eq!(resolve_with_rules(source, &[invalid]).0, source);
         assert_eq!(resolve_with_rules(source, &[]).0, source);
+    }
+
+    #[test]
+    fn string_rule_supports_semicolon_separated_hosts() {
+        let mut rule = rule("mirror.example.com");
+        rule.rules = Some("cdn.steamstatic.com; community.steamstatic.com".to_string());
+
+        assert_eq!(
+            resolve_with_rules("https://community.steamstatic.com/public", &[rule]).0,
+            "https://mirror.example.com/public"
+        );
     }
 }

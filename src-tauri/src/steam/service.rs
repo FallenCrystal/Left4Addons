@@ -200,7 +200,7 @@ pub async fn fetch_steam_details_web(workshop_ids: &[String]) -> Result<Vec<Valu
         params.push((format!("publishedfileids[{}]", index), id.clone()));
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::mirrors::MirrorManager::client_builder_for(url)
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
@@ -233,7 +233,9 @@ pub async fn fetch_collection_children_web(collection_id: &str) -> Result<Vec<St
         ("publishedfileids[0]".to_string(), collection_id.to_string()),
     ];
 
-    let client = reqwest::Client::new();
+    let client = crate::mirrors::MirrorManager::client_builder_for(url)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let res = client
         .post_mirrored(url)
         .form(&params)

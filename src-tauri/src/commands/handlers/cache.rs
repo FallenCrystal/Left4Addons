@@ -30,7 +30,7 @@ pub async fn cache_remote_image(
         return Ok(cached_path);
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::mirrors::MirrorManager::client_builder_for(parsed.as_str())
         .timeout(Duration::from_secs(8))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
