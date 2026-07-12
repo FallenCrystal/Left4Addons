@@ -100,9 +100,10 @@ export interface Addon {
   filesCount: number;
   imagePath?: string;
   workshopId?: string;
-  filenameWorkshopIdCandidate?: string;
-  filenameWorkshopIdValidationStatus?: 'pending' | 'verified' | 'rejected';
-  filenameWorkshopIdLastAttemptAt?: string;
+  workshopIdCandidate?: string;
+  workshopIdSource?: 'filename' | 'addonUrl';
+  workshopIdValidationStatus?: 'pending' | 'verified' | 'rejected';
+  workshopIdLastAttemptAt?: string;
   addonInfo?: AddonInfo;
   steamDetails?: SteamDetails;
   workshopDetails?: WorkshopDetails;

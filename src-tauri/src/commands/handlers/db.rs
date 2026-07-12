@@ -1,10 +1,12 @@
 use super::*;
 use tauri::{AppHandle, Manager, State};
 
-const FILENAME_WORKSHOP_VALIDATION_RETRY_SECS: i64 = 30 * 60;
-const FILENAME_WORKSHOP_STATUS_PENDING: &str = "pending";
-const FILENAME_WORKSHOP_STATUS_VERIFIED: &str = "verified";
-const FILENAME_WORKSHOP_STATUS_REJECTED: &str = "rejected";
+const WORKSHOP_ID_VALIDATION_RETRY_SECS: i64 = 30 * 60;
+const WORKSHOP_ID_STATUS_PENDING: &str = "pending";
+const WORKSHOP_ID_STATUS_VERIFIED: &str = "verified";
+const WORKSHOP_ID_STATUS_REJECTED: &str = "rejected";
+const WORKSHOP_ID_SOURCE_FILENAME: &str = "filename";
+const WORKSHOP_ID_SOURCE_ADDON_URL: &str = "addonUrl";
 
 fn normalize_filename_workshop_id(value: &str) -> Option<String> {
     if value.is_empty() || !value.chars().all(|ch| ch.is_ascii_digit()) {
@@ -66,22 +68,22 @@ fn is_successful_workshop_detail(details: &Value) -> bool {
     }
 }
 
-fn is_valid_filename_workshop_detail(candidate: &str, details: &Value) -> bool {
+fn is_valid_workshop_item_detail(candidate: &str, details: &Value) -> bool {
     workshop_detail_id(details).as_deref() == Some(candidate)
         && is_successful_workshop_detail(details)
         && !is_collection_detail(details)
 }
 
-fn filename_candidate_is_due(
+fn workshop_id_candidate_is_due(
     addon: &Addon,
     force: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     if addon.is_dummy
-        || addon.filename_workshop_id_candidate.is_none()
+        || addon.workshop_id_candidate.is_none()
         || matches!(
-            addon.filename_workshop_id_validation_status.as_deref(),
-            Some(FILENAME_WORKSHOP_STATUS_VERIFIED | FILENAME_WORKSHOP_STATUS_REJECTED)
+            addon.workshop_id_validation_status.as_deref(),
+            Some(WORKSHOP_ID_STATUS_VERIFIED | WORKSHOP_ID_STATUS_REJECTED)
         )
     {
         return false;
@@ -92,18 +94,18 @@ fn filename_candidate_is_due(
     }
 
     addon
-        .filename_workshop_id_last_attempt_at
+        .workshop_id_last_attempt_at
         .as_deref()
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
         .map(|attempted_at| {
             now.signed_duration_since(attempted_at.with_timezone(&chrono::Utc))
                 .num_seconds()
-                >= FILENAME_WORKSHOP_VALIDATION_RETRY_SECS
+                >= WORKSHOP_ID_VALIDATION_RETRY_SECS
         })
         .unwrap_or(true)
 }
 
-fn apply_filename_workshop_validation(
+fn apply_workshop_id_validation(
     addons: &mut HashMap<String, Addon>,
     attempted_ids: &HashSet<String>,
     details_by_id: Option<&HashMap<String, Value>>,
@@ -113,7 +115,7 @@ fn apply_filename_workshop_validation(
     let mut updated = HashMap::new();
 
     for (old_id, mut addon) in std::mem::take(addons) {
-        let Some(candidate) = addon.filename_workshop_id_candidate.clone() else {
+        let Some(candidate) = addon.workshop_id_candidate.clone() else {
             updated.insert(old_id, addon);
             continue;
         };
@@ -122,30 +124,43 @@ fn apply_filename_workshop_validation(
             continue;
         }
 
-        addon.filename_workshop_id_last_attempt_at = Some(attempted_at.to_string());
+        addon.workshop_id_last_attempt_at = Some(attempted_at.to_string());
         match details_by_id {
             Some(details_by_id) => {
                 let valid_details = details_by_id
                     .get(&candidate)
-                    .filter(|details| is_valid_filename_workshop_detail(&candidate, details));
+                    .filter(|details| is_valid_workshop_item_detail(&candidate, details));
                 if let Some(details) = valid_details {
                     addon.id = candidate.clone();
                     addon.workshop_id = Some(candidate.clone());
-                    addon.filename_workshop_id_validation_status =
-                        Some(FILENAME_WORKSHOP_STATUS_VERIFIED.to_string());
+                    addon.workshop_id_validation_status =
+                        Some(WORKSHOP_ID_STATUS_VERIFIED.to_string());
                     addon.steam_details = Some(details.clone());
                     if old_id != addon.id {
                         id_migrations.insert(old_id, addon.id.clone());
                     }
                 } else {
-                    addon.workshop_id = workshop_id_from_addon_url(&addon);
-                    addon.filename_workshop_id_validation_status =
-                        Some(FILENAME_WORKSHOP_STATUS_REJECTED.to_string());
+                    let fallback = (addon.workshop_id_source.as_deref()
+                        == Some(WORKSHOP_ID_SOURCE_FILENAME))
+                    .then(|| workshop_id_from_addon_url(&addon))
+                    .flatten()
+                    .filter(|url_id| url_id != &candidate);
+                    if let Some(url_id) = fallback {
+                        addon.workshop_id_candidate = Some(url_id);
+                        addon.workshop_id_source = Some(WORKSHOP_ID_SOURCE_ADDON_URL.to_string());
+                        addon.workshop_id_validation_status =
+                            Some(WORKSHOP_ID_STATUS_PENDING.to_string());
+                        addon.workshop_id_last_attempt_at = None;
+                    } else {
+                        addon.workshop_id_validation_status =
+                            Some(WORKSHOP_ID_STATUS_REJECTED.to_string());
+                    }
+                    addon.workshop_id = None;
+                    addon.steam_details = None;
                 }
             }
             None => {
-                addon.filename_workshop_id_validation_status =
-                    Some(FILENAME_WORKSHOP_STATUS_PENDING.to_string());
+                addon.workshop_id_validation_status = Some(WORKSHOP_ID_STATUS_PENDING.to_string());
             }
         }
 
@@ -156,7 +171,7 @@ fn apply_filename_workshop_validation(
     *addons = updated;
 }
 
-pub(super) async fn validate_filename_workshop_candidates(
+pub(super) async fn validate_workshop_id_candidates(
     db: &mut Database,
     workshop_service: &WorkshopService,
     force: bool,
@@ -167,75 +182,75 @@ pub(super) async fn validate_filename_workshop_candidates(
         return;
     }
 
-    let mut candidate_ids = HashSet::new();
-    for addon in db
-        .addons
-        .values()
-        .chain(db.known_uninstalled_addons.values())
-    {
-        if filename_candidate_is_due(addon, force, now) {
-            if let Some(candidate) = addon.filename_workshop_id_candidate.as_ref() {
-                candidate_ids.insert(candidate.clone());
+    // A rejected filename candidate can immediately fall back to addonurl0.
+    for _ in 0..2 {
+        let mut candidate_ids = HashSet::new();
+        for addon in db
+            .addons
+            .values()
+            .chain(db.known_uninstalled_addons.values())
+        {
+            if workshop_id_candidate_is_due(addon, force, now) {
+                if let Some(candidate) = addon.workshop_id_candidate.as_ref() {
+                    candidate_ids.insert(candidate.clone());
+                }
             }
         }
-    }
-    if candidate_ids.is_empty() {
-        return;
-    }
-
-    let mut candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
-    candidate_ids.sort();
-    let attempted_ids = candidate_ids.iter().cloned().collect::<HashSet<_>>();
-    let attempted_at = now.to_rfc3339();
-    let details_by_id = match fetch_steam_details_hybrid(
-        workshop_service,
-        &candidate_ids,
-        source_policy.allow_bridge(),
-        source_policy.allow_web_api(),
-        source_policy.source_order(),
-    )
-    .await
-    {
-        Ok(details) => Some(
-            details
-                .into_iter()
-                .filter_map(|details| workshop_detail_id(&details).map(|id| (id, details)))
-                .collect::<HashMap<_, _>>(),
-        ),
-        Err(err) => {
-            eprintln!(
-                "Failed to validate workshop IDs from VPK filenames: {}",
-                err
-            );
-            None
+        if candidate_ids.is_empty() {
+            break;
         }
-    };
 
-    let mut id_migrations = HashMap::new();
-    apply_filename_workshop_validation(
-        &mut db.addons,
-        &attempted_ids,
-        details_by_id.as_ref(),
-        &attempted_at,
-        &mut id_migrations,
-    );
-    apply_filename_workshop_validation(
-        &mut db.known_uninstalled_addons,
-        &attempted_ids,
-        details_by_id.as_ref(),
-        &attempted_at,
-        &mut id_migrations,
-    );
+        let mut candidate_ids = candidate_ids.into_iter().collect::<Vec<_>>();
+        candidate_ids.sort();
+        let attempted_ids = candidate_ids.iter().cloned().collect::<HashSet<_>>();
+        let attempted_at = now.to_rfc3339();
+        let details_by_id = match fetch_steam_details_hybrid(
+            workshop_service,
+            &candidate_ids,
+            source_policy.allow_bridge(),
+            source_policy.allow_web_api(),
+            source_policy.source_order(),
+        )
+        .await
+        {
+            Ok(details) => Some(
+                details
+                    .into_iter()
+                    .filter_map(|details| workshop_detail_id(&details).map(|id| (id, details)))
+                    .collect::<HashMap<_, _>>(),
+            ),
+            Err(err) => {
+                eprintln!("Failed to validate Workshop IDs from VPK metadata: {}", err);
+                None
+            }
+        };
 
-    if !id_migrations.is_empty() {
-        for group in &mut db.groups {
-            let mut seen = HashSet::new();
-            group.addons = group
-                .addons
-                .iter()
-                .map(|id| id_migrations.get(id).cloned().unwrap_or_else(|| id.clone()))
-                .filter(|id| seen.insert(id.clone()))
-                .collect();
+        let mut id_migrations = HashMap::new();
+        apply_workshop_id_validation(
+            &mut db.addons,
+            &attempted_ids,
+            details_by_id.as_ref(),
+            &attempted_at,
+            &mut id_migrations,
+        );
+        apply_workshop_id_validation(
+            &mut db.known_uninstalled_addons,
+            &attempted_ids,
+            details_by_id.as_ref(),
+            &attempted_at,
+            &mut id_migrations,
+        );
+
+        if !id_migrations.is_empty() {
+            for group in &mut db.groups {
+                let mut seen = HashSet::new();
+                group.addons = group
+                    .addons
+                    .iter()
+                    .map(|id| id_migrations.get(id).cloned().unwrap_or_else(|| id.clone()))
+                    .filter(|id| seen.insert(id.clone()))
+                    .collect();
+            }
         }
     }
 }
@@ -355,13 +370,10 @@ pub fn load_db(
                     id: id.clone(),
                     vpk_name: entry.vpk_name.clone(),
                     workshop_id: entry.workshop_id.clone(),
-                    filename_workshop_id_candidate: entry.filename_workshop_id_candidate.clone(),
-                    filename_workshop_id_validation_status: entry
-                        .filename_workshop_id_validation_status
-                        .clone(),
-                    filename_workshop_id_last_attempt_at: entry
-                        .filename_workshop_id_last_attempt_at
-                        .clone(),
+                    workshop_id_candidate: entry.workshop_id_candidate.clone(),
+                    workshop_id_source: entry.workshop_id_source.clone(),
+                    workshop_id_validation_status: entry.workshop_id_validation_status.clone(),
+                    workshop_id_last_attempt_at: entry.workshop_id_last_attempt_at.clone(),
                     addon_info: entry.addon_info.clone(),
                     has_image: entry.has_image,
                     image_path: entry.image_path.clone(),
@@ -451,13 +463,10 @@ pub fn save_db_internal(
                 id: id.clone(),
                 vpk_name: addon.vpk_name.clone(),
                 workshop_id: addon.workshop_id.clone(),
-                filename_workshop_id_candidate: addon.filename_workshop_id_candidate.clone(),
-                filename_workshop_id_validation_status: addon
-                    .filename_workshop_id_validation_status
-                    .clone(),
-                filename_workshop_id_last_attempt_at: addon
-                    .filename_workshop_id_last_attempt_at
-                    .clone(),
+                workshop_id_candidate: addon.workshop_id_candidate.clone(),
+                workshop_id_source: addon.workshop_id_source.clone(),
+                workshop_id_validation_status: addon.workshop_id_validation_status.clone(),
+                workshop_id_last_attempt_at: addon.workshop_id_last_attempt_at.clone(),
                 addon_info: addon.addon_info.clone(),
                 has_image: addon.has_image,
                 image_path: addon.image_path.clone(),
@@ -476,13 +485,10 @@ pub fn save_db_internal(
                 id: id.clone(),
                 vpk_name: addon.vpk_name.clone(),
                 workshop_id: addon.workshop_id.clone(),
-                filename_workshop_id_candidate: addon.filename_workshop_id_candidate.clone(),
-                filename_workshop_id_validation_status: addon
-                    .filename_workshop_id_validation_status
-                    .clone(),
-                filename_workshop_id_last_attempt_at: addon
-                    .filename_workshop_id_last_attempt_at
-                    .clone(),
+                workshop_id_candidate: addon.workshop_id_candidate.clone(),
+                workshop_id_source: addon.workshop_id_source.clone(),
+                workshop_id_validation_status: addon.workshop_id_validation_status.clone(),
+                workshop_id_last_attempt_at: addon.workshop_id_last_attempt_at.clone(),
                 addon_info: addon.addon_info.clone(),
                 has_image: addon.has_image,
                 image_path: addon.image_path.clone(),
@@ -662,27 +668,42 @@ pub async fn scan_addons_internal(
                 .map(|v| v == "A dummy addon generated by Left 4 Addons")
                 .unwrap_or(false);
 
-            let filename_verified = !is_dummy
-                && filename_candidate.as_ref().is_some_and(|candidate| {
-                    cached.as_ref().is_some_and(|addon| {
-                        addon.filename_workshop_id_candidate.as_deref() == Some(candidate)
-                            && addon.filename_workshop_id_validation_status.as_deref()
-                                == Some(FILENAME_WORKSHOP_STATUS_VERIFIED)
-                            && addon.workshop_id.as_deref() == Some(candidate)
+            let filename_rejected = filename_candidate.as_ref().is_some_and(|candidate| {
+                cached.as_ref().is_some_and(|addon| {
+                    addon.workshop_id_candidate.as_deref() == Some(candidate)
+                        && addon.workshop_id_source.as_deref() == Some(WORKSHOP_ID_SOURCE_FILENAME)
+                        && addon.workshop_id_validation_status.as_deref()
+                            == Some(WORKSHOP_ID_STATUS_REJECTED)
+                })
+            });
+            let (candidate, source) = if !is_dummy && filename_rejected {
+                url_workshop_id
+                    .clone()
+                    .map(|id| (id, WORKSHOP_ID_SOURCE_ADDON_URL.to_string()))
+            } else {
+                filename_candidate
+                    .clone()
+                    .map(|id| (id, WORKSHOP_ID_SOURCE_FILENAME.to_string()))
+                    .or_else(|| {
+                        url_workshop_id
+                            .clone()
+                            .map(|id| (id, WORKSHOP_ID_SOURCE_ADDON_URL.to_string()))
                     })
+            }
+            .unzip();
+            let candidate_matches = !is_dummy
+                && cached.as_ref().is_some_and(|addon| {
+                    addon.workshop_id_candidate == candidate
+                        && addon.workshop_id_source.as_deref() == source.as_deref()
                 });
-            let filename_rejected = !is_dummy
-                && filename_candidate.as_ref().is_some_and(|candidate| {
-                    cached.as_ref().is_some_and(|addon| {
-                        addon.filename_workshop_id_candidate.as_deref() == Some(candidate)
-                            && addon.filename_workshop_id_validation_status.as_deref()
-                                == Some(FILENAME_WORKSHOP_STATUS_REJECTED)
-                    })
+            let candidate_verified = candidate_matches
+                && cached.as_ref().is_some_and(|addon| {
+                    addon.workshop_id_validation_status.as_deref()
+                        == Some(WORKSHOP_ID_STATUS_VERIFIED)
+                        && addon.workshop_id == candidate
                 });
-            let workshop_id = if is_dummy || filename_verified {
-                filename_candidate.clone().or(url_workshop_id.clone())
-            } else if filename_rejected || filename_candidate.is_none() {
-                url_workshop_id.clone()
+            let workshop_id = if is_dummy || candidate_verified {
+                candidate.clone()
             } else {
                 None
             };
@@ -705,24 +726,24 @@ pub async fn scan_addons_internal(
                 id: id.clone(),
                 vpk_name: vpk_name.clone(),
                 workshop_id: workshop_id.clone(),
-                filename_workshop_id_candidate: if is_dummy {
+                workshop_id_candidate: if is_dummy { None } else { candidate.clone() },
+                workshop_id_source: if is_dummy { None } else { source.clone() },
+                workshop_id_validation_status: if is_dummy || candidate.is_none() {
                     None
+                } else if candidate_matches {
+                    cached
+                        .as_ref()
+                        .and_then(|addon| addon.workshop_id_validation_status.clone())
                 } else {
-                    filename_candidate.clone()
+                    Some(WORKSHOP_ID_STATUS_PENDING.to_string())
                 },
-                filename_workshop_id_validation_status: if is_dummy || filename_candidate.is_none()
-                {
+                workshop_id_last_attempt_at: if candidate_matches {
+                    cached
+                        .as_ref()
+                        .and_then(|addon| addon.workshop_id_last_attempt_at.clone())
+                } else {
                     None
-                } else if filename_verified {
-                    Some(FILENAME_WORKSHOP_STATUS_VERIFIED.to_string())
-                } else if filename_rejected {
-                    Some(FILENAME_WORKSHOP_STATUS_REJECTED.to_string())
-                } else {
-                    Some(FILENAME_WORKSHOP_STATUS_PENDING.to_string())
                 },
-                filename_workshop_id_last_attempt_at: cached
-                    .as_ref()
-                    .and_then(|addon| addon.filename_workshop_id_last_attempt_at.clone()),
                 addon_info,
                 has_image,
                 image_path,
@@ -744,15 +765,10 @@ pub async fn scan_addons_internal(
                         id: id.clone(),
                         vpk_name: vpk_name.clone(),
                         workshop_id: workshop_id.clone(),
-                        filename_workshop_id_candidate: addon
-                            .filename_workshop_id_candidate
-                            .clone(),
-                        filename_workshop_id_validation_status: addon
-                            .filename_workshop_id_validation_status
-                            .clone(),
-                        filename_workshop_id_last_attempt_at: addon
-                            .filename_workshop_id_last_attempt_at
-                            .clone(),
+                        workshop_id_candidate: addon.workshop_id_candidate.clone(),
+                        workshop_id_source: addon.workshop_id_source.clone(),
+                        workshop_id_validation_status: addon.workshop_id_validation_status.clone(),
+                        workshop_id_last_attempt_at: addon.workshop_id_last_attempt_at.clone(),
                         addon_info: addon.addon_info.clone(),
                         has_image: addon.has_image,
                         image_path: addon.image_path.clone(),
@@ -774,33 +790,41 @@ pub async fn scan_addons_internal(
                 .map(|v| v == "A dummy addon generated by Left 4 Addons")
                 .unwrap_or(false);
 
-            let filename_candidate = extract_workshop_id_from_vpk_filename(&vpk_name);
             if !addon.is_dummy {
-                if let Some(candidate) = filename_candidate {
-                    let verified = addon.filename_workshop_id_candidate.as_deref()
-                        == Some(candidate.as_str())
-                        && addon.filename_workshop_id_validation_status.as_deref()
-                            == Some(FILENAME_WORKSHOP_STATUS_VERIFIED)
-                        && addon.workshop_id.as_deref() == Some(candidate.as_str());
-                    let rejected = addon.filename_workshop_id_candidate.as_deref()
-                        == Some(candidate.as_str())
-                        && addon.filename_workshop_id_validation_status.as_deref()
-                            == Some(FILENAME_WORKSHOP_STATUS_REJECTED);
-                    addon.filename_workshop_id_candidate = Some(candidate);
+                let filename_candidate = extract_workshop_id_from_vpk_filename(&vpk_name);
+                let url_candidate = workshop_id_from_addon_url(&addon);
+                let filename_rejected = filename_candidate.as_ref().is_some_and(|candidate| {
+                    addon.workshop_id_candidate.as_deref() == Some(candidate)
+                        && addon.workshop_id_source.as_deref() == Some(WORKSHOP_ID_SOURCE_FILENAME)
+                        && addon.workshop_id_validation_status.as_deref()
+                            == Some(WORKSHOP_ID_STATUS_REJECTED)
+                });
+                let (candidate, source) = if filename_rejected {
+                    url_candidate.map(|id| (id, WORKSHOP_ID_SOURCE_ADDON_URL.to_string()))
+                } else {
+                    filename_candidate
+                        .map(|id| (id, WORKSHOP_ID_SOURCE_FILENAME.to_string()))
+                        .or_else(|| {
+                            url_candidate.map(|id| (id, WORKSHOP_ID_SOURCE_ADDON_URL.to_string()))
+                        })
+                }
+                .unzip();
+                if candidate.is_some() {
+                    let matches_cached = addon.workshop_id_candidate == candidate
+                        && addon.workshop_id_source == source;
+                    let verified = matches_cached
+                        && addon.workshop_id_validation_status.as_deref()
+                            == Some(WORKSHOP_ID_STATUS_VERIFIED);
+                    addon.workshop_id_candidate = candidate.clone();
+                    addon.workshop_id_source = source;
                     if verified {
-                        addon.filename_workshop_id_validation_status =
-                            Some(FILENAME_WORKSHOP_STATUS_VERIFIED.to_string());
-                    } else if rejected {
-                        addon.filename_workshop_id_validation_status =
-                            Some(FILENAME_WORKSHOP_STATUS_REJECTED.to_string());
-                        addon.workshop_id = workshop_id_from_addon_url(&addon);
+                        addon.workshop_id = candidate;
                     } else {
-                        addon.filename_workshop_id_validation_status =
-                            Some(FILENAME_WORKSHOP_STATUS_PENDING.to_string());
+                        addon.workshop_id_validation_status =
+                            Some(WORKSHOP_ID_STATUS_PENDING.to_string());
+                        addon.workshop_id_last_attempt_at = None;
                         addon.workshop_id = None;
                     }
-                } else if addon.workshop_id.is_none() {
-                    addon.workshop_id = workshop_id_from_addon_url(&addon);
                 }
             }
 
@@ -822,14 +846,13 @@ pub async fn scan_addons_internal(
                                 id: hash.clone(),
                                 vpk_name: addon.vpk_name.clone(),
                                 workshop_id: None,
-                                filename_workshop_id_candidate: addon
-                                    .filename_workshop_id_candidate
+                                workshop_id_candidate: addon.workshop_id_candidate.clone(),
+                                workshop_id_source: addon.workshop_id_source.clone(),
+                                workshop_id_validation_status: addon
+                                    .workshop_id_validation_status
                                     .clone(),
-                                filename_workshop_id_validation_status: addon
-                                    .filename_workshop_id_validation_status
-                                    .clone(),
-                                filename_workshop_id_last_attempt_at: addon
-                                    .filename_workshop_id_last_attempt_at
+                                workshop_id_last_attempt_at: addon
+                                    .workshop_id_last_attempt_at
                                     .clone(),
                                 addon_info: addon.addon_info.clone(),
                                 has_image: addon.has_image,
@@ -855,13 +878,10 @@ pub async fn scan_addons_internal(
                     id: id.clone(),
                     vpk_name: entry.vpk_name.clone(),
                     workshop_id: entry.workshop_id.clone(),
-                    filename_workshop_id_candidate: entry.filename_workshop_id_candidate.clone(),
-                    filename_workshop_id_validation_status: entry
-                        .filename_workshop_id_validation_status
-                        .clone(),
-                    filename_workshop_id_last_attempt_at: entry
-                        .filename_workshop_id_last_attempt_at
-                        .clone(),
+                    workshop_id_candidate: entry.workshop_id_candidate.clone(),
+                    workshop_id_source: entry.workshop_id_source.clone(),
+                    workshop_id_validation_status: entry.workshop_id_validation_status.clone(),
+                    workshop_id_last_attempt_at: entry.workshop_id_last_attempt_at.clone(),
                     addon_info: entry.addon_info.clone(),
                     has_image: entry.has_image,
                     image_path: entry.image_path.clone(),
@@ -886,7 +906,7 @@ pub async fn scan_addons_internal(
 
     db.addons = active_addons;
     db.known_uninstalled_addons = uninstalled;
-    validate_filename_workshop_candidates(db, workshop_service, false).await;
+    validate_workshop_id_candidates(db, workshop_service, false).await;
 
     let mut vpk_to_id = HashMap::new();
     for addon in db.addons.values() {
@@ -938,9 +958,9 @@ pub async fn get_addons(state: State<'_, crate::AppState>) -> Result<Database, S
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_filename_workshop_validation, extract_workshop_id_from_vpk_filename,
-        is_valid_filename_workshop_detail, FILENAME_WORKSHOP_STATUS_PENDING,
-        FILENAME_WORKSHOP_STATUS_REJECTED, FILENAME_WORKSHOP_STATUS_VERIFIED,
+        apply_workshop_id_validation, extract_workshop_id_from_vpk_filename,
+        is_valid_workshop_item_detail, WORKSHOP_ID_SOURCE_ADDON_URL, WORKSHOP_ID_SOURCE_FILENAME,
+        WORKSHOP_ID_STATUS_PENDING, WORKSHOP_ID_STATUS_REJECTED, WORKSHOP_ID_STATUS_VERIFIED,
     };
     use crate::commands::types::Addon;
     use serde_json::json;
@@ -951,11 +971,10 @@ mod tests {
             id: id.to_string(),
             vpk_name: format!("[{}]Manual Addon.vpk", candidate),
             workshop_id: None,
-            filename_workshop_id_candidate: Some(candidate.to_string()),
-            filename_workshop_id_validation_status: Some(
-                FILENAME_WORKSHOP_STATUS_PENDING.to_string(),
-            ),
-            filename_workshop_id_last_attempt_at: None,
+            workshop_id_candidate: Some(candidate.to_string()),
+            workshop_id_source: Some(WORKSHOP_ID_SOURCE_FILENAME.to_string()),
+            workshop_id_validation_status: Some(WORKSHOP_ID_STATUS_PENDING.to_string()),
+            workshop_id_last_attempt_at: None,
             addon_info: json!({}),
             has_image: false,
             image_path: None,
@@ -1001,23 +1020,23 @@ mod tests {
 
     #[test]
     fn accepts_only_existing_non_collection_details() {
-        assert!(is_valid_filename_workshop_detail(
+        assert!(is_valid_workshop_item_detail(
             "3560883926",
             &json!({ "publishedfileid": "3560883926", "result": 1, "file_type": "item" })
         ));
-        assert!(!is_valid_filename_workshop_detail(
+        assert!(!is_valid_workshop_item_detail(
             "3560883926",
             &json!({ "publishedfileid": "3560883926", "result": 1, "file_type": "collection" })
         ));
-        assert!(!is_valid_filename_workshop_detail(
+        assert!(!is_valid_workshop_item_detail(
             "3560883926",
             &json!({ "publishedfileid": "3560883926", "result": 1, "file_type": 2 })
         ));
-        assert!(!is_valid_filename_workshop_detail(
+        assert!(!is_valid_workshop_item_detail(
             "3560883926",
             &json!({ "publishedfileid": "3560883926", "result": 9 })
         ));
-        assert!(!is_valid_filename_workshop_detail(
+        assert!(!is_valid_workshop_item_detail(
             "3560883926",
             &json!({ "publishedfileid": "123" })
         ));
@@ -1034,7 +1053,7 @@ mod tests {
         )]);
         let mut migrations = HashMap::new();
 
-        apply_filename_workshop_validation(
+        apply_workshop_id_validation(
             &mut addons,
             &attempted_ids,
             Some(&details),
@@ -1045,8 +1064,8 @@ mod tests {
         let resolved = addons.get("3560883926").unwrap();
         assert_eq!(resolved.workshop_id.as_deref(), Some("3560883926"));
         assert_eq!(
-            resolved.filename_workshop_id_validation_status.as_deref(),
-            Some(FILENAME_WORKSHOP_STATUS_VERIFIED)
+            resolved.workshop_id_validation_status.as_deref(),
+            Some(WORKSHOP_ID_STATUS_VERIFIED)
         );
         assert_eq!(
             migrations.get("local-hash").map(String::as_str),
@@ -1055,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn rejected_filename_id_falls_back_to_existing_addon_url() {
+    fn rejects_collection_id_from_addon_url_after_filename_fallback() {
         let mut local = addon("local-hash", "3560883926");
         local.addon_info = json!({
             "addonurl0": "https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890"
@@ -1063,7 +1082,7 @@ mod tests {
         let mut addons = HashMap::from([("local-hash".to_string(), local)]);
         let attempted_ids = HashSet::from(["3560883926".to_string()]);
 
-        apply_filename_workshop_validation(
+        apply_workshop_id_validation(
             &mut addons,
             &attempted_ids,
             Some(&HashMap::new()),
@@ -1072,10 +1091,36 @@ mod tests {
         );
 
         let rejected = addons.get("local-hash").unwrap();
-        assert_eq!(rejected.workshop_id.as_deref(), Some("1234567890"));
+        assert_eq!(rejected.workshop_id, None);
         assert_eq!(
-            rejected.filename_workshop_id_validation_status.as_deref(),
-            Some(FILENAME_WORKSHOP_STATUS_REJECTED)
+            rejected.workshop_id_candidate.as_deref(),
+            Some("1234567890")
+        );
+        assert_eq!(
+            rejected.workshop_id_source.as_deref(),
+            Some(WORKSHOP_ID_SOURCE_ADDON_URL)
+        );
+        assert_eq!(
+            rejected.workshop_id_validation_status.as_deref(),
+            Some(WORKSHOP_ID_STATUS_PENDING)
+        );
+
+        apply_workshop_id_validation(
+            &mut addons,
+            &HashSet::from(["1234567890".to_string()]),
+            Some(&HashMap::from([(
+                "1234567890".to_string(),
+                json!({ "publishedfileid": "1234567890", "file_type": "collection" }),
+            )])),
+            "2026-07-12T00:01:00Z",
+            &mut HashMap::new(),
+        );
+
+        let rejected = addons.get("local-hash").unwrap();
+        assert_eq!(rejected.workshop_id, None);
+        assert_eq!(
+            rejected.workshop_id_validation_status.as_deref(),
+            Some(WORKSHOP_ID_STATUS_REJECTED)
         );
     }
 }
