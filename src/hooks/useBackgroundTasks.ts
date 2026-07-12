@@ -54,6 +54,7 @@ export function useBackgroundTasks({
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTask[]>([]);
   const tasksRef = useRef<BackgroundTask[]>([]);
   const activeDownloadsRef = useRef(0);
+  const runningDownloadTaskIdsRef = useRef<Set<string>>(new Set());
   const crawlRunningRef = useRef(false);
   const dependencyRunningRef = useRef(false);
   const lastCrawlAtRef = useRef(0);
@@ -82,26 +83,36 @@ export function useBackgroundTasks({
   }, [commitTasks]);
 
   useEffect(() => {
+    let active = true;
+
     void invoke<BackgroundTask[]>('get_background_tasks')
       .then((tasks) => {
+        if (!active) return;
+
         const safeTasks = Array.isArray(tasks) ? tasks : [];
         const restored = safeTasks.map((task) => (
           task.status === 'running' ? { ...task, status: 'queued' as const } : task
         ));
         commitTasks(restored);
         setTimeout(() => {
+          if (!active) return;
           processDownloadQueueRef.current();
           processCrawlQueueRef.current();
           processDependencyQueueRef.current();
         }, 0);
       })
       .catch((err) => console.error('Failed to load background tasks:', err));
+
+    return () => {
+      active = false;
+    };
   }, [commitTasks]);
 
   const runDownloadTask = useCallback(async (task: BackgroundTask) => {
     const workshopId = task.targetIds[0];
-    if (!workshopId) return;
+    if (!workshopId || runningDownloadTaskIdsRef.current.has(task.id)) return;
 
+    runningDownloadTaskIdsRef.current.add(task.id);
     activeDownloadsRef.current += 1;
     patchTask(task.id, { status: 'running', progress: 0, startedAt: nowIso(), error: undefined });
 
@@ -147,6 +158,7 @@ export function useBackgroundTasks({
         }
       }
     } finally {
+      runningDownloadTaskIdsRef.current.delete(task.id);
       activeDownloadsRef.current = Math.max(0, activeDownloadsRef.current - 1);
       processDownloadQueueRef.current();
     }
@@ -155,7 +167,11 @@ export function useBackgroundTasks({
   const processDownloadQueue = useCallback(() => {
     const concurrency = Math.max(1, Math.trunc(downloadConcurrency || 1));
     while (activeDownloadsRef.current < concurrency) {
-      const next = tasksRef.current.find((task) => task.kind === 'download' && task.status === 'queued');
+      const next = tasksRef.current.find((task) => (
+        task.kind === 'download' &&
+        task.status === 'queued' &&
+        !runningDownloadTaskIdsRef.current.has(task.id)
+      ));
       if (!next) return;
       void runDownloadTask(next);
     }

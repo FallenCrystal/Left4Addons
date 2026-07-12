@@ -55,6 +55,7 @@ describe('SettingsView', () => {
         true,
         false,
         3,
+        'ask',
         baseSettings.workshopSourceSettings,
       );
     });
@@ -87,6 +88,7 @@ describe('SettingsView', () => {
         false,
         false,
         3,
+        'ask',
         baseSettings.workshopSourceSettings,
       );
     });
@@ -117,6 +119,7 @@ describe('SettingsView', () => {
         false,
         false,
         3,
+        'ask',
         expect.objectContaining({
           preset: 'hybrid',
           sdkHtmlScope: 'all',

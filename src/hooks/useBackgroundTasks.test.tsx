@@ -1,3 +1,4 @@
+import React, { StrictMode } from 'react';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { useBackgroundTasks } from './useBackgroundTasks';
@@ -67,5 +68,45 @@ describe('useBackgroundTasks dependency checks', () => {
     expect(mockFetchDependencySnapshot.mock.calls.map(([id]) => id)).toEqual(['A', 'B', 'C']);
     expect(mockInvoke.mock.calls.filter(([command]) => command === 'persist_workshop_page_details')).toHaveLength(3);
     expect(updateLocalState).toHaveBeenCalledTimes(1);
+  });
+
+  test('restores a persisted download only once under StrictMode', async () => {
+    let resolveDownload: (() => void) | undefined;
+    const downloadPromise = new Promise<void>((resolve) => {
+      resolveDownload = resolve;
+    });
+    const restoredTask = {
+      id: 'download_A_restored',
+      kind: 'download' as const,
+      status: 'running' as const,
+      targetIds: ['A'],
+      progress: 42,
+      createdAt: new Date().toISOString(),
+    };
+
+    mockInvoke.mockImplementation((command) => {
+      if (command === 'get_background_tasks') return Promise.resolve([restoredTask]);
+      if (command === 'download_addon') return downloadPromise;
+      return Promise.resolve();
+    });
+
+    renderHook(() => useBackgroundTasks({
+      enabled: true,
+      downloadConcurrency: 2,
+      addons: {},
+      knownUninstalledAddons: {},
+      updateLocalState: vi.fn(),
+      onDownloadSuccess: vi.fn(),
+      onDownloadCancelled: vi.fn(),
+      onTaskError: vi.fn(),
+    }), {
+      wrapper: ({ children }) => <StrictMode>{children}</StrictMode>,
+    });
+
+    await waitFor(() => {
+      expect(mockInvoke.mock.calls.filter(([command]) => command === 'download_addon')).toHaveLength(1);
+    });
+
+    resolveDownload?.();
   });
 });
