@@ -80,4 +80,23 @@ describe('ssrParser', () => {
     expect(details.collectionItems?.[0].authorVanityId).toBe('perfectbuddy');
     expect(details.collectionItems?.[0].stars).toBe(5);
   });
+
+  test('uses the current Steam preview image as the cover when no gallery exists', () => {
+    const details = parseWorkshopPageDetails(`
+      <div class="workshopItemTitle">Lingshan-Guangxi V2.9</div>
+      <div id="highlight_player_area">
+        <img
+          id="previewImage"
+          class="workshopItemPreviewImageEnlargeable"
+          src="https://images.steamusercontent.com/ugc/10303821298862575212/4771C25DD397BD581B244C8A37355A1AB7603C04/?imw=637&amp;imh=358&amp;ima=fit"
+        >
+      </div>
+      <script>var rgFullScreenshotURLs = [];</script>
+    `);
+
+    expect(details.previewUrl).toBe(
+      'https://images.steamusercontent.com/ugc/10303821298862575212/4771C25DD397BD581B244C8A37355A1AB7603C04/',
+    );
+    expect(details.imageGallery).toEqual([]);
+  });
 });

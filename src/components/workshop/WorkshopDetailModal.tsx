@@ -294,7 +294,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
 
   // Build gallery: cover image first, then scraped screenshots
   const scrapedGallery = pageDetails?.imageGallery || [];
-  const coverUrl = item.imagePath || '';
+  const coverUrl = pageDetails?.previewUrl || item.imagePath || '';
   // Deduplicate: if cover is already in scraped gallery, don't add it twice
   const gallery = coverUrl
     ? [coverUrl, ...scrapedGallery.filter((u) => u !== coverUrl)]
@@ -322,7 +322,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
             <Gallery
               gallery={gallery}
               title={item.title}
-              fallbackImage={item.imagePath}
+              fallbackImage={coverUrl}
               cacheRemote={shouldCacheRemote}
             />
 
@@ -430,7 +430,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
           <div style={{ display: 'flex', gap: '12px' }}>
             <button
               className="btn btn-primary"
-              onClick={() => onDownload(item.workshopId, item.title, (item as any).previewUrl || item.imagePath)}
+              onClick={() => onDownload(item.workshopId, item.title, coverUrl)}
               disabled={isSubmitting || isDownloaded || downloading}
             >
               <Download size={14} />

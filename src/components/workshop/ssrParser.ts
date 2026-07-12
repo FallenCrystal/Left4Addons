@@ -559,7 +559,9 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
     const all = (selector: string) => Array.from(doc.querySelectorAll(selector));
 
     result.title = text('.workshopItemTitle');
-    result.previewUrl = toFullSizeUrl(attr('#previewImageMain', 'src'));
+    // Steam currently uses #previewImage. Keep the older selector for cached
+    // or legacy page markup so a no-screenshot item still has its cover.
+    result.previewUrl = toFullSizeUrl(attr('#previewImage, #previewImageMain', 'src'));
 
     const descriptionNode = doc.querySelector('.workshopItemDescription');
     if (descriptionNode) {

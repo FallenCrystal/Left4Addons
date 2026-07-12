@@ -1,4 +1,4 @@
-import { render, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { WorkshopDetailModal } from './WorkshopDetailModal';
 import type { WorkshopItem, WorkshopPageDetails } from './types';
@@ -87,5 +87,46 @@ describe('WorkshopDetailModal', () => {
     const description = container.querySelector('.description-block')?.textContent;
     expect(description).toBe('Subscribe to ALL 6 PARTS.\n\nPlease rate part 1.');
     expect(description).not.toBe('Subscribe to ALL 6 PART');
+  });
+
+  test('uses the scraped cover for a no-gallery item and its download task', async () => {
+    const pageDetails = {
+      ...createPageDetails(),
+      previewUrl: 'https://images.steamusercontent.com/ugc/cover-image/',
+    };
+    const onDownload = vi.fn();
+    mockGetWorkshopPageSnapshot.mockResolvedValue(pageDetails);
+    mockFetchWorkshopPageDetails.mockResolvedValue(pageDetails);
+
+    render(
+      <WorkshopDetailModal
+        open
+        item={createWorkshopItem()}
+        collection={null}
+        onClose={vi.fn()}
+        onDownload={onDownload}
+        onOpenLink={vi.fn()}
+        onImportCollection={vi.fn()}
+        onItemNavigate={vi.fn()}
+        onCollectionNavigate={vi.fn()}
+        addons={{}}
+        knownUninstalledAddons={{}}
+        downloadProgress={{}}
+        isSubmitting={false}
+        groups={[]}
+        isLoading={false}
+        onDatabaseUpdate={vi.fn()}
+      />,
+    );
+
+    const cover = await screen.findByAltText('Early Days PART 1/6') as HTMLImageElement;
+    expect(cover.src).toBe('https://images.steamusercontent.com/ugc/cover-image/');
+
+    fireEvent.click(screen.getByRole('button', { name: /下载/i }));
+    expect(onDownload).toHaveBeenCalledWith(
+      '3560883926',
+      'Early Days PART 1/6',
+      'https://images.steamusercontent.com/ugc/cover-image/',
+    );
   });
 });
