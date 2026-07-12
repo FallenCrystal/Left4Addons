@@ -129,6 +129,7 @@ pub async fn steam_sync(state: State<'_, crate::AppState>) -> Result<Database, S
             &state.workshop_service,
         )
         .await?;
+        validate_filename_workshop_candidates(&mut db, &state.workshop_service, true).await;
 
         let mut ids = Vec::new();
         for addon in db.addons.values() {
@@ -714,6 +715,9 @@ pub async fn add_known_addon(
             id: id.clone(),
             vpk_name: dest_filename.clone(),
             workshop_id: Some(workshop_id.clone()),
+            filename_workshop_id_candidate: None,
+            filename_workshop_id_validation_status: None,
+            filename_workshop_id_last_attempt_at: None,
             addon_info: serde_json::Value::Null,
             has_image,
             image_path,

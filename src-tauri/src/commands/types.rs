@@ -174,6 +174,12 @@ pub struct Addon {
     pub vpk_name: String,
     #[serde(rename = "workshopId")]
     pub workshop_id: Option<String>,
+    #[serde(rename = "filenameWorkshopIdCandidate", default)]
+    pub filename_workshop_id_candidate: Option<String>,
+    #[serde(rename = "filenameWorkshopIdValidationStatus", default)]
+    pub filename_workshop_id_validation_status: Option<String>,
+    #[serde(rename = "filenameWorkshopIdLastAttemptAt", default)]
+    pub filename_workshop_id_last_attempt_at: Option<String>,
     #[serde(rename = "addonInfo")]
     pub addon_info: serde_json::Value,
     #[serde(rename = "hasImage")]
@@ -208,6 +214,12 @@ pub struct LocalAddon {
     pub vpk_name: String,
     #[serde(rename = "workshopId")]
     pub workshop_id: Option<String>,
+    #[serde(rename = "filenameWorkshopIdCandidate", default)]
+    pub filename_workshop_id_candidate: Option<String>,
+    #[serde(rename = "filenameWorkshopIdValidationStatus", default)]
+    pub filename_workshop_id_validation_status: Option<String>,
+    #[serde(rename = "filenameWorkshopIdLastAttemptAt", default)]
+    pub filename_workshop_id_last_attempt_at: Option<String>,
     #[serde(rename = "filesCount")]
     pub files_count: usize,
     #[serde(rename = "fileSize")]
@@ -232,6 +244,12 @@ pub struct KnownAddonEntry {
     pub vpk_name: String,
     #[serde(rename = "workshopId")]
     pub workshop_id: Option<String>,
+    #[serde(rename = "filenameWorkshopIdCandidate", default)]
+    pub filename_workshop_id_candidate: Option<String>,
+    #[serde(rename = "filenameWorkshopIdValidationStatus", default)]
+    pub filename_workshop_id_validation_status: Option<String>,
+    #[serde(rename = "filenameWorkshopIdLastAttemptAt", default)]
+    pub filename_workshop_id_last_attempt_at: Option<String>,
     #[serde(rename = "addonInfo")]
     pub addon_info: serde_json::Value,
     #[serde(rename = "hasImage")]
