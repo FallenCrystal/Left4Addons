@@ -24,17 +24,13 @@
 > 
 > Antigravity 并没有我想象中的那么难用, 但是就想闲暇之余蹬一下额度而已.  
 > 我只做了找bug和UI/UX反馈, 没有对其进行代码Review.  
-> 环境为 Antigravity + Gemini (3.5 Flash High & 3.1 Pro High)
-
-> [!WARNING]
-> 
-> 当前分支 `main` 落后太多且有较多问题. 在这上面冒的险还不如构建使用分支 `integrated-steam-workshop`. 但在我看来两个分支都有相当多问题, 在稳定前不建议深度使用.
-
+> 环境:  
+> - Antigravity + Gemini 3.5 Flash / 3.1 Pro (High)
+> - Codex + GPT 5.4 / 5.5 / 5.6 Terra (xHigh / High)
 ---
 
 ## 特色功能
 
-- 战役 (Campaign) Part 合并: 支持自动检测将分散的战役 Part 文件合并为一组.
 - (批量) 重命名: 自动重命名为可读名称, 避免在创意工坊 ID 列表里大海捞针
 - 快速移动: 将想要的附加组件从创意工坊内移动到 `addons` 文件夹下.   
   (但是不支持自动取消订阅)
@@ -42,6 +38,10 @@
   (不支持还未移动到 `addons` 文件夹下的组件)
 - Dummy Bypass (实验性): 通过一个空的合法 `.vpk` 文件,  
   允许在不取消订阅的情况下将附件移出创意工坊并绕过创意工坊更新检查.
+- 内置创意工坊 & 下载: 无需订阅, 无需启动游戏 一键下载并加载组件!   
+  自动解析组件依赖关系(创意工坊), 自动重试断点续传和并发下载(默认2)等.
+- 一键抓取现有 Steam 创意工坊订阅 (需要启用 Steamworks SDK)
+- 为高级用户准备的 [mirror.json](docs/mirrors-configuration.md), 修改 HTTP 请求头, 自配置CDN等..
 
 ## 局限性
 - Dummy Bypass:
@@ -52,12 +52,10 @@
     尽管创意工坊侧的 Dummy 附件不添加任何游戏内容.
 - Steamworks SDK 集成:
   - 使用 Steamworks SDK 会让 Left 4 Addons 伪造成“求生之路”游戏, 以通过 Steam 访问其创意工坊内容.
-  - Left 4 Addons 使用 Steamworks SDK 时, 启动《求生之路》会导致游戏本体不被 VAC 信任.
-  - 该项是为了避免只有 Steam 才能访问创意工坊而设计的, 具体取决于你使用的加速器.
-  - 如果你的网络环境随时能访问网页版创意工坊, 建议前往设置禁用 Steamworks SDK.
-  - 如果 Left 4 Addons 在本次启动后已经调用过一次 Steamworks SDK, 那么即使随后在设置中禁用 Steamworks SDK, Steam 侧“正在游玩 L4D2”的状态也不保证会立即消失; 某些情况下需要完全关闭 Left 4 Addons 才会解除.
-  - 如果 Steam 侧“正在游玩 L4D2”的状态是由 Left 4 Addons 拉起的, 那么从 Steam 客户端停止它会导致 Left 4 Addons 应用程序一并退出.
-  - 更完整的 SDK 搜索/下载限制与实现细节见 `docs/steamworks-sdk-details.md`.
+  - Left 4 Addons 使用 Steamworks SDK 时,  
+    启动《求生之路》会导致游戏本体不被 VAC 信任. (但不会导致 VAC 封禁)  
+    启动游戏时应先关闭 L4A.
+  - 更完整的 SDK 搜索/下载限制与实现细节见 [文档](docs/steamworks-sdk-details.md).
 
 ---
 
