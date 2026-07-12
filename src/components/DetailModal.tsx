@@ -324,14 +324,6 @@ export const DetailModal: React.FC<DetailModalProps> = ({
                 >
                   <span>{t('detailModal.webViewOfficial')}</span>
                 </a>
-                <a 
-                  href="#"
-                  onClick={(e) => handleOpenLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}
-                  className="btn btn-text"
-                  style={{ display: 'inline-flex', gap: '6px' }}
-                >
-                  <span>{t('detailModal.mirrorWebView')}</span>
-                </a>
               </>
             )}
             {!addon.workshopId && addonUrl && (

@@ -9,8 +9,7 @@ interface AddonCardProps {
   addon: Addon;
   groups: Group[];
   onToggle: (id: string, isEnabled: boolean) => void;
-  onAddToGroup: (id: string, groupId: string) => void;
-  onRemoveFromGroup: (id: string, groupId: string) => void;
+  onAddToGroup: (id: string) => void;
   onOpenLink: (url: string) => void;
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
@@ -29,7 +28,6 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   groups,
   onToggle,
   onAddToGroup,
-  onRemoveFromGroup,
   onOpenLink,
   onMoveClick,
   onRenameClick,
@@ -189,19 +187,13 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                   </button>
                 )}
                 {addon.workshopId && (
-                  <div className="dropdown">
-                    <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
-                      <ExternalLink size={14} />
-                    </button>
-                    <div className="dropdown-content">
-                      <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
-                        {t('addonCard.openInSteam')}
-                      </button>
-                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                        {t('addonCard.openInBrowser')}
-                      </button>
-                    </div>
-                  </div>
+                  <button
+                    className="btn btn-secondary btn-icon-only"
+                    onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}
+                    title={t('addonCard.openInSteam')}
+                  >
+                    <ExternalLink size={14} />
+                  </button>
                 )}
               </div>
             </>
@@ -219,52 +211,23 @@ export const AddonCard: React.FC<AddonCardProps> = ({
               </label>
 
               <div style={{ display: 'flex', gap: '6px' }}>
-                <div className="dropdown">
-                  <button className="btn btn-secondary btn-icon-only" title={t('addonCard.addOrRemoveGroup')} disabled={isSubmitting}>
-                    <FolderPlus size={14} />
-                  </button>
-                  <div className="dropdown-content">
-                    {groups.map(g => (
-                      <button
-                        key={g.id}
-                        onClick={() => onAddToGroup(addon.id, g.id)}
-                        disabled={isSubmitting || (itemGroup && itemGroup.id === g.id)}
-                      >
-                        {g.name}
-                      </button>
-                    ))}
-                    {itemGroup && (
-                      <button
-                        onClick={() => onRemoveFromGroup(addon.id, itemGroup.id)}
-                        disabled={isSubmitting}
-                        style={{ color: 'var(--md-sys-color-error)' }}
-                      >
-                        {t('addonCard.removeFromGroup', { name: itemGroup.name })}
-                      </button>
-                    )}
-                    {groups.length === 0 && !itemGroup && (
-                      <button disabled style={{ fontStyle: 'italic' }}>{t('addonCard.noGroupsTooltip')}</button>
-                    )}
-                  </div>
-                </div>
+                <button
+                  className="btn btn-secondary btn-icon-only"
+                  onClick={() => onAddToGroup(addon.id)}
+                  title={t('addonCard.addOrRemoveGroup')}
+                  disabled={isSubmitting}
+                >
+                  <FolderPlus size={14} />
+                </button>
 
                 {addon.workshopId ? (
-                  <div className="dropdown">
-                    <button className="btn btn-secondary btn-icon-only" title={t('addonCard.openLink')}>
-                      <ExternalLink size={14} />
-                    </button>
-                    <div className="dropdown-content">
-                      <button onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}>
-                        {t('addonCard.openInSteam')}
-                      </button>
-                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.com/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                        {t('addonCard.openInBrowser')}
-                      </button>
-                      <button onClick={(e) => handleLinkClick(e, `https://steamcommunity.net/sharedfiles/filedetails/?id=${addon.workshopId}`)}>
-                        {t('addonCard.openInMirror')}
-                      </button>
-                    </div>
-                  </div>
+                  <button
+                    className="btn btn-secondary btn-icon-only"
+                    onClick={(e) => handleLinkClick(e, `steam://url/CommunityFilePage/${addon.workshopId}`)}
+                    title={t('addonCard.openInSteam')}
+                  >
+                    <ExternalLink size={14} />
+                  </button>
                 ) : addonUrl ? (
                   <button
                     className="btn btn-secondary"

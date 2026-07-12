@@ -96,7 +96,6 @@ function App() {
     handleDeleteGroup,
     handleRenameGroup,
     groupActionBatch,
-    removeAddonFromGroup,
     addAddonToGroup,
     triggerRenameModal,
     handleSelectToggle,
@@ -143,6 +142,7 @@ function App() {
   const [masterCollectionModal, setMasterCollectionModal] = useState(false);
   const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [addToGroupModal, setAddToGroupModal] = useState(false);
+  const [singleAddToGroupAddonId, setSingleAddToGroupAddonId] = useState<string | null>(null);
   const [addToMcModal, setAddToMcModal] = useState(false);
   const [renameCollectionModal, setRenameCollectionModal] = useState<{ open: boolean; collectionId: string; currentName: string }>({
     open: false,
@@ -386,8 +386,10 @@ function App() {
                           addon={addonData}
                           groups={groups}
                           onToggle={toggleAddon}
-                          onAddToGroup={addAddonToGroup}
-                          onRemoveFromGroup={removeAddonFromGroup}
+                          onAddToGroup={(addonId) => {
+                            setSingleAddToGroupAddonId(addonId);
+                            setAddToGroupModal(true);
+                          }}
                           onOpenLink={handleOpenLink}
                           onMoveClick={handleMoveClick}
                           onRenameClick={triggerRenameModal}
@@ -594,10 +596,18 @@ function App() {
         open={addToGroupModal}
         groups={groups}
         isSubmitting={isSubmitting}
-        onCancel={() => setAddToGroupModal(false)}
-        onConfirm={async (groupId) => {
-          await handleBatchAddToGroup(groupId);
+        onCancel={() => {
           setAddToGroupModal(false);
+          setSingleAddToGroupAddonId(null);
+        }}
+        onConfirm={async (groupId) => {
+          if (singleAddToGroupAddonId) {
+            await addAddonToGroup(singleAddToGroupAddonId, groupId);
+          } else {
+            await handleBatchAddToGroup(groupId);
+          }
+          setAddToGroupModal(false);
+          setSingleAddToGroupAddonId(null);
         }}
       />
 

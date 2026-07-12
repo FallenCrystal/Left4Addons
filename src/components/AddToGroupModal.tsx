@@ -102,7 +102,15 @@ export const AddToGroupModal: React.FC<AddToGroupModalProps> = ({
                     disabled={isSubmitting}
                   >
                     <FolderPlus size={16} style={{ color: isSelected ? 'var(--md-sys-color-primary)' : 'var(--md-sys-color-outline)', flexShrink: 0 }} />
-                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    <span style={{
+                      flex: 1,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      fontFamily: "'Outfit', system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif",
+                      fontWeight: 600,
+                      fontSize: '13.5px'
+                    }}>
                       {group.name}
                     </span>
                     <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)' }}>
