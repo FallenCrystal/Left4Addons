@@ -1,37 +1,12 @@
+use md5::{Digest, Md5};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use serde::{Serialize, Deserialize};
-use md5::{Md5, Digest};
 
-#[derive(Debug, Clone)]
-pub struct VpkEntry {
-    pub crc: u32,
-    pub preload_bytes: u16,
-    pub archive_index: u16,
-    pub entry_offset: u32,
-    pub entry_length: u32,
-    pub preload_data: Vec<u8>,
-    pub header_size: u32,
-    pub tree_size: u32,
-}
+use super::types::{AddonMetadata, VpkEntry, VpkFileToWrite};
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
-pub struct AddonMetadata {
-    #[serde(rename = "addonInfo")]
-    pub addon_info: serde_json::Value,
-    #[serde(rename = "hasImage")]
-    pub has_image: bool,
-    #[serde(rename = "imagePath")]
-    pub image_path: Option<String>,
-    #[serde(rename = "filesCount")]
-    pub files_count: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-fn read_string(buf: &[u8], offset: &mut usize) -> String {
+pub(crate) fn read_string(buf: &[u8], offset: &mut usize) -> String {
     let start = *offset;
     while *offset < buf.len() && buf[*offset] != 0 {
         *offset += 1;
@@ -41,10 +16,13 @@ fn read_string(buf: &[u8], offset: &mut usize) -> String {
     s
 }
 
-pub fn parse_vpk<P: AsRef<Path>>(file_path: P) -> Result<(HashMap<String, VpkEntry>, File), String> {
+pub fn parse_vpk<P: AsRef<Path>>(
+    file_path: P,
+) -> Result<(HashMap<String, VpkEntry>, File), String> {
     let mut file = File::open(&file_path).map_err(|e| e.to_string())?;
     let mut header_buf = vec![0; 28];
-    file.read_exact(&mut header_buf).map_err(|e| e.to_string())?;
+    file.read_exact(&mut header_buf)
+        .map_err(|e| e.to_string())?;
 
     let signature = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
     if signature != 0x55aa1234 {
@@ -65,7 +43,8 @@ pub fn parse_vpk<P: AsRef<Path>>(file_path: P) -> Result<(HashMap<String, VpkEnt
         return Err(format!("Unsupported VPK version: {}", version));
     }
 
-    file.seek(SeekFrom::Start(header_size as u64)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(header_size as u64))
+        .map_err(|e| e.to_string())?;
     let mut tree_buf = vec![0; tree_size as usize];
     file.read_exact(&mut tree_buf).map_err(|e| e.to_string())?;
 
@@ -105,11 +84,10 @@ pub fn parse_vpk<P: AsRef<Path>>(file_path: P) -> Result<(HashMap<String, VpkEnt
                 let _terminator = u16::from_le_bytes(entry_slice[16..18].try_into().unwrap());
 
                 let mut preload_data = Vec::new();
-                if preload_bytes > 0 {
-                    if offset + preload_bytes as usize <= tree_buf.len() {
-                        preload_data.extend_from_slice(&tree_buf[offset..offset + preload_bytes as usize]);
-                        offset += preload_bytes as usize;
-                    }
+                if preload_bytes > 0 && offset + preload_bytes as usize <= tree_buf.len() {
+                    preload_data
+                        .extend_from_slice(&tree_buf[offset..offset + preload_bytes as usize]);
+                    offset += preload_bytes as usize;
                 }
 
                 let norm_path = path_str.trim();
@@ -142,7 +120,8 @@ pub fn parse_vpk<P: AsRef<Path>>(file_path: P) -> Result<(HashMap<String, VpkEnt
 pub fn get_file_content(file: &mut File, entry: &VpkEntry) -> std::io::Result<Vec<u8>> {
     let mut data = entry.preload_data.clone();
     if entry.entry_length > 0 {
-        let file_offset = entry.header_size as u64 + entry.tree_size as u64 + entry.entry_offset as u64;
+        let file_offset =
+            entry.header_size as u64 + entry.tree_size as u64 + entry.entry_offset as u64;
         file.seek(SeekFrom::Start(file_offset))?;
         let mut file_buf = vec![0; entry.entry_length as usize];
         file.read_exact(&mut file_buf)?;
@@ -158,7 +137,7 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
         let mut chars = line.chars().peekable();
         let mut in_quote = false;
         let mut escaped = false;
-        
+
         while let Some(c) = chars.next() {
             if escaped {
                 clean_line.push(c);
@@ -203,7 +182,7 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
             let mut s = String::new();
             s.push(chars.next().unwrap());
             let mut escaped = false;
-            while let Some(nc) = chars.next() {
+            for nc in chars.by_ref() {
                 s.push(nc);
                 if escaped {
                     escaped = false;
@@ -238,7 +217,7 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
     }
 
     let mut index = 0;
-    
+
     fn parse_object(tokens: &[String], index: &mut usize) -> HashMap<String, serde_json::Value> {
         let mut obj = HashMap::new();
         while *index < tokens.len() {
@@ -251,14 +230,14 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
                 *index += 1;
                 continue;
             }
-            
+
             let key = clean_token(tok).to_lowercase();
             *index += 1;
-            
+
             if *index >= tokens.len() {
                 break;
             }
-            
+
             let next_tok = &tokens[*index];
             if next_tok == "{" {
                 *index += 1;
@@ -279,10 +258,12 @@ pub fn parse_key_values(text: &str) -> serde_json::Value {
         let tok = &tokens[index];
         index += 1;
         if tok == "{" {
-            return serde_json::to_value(parse_object(&tokens, &mut index)).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            return serde_json::to_value(parse_object(&tokens, &mut index))
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         } else if index < tokens.len() && tokens[index] == "{" {
             index += 1;
-            return serde_json::to_value(parse_object(&tokens, &mut index)).unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            return serde_json::to_value(parse_object(&tokens, &mut index))
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         }
     }
 
@@ -294,7 +275,7 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     cache_dir: Q,
 ) -> AddonMetadata {
     let mut result = AddonMetadata::default();
-    
+
     let (files, mut file) = match parse_vpk(&vpk_path) {
         Ok(val) => val,
         Err(err) => {
@@ -306,29 +287,51 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     result.files_count = files.len();
 
     // Find addoninfo.txt
+    let mut addoninfo_content = String::new();
     let addoninfo_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addoninfo.txt" || lower.ends_with("/addoninfo.txt") || lower.ends_with("\\addoninfo.txt")
+        lower == "addoninfo.txt"
+            || lower.ends_with("/addoninfo.txt")
+            || lower.ends_with("\\addoninfo.txt")
     });
     if let Some(key) = addoninfo_key {
         if let Some(entry) = files.get(key) {
             if let Ok(content_bytes) = get_file_content(&mut file, entry) {
                 let text = String::from_utf8_lossy(&content_bytes);
                 result.addon_info = parse_key_values(&text);
+                addoninfo_content = text.to_string();
             }
         }
     }
 
+    // Fast hash based on addoninfo and directory structure
+    let mut hasher = Md5::new();
+    hasher.update(addoninfo_content.as_bytes());
+    let mut paths: Vec<&String> = files.keys().collect();
+    paths.sort();
+    for p in paths {
+        hasher.update(p.as_bytes());
+    }
+    result.hash = format!("{:x}", hasher.finalize());
+
     // Find addonimage.jpg or addonimage.vtf
     let addonimage_jpg_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addonimage.jpg" || lower.ends_with("/addonimage.jpg") || lower.ends_with("\\addonimage.jpg") ||
-        lower == "addonimage.jpeg" || lower.ends_with("/addonimage.jpeg") || lower.ends_with("\\addonimage.jpeg") ||
-        lower == "addonimage.png" || lower.ends_with("/addonimage.png") || lower.ends_with("\\addonimage.png")
+        lower == "addonimage.jpg"
+            || lower.ends_with("/addonimage.jpg")
+            || lower.ends_with("\\addonimage.jpg")
+            || lower == "addonimage.jpeg"
+            || lower.ends_with("/addonimage.jpeg")
+            || lower.ends_with("\\addonimage.jpeg")
+            || lower == "addonimage.png"
+            || lower.ends_with("/addonimage.png")
+            || lower.ends_with("\\addonimage.png")
     });
     let addonimage_vtf_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addonimage.vtf" || lower.ends_with("/addonimage.vtf") || lower.ends_with("\\addonimage.vtf")
+        lower == "addonimage.vtf"
+            || lower.ends_with("/addonimage.vtf")
+            || lower.ends_with("\\addonimage.vtf")
     });
 
     let vpk_name = vpk_path
@@ -336,14 +339,12 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    let clean_vpk_name = vpk_name
-        .replace(".disabled", "")
-        .replace(".vpk", "");
-    
+    let clean_vpk_name = vpk_name.replace(".disabled", "").replace(".vpk", "");
+
     let mut hasher = Md5::new();
     hasher.update(clean_vpk_name.as_bytes());
     let hash_result = hasher.finalize();
-    
+
     let cache_filename = format!("{:x}_image.jpg", hash_result);
     let full_cache_path = cache_dir.as_ref().join(&cache_filename);
     let mut image_saved = false;
@@ -376,7 +377,10 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
                     // Try to decode VTF to JPG
                     if let Ok(vtf) = vtf::from_bytes(&vtf_bytes) {
                         if let Ok(decoded) = vtf.highres_image.decode(0) {
-                            if decoded.save_with_format(&full_cache_path, image::ImageFormat::Jpeg).is_ok() {
+                            if decoded
+                                .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                .is_ok()
+                            {
                                 result.has_image = true;
                                 result.image_path = Some(format!("/cache/{}", cache_filename));
                             }
@@ -388,14 +392,6 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     }
 
     result
-}
-
-#[derive(Debug, Clone)]
-pub struct VpkFileToWrite {
-    pub ext: String,
-    pub path: String,
-    pub filename: String,
-    pub content: Vec<u8>,
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
@@ -419,7 +415,8 @@ pub fn write_vpk<P: AsRef<Path>>(file_path: P, files: &[VpkFileToWrite]) -> Resu
 
     let mut ext_map: HashMap<String, HashMap<String, Vec<&VpkFileToWrite>>> = HashMap::new();
     for f in files {
-        ext_map.entry(f.ext.clone())
+        ext_map
+            .entry(f.ext.clone())
             .or_default()
             .entry(f.path.clone())
             .or_default()
@@ -434,27 +431,31 @@ pub fn write_vpk<P: AsRef<Path>>(file_path: P, files: &[VpkFileToWrite]) -> Resu
         let ext_str = if ext.is_empty() { " " } else { ext };
         tree_buf.extend_from_slice(ext_str.as_bytes());
         tree_buf.push(0);
-        
+
         for (path, file_list) in paths {
             let path_str = if path.is_empty() { " " } else { path };
             tree_buf.extend_from_slice(path_str.as_bytes());
             tree_buf.push(0);
-            
+
             for f in file_list {
-                let filename_str = if f.filename.is_empty() { " " } else { &f.filename };
+                let filename_str = if f.filename.is_empty() {
+                    " "
+                } else {
+                    &f.filename
+                };
                 tree_buf.extend_from_slice(filename_str.as_bytes());
                 tree_buf.push(0);
-                
+
                 let crc_val = crc32(&f.content);
                 let entry_length = f.content.len() as u32;
-                
+
                 tree_buf.extend_from_slice(&crc_val.to_le_bytes());
                 tree_buf.extend_from_slice(&0u16.to_le_bytes());
                 tree_buf.extend_from_slice(&0x7fffu16.to_le_bytes());
                 tree_buf.extend_from_slice(&data_offset.to_le_bytes());
                 tree_buf.extend_from_slice(&entry_length.to_le_bytes());
                 tree_buf.extend_from_slice(&0xffffu16.to_le_bytes());
-                
+
                 data_offset += entry_length;
                 files_to_write_data.push(&f.content);
             }
@@ -466,9 +467,12 @@ pub fn write_vpk<P: AsRef<Path>>(file_path: P, files: &[VpkFileToWrite]) -> Resu
 
     let tree_size = tree_buf.len() as u32;
 
-    file.write_all(&0x55aa1234u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    file.write_all(&1u32.to_le_bytes()).map_err(|e| e.to_string())?;
-    file.write_all(&tree_size.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&0x55aa1234u32.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&1u32.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&tree_size.to_le_bytes())
+        .map_err(|e| e.to_string())?;
 
     file.write_all(&tree_buf).map_err(|e| e.to_string())?;
 
@@ -487,12 +491,15 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
 
     let addoninfo_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addoninfo.txt" || lower.ends_with("/addoninfo.txt") || lower.ends_with("\\addoninfo.txt")
+        lower == "addoninfo.txt"
+            || lower.ends_with("/addoninfo.txt")
+            || lower.ends_with("\\addoninfo.txt")
     });
 
     let mut steam_app_id = "550".to_string();
     let mut addon_version = "1.0".to_string();
-    let mut addon_title = original_vpk_path.as_ref()
+    let mut addon_title = original_vpk_path
+        .as_ref()
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
@@ -528,7 +535,9 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
     // Find and extract addonimage.jpg
     let addonimage_jpg_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addonimage.jpg" || lower.ends_with("/addonimage.jpg") || lower.ends_with("\\addonimage.jpg")
+        lower == "addonimage.jpg"
+            || lower.ends_with("/addonimage.jpg")
+            || lower.ends_with("\\addonimage.jpg")
     });
     if let Some(key) = addonimage_jpg_key {
         if let Some(entry) = files.get(key) {
@@ -546,7 +555,9 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
     // Find and extract addonimage.vtf
     let addonimage_vtf_key = files.keys().find(|k| {
         let lower = k.to_lowercase();
-        lower == "addonimage.vtf" || lower.ends_with("/addonimage.vtf") || lower.ends_with("\\addonimage.vtf")
+        lower == "addonimage.vtf"
+            || lower.ends_with("/addonimage.vtf")
+            || lower.ends_with("\\addonimage.vtf")
     });
     if let Some(key) = addonimage_vtf_key {
         if let Some(entry) = files.get(key) {
@@ -568,6 +579,7 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
     "addonversion" "{}"
     "addontitle" "{} (L4A Dummy)"
     "addonDescription" "A dummy addon generated by Left 4 Addons"
+    "l4aDummy" "1"
 }}
 "#,
         steam_app_id, addon_version, addon_title
@@ -584,131 +596,3 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn test_read_string() {
-        let buf = b"hello\0world\0";
-        let mut offset = 0;
-        let s1 = read_string(buf, &mut offset);
-        assert_eq!(s1, "hello");
-        assert_eq!(offset, 6);
-
-        let s2 = read_string(buf, &mut offset);
-        assert_eq!(s2, "world");
-        assert_eq!(offset, 12);
-    }
-
-    #[test]
-    fn test_parse_key_values_simple() {
-        let kv = r#"
-            "AddonInfo"
-            {
-                "addonTitle" "Test Addon"
-                "addonVersion" "1.0"
-                "addonAuthor" "Test Author"
-            }
-        "#;
-        let parsed = parse_key_values(kv);
-        assert!(parsed.is_object());
-        let obj = parsed.as_object().unwrap();
-        
-        assert_eq!(obj.get("addontitle").unwrap().as_str().unwrap(), "Test Addon");
-        assert_eq!(obj.get("addonversion").unwrap().as_str().unwrap(), "1.0");
-        assert_eq!(obj.get("addonauthor").unwrap().as_str().unwrap(), "Test Author");
-    }
-
-    #[test]
-    fn test_parse_key_values_nested() {
-        let kv = r#"
-            "AddonInfo"
-            {
-                "addonTitle" "Nested Addon"
-                "addonContent_Campaign" "1"
-                "NestedObject"
-                {
-                    "Key1" "Value1"
-                }
-            }
-        "#;
-        let parsed = parse_key_values(kv);
-        assert!(parsed.is_object());
-        let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("addontitle").unwrap().as_str().unwrap(), "Nested Addon");
-        assert_eq!(obj.get("addoncontent_campaign").unwrap().as_str().unwrap(), "1");
-        
-        let nested = obj.get("nestedobject").unwrap().as_object().unwrap();
-        assert_eq!(nested.get("key1").unwrap().as_str().unwrap(), "Value1");
-    }
-
-    #[test]
-    fn test_parse_key_values_comments() {
-        let kv = r#"
-            // This is a comment
-            "AddonInfo"
-            {
-                "addonTitle" "Commented Addon" // inline comment
-                "addonVersion" "2.0"
-            }
-        "#;
-        let parsed = parse_key_values(kv);
-        assert!(parsed.is_object());
-        let obj = parsed.as_object().unwrap();
-        assert_eq!(obj.get("addontitle").unwrap().as_str().unwrap(), "Commented Addon");
-        assert_eq!(obj.get("addonversion").unwrap().as_str().unwrap(), "2.0");
-    }
-
-    #[test]
-    fn test_extract_addon_metadata_mock_vpk() {
-        let temp_dir = PathBuf::from("../target/test_temp_dir");
-        if !temp_dir.exists() {
-            let _ = std::fs::create_dir_all(&temp_dir);
-        }
-        
-        let vpk_path = temp_dir.join("mock_addon.vpk");
-        let temp_cache_dir = temp_dir.join("cache");
-        
-        {
-            use std::io::Write;
-            let mut file = File::create(&vpk_path).unwrap();
-            let content = b"\"addoninfo\"\n{\n\"addontitle\" \"Mock Addon\"\n}";
-            
-            let mut tree = Vec::new();
-            tree.extend_from_slice(b"txt\0");
-            tree.extend_from_slice(b"my_folder\0");
-            tree.extend_from_slice(b"addoninfo\0");
-            tree.extend_from_slice(&0u32.to_le_bytes());
-            tree.extend_from_slice(&0u16.to_le_bytes());
-            tree.extend_from_slice(&0x7fffu16.to_le_bytes());
-            tree.extend_from_slice(&0u32.to_le_bytes());
-            tree.extend_from_slice(&(content.len() as u32).to_le_bytes());
-            tree.extend_from_slice(&0xffffu16.to_le_bytes());
-            
-            tree.extend_from_slice(b"\0");
-            tree.extend_from_slice(b"\0");
-            tree.extend_from_slice(b"\0");
-            
-            let tree_size = tree.len() as u32;
-            
-            file.write_all(&0x55aa1234u32.to_le_bytes()).unwrap();
-            file.write_all(&1u32.to_le_bytes()).unwrap();
-            file.write_all(&tree_size.to_le_bytes()).unwrap();
-            file.write_all(&tree).unwrap();
-            file.write_all(content).unwrap();
-        }
-
-        let metadata = extract_addon_metadata(&vpk_path, &temp_cache_dir);
-        assert!(metadata.error.is_none());
-        assert_eq!(metadata.files_count, 1);
-        
-        let addon_title = metadata.addon_info.get("addontitle").and_then(|t| t.as_str());
-        assert_eq!(addon_title, Some("Mock Addon"));
-        
-        let _ = std::fs::remove_dir_all(&temp_dir);
-    }
-}
-

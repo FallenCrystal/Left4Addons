@@ -23,6 +23,7 @@ WebView2Loader.dll
 
 # Rust/Tauri Target
 src-tauri/target/
+steam-bridge/target/
 
 # Editor directories and files
 .vscode/*
@@ -34,3 +35,10 @@ src-tauri/target/
 *.njsproj
 *.sln
 *.sw?
+
+# Left4Addons specific ignores
+.playwright-mcp
+known_addons.json
+/l4a
+package-lock.json
+

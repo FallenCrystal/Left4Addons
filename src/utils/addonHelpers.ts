@@ -23,6 +23,18 @@ export function getAddonInfoValue(addon: Addon, key: string): any {
   return foundKey ? info[foundKey as keyof typeof info] : undefined;
 }
 
+export function isPlaceholderAuthorName(value: unknown, identities: string[] = []): boolean {
+  const name = typeof value === 'string' ? value.trim() : '';
+  if (!name) return true;
+
+  const normalized = name.toLowerCase();
+  if (/^\d+$/.test(name) || normalized === 'author_name' || normalized === '[unknown]') {
+    return true;
+  }
+
+  return identities.some((identity) => normalized === String(identity || '').trim().toLowerCase());
+}
+
 // Category mappings from keys
 export function getAddonCategories(addon: Addon): string[] {
   const categories = new Set<string>();
@@ -81,11 +93,29 @@ export function getAddonCategories(addon: Addon): string[] {
       if (tag.includes('ui') || tag.includes('hud') || tag.includes('icon')) categories.add('UI/Textures');
     });
   }
+
+  const cachedTags = [
+    ...(addon.workshopDetails?.tags || []),
+    ...(addon.workshopDetails?.pageTags || []).map(t => t.name),
+  ];
+  cachedTags.forEach((tagStr) => {
+    if (typeof tagStr !== 'string' || !tagStr) return;
+    const tag = tagStr.toLowerCase();
+    if (tag.includes('campaign') || tag.includes('map')) categories.add('Campaign');
+    if (tag.includes('survivor') || tag.includes('character')) categories.add('Survivor');
+    if (tag.includes('weapon') || tag.includes('melee') || tag.includes('gun')) categories.add('Weapon Model');
+    if (tag.includes('skin') || tag.includes('texture') || tag.includes('material')) categories.add('Skin');
+    if (tag.includes('script') || tag.includes('mod')) categories.add('Script');
+    if (tag.includes('sound') || tag.includes('music') || tag.includes('voice')) categories.add('Sound/Music');
+    if (tag.includes('infected') || tag.includes('monster')) categories.add('Infected');
+    if (tag.includes('ui') || tag.includes('hud') || tag.includes('icon')) categories.add('UI/Textures');
+  });
   
-  if (categories.size === 0) {
+  // Don't show "Other" for uninstalled items with no metadata
+  if (categories.size === 0 && addon.dirType !== 'none') {
     categories.add('Other');
   }
-  
+
   return Array.from(categories);
 }
 
@@ -93,14 +123,6 @@ export const getImageUrl = (path?: string): string => {
   if (!path) return '';
   if (path.startsWith('http://') || path.startsWith('https://')) {
     return path;
-  }
-  if (path.startsWith('/cache/')) {
-    const filename = path.slice(7);
-    const isApple = navigator.userAgent.includes('Mac OS X') || navigator.userAgent.includes('iPhone') || navigator.userAgent.includes('iPad');
-    if (!isApple) {
-      return `http://cache.localhost/${filename}`;
-    }
-    return `cache://localhost/${filename}`;
   }
   return path;
 };
@@ -123,17 +145,38 @@ export const getAddonUrl = (addon: Addon): string | null => {
 export const getAddonAuthor = (addon: Addon): string => {
   if (!addon) return 'Unknown Author';
   const author = getAddonInfoValue(addon, 'addonauthor') || getAddonInfoValue(addon, 'author');
-  if (author && typeof author === 'string' && author.trim()) {
+  if (typeof author === 'string' && !isPlaceholderAuthorName(author)) {
     return author.trim();
   }
-  if (addon.steamDetails?.creator_name) {
-    return addon.steamDetails.creator_name;
+  const workshopAuthor = addon.workshopDetails?.creatorName || addon.workshopDetails?.authorName;
+  if (typeof workshopAuthor === 'string' && !isPlaceholderAuthorName(workshopAuthor)) {
+    return workshopAuthor.trim();
   }
-  if (addon.steamDetails?.creator && addon.steamDetails.creator !== '0') {
-    return addon.steamDetails.creator;
+  const steamAuthor = addon.steamDetails?.creator_name;
+  if (typeof steamAuthor === 'string' && !isPlaceholderAuthorName(steamAuthor)) {
+    return steamAuthor;
+  }
+  const steamCreator = addon.steamDetails?.creator;
+  if (typeof steamCreator === 'string' && !isPlaceholderAuthorName(steamCreator)) {
+    return steamCreator;
   }
   return 'Unknown Author';
 };
+
+export function sortAddonsDownloadedFirst(addons: Addon[]): Addon[] {
+  const installed: Addon[] = [];
+  const uninstalled: Addon[] = [];
+
+  addons.forEach((addon) => {
+    if (addon.dirType === 'none') {
+      uninstalled.push(addon);
+    } else {
+      installed.push(addon);
+    }
+  });
+
+  return [...installed, ...uninstalled];
+}
 
 /**
  * Helper to suggest a unique VPK name for an addon, avoiding name conflicts.
@@ -183,7 +226,7 @@ export function getSuggestedVpkName(
   let counter = 1;
   let finalName = baseSuggestedName;
   while (
-    Object.keys(addons).some(key => key.toLowerCase() === finalName.toLowerCase() && key !== addon.vpkName)
+    Object.keys(addons).some(key => key.toLowerCase() === finalName.toLowerCase() && key !== addon.id)
   ) {
     const dotIndex = baseSuggestedName.lastIndexOf('.vpk');
     const nameWithoutExt = baseSuggestedName.slice(0, dotIndex);
@@ -193,4 +236,3 @@ export function getSuggestedVpkName(
 
   return finalName;
 }
-

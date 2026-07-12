@@ -6,6 +6,7 @@ import {
   getAddonUrl,
   getAddonAuthor,
   getSuggestedVpkName,
+  sortAddonsDownloadedFirst,
 } from './addonHelpers';
 import { Addon } from '../types/addon';
 
@@ -26,7 +27,7 @@ describe('addonHelpers', () => {
   describe('getAddonCategories', () => {
     test('should return Campaign when addonContent_Campaign is 1', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -40,7 +41,7 @@ describe('addonHelpers', () => {
 
     test('should match category keys case-insensitively', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -48,7 +49,7 @@ describe('addonHelpers', () => {
         addonInfo: {
           addoncontent_campaign: '1',
           ADDONCONTENT_SURVIVOR: '1',
-        },
+        } as any,
       };
       const cats = getAddonCategories(addon);
       expect(cats).toContain('Campaign');
@@ -57,7 +58,7 @@ describe('addonHelpers', () => {
 
     test('should ignore keys with value 0', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -76,7 +77,7 @@ describe('addonHelpers', () => {
 
     test('should fall back to Other when no categories are present', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -88,7 +89,7 @@ describe('addonHelpers', () => {
 
     test('should extract categories from steam details tags', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -113,17 +114,17 @@ describe('addonHelpers', () => {
       expect(getImageUrl('http://example.com/test.jpg')).toBe('http://example.com/test.jpg');
     });
 
-    test('should convert cache path to localhost cache url', () => {
+    test('should return cache path unchanged for IPC image loading', () => {
       const cachePath = '/cache/abc_image.jpg';
       const result = getImageUrl(cachePath);
-      expect(result).toSatisfy((val: string) => val.includes('localhost/abc_image.jpg'));
+      expect(result).toBe(cachePath);
     });
   });
 
   describe('getAddonUrl', () => {
     test('should return correct URL when available', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -137,7 +138,7 @@ describe('addonHelpers', () => {
 
     test('should prepend https to url if it has domain structure', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -151,7 +152,7 @@ describe('addonHelpers', () => {
 
     test('should return null when URL is invalid or empty', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -167,7 +168,7 @@ describe('addonHelpers', () => {
   describe('getAddonAuthor', () => {
     test('should return addonAuthor if present in addonInfo', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -181,7 +182,7 @@ describe('addonHelpers', () => {
 
     test('should return steamDetails creator_name if addonInfo has no author', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -193,9 +194,23 @@ describe('addonHelpers', () => {
       expect(getAddonAuthor(addon)).toBe('Creator Name');
     });
 
+    test('skips AUTHOR_NAME from addoninfo and falls back to workshop metadata', () => {
+      const addon: Addon = {
+        id: 'test.vpk', vpkName: 'test.vpk',
+        dirType: 'loading',
+        isEnabled: true,
+        fileSize: 100,
+        filesCount: 1,
+        addonInfo: { addonAuthor: 'AUTHOR_NAME' },
+        steamDetails: { creator_name: 'Actual Creator' },
+      };
+
+      expect(getAddonAuthor(addon)).toBe('Actual Creator');
+    });
+
     test('should return Unknown Author if no author info is present', () => {
       const addon: Addon = {
-        vpkName: 'test.vpk',
+        id: 'test.vpk', vpkName: 'test.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -208,7 +223,7 @@ describe('addonHelpers', () => {
   describe('getSuggestedVpkName', () => {
     test('should strip brackets and suggest clean vpk name for non-workshop item', () => {
       const addon: Addon = {
-        vpkName: '[OldGroup]my_addon.vpk',
+        id: '[OldGroup]my_addon.vpk', vpkName: '[OldGroup]my_addon.vpk',
         dirType: 'loading',
         isEnabled: true,
         fileSize: 100,
@@ -220,7 +235,7 @@ describe('addonHelpers', () => {
 
     test('should suggest name with workshopId prefix for workshop items', () => {
       const addon: Addon = {
-        vpkName: '2938529557.vpk',
+        id: '2938529557.vpk', vpkName: '2938529557.vpk',
         dirType: 'workshop',
         isEnabled: true,
         fileSize: 100,
@@ -236,7 +251,7 @@ describe('addonHelpers', () => {
 
     test('should avoid name conflicts by appending a counter', () => {
       const addon: Addon = {
-        vpkName: 'temp.vpk',
+        id: 'temp.vpk', vpkName: 'temp.vpk',
         dirType: 'workshop',
         isEnabled: true,
         fileSize: 100,
@@ -248,7 +263,7 @@ describe('addonHelpers', () => {
       };
       const existing: Record<string, Addon> = {
         '[123]Cool Map.vpk': {
-          vpkName: '[123]Cool Map.vpk',
+          id: '[123]Cool Map.vpk', vpkName: '[123]Cool Map.vpk',
           dirType: 'loading',
           isEnabled: true,
           fileSize: 100,
@@ -257,6 +272,52 @@ describe('addonHelpers', () => {
       };
       const suggested = getSuggestedVpkName(addon, undefined, existing);
       expect(suggested).toBe('[123]Cool Map_1.vpk');
+    });
+  });
+
+  describe('sortAddonsDownloadedFirst', () => {
+    test('should move downloaded addons ahead of uninstalled ones while preserving relative order', () => {
+      const addons: Addon[] = [
+        {
+          id: 'missing-1',
+          vpkName: 'missing-1.vpk',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+        {
+          id: 'installed-1',
+          vpkName: 'installed-1.vpk',
+          dirType: 'loading',
+          isEnabled: true,
+          fileSize: 1,
+          filesCount: 1,
+        },
+        {
+          id: 'installed-2',
+          vpkName: 'installed-2.vpk',
+          dirType: 'workshop',
+          isEnabled: true,
+          fileSize: 1,
+          filesCount: 1,
+        },
+        {
+          id: 'missing-2',
+          vpkName: 'missing-2.vpk',
+          dirType: 'none',
+          isEnabled: false,
+          fileSize: 0,
+          filesCount: 0,
+        },
+      ];
+
+      expect(sortAddonsDownloadedFirst(addons).map((addon) => addon.id)).toEqual([
+        'installed-1',
+        'installed-2',
+        'missing-1',
+        'missing-2',
+      ]);
     });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, test, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { GroupHeader } from './GroupHeader';
-import { Group } from '../types/addon';
+import { Addon, Group } from '../types/addon';
 
 describe('GroupHeader', () => {
   const mockGroup: Group = {
@@ -9,6 +9,17 @@ describe('GroupHeader', () => {
     name: 'Campaign Maps',
     addons: ['addon1.vpk', 'addon2.vpk'],
   };
+
+  const mockAddons: Addon[] = [
+    {
+      id: 'addon1.vpk', vpkName: 'addon1.vpk',
+      dirType: 'loading', isEnabled: true, fileSize: 100, filesCount: 1,
+    },
+    {
+      id: 'addon2.vpk', vpkName: 'addon2.vpk',
+      dirType: 'workshop', isEnabled: false, fileSize: 200, filesCount: 2,
+    },
+  ];
 
   test('renders group details and handles actions', () => {
     const onRenameGroup = vi.fn();
@@ -18,6 +29,7 @@ describe('GroupHeader', () => {
     render(
       <GroupHeader
         currentGroup={mockGroup}
+        groupAddons={mockAddons}
         onRenameGroup={onRenameGroup}
         onDeleteGroup={onDeleteGroup}
         onGroupActionBatch={onGroupActionBatch}

@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "tauri:build:win-gnu": "npm run build && cargo build --release --target x86_64-pc-windows-gnu --manifest-path src-tauri/Cargo.toml",
     "lint": "oxlint",
     "preview": "vite preview",
     "tauri:dev": "tauri dev",
@@ -28,6 +29,7 @@
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
+    "esbuild": "^0.28.1",
     "jsdom": "^29.1.1",
     "oxlint": "^1.71.0",
     "typescript": "^6.0.3",

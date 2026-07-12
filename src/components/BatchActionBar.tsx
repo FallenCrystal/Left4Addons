@@ -1,120 +1,245 @@
-import { CheckSquare, Unlock, Lock, FolderOpen, Edit3, FolderPlus, X } from 'lucide-react';
-import { Addon, Group } from '../types/addon';
+import { CheckSquare, Square, Unlock, Lock, FolderOpen, Edit3, FolderPlus, Library, X, Download, HardDrive, Globe, Trash2 } from 'lucide-react';
+import { Addon, Group, MasterCollection } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 
 interface BatchActionBarProps {
-  selectedVpkNames: string[];
+  selectedIds: string[];
   filteredItems: Addon[];
   addons: Record<string, Addon>;
+  knownUninstalledAddons?: Record<string, Addon>;
   groups: Group[];
+  masterCollections?: MasterCollection[];
+  selectedGroupIds?: string[];
   onSelectAll: (visibleItems: Addon[]) => void;
+  onSelectAllGroups?: (groups: Group[]) => void;
   onBatchToggle: (enabled: boolean) => void;
   onBatchMove: () => void;
   onBatchRename: () => void;
-  onBatchAddToGroup: (groupId: string) => void;
+  onBatchAddToGroup: () => void;
+  onBatchAddToMasterCollection?: () => void;
+  onBatchDownload?: (ids: string[]) => void;
+  onBatchDelete?: (ids: string[]) => void;
   onClearSelection: () => void;
+  isSubmitting?: boolean;
 }
 
 export function BatchActionBar({
-  selectedVpkNames,
+  selectedIds,
   filteredItems,
   addons,
+  knownUninstalledAddons = {},
   groups,
+  masterCollections = [],
+  selectedGroupIds = [],
   onSelectAll,
+  onSelectAllGroups,
   onBatchToggle,
   onBatchMove,
   onBatchRename,
   onBatchAddToGroup,
+  onBatchAddToMasterCollection,
+  onBatchDownload,
+  onBatchDelete,
   onClearSelection,
+  isSubmitting = false,
 }: BatchActionBarProps) {
   const { t } = useTranslation();
-  const isAllSelected = filteredItems.every(item => selectedVpkNames.includes(item.vpkName));
-  const hasWorkshopSelected = selectedVpkNames.some(name => addons[name]?.dirType === 'workshop');
+
+  // Determine what's selected
+  const hasAddonSelection = selectedIds.length > 0;
+  const hasGroupSelection = selectedGroupIds.length > 0;
+  const totalSelected = selectedIds.length + selectedGroupIds.length;
+
+  const selectedAddons = selectedIds
+    .map((id) => addons[id] || knownUninstalledAddons[id])
+    .filter((addon): addon is Addon => Boolean(addon));
+
+  // If any uninstalled addon is selected, certain actions shouldn't be available
+  const allInstalled = selectedAddons.every((addon) => addon.dirType !== 'none');
+  
+  const canBatchEnable = allInstalled && selectedAddons.some((addon) => !addon.isEnabled);
+  const canBatchDisable = allInstalled && selectedAddons.some((addon) => addon.isEnabled);
+  const canBatchMove = allInstalled && selectedAddons.some((addon) => addon.dirType === 'workshop');
+  const canBatchRename = allInstalled && selectedAddons.length > 0;
+  const canBatchDelete = allInstalled && selectedAddons.length > 0;
+  
+  const uninstalledIds = selectedAddons.filter(a => a.dirType === 'none').map(a => a.id);
+  const installedIds = selectedAddons.filter(a => a.dirType !== 'none').map(a => a.id);
+  const canBatchDownload = uninstalledIds.length > 0;
+
+  // Check if we're in master collection view (only groups selected)
+  const isGroupOnlySelection = hasGroupSelection && !hasAddonSelection;
+
+  const hasDownloaded = filteredItems.some((item) => item.dirType !== 'none');
+  const hasUndownloaded = filteredItems.some((item) => item.dirType === 'none');
+  const showSelectiveSelection = selectedIds.length === 0 && hasDownloaded && hasUndownloaded;
 
   return (
     <div className="batch-action-bar">
       <div className="batch-action-info">
-        {t('batchActionBar.selectedCount', { count: selectedVpkNames.length })}
+        {totalSelected === 0 ? t('batchActionBar.noneSelected') : t('batchActionBar.selectedCount', { count: totalSelected })}
       </div>
       <div className="batch-action-buttons">
-        <button 
-          className="btn btn-secondary"
-          style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-          onClick={() => onSelectAll(filteredItems)}
-        >
-          <CheckSquare size={14} />
-          <span>
-            {isAllSelected ? t('batchActionBar.deselectAll') : t('batchActionBar.selectAll')}
-          </span>
-        </button>
+        {/* Select All button */}
+        {!isGroupOnlySelection && (
+          <>
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+              onClick={() => onSelectAll(filteredItems)}
+              disabled={isSubmitting}
+            >
+              {filteredItems.every(item => selectedIds.includes(item.id)) ? <Square size={14} /> : <CheckSquare size={14} />}
+              <span>
+                {filteredItems.every(item => selectedIds.includes(item.id)) ? t('batchActionBar.deselectAll') : t('batchActionBar.selectAll')}
+              </span>
+            </button>
 
-        <button 
-          className="btn btn-primary"
-          style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-          onClick={() => onBatchToggle(true)}
-          disabled={selectedVpkNames.length === 0}
-        >
-          <Unlock size={14} />
-          <span>{t('batchActionBar.enable')}</span>
-        </button>
+            {showSelectiveSelection && (
+              <>
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={() => onSelectAll(filteredItems.filter(item => item.dirType !== 'none'))}
+                  disabled={isSubmitting}
+                >
+                  <HardDrive size={14} />
+                  <span>{t('batchActionBar.selectDownloaded')}</span>
+                </button>
 
-        <button 
-          className="btn btn-secondary"
-          style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-          onClick={() => onBatchToggle(false)}
-          disabled={selectedVpkNames.length === 0}
-        >
-          <Lock size={14} />
-          <span>{t('batchActionBar.disable')}</span>
-        </button>
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                  onClick={() => onSelectAll(filteredItems.filter(item => item.dirType === 'none'))}
+                  disabled={isSubmitting}
+                >
+                  <Globe size={14} />
+                  <span>{t('batchActionBar.selectUndownloaded')}</span>
+                </button>
+              </>
+            )}
+          </>
+        )}
 
-        {hasWorkshopSelected && (
-          <button 
+        {isGroupOnlySelection && onSelectAllGroups && (
+          <button
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-            onClick={onBatchMove}
-            disabled={selectedVpkNames.length === 0}
+            onClick={() => onSelectAllGroups(groups)}
+            disabled={isSubmitting}
           >
-            <FolderOpen size={14} />
-            <span>{t('batchActionBar.moveToManual')}</span>
+            {groups.every(g => selectedGroupIds.includes(g.id)) ? <Square size={14} /> : <CheckSquare size={14} />}
+            <span>
+              {groups.every(g => selectedGroupIds.includes(g.id)) ? t('batchActionBar.deselectAll') : t('batchActionBar.selectAll')}
+            </span>
           </button>
         )}
 
-        <button 
-          className="btn btn-secondary"
-          style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-          onClick={onBatchRename}
-          disabled={selectedVpkNames.length === 0}
-        >
-          <Edit3 size={14} />
-          <span>{t('batchActionBar.autoRename')}</span>
-        </button>
+        {/* Addon-specific actions */}
+        {hasAddonSelection && (
+          <>
+            {canBatchEnable && (
+              <button
+                className="btn btn-primary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                onClick={() => onBatchToggle(true)}
+                disabled={isSubmitting}
+              >
+                <Unlock size={14} />
+                <span>{t('batchActionBar.enable')}</span>
+              </button>
+            )}
 
-        <div className="dropdown">
-          <button 
+            {canBatchDisable && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                onClick={() => onBatchToggle(false)}
+                disabled={isSubmitting}
+              >
+                <Lock size={14} />
+                <span>{t('batchActionBar.disable')}</span>
+              </button>
+            )}
+
+            {canBatchMove && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                onClick={onBatchMove}
+                disabled={isSubmitting}
+              >
+                <FolderOpen size={14} />
+                <span>{t('batchActionBar.moveToManual')}</span>
+              </button>
+            )}
+
+            {canBatchRename && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                onClick={onBatchRename}
+                disabled={isSubmitting}
+              >
+                <Edit3 size={14} />
+                <span>{t('batchActionBar.autoRename')}</span>
+              </button>
+            )}
+
+            {canBatchDelete && onBatchDelete && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--md-sys-color-error)' }}
+                onClick={() => onBatchDelete(installedIds)}
+                disabled={isSubmitting}
+              >
+                <Trash2 size={14} />
+                <span>{t('batchActionBar.batchDelete')}</span>
+              </button>
+            )}
+
+            <button
+              className="btn btn-secondary"
+              style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+              onClick={onBatchAddToGroup}
+              disabled={selectedIds.length === 0 || groups.length === 0 || isSubmitting}
+            >
+              <FolderPlus size={14} />
+              <span>{t('batchActionBar.addToGroup')}</span>
+            </button>
+
+            {canBatchDownload && onBatchDownload && (
+              <button
+                className="btn btn-primary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
+                onClick={() => onBatchDownload(uninstalledIds)}
+                disabled={isSubmitting}
+              >
+                <Download size={14} />
+                <span>{t('batchActionBar.download')}</span>
+              </button>
+            )}
+          </>
+        )}
+
+        {/* Group-specific actions */}
+        {hasGroupSelection && onBatchAddToMasterCollection && (
+          <button
             className="btn btn-secondary"
             style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}
-            disabled={selectedVpkNames.length === 0}
+            onClick={onBatchAddToMasterCollection}
+            disabled={selectedGroupIds.length === 0 || masterCollections.length === 0 || isSubmitting}
           >
-            <FolderPlus size={14} />
-            <span>{t('batchActionBar.addToGroup')}</span>
+            <Library size={14} />
+            <span>{t('batchActionBar.addToMasterCollection')}</span>
           </button>
-          <div className="dropdown-content">
-            {groups.map(g => (
-              <button key={g.id} onClick={() => onBatchAddToGroup(g.id)}>
-                {g.name}
-              </button>
-            ))}
-            {groups.length === 0 && (
-              <button disabled style={{ fontStyle: 'italic' }}>{t('batchActionBar.noGroups')}</button>
-            )}
-          </div>
-        </div>
+        )}
 
-        <button 
+        <button
           className="btn btn-secondary"
           style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--md-sys-color-error)' }}
           onClick={onClearSelection}
+          disabled={isSubmitting}
         >
           <X size={14} />
           <span>{t('batchActionBar.exitBatch')}</span>
