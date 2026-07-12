@@ -1,5 +1,5 @@
 import React from 'react';
-import { FolderPlus, ExternalLink, Move, Edit3, FileText, Download } from 'lucide-react';
+import { FolderPlus, ExternalLink, Move, Edit3, FileText, Download, Trash2 } from 'lucide-react';
 import { Addon, Group } from '../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../utils/addonHelpers';
 import { CacheImage } from './CacheImage';
@@ -15,6 +15,7 @@ interface AddonCardProps {
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
   onDetailClick: (addon: Addon) => void;
+  onDeleteClick?: (addon: Addon) => void;
   onDownload?: (workshopId: string, title?: string, imagePath?: string) => void;
   isSelectMode: boolean;
   isSelected: boolean;
@@ -33,6 +34,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   onMoveClick,
   onRenameClick,
   onDetailClick,
+  onDeleteClick,
   onDownload,
   isSelectMode,
   isSelected,
@@ -293,6 +295,18 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                 >
                   <Edit3 size={14} />
                 </button>
+
+                {onDeleteClick && (
+                  <button
+                    className="btn btn-secondary btn-icon-only"
+                    onClick={() => onDeleteClick(addon)}
+                    disabled={isSubmitting}
+                    title={t('addonCard.deleteAddon')}
+                    style={{ color: 'var(--md-sys-color-error)' }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
               </div>
             </>
           )}

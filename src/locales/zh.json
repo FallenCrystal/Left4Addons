@@ -116,7 +116,8 @@
     "openInMirror": "在浏览器中打开 (国内镜像)",
     "openBuiltInSource": "打开组件内置来源网页",
     "moveToManual": "移动到手动安装目录 (Addons)",
-    "renameAddon": "重命名附件文件"
+    "renameAddon": "重命名附件文件",
+    "deleteAddon": "删除此组件"
   },
   "batchActionBar": {
     "selectedCount": "已选择 {{count}} 个组件",
@@ -136,7 +137,8 @@
     "searchGroups": "搜索分组...",
     "noGroups": "无分组",
     "exitBatch": "退出批量",
-    "download": "下载"
+    "download": "下载",
+    "batchDelete": "批量删除"
   },
   "groupCard": {
     "partiallyEnabled": "部分启用",
@@ -503,5 +505,16 @@
       "addFailed": "添加失败: {{err}}",
       "fetchFailed": "无法获取详细信息: {{err}}"
     }
+  },
+  "deleteConfirmModal": {
+    "title": "删除组件确认",
+    "subtitle": "您正准备删除 {{count}} 个组件，请仔细阅读以下提示：",
+    "workshopTitle": "创意工坊组件 ({{count}} 个)",
+    "workshopDesc": "删除后，如果创意工坊的原作更新，您将永久丢失当前安装的版本。这些文件必须重新通过创意工坊下载才能再次使用。",
+    "localTitle": "外部/非创意工坊组件 ({{count}} 个)",
+    "localDesc": "系统无法通过创意工坊自动下载这些组件。即使包含外部链接，删除后也可能永久丢失这些文件，且无法自动恢复！",
+    "confirmQuestion": "确定要继续删除操作吗？",
+    "btnWorkshopOnly": "仅删除创意工坊内容",
+    "btnDeleteAll": "删除所有"
   }
 }

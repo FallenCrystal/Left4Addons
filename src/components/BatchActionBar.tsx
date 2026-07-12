@@ -1,4 +1,4 @@
-import { CheckSquare, Square, Unlock, Lock, FolderOpen, Edit3, FolderPlus, Library, X, Download, HardDrive, Globe } from 'lucide-react';
+import { CheckSquare, Square, Unlock, Lock, FolderOpen, Edit3, FolderPlus, Library, X, Download, HardDrive, Globe, Trash2 } from 'lucide-react';
 import { Addon, Group, MasterCollection } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 
@@ -18,6 +18,7 @@ interface BatchActionBarProps {
   onBatchAddToGroup: () => void;
   onBatchAddToMasterCollection?: () => void;
   onBatchDownload?: (ids: string[]) => void;
+  onBatchDelete?: (ids: string[]) => void;
   onClearSelection: () => void;
   isSubmitting?: boolean;
 }
@@ -38,6 +39,7 @@ export function BatchActionBar({
   onBatchAddToGroup,
   onBatchAddToMasterCollection,
   onBatchDownload,
+  onBatchDelete,
   onClearSelection,
   isSubmitting = false,
 }: BatchActionBarProps) {
@@ -59,8 +61,10 @@ export function BatchActionBar({
   const canBatchDisable = allInstalled && selectedAddons.some((addon) => addon.isEnabled);
   const canBatchMove = allInstalled && selectedAddons.some((addon) => addon.dirType === 'workshop');
   const canBatchRename = allInstalled && selectedAddons.length > 0;
+  const canBatchDelete = allInstalled && selectedAddons.length > 0;
   
   const uninstalledIds = selectedAddons.filter(a => a.dirType === 'none').map(a => a.id);
+  const installedIds = selectedAddons.filter(a => a.dirType !== 'none').map(a => a.id);
   const canBatchDownload = uninstalledIds.length > 0;
 
   // Check if we're in master collection view (only groups selected)
@@ -179,6 +183,18 @@ export function BatchActionBar({
               >
                 <Edit3 size={14} />
                 <span>{t('batchActionBar.autoRename')}</span>
+              </button>
+            )}
+
+            {canBatchDelete && onBatchDelete && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--md-sys-color-error)' }}
+                onClick={() => onBatchDelete(installedIds)}
+                disabled={isSubmitting}
+              >
+                <Trash2 size={14} />
+                <span>{t('batchActionBar.batchDelete')}</span>
               </button>
             )}
 

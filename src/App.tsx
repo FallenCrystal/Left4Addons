@@ -23,6 +23,7 @@ import { BatchActionBar } from './components/BatchActionBar';
 import { KnownUninstalledView } from './components/KnownUninstalledView';
 import { WorkshopBrowser } from './components/WorkshopBrowser';
 import { MasterCollectionModal } from './components/MasterCollectionModal';
+import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { MasterCollectionHeader } from './components/MasterCollectionHeader';
 import { AddToGroupModal } from './components/AddToGroupModal';
 import { PromptModal } from './components/PromptModal';
@@ -110,6 +111,9 @@ function App() {
     handleFilterTabChange,
     downloadAddon,
     deleteAddons,
+    executeRealDelete,
+    deleteConfirmModal,
+    setDeleteConfirmModal,
     handleBatchDownload,
     recordSeenItems,
     backgroundTasks,
@@ -388,6 +392,7 @@ function App() {
                           onMoveClick={handleMoveClick}
                           onRenameClick={triggerRenameModal}
                           onDetailClick={(addon) => setDetailModal({ open: true, addon })}
+                          onDeleteClick={(addon) => setDeleteConfirmModal({ open: true, addons: [addon], removeFromKnown: false })}
                           onDownload={downloadAddon}
                           isSelectMode={isSelectMode}
                           isSelected={selectedIds.includes(addonData.id)}
@@ -526,6 +531,19 @@ function App() {
         }}
       />
 
+      <DeleteConfirmModal
+        open={deleteConfirmModal.open}
+        addons={deleteConfirmModal.addons}
+        isSubmitting={isSubmitting}
+        onCancel={() => {
+          setDeleteConfirmModal({ open: false, addons: [], removeFromKnown: false });
+          setIsSubmitting(false);
+        }}
+        onConfirm={(deleteMode) => {
+          executeRealDelete(deleteMode, deleteConfirmModal.removeFromKnown, deleteConfirmModal.addons.map(a => a.id));
+        }}
+      />
+
       <WorkshopActionWarningModal
         open={workshopActionModal.open}
         actionName={workshopActionModal.actionName}
@@ -632,6 +650,10 @@ function App() {
           onBatchAddToGroup={() => setAddToGroupModal(true)}
           onBatchAddToMasterCollection={() => setAddToMcModal(true)}
           onBatchDownload={handleBatchDownload}
+          onBatchDelete={(ids) => {
+            const items = ids.map(id => addons[id] || knownUninstalledAddons[id]).filter(Boolean);
+            setDeleteConfirmModal({ open: true, addons: items, removeFromKnown: false });
+          }}
           onClearSelection={handleClearSelection}
           isSubmitting={isSubmitting}
         />

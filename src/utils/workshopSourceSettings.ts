@@ -28,7 +28,7 @@ export function resolveWorkshopSdkHtmlScope(
 export function normalizeWorkshopSourceSettings(
   settings?: Partial<WorkshopSourceSettings> | null,
 ): WorkshopSourceSettings {
-  const normalizedPreset = settings?.preset === 'sdkOnly' ? 'sdk-only' : (settings?.preset || DEFAULT_WORKSHOP_SOURCE_SETTINGS.preset);
+  const normalizedPreset = (settings as any)?.preset === 'sdkOnly' ? 'sdk-only' : (settings?.preset || DEFAULT_WORKSHOP_SOURCE_SETTINGS.preset);
   const sdkHtmlScope = resolveWorkshopSdkHtmlScope(
     settings?.sdkHtmlScope,
     normalizedPreset,

@@ -116,7 +116,8 @@
     "openInMirror": "Open in Browser (Mirror)",
     "openBuiltInSource": "Open built-in source page",
     "moveToManual": "Move to Manual (Addons)",
-    "renameAddon": "Rename Addon File"
+    "renameAddon": "Rename Addon File",
+    "deleteAddon": "Delete this Addon"
   },
   "batchActionBar": {
     "selectedCount": "{{count}} addons selected",
@@ -136,7 +137,8 @@
     "searchGroups": "Search groups...",
     "noGroups": "No Groups",
     "exitBatch": "Exit Batch",
-    "download": "Download"
+    "download": "Download",
+    "batchDelete": "Batch Delete"
   },
   "groupCard": {
     "partiallyEnabled": "Partially Enabled",
@@ -503,5 +505,16 @@
       "addFailed": "Failed to add: {{err}}",
       "fetchFailed": "Unable to fetch details: {{err}}"
     }
+  },
+  "deleteConfirmModal": {
+    "title": "Confirm Deletion",
+    "subtitle": "You are about to delete {{count}} addons. Please read the following notices carefully:",
+    "workshopTitle": "Workshop Addons ({{count}})",
+    "workshopDesc": "If the original Workshop item is updated after deletion, you will permanently lose the currently installed version. These files must be re-downloaded via the Workshop to be used again.",
+    "localTitle": "External/Non-Workshop Addons ({{count}})",
+    "localDesc": "The system cannot automatically download these addons via the Workshop. Even if they contain external links, deleting them may result in permanent loss, and they cannot be automatically restored!",
+    "confirmQuestion": "Are you sure you want to proceed with the deletion?",
+    "btnWorkshopOnly": "Delete Workshop Content Only",
+    "btnDeleteAll": "Delete All"
   }
 }

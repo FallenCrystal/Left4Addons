@@ -107,6 +107,7 @@ export function useAddonManager() {
   const [settingsModal, setSettingsModal] = useState<{ open: boolean; loadingDir: string }>({ open: false, loadingDir: '' });
   const [linkConfirmModal, setLinkConfirmModal] = useState<{ open: boolean; url: string }>({ open: false, url: '' });
   const [confirmModal, setConfirmModal] = useState<{ open: boolean; title: string; message: string; onConfirm: (() => void) | null }>({ open: false, title: '', message: '', onConfirm: null });
+  const [deleteConfirmModal, setDeleteConfirmModal] = useState<{ open: boolean; addons: Addon[]; removeFromKnown: boolean }>({ open: false, addons: [], removeFromKnown: false });
   const [workshopActionModal, setWorkshopActionModal] = useState<{ open: boolean; actionName: string; addons: Addon[]; onProceed: (() => void) | null }>({ open: false, actionName: '', addons: [], onProceed: null });
 
   // Add toast helper
@@ -767,40 +768,58 @@ export function useAddonManager() {
     if (isSubmitting) return;
     
     // Check if any of these ids are local non-workshop items
-    const nonWorkshopItems = ids.filter(name => {
-      const ad = addons[name] || knownUninstalledAddons[name];
-      return ad && !ad.workshopId;
-    });
+    const selectedAddons = ids.map(id => addons[id] || knownUninstalledAddons[id]).filter(Boolean);
 
-    const executeDelete = async () => {
-      setIsSubmitting(true);
-      try {
-        const data: DatabasePayload = await invoke('delete_addons', { ids, deleteFile, removeFromKnown });
-        updateLocalState(data);
-        addToast('删除组件成功', 'success');
-        handleClearSelection();
-      } catch (err) {
-        addToast(`删除失败: ${err}`, 'error');
-      } finally {
-        setIsSubmitting(false);
-      }
-    };
-
-    if (nonWorkshopItems.length > 0 && deleteFile) {
-      // Show warning for non-workshop items
-      setConfirmModal({
+    if (deleteFile) {
+      setDeleteConfirmModal({
         open: true,
-        title: '删除本地非创意工坊组件',
-        message: `您选择的组件中包含 ${nonWorkshopItems.length} 个本地非创意工坊组件。永久删除这些文件后将无法恢复，确定要删除吗？\n\n${nonWorkshopItems.slice(0, 5).join('\n')}${nonWorkshopItems.length > 5 ? '\n...' : ''}`,
-        onConfirm: executeDelete
+        addons: selectedAddons,
+        removeFromKnown,
       });
     } else {
+      const executeDelete = async () => {
+        setIsSubmitting(true);
+        try {
+          const data: DatabasePayload = await invoke('delete_addons', { ids, deleteFile, removeFromKnown });
+          updateLocalState(data);
+          addToast('删除组件记录成功', 'success');
+          handleClearSelection();
+        } catch (err) {
+          addToast(`删除记录失败: ${err}`, 'error');
+        } finally {
+          setIsSubmitting(false);
+        }
+      };
+
       setConfirmModal({
         open: true,
-        title: '删除组件',
-        message: `确定要删除选中的 ${ids.length} 个组件吗？`,
+        title: '删除组件记录',
+        message: `确定要删除选中的 ${ids.length} 个组件记录吗？`,
         onConfirm: executeDelete
       });
+    }
+  };
+
+  const executeRealDelete = async (deleteMode: 'all' | 'workshop-only', removeFromKnown: boolean, ids: string[]) => {
+    setIsSubmitting(true);
+    
+    let targetIds = ids;
+    if (deleteMode === 'workshop-only') {
+      targetIds = ids.filter(id => {
+        const ad = addons[id] || knownUninstalledAddons[id];
+        return ad && ad.workshopId;
+      });
+    }
+    
+    try {
+      const data: DatabasePayload = await invoke('delete_addons', { ids: targetIds, deleteFile: true, removeFromKnown });
+      updateLocalState(data);
+      addToast('删除组件成功', 'success');
+      handleClearSelection();
+    } catch (err) {
+      addToast(`删除失败: ${err}`, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -1475,6 +1494,8 @@ export function useAddonManager() {
     setLinkConfirmModal,
     confirmModal,
     setConfirmModal,
+    deleteConfirmModal,
+    setDeleteConfirmModal,
     workshopActionModal,
     setWorkshopActionModal,
 
@@ -1510,6 +1531,7 @@ export function useAddonManager() {
     handleFilterTabChange,
     downloadAddon,
     deleteAddons,
+    executeRealDelete,
     handleBatchDownload,
     enqueueWorkshopCrawl,
     recordSeenItems,
