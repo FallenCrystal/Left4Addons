@@ -73,7 +73,7 @@ impl MirrorManager {
                             }
                         }
                         re.push_str(&regex::escape(domain));
-                        re.push_str("$");
+                        re.push('$');
                         re
                     } else if let Some(rules_str) = &rule.rules {
                         // Quick parse of `rules`: e.g. "[store,media].steampowered.com"
@@ -92,7 +92,7 @@ impl MirrorManager {
                                 in_bracket = false;
                                 // Escape each item inside the bracket properly
                                 let parts: Vec<String> = current_group.split(',')
-                                    .map(|s| regex::escape(s))
+                                    .map(regex::escape)
                                     .collect();
                                 regex_str.push_str(&parts.join("|"));
                                 current_group.clear();

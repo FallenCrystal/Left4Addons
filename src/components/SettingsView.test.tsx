@@ -102,9 +102,8 @@ describe('SettingsView', () => {
     );
 
     fireEvent.click(screen.getByText('数据来源'));
-    fireEvent.change(screen.getByDisplayValue('创意工坊搜索'), {
-      target: { value: 'all' },
-    });
+    fireEvent.click(screen.getByText('创意工坊搜索'));
+    fireEvent.click(screen.getByText('允许所有'));
     fireEvent.click(screen.getByText('保存并重新扫描'));
 
     await waitFor(() => {
