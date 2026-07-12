@@ -38,6 +38,10 @@ pub struct WorkshopSourceSettings {
     pub allow_sdk_html_hybrid: bool,
     #[serde(rename = "sdkHtmlScope", default = "default_sdk_html_scope")]
     pub sdk_html_scope: String,
+    #[serde(rename = "dependencySdkRefresh", default = "default_dependency_sdk_refresh")]
+    pub dependency_sdk_refresh: String,
+    #[serde(rename = "dependencyHtmlRefresh", default = "default_dependency_html_refresh")]
+    pub dependency_html_refresh: String,
     #[serde(default = "default_source_order")]
     pub source_order: Vec<String>,
     #[serde(default = "default_cache_retention")]
@@ -72,6 +76,14 @@ fn default_sdk_html_scope() -> String {
     "search".to_string()
 }
 
+fn default_dependency_sdk_refresh() -> String {
+    "always".to_string()
+}
+
+fn default_dependency_html_refresh() -> String {
+    "cache-missing".to_string()
+}
+
 fn default_cache_retention() -> String {
     "keep".to_string()
 }
@@ -85,6 +97,8 @@ impl Default for WorkshopSourceSettings {
             allow_steam_community_html: true,
             allow_sdk_html_hybrid: false,
             sdk_html_scope: default_sdk_html_scope(),
+            dependency_sdk_refresh: default_dependency_sdk_refresh(),
+            dependency_html_refresh: default_dependency_html_refresh(),
             source_order: default_source_order(),
             cache_retention: default_cache_retention(),
         }

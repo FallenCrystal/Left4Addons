@@ -25,6 +25,7 @@ interface WorkshopDetailModalProps {
   } | null;
   onClose: () => void;
   onDownload: WorkshopBrowserProps['onDownload'];
+  onDownloadMany?: WorkshopBrowserProps['onDownloadMany'];
   onOpenLink: WorkshopBrowserProps['onOpenLink'];
   onImportCollection: WorkshopBrowserProps['onImportCollection'];
   /** Navigate to an addon detail within the app */
@@ -46,6 +47,7 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
   collection,
   onClose,
   onDownload,
+  onDownloadMany,
   onOpenLink,
   onImportCollection,
   onItemNavigate,
@@ -237,7 +239,18 @@ export const WorkshopDetailModal: React.FC<WorkshopDetailModalProps> = ({
                 <FolderPlus size={14} />
                 <span>{t('workshop.detail.importAsGroup')}</span>
               </button>
-              <button className="btn btn-secondary" onClick={() => displayCollectionItems.forEach((subItem) => onDownload(subItem.workshopId, subItem.title, subItem.imagePath))} disabled={isSubmitting}>
+              <button className="btn btn-secondary" onClick={() => {
+                const downloadItems = displayCollectionItems.map((subItem) => ({
+                  workshopId: subItem.workshopId,
+                  title: subItem.title,
+                  imagePath: subItem.imagePath,
+                }));
+                if (onDownloadMany) {
+                  onDownloadMany(downloadItems);
+                } else {
+                  downloadItems.forEach((subItem) => onDownload(subItem.workshopId, subItem.title, subItem.imagePath));
+                }
+              }} disabled={isSubmitting}>
                 <Download size={14} />
                 <span>{t('workshop.detail.downloadAll', { count: allWorkshopIds.length })}</span>
               </button>

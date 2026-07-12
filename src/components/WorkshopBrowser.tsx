@@ -53,6 +53,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   knownUninstalledAddons,
   downloadProgress,
   onDownload,
+  onDownloadMany,
   onOpenLink,
   onImportCollection,
   onRecordSeenItems,
@@ -546,6 +547,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         collection={selectedCollection}
         onClose={() => { setSelectedItem(null); setSelectedCollection(null); }}
         onDownload={onDownload}
+        onDownloadMany={onDownloadMany}
         onOpenLink={onOpenLink}
         onImportCollection={onImportCollection}
         onItemNavigate={viewItemDetails}

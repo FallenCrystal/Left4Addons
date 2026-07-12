@@ -66,6 +66,9 @@
     "noTasks": "No active tasks",
     "noTasksDesc": "Active downloads or workshop crawls will appear here",
     "syncing": "Syncing workshop info...",
+    "dependencyChecking": "Checking dependencies...",
+    "dependencyQueued": "Waiting to check dependencies",
+    "dependencyPartial": "Dependency check completed with failed nodes",
     "syncDesc": "Fetching and updating Steam Workshop metadata for addons",
     "downloading": "Downloading addons...",
     "warning": "Task warnings",
@@ -299,6 +302,14 @@
     "sourcePresetSdkOnly": "Steam/SDK Only: no Steam Web API or web crawling",
     "sourcePresetOffline": "Offline Mode: local files and cache only",
     "sourcePresetHybrid": "Allow all HTML fetch scopes",
+    "dependencyRefreshTitle": "Dependency check refresh policy",
+    "dependencyRefreshDesc": "SDK queries can usually refresh dependency relations safely; Steam Community page fetches remain protected by the global rate limit.",
+    "dependencySdkRefreshLabel": "Steamworks SDK",
+    "dependencyHtmlRefreshLabel": "Steam Community HTML",
+    "dependencyRefresh": {
+      "always": "Refresh every check",
+      "cache-missing": "Fetch only when missing from cache"
+    },
     "sourceHybridWarning": "Using Steamworks SDK and steamcommunity crawling at the same time may make Steam Community IP rate limiting more likely. Enable this only when you need web-only author, tag, or page detail enrichment.",
     "sourceSteamworksSdk": "Steamworks SDK",
     "sourceSteamWebApi": "Steam Web API",
@@ -342,7 +353,12 @@
     ],
     "licenseTitle": "Open Source License",
     "licenseDesc": "This project is open source under the MIT License.",
-    "languageLabel": "Interface Language:"
+    "languageLabel": "Interface Language:",
+    "dependencyMissingBehaviorLabel": "Behavior when dependencies are missing",
+    "behaviorAlways": "Always download",
+    "behaviorAsk": "Ask [Default]",
+    "behaviorIgnore": "Ignore (Not recommended)",
+    "behaviorIgnoreWarning": "Warning: Ignoring dependencies may cause addons to not work properly. Dependency checks will be skipped."
   },
   "settingsModal": {
     "title": "Configure Addon Directory Path"
@@ -516,5 +532,22 @@
     "confirmQuestion": "Are you sure you want to proceed with the deletion?",
     "btnWorkshopOnly": "Delete Workshop Content Only",
     "btnDeleteAll": "Delete All"
+  },
+  "dependencyPrompt": {
+    "warningTitle": "Are you sure?",
+    "warningDesc": "While a few addons may have optional dependencies, please ensure you have a good reason not to download any of them and understand the impact on the addons and the game.",
+    "goBack": "Go Back",
+    "confirmCancel": "Confirm",
+    "title": "Missing Dependencies Found",
+    "desc": "These items are required dependencies for addons you have installed or are currently downloading.",
+    "goToSettings": "Go to settings to change default behavior",
+    "search": "Search dependencies...",
+    "selectedCount": "Selected: {{count}}",
+    "selectAll": "Select All (This Page)",
+    "noResults": "No matching dependencies found",
+    "remindLater": "Remind me later",
+    "cancelAll": "I don't want to download any",
+    "downloadFirst": "Download these first",
+    "download": "Download Selected"
   }
 }

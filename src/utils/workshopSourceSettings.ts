@@ -1,4 +1,4 @@
-import type { WorkshopSdkHtmlScope, WorkshopSourceSettings } from '../types/addon';
+import type { DependencyRefreshMode, WorkshopSdkHtmlScope, WorkshopSourceSettings } from '../types/addon';
 
 export const DEFAULT_WORKSHOP_SOURCE_SETTINGS: WorkshopSourceSettings = {
   preset: 'conservative',
@@ -7,6 +7,8 @@ export const DEFAULT_WORKSHOP_SOURCE_SETTINGS: WorkshopSourceSettings = {
   allowSteamCommunityHtml: true,
   allowSdkHtmlHybrid: false,
   sdkHtmlScope: 'search',
+  dependencySdkRefresh: 'always',
+  dependencyHtmlRefresh: 'cache-missing',
   sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
   cacheRetention: 'keep',
 };
@@ -25,6 +27,10 @@ export function resolveWorkshopSdkHtmlScope(
   return 'search';
 }
 
+function resolveDependencyRefreshMode(value: DependencyRefreshMode | string | null | undefined, fallback: DependencyRefreshMode): DependencyRefreshMode {
+  return value === 'always' || value === 'cache-missing' ? value : fallback;
+}
+
 export function normalizeWorkshopSourceSettings(
   settings?: Partial<WorkshopSourceSettings> | null,
 ): WorkshopSourceSettings {
@@ -41,6 +47,14 @@ export function normalizeWorkshopSourceSettings(
     preset: normalizedPreset as WorkshopSourceSettings['preset'],
     allowSdkHtmlHybrid: sdkHtmlScope === 'all',
     sdkHtmlScope,
+    dependencySdkRefresh: resolveDependencyRefreshMode(
+      settings?.dependencySdkRefresh,
+      DEFAULT_WORKSHOP_SOURCE_SETTINGS.dependencySdkRefresh,
+    ),
+    dependencyHtmlRefresh: resolveDependencyRefreshMode(
+      settings?.dependencyHtmlRefresh,
+      DEFAULT_WORKSHOP_SOURCE_SETTINGS.dependencyHtmlRefresh,
+    ),
     sourceOrder: settings?.sourceOrder?.length
       ? settings.sourceOrder
       : DEFAULT_WORKSHOP_SOURCE_SETTINGS.sourceOrder,
@@ -61,7 +75,7 @@ export function shouldAllowSteamCommunityHtmlSource(
     return true;
   }
 
-  if (source === 'addon-detail' || source === 'workshop-detail') {
+  if (source === 'addon-detail' || source === 'workshop-detail' || source === 'dependency-check') {
     return true;
   }
 

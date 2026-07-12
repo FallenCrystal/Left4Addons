@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Addon, BackgroundTask, DatabasePayload, Settings } from '../types/addon';
-import { fetchWorkshopItem } from '../services/workshopClient';
+import { fetchWorkshopDependencySnapshot, fetchWorkshopItem } from '../services/workshopClient';
 
 const WORKSHOP_CRAWL_COOLDOWN_MS = 6000;
 
@@ -55,9 +55,12 @@ export function useBackgroundTasks({
   const tasksRef = useRef<BackgroundTask[]>([]);
   const activeDownloadsRef = useRef(0);
   const crawlRunningRef = useRef(false);
+  const dependencyRunningRef = useRef(false);
   const lastCrawlAtRef = useRef(0);
   const processDownloadQueueRef = useRef<() => void>(() => {});
   const processCrawlQueueRef = useRef<() => void>(() => {});
+  const processDependencyQueueRef = useRef<() => void>(() => {});
+  const enqueueDependencyCheckRef = useRef<(workshopIds: string[], source?: string) => string | null>(() => null);
 
   const commitTasks = useCallback((tasks: BackgroundTask[]) => {
     const next = trimTasks(tasks);
@@ -89,6 +92,7 @@ export function useBackgroundTasks({
         setTimeout(() => {
           processDownloadQueueRef.current();
           processCrawlQueueRef.current();
+          processDependencyQueueRef.current();
         }, 0);
       })
       .catch((err) => console.error('Failed to load background tasks:', err));
@@ -211,6 +215,7 @@ export function useBackgroundTasks({
 
     if (newTasks.length === 0) return;
     commitTasks([...tasksRef.current, ...newTasks]);
+    enqueueDependencyCheckRef.current(newTasks.map((task) => task.targetIds[0]), 'download-dependency-check');
     processDownloadQueueRef.current();
   }, [addons, knownUninstalledAddons, commitTasks]);
 
@@ -313,6 +318,159 @@ export function useBackgroundTasks({
     processCrawlQueueRef.current();
   }, [addons, knownUninstalledAddons, commitTasks]);
 
+  const runDependencyCheckTask = useCallback(async (task: BackgroundTask) => {
+    const rootIds = task.dependencyCheck?.rootIds?.length
+      ? task.dependencyCheck.rootIds
+      : task.targetIds;
+    const seedIds = task.dependencyCheck?.seedIds?.length
+      ? task.dependencyCheck.seedIds
+      : rootIds;
+    if (seedIds.length === 0) return;
+
+    dependencyRunningRef.current = true;
+    const pending = [...new Set(seedIds.map((id) => id.trim()).filter(Boolean))];
+    const visited = new Set<string>();
+    const failedNodes: { workshopId: string; error: string }[] = [];
+    let completedCount = 0;
+    let latestData: DatabasePayload | null = null;
+    patchTask(task.id, {
+      status: 'running',
+      progress: 0,
+      startedAt: nowIso(),
+      finishedAt: undefined,
+      error: undefined,
+      dependencyCheck: {
+        rootIds,
+        seedIds,
+        discoveredCount: pending.length,
+        completedCount: 0,
+        failedNodes: [],
+      },
+    });
+
+    try {
+      while (pending.length > 0) {
+        const currentTask = tasksRef.current.find((candidate) => candidate.id === task.id);
+        if (currentTask?.status === 'cancelled') return;
+
+        const workshopId = pending.shift()!;
+        if (visited.has(workshopId)) continue;
+        visited.add(workshopId);
+
+        try {
+          const details = await fetchWorkshopDependencySnapshot(workshopId);
+          const data = await invoke<DatabasePayload>('persist_workshop_page_details', {
+            workshopId,
+            details,
+            source: 'dependency-check',
+          });
+          if (isDatabasePayload(data)) {
+            latestData = data;
+          }
+
+          for (const dependency of details.requiredItems || []) {
+            const dependencyId = dependency.workshopId?.trim();
+            if (dependencyId && !visited.has(dependencyId) && !pending.includes(dependencyId)) {
+              pending.push(dependencyId);
+            }
+          }
+        } catch (err) {
+          failedNodes.push({ workshopId, error: String(err) });
+        }
+
+        completedCount += 1;
+        const discoveredCount = visited.size + pending.length;
+        const currentProgress = tasksRef.current.find((candidate) => candidate.id === task.id)?.progress || 0;
+        patchTask(task.id, {
+          progress: Math.max(currentProgress, Math.min(99, Math.ceil((completedCount / Math.max(discoveredCount, 1)) * 100))),
+          dependencyCheck: {
+            rootIds,
+            seedIds,
+            discoveredCount,
+            completedCount,
+            failedNodes: [...failedNodes],
+          },
+        });
+      }
+
+      if (latestData) {
+        updateLocalState(latestData);
+      }
+      const currentTask = tasksRef.current.find((candidate) => candidate.id === task.id);
+      if (currentTask?.status !== 'cancelled') {
+        patchTask(task.id, {
+          status: 'completed',
+          progress: 100,
+          finishedAt: nowIso(),
+          error: failedNodes.length > 0 ? `${failedNodes.length} dependency node(s) could not be resolved` : undefined,
+          dependencyCheck: {
+            rootIds,
+            seedIds,
+            discoveredCount: visited.size,
+            completedCount,
+            failedNodes,
+          },
+        });
+      }
+    } finally {
+      dependencyRunningRef.current = false;
+      processDependencyQueueRef.current();
+    }
+  }, [patchTask, updateLocalState]);
+
+  const processDependencyQueue = useCallback(() => {
+    if (dependencyRunningRef.current) return;
+    const next = tasksRef.current.find((task) => task.kind === 'dependency-check' && task.status === 'queued');
+    if (next) {
+      void runDependencyCheckTask(next);
+    }
+  }, [runDependencyCheckTask]);
+
+  useEffect(() => {
+    processDependencyQueueRef.current = processDependencyQueue;
+  }, [processDependencyQueue]);
+
+  const enqueueDependencyCheck = useCallback((workshopIds: string[], source = 'manual-dependency-check'): string | null => {
+    const rootIds = [...new Set(workshopIds.map((id) => id.trim()).filter(Boolean))];
+    if (rootIds.length === 0) return null;
+
+    const activeRootIds = new Set(
+      tasksRef.current
+        .filter((task) => task.kind === 'dependency-check' && ['queued', 'running'].includes(task.status))
+        .flatMap((task) => task.dependencyCheck?.rootIds || task.targetIds),
+    );
+    const newRootIds = rootIds.filter((id) => !activeRootIds.has(id));
+    if (newRootIds.length === 0) return null;
+
+    const id = taskId('dependency-check', newRootIds[0]);
+    const task: BackgroundTask = {
+      id,
+      kind: 'dependency-check',
+      status: 'queued',
+      source,
+      targetIds: newRootIds,
+      progress: 0,
+      createdAt: nowIso(),
+      title: newRootIds.length === 1
+        ? `Dependency check (${newRootIds[0]})`
+        : `Dependency check (${newRootIds.length} items)`,
+      dependencyCheck: {
+        rootIds: newRootIds,
+        seedIds: newRootIds,
+        discoveredCount: newRootIds.length,
+        completedCount: 0,
+        failedNodes: [],
+      },
+    };
+    commitTasks([...tasksRef.current, task]);
+    processDependencyQueueRef.current();
+    return id;
+  }, [commitTasks]);
+
+  useEffect(() => {
+    enqueueDependencyCheckRef.current = enqueueDependencyCheck;
+  }, [enqueueDependencyCheck]);
+
   const recordSeenItems = useCallback(async (items: any[], source = 'workshop-browser') => {
     if (items.length === 0) return;
     try {
@@ -380,6 +538,8 @@ export function useBackgroundTasks({
       setTimeout(() => processDownloadQueueRef.current(), 0);
     } else if (task.kind === 'workshop-crawl') {
       setTimeout(() => processCrawlQueueRef.current(), 0);
+    } else if (task.kind === 'dependency-check') {
+      setTimeout(() => processDependencyQueueRef.current(), 0);
     }
   }, [onDownloadCancelled, patchTask]);
 
@@ -387,19 +547,33 @@ export function useBackgroundTasks({
     const task = tasksRef.current.find((t) => t.id === id);
     if (!task) return;
 
+    const retryIds = task.kind === 'dependency-check'
+      ? task.dependencyCheck?.failedNodes.map((node) => node.workshopId).filter(Boolean)
+      : undefined;
     patchTask(id, {
       status: 'queued',
       progress: 0,
       error: undefined,
       createdAt: nowIso(),
       startedAt: undefined,
-      finishedAt: undefined
+      finishedAt: undefined,
+      dependencyCheck: task.kind === 'dependency-check'
+        ? {
+          rootIds: task.dependencyCheck?.rootIds || task.targetIds,
+          seedIds: retryIds?.length ? retryIds : task.dependencyCheck?.rootIds || task.targetIds,
+          discoveredCount: retryIds?.length || task.dependencyCheck?.rootIds?.length || task.targetIds.length,
+          completedCount: 0,
+          failedNodes: [],
+        }
+        : task.dependencyCheck,
     });
 
     if (task.kind === 'download') {
       setTimeout(() => processDownloadQueueRef.current(), 0);
     } else if (task.kind === 'workshop-crawl') {
       setTimeout(() => processCrawlQueueRef.current(), 0);
+    } else if (task.kind === 'dependency-check') {
+      setTimeout(() => processDependencyQueueRef.current(), 0);
     }
   }, [patchTask]);
 
@@ -414,6 +588,7 @@ export function useBackgroundTasks({
     backgroundTasks,
     enqueueDownloads,
     enqueueWorkshopCrawl,
+    enqueueDependencyCheck,
     recordSeenItems,
     upsertWarningTask,
     cancelTask,

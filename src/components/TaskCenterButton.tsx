@@ -22,10 +22,10 @@ export const TaskCenterButton: React.FC<TaskCenterButtonProps> = ({
   );
 
   const isSyncing = syncingSteam || backgroundTasks.some(
-    (t) => t.kind === 'workshop-crawl' && (t.status === 'running' || t.status === 'queued')
+    (t) => (t.kind === 'workshop-crawl' || t.kind === 'dependency-check') && (t.status === 'running' || t.status === 'queued')
   );
 
-  const hasWarning = backgroundTasks.some((t) => t.status === 'failed');
+  const hasWarning = backgroundTasks.some((t) => t.status === 'failed' || (t.kind === 'dependency-check' && (t.dependencyCheck?.failedNodes.length || 0) > 0));
 
   // Icon, color, animation priority: Download -> Sync -> Warning -> No tasks
   let icon = <ClipboardCheck size={20} />;

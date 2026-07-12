@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { X, RotateCw, Trash2, AlertTriangle, Loader2, RefreshCw, ClipboardCheck } from 'lucide-react';
+import { X, RotateCw, Trash2, AlertTriangle, Loader2, RefreshCw, ClipboardCheck, Network } from 'lucide-react';
 import { BackgroundTask, WorkshopSourceSettings } from '../types/addon';
 import { CacheImage } from './CacheImage';
 
@@ -38,7 +38,10 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
     (t) => t.status === 'running' || t.status === 'queued'
   );
 
-  const failedTasks = backgroundTasks.filter((t) => t.status === 'failed');
+  const failedTasks = backgroundTasks.filter((t) => (
+    t.status === 'failed' ||
+    (t.kind === 'dependency-check' && (t.dependencyCheck?.failedNodes.length || 0) > 0)
+  ));
 
   const finishedTasks = backgroundTasks.filter(
     (t) => t.status === 'completed' || t.status === 'cancelled'
@@ -206,6 +209,7 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
               <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 {activeTasks.map((task) => {
                   const isDownload = task.kind === 'download';
+                  const isDependencyCheck = task.kind === 'dependency-check';
                   const workshopId = task.targetIds[0];
                   // If download, read current progress percent
                   const percent = isDownload ? (downloadProgress[workshopId] ?? task.progress ?? 0) : 0;
@@ -249,7 +253,9 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                             color: 'var(--md-sys-color-primary)',
                           }}
                         >
-                          <RefreshCw size={20} className={isRunning ? 'animate-spin' : ''} />
+                          {isDependencyCheck
+                            ? (isRunning ? <Loader2 size={20} className="animate-spin" /> : <Network size={20} />)
+                            : <RefreshCw size={20} className={isRunning ? 'animate-spin' : ''} />}
                         </div>
                       )}
 
@@ -273,10 +279,15 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                               ? isRunning
                                 ? `${t('taskCenter.downloading', '正在下载')}...`
                                 : t('taskCenter.inQueue', '等待下载')
+                              : isDependencyCheck
+                                ? isRunning
+                                  ? t('taskCenter.dependencyChecking', '正在检查依赖...')
+                                  : t('taskCenter.dependencyQueued', '等待检查依赖')
                               : isRunning
                                 ? `${t('taskCenter.syncing', '正在同步')}...`
                                 : t('taskCenter.inQueue', '等待同步')}
                           </span>
+                          {isDependencyCheck && <span>{task.dependencyCheck?.completedCount || 0} / {task.dependencyCheck?.discoveredCount || 0}</span>}
                           {isDownload && isRunning && <span>{percent}%</span>}
                         </div>
 
@@ -341,6 +352,7 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                 {failedTasks.map((task) => {
                   const workshopId = task.targetIds[0];
                   const isWarningTask = task.kind === 'warning';
+                  const isPartialDependencyCheck = task.kind === 'dependency-check' && (task.dependencyCheck?.failedNodes.length || 0) > 0;
                   const taskTitle = task.title || (
                     isWarningTask
                       ? t('taskCenter.steamworksUnavailableTitle', 'Steamworks SDK 不可用')
@@ -378,6 +390,8 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                               ? t('taskCenter.warningTitle', '功能受限警告')
                               : task.kind === 'download'
                                 ? t('taskCenter.downloadFailed', '下载失败')
+                                : isPartialDependencyCheck
+                                  ? t('taskCenter.dependencyPartial', '依赖检查已完成，但部分节点失败')
                                 : t('taskCenter.syncFailed', '同步元数据失败')}
                           </div>
                         </div>
@@ -440,6 +454,11 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                           {t('taskCenter.errorDetails', { err: task.error })}
                         </div>
                       )}
+                      {isPartialDependencyCheck && task.dependencyCheck?.failedNodes.map((node) => (
+                        <div key={node.workshopId} style={{ marginTop: '6px', fontSize: '11px', color: 'var(--md-sys-color-on-surface-variant)' }}>
+                          {node.workshopId}: {node.error}
+                        </div>
+                      ))}
                     </div>
                   );
                 })}

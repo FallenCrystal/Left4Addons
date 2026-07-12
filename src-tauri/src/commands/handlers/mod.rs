@@ -156,7 +156,7 @@ fn resolve_sdk_html_scope(configured_scope: &str, preset: &str, allow_sdk_html_h
 }
 
 fn is_manual_detail_workshop_fetch_source(source: &str) -> bool {
-    matches!(source, "addon-detail" | "workshop-detail")
+    matches!(source, "addon-detail" | "workshop-detail" | "dependency-check")
 }
 
 fn is_search_workshop_fetch_source(source: &str) -> bool {

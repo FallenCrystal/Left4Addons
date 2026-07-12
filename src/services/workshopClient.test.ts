@@ -5,12 +5,14 @@ const {
   mockParseHomepageSections,
   mockParseSSRItems,
   mockParseTagCategories,
+  mockParseWorkshopPageDetails,
   mockRememberWorkshopItems,
 } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
   mockParseHomepageSections: vi.fn(),
   mockParseSSRItems: vi.fn(),
   mockParseTagCategories: vi.fn(),
+  mockParseWorkshopPageDetails: vi.fn(),
   mockRememberWorkshopItems: vi.fn((items: unknown) => items),
 }));
 
@@ -22,7 +24,7 @@ vi.mock('../components/workshop/ssrParser', () => ({
   parseHomepageSections: (html: string) => mockParseHomepageSections(html),
   parseSSRItems: (html: string, source: string) => mockParseSSRItems(html, source),
   parseTagCategories: (html: string) => mockParseTagCategories(html),
-  parseWorkshopPageDetails: vi.fn(),
+  parseWorkshopPageDetails: (html: string) => mockParseWorkshopPageDetails(html),
 }));
 
 vi.mock('../components/workshop/authorDirectory', () => ({
@@ -38,6 +40,7 @@ describe('workshopClient', () => {
     mockParseHomepageSections.mockReset();
     mockParseSSRItems.mockReset();
     mockParseTagCategories.mockReset();
+    mockParseWorkshopPageDetails.mockReset();
     mockRememberWorkshopItems.mockClear();
     localStorage.clear();
   });
@@ -180,6 +183,8 @@ describe('workshopClient', () => {
       allowSteamCommunityHtml: true,
       allowSdkHtmlHybrid: true,
       sdkHtmlScope: 'all',
+      dependencySdkRefresh: 'always',
+      dependencyHtmlRefresh: 'cache-missing',
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     });
@@ -279,6 +284,8 @@ describe('workshopClient', () => {
       allowSteamWebApi: true,
       allowSteamCommunityHtml: true,
       sdkHtmlScope: 'navigation',
+      dependencySdkRefresh: 'always',
+      dependencyHtmlRefresh: 'cache-missing',
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     });
@@ -569,5 +576,82 @@ describe('workshopClient', () => {
       { title: 'Child One', workshopId: '200' },
       { title: 'Child Two', workshopId: '300' },
     ]);
+  });
+
+  test('fetchWorkshopDependencySnapshot refreshes SDK dependency relations even when a cache entry exists', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '100': {
+            workshopId: '100',
+            lastPageFetchedAt: '2026-01-01T00:00:00Z',
+            requiredItems: [{ title: 'Old dependency', workshopId: '200' }],
+          },
+          '300': { workshopId: '300', title: 'Fresh dependency' },
+        });
+      }
+      if (cmd === 'get_workshop_capabilities') {
+        return Promise.resolve({ bridgeAvailable: true, canQueryItems: true, canQueryHome: true });
+      }
+      if (cmd === 'query_workshop_item') {
+        return Promise.resolve({
+          source: 'steam-sdk',
+          item: { publishedfileid: '100', file_type: 'item', child_item_ids: ['300'] },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    workshopClient.setWorkshopSourceSettings({
+      preset: 'conservative',
+      allowSteamworksSdk: true,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: false,
+      sdkHtmlScope: 'search',
+      sourceOrder: ['steamworks-sdk', 'steam-web-api'],
+      cacheRetention: 'keep',
+      dependencySdkRefresh: 'always',
+      dependencyHtmlRefresh: 'cache-missing',
+    });
+
+    const snapshot = await workshopClient.fetchWorkshopDependencySnapshot('100');
+
+    expect(snapshot.requiredItems).toEqual([{ title: 'Fresh dependency', workshopId: '300' }]);
+    expect(mockInvoke).toHaveBeenCalledWith('query_workshop_item', { workshopId: '100' });
+  });
+
+  test('fetchWorkshopDependencySnapshot reuses a cached page relation when SDK is unavailable', async () => {
+    mockInvoke.mockImplementation((cmd) => {
+      if (cmd === 'get_workshop_cache') {
+        return Promise.resolve({
+          '100': {
+            workshopId: '100',
+            lastPageFetchedAt: '2026-01-01T00:00:00Z',
+            requiredItems: [{ title: 'Cached dependency', workshopId: '200' }],
+          },
+        });
+      }
+      throw new Error(`Unexpected command: ${cmd}`);
+    });
+
+    const workshopClient = await import('./workshopClient');
+    workshopClient.setSteamworksSdkDisabled(true);
+    workshopClient.setWorkshopSourceSettings({
+      preset: 'conservative',
+      allowSteamworksSdk: false,
+      allowSteamWebApi: true,
+      allowSteamCommunityHtml: true,
+      sdkHtmlScope: 'search',
+      sourceOrder: ['steamworks-sdk', 'steam-web-api'],
+      cacheRetention: 'keep',
+      dependencySdkRefresh: 'always',
+      dependencyHtmlRefresh: 'cache-missing',
+    });
+
+    const snapshot = await workshopClient.fetchWorkshopDependencySnapshot('100');
+
+    expect(snapshot.requiredItems).toEqual([{ title: 'Cached dependency', workshopId: '200' }]);
+    expect(mockInvoke).not.toHaveBeenCalledWith('fetch_workshop_html', expect.anything());
   });
 });

@@ -940,6 +940,81 @@ export async function fetchWorkshopPageDetails(workshopId: string, source: strin
   }
 }
 
+/**
+ * Resolve the dependency relation for one item without letting an item snapshot
+ * hide a newer SDK relation. HTML is intentionally cache-first to respect the
+ * Community fetch gate.
+ */
+export async function fetchWorkshopDependencySnapshot(workshopId: string): Promise<WorkshopPageDetails> {
+  const cache = await readWorkshopItemCache();
+  const cachedEntry = cache[workshopId];
+  const cachedDetails = cachedEntry
+    ? mapCachedDetailToPageDetails(cachedEntry, cache)
+    : null;
+  const hasCachedPage = Boolean(cachedEntry?.lastPageFetchedAt);
+  const hasCachedDependencyRelation = hasCachedPage ||
+    Array.isArray(cachedEntry?.requiredItems) ||
+    Array.isArray(cachedEntry?.childItemIds);
+  const capabilities = shouldUseSteamworksSdk()
+    ? await getWorkshopCapabilities().catch(() => null)
+    : null;
+  const canUseSdk = Boolean(capabilities?.canQueryItems);
+  const shouldRefreshSdk = workshopSourceSettings.dependencySdkRefresh === 'always' || !hasCachedDependencyRelation;
+  let details = cachedDetails;
+  let sdkProvidedRelation = false;
+
+  if (canUseSdk && shouldRefreshSdk) {
+    try {
+      const data = await invoke<WorkshopItemResponse>('query_workshop_item', { workshopId });
+      reportWorkshopWarnings(data.warnings);
+      const sdkDetails = await enrichRequiredItemsWithSdkDetails(
+        mapSteamDetailToPageDetails(data.item, cache),
+        cache,
+      );
+      sdkProvidedRelation = Array.isArray(data.item?.child_item_ids) ||
+        Array.isArray(data.item?.childItemIds) ||
+        Boolean(normalizeText(data.item?.file_type || data.item?.fileType));
+      details = mergeWorkshopPageDetails(cachedDetails, sdkDetails);
+      if (sdkProvidedRelation) {
+        details = {
+          ...details,
+          fileType: sdkDetails.fileType || details.fileType,
+          childItemIds: sdkDetails.childItemIds,
+          requiredItems: sdkDetails.requiredItems,
+        };
+      }
+    } catch (err) {
+      console.warn('Steam SDK dependency query failed:', err);
+    }
+  }
+
+  const shouldFetchHtml = shouldUseSteamCommunityHtmlFor('dependency-check', capabilities) && (
+    workshopSourceSettings.dependencyHtmlRefresh === 'always' || !hasCachedPage
+  );
+  if (shouldFetchHtml) {
+    try {
+      const url = `https://steamcommunity.com/sharedfiles/filedetails/?id=${workshopId}`;
+      const html = await fetchWorkshopHtml(url, 'dependency-check');
+      const htmlDetails = parseWorkshopPageDetails(html);
+      details = {
+        ...mergeWorkshopPageDetails(details, htmlDetails),
+        requiredItems: htmlDetails.requiredItems,
+      };
+    } catch (err) {
+      if (!sdkProvidedRelation && !hasCachedDependencyRelation) {
+        throw err;
+      }
+      console.warn('Steam Community dependency page fetch failed:', err);
+    }
+  }
+
+  if (!details || (!sdkProvidedRelation && !hasCachedDependencyRelation && !shouldFetchHtml)) {
+    throw new Error('No enabled source can determine this item\'s dependencies');
+  }
+
+  return enrichRequiredItemsWithSdkDetails(details, cache);
+}
+
 export async function getWorkshopPageSnapshot(workshopId: string): Promise<WorkshopPageDetails | null> {
   const cache = await readWorkshopItemCache();
   const detail = cache[workshopId];

@@ -97,6 +97,7 @@ export interface WorkshopBrowserProps {
   knownUninstalledAddons: Record<string, any>;
   downloadProgress: Record<string, number>;
   onDownload: (workshopId: string, title?: string, imagePath?: string) => void;
+  onDownloadMany?: (items: { workshopId: string; title?: string; imagePath?: string }[]) => void;
   onOpenLink: (url: string) => void;
   onImportCollection: (name: string, itemIds: string[]) => void;
   onRecordSeenItems?: (items: WorkshopItem[], source?: string) => void;

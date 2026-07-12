@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle } from 'lucide-react';
-import { Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings } from '../types/addon';
+import { DependencyRefreshMode, Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings, DependencyMissingBehavior } from '../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from './TransHTML';
 import { DEFAULT_WORKSHOP_SOURCE_SETTINGS, normalizeWorkshopSourceSettings } from '../utils/workshopSourceSettings';
@@ -20,6 +20,7 @@ interface SettingsViewProps {
     disableSteamworksSdk: boolean,
     forceSteamworksSdkDownload: boolean,
     maxDownloadRetries: number,
+    dependencyMissingBehavior: DependencyMissingBehavior,
     workshopSourceSettings: WorkshopSourceSettings,
   ) => Promise<void>;
 }
@@ -31,6 +32,7 @@ const SOURCE_LABEL_KEYS: Record<string, string> = {
 };
 
 const SCOPE_OPTIONS: WorkshopSdkHtmlScope[] = ['disabled', 'search', 'navigation', 'all'];
+const DEPENDENCY_REFRESH_OPTIONS: DependencyRefreshMode[] = ['always', 'cache-missing'];
 
 function clampDownloadConcurrency(value: number) {
   if (!Number.isFinite(value)) {
@@ -53,6 +55,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [disableSteamworksSdk, setDisableSteamworksSdk] = useState(false);
   const [forceSteamworksSdkDownload, setForceSteamworksSdkDownload] = useState(false);
   const [maxDownloadRetriesInput, setMaxDownloadRetriesInput] = useState('3');
+  const [dependencyMissingBehavior, setDependencyMissingBehavior] = useState<DependencyMissingBehavior>('ask');
   const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_WORKSHOP_SOURCE_SETTINGS);
 
   useEffect(() => {
@@ -63,6 +66,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setDisableSteamworksSdk(settings.disableSteamworksSdk || false);
     setForceSteamworksSdkDownload(settings.forceSteamworksSdkDownload || false);
     setMaxDownloadRetriesInput(String(settings.maxDownloadRetries ?? 3));
+    setDependencyMissingBehavior(settings.dependencyMissingBehavior || 'ask');
     setWorkshopSourceSettings(normalizeWorkshopSourceSettings(settings.workshopSourceSettings));
   }, [settings]);
 
@@ -85,6 +89,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       disableSteamworksSdk,
       forceSteamworksSdkDownload,
       maxRetries,
+      dependencyMissingBehavior,
       workshopSourceSettings,
     );
   };
@@ -382,6 +387,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
                     {t('settings.maxDownloadRetriesHelp')}
                   </span>
+                </div>
+
+                <div className="form-group" style={{ marginBottom: '24px' }}>
+                  <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                    {t('settings.dependencyMissingBehaviorLabel', 'Behavior when dependencies are missing')}
+                  </label>
+                  <CustomSelect
+                    options={[
+                      { value: 'always', label: t('settings.behaviorAlways', 'Always download') },
+                      { value: 'ask', label: t('settings.behaviorAsk', 'Ask [Default]') },
+                      { value: 'ignore', label: t('settings.behaviorIgnore', 'Ignore (Not recommended)') },
+                    ]}
+                    value={dependencyMissingBehavior}
+                    onChange={(val) => setDependencyMissingBehavior(val as DependencyMissingBehavior)}
+                    minWidth="100%"
+                    style={{ width: '100%', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                  />
+                  {dependencyMissingBehavior === 'ignore' && (
+                    <div style={{ padding: '10px 12px', borderRadius: '8px', background: 'var(--md-sys-color-error-container)', color: 'var(--md-sys-color-on-error-container)', fontSize: '12px', lineHeight: '1.5', marginTop: '12px', display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+                      <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: '2px' }} />
+                      <span>{t('settings.behaviorIgnoreWarning', 'Warning: Ignoring dependencies may cause addons to not work properly. Dependency checks will be skipped.')}</span>
+                    </div>
+                  )}
                 </div>
 
                 <div className="form-group">
@@ -698,6 +726,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         </div>
                       </div>
                     ))}
+                  </div>
+                </div>
+
+                <div style={{ padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.dependencyRefreshTitle')}
+                  </label>
+                  <p style={{ margin: '0 0 12px', fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5' }}>
+                    {t('settings.dependencyRefreshDesc')}
+                  </p>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '12px' }}>
+                    <div>
+                      <label className="form-label" style={{ fontSize: '12px', marginBottom: '6px', display: 'block' }}>
+                        {t('settings.dependencySdkRefreshLabel')}
+                      </label>
+                      <CustomSelect
+                        options={DEPENDENCY_REFRESH_OPTIONS.map((mode) => ({ value: mode, label: t(`settings.dependencyRefresh.${mode}`) }))}
+                        value={workshopSourceSettings.dependencySdkRefresh}
+                        onChange={(value) => updateSourceSettings({ dependencySdkRefresh: value as DependencyRefreshMode })}
+                        minWidth="100%"
+                        style={{ width: '100%', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                      />
+                    </div>
+                    <div>
+                      <label className="form-label" style={{ fontSize: '12px', marginBottom: '6px', display: 'block' }}>
+                        {t('settings.dependencyHtmlRefreshLabel')}
+                      </label>
+                      <CustomSelect
+                        options={DEPENDENCY_REFRESH_OPTIONS.map((mode) => ({ value: mode, label: t(`settings.dependencyRefresh.${mode}`) }))}
+                        value={workshopSourceSettings.dependencyHtmlRefresh}
+                        onChange={(value) => updateSourceSettings({ dependencyHtmlRefresh: value as DependencyRefreshMode })}
+                        minWidth="100%"
+                        style={{ width: '100%', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                      />
+                    </div>
                   </div>
                 </div>
 

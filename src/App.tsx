@@ -28,6 +28,7 @@ import { MasterCollectionHeader } from './components/MasterCollectionHeader';
 import { AddToGroupModal } from './components/AddToGroupModal';
 import { PromptModal } from './components/PromptModal';
 import { TaskCenterModal } from './components/TaskCenterModal';
+import { DependencyPromptContainer } from './components/DependencyPromptContainer';
 import { useState } from 'react';
 import { sortAddonsDownloadedFirst } from './utils/addonHelpers';
 import { findKnownWorkshopEntry } from './utils/workshopKnown';
@@ -109,6 +110,7 @@ function App() {
     handleBatchAddToGroup,
     handleFilterTabChange,
     downloadAddon,
+    downloadAddons,
     deleteAddons,
     executeRealDelete,
     deleteConfirmModal,
@@ -251,6 +253,7 @@ function App() {
             knownUninstalledAddons={knownUninstalledAddons}
             downloadProgress={downloadProgress}
             onDownload={downloadAddon}
+            onDownloadMany={downloadAddons}
             onOpenLink={handleOpenLink}
             onImportCollection={async (name, itemIds) => {
               await handleCreateGroup(name, itemIds, undefined, undefined, 'workshop-import');
@@ -640,6 +643,18 @@ function App() {
         onRetryTask={retryTask}
         onClearFinishedTasks={clearFinishedTasks}
         workshopSourceSettings={settings.workshopSourceSettings}
+      />
+
+      {/* Dependency Prompt Container */}
+      <DependencyPromptContainer
+        addons={addons}
+        knownUninstalledAddons={knownUninstalledAddons}
+        backgroundTasks={backgroundTasks}
+        settings={settings}
+        onDownload={downloadAddons}
+        onGoToSettings={() => {
+          handleFilterTabChange('settings', null);
+        }}
       />
 
       {/* Floating Batch Action Bar */}

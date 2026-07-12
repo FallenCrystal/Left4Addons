@@ -108,7 +108,7 @@ export interface Addon {
 
 export interface BackgroundTask {
   id: string;
-  kind: 'download' | 'workshop-crawl' | 'warning';
+  kind: 'download' | 'workshop-crawl' | 'dependency-check' | 'warning';
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   source?: string;
   targetIds: string[];
@@ -120,6 +120,13 @@ export interface BackgroundTask {
   finishedAt?: string;
   title?: string;
   imagePath?: string;
+  dependencyCheck?: {
+    rootIds: string[];
+    seedIds?: string[];
+    discoveredCount: number;
+    completedCount: number;
+    failedNodes: { workshopId: string; error: string }[];
+  };
 }
 
 export interface Group {
@@ -141,6 +148,10 @@ export interface MasterCollection {
   icon?: string;
 }
 
+export type DependencyMissingBehavior = 'always' | 'ask' | 'ignore';
+export type WorkshopSdkHtmlScope = 'disabled' | 'search' | 'navigation' | 'all';
+export type DependencyRefreshMode = 'always' | 'cache-missing';
+
 export interface Settings {
   workshopDir: string;
   loadingDir: string;
@@ -150,10 +161,9 @@ export interface Settings {
   disableSteamworksSdk: boolean;
   forceSteamworksSdkDownload?: boolean;
   maxDownloadRetries?: number;
+  dependencyMissingBehavior?: DependencyMissingBehavior;
   workshopSourceSettings?: WorkshopSourceSettings;
 }
-
-export type WorkshopSdkHtmlScope = 'disabled' | 'search' | 'navigation' | 'all';
 
 export interface WorkshopSourceSettings {
   preset: 'conservative' | 'sdk-only' | 'offline' | 'hybrid';
@@ -162,6 +172,8 @@ export interface WorkshopSourceSettings {
   allowSteamCommunityHtml: boolean;
   allowSdkHtmlHybrid?: boolean;
   sdkHtmlScope: WorkshopSdkHtmlScope;
+  dependencySdkRefresh: DependencyRefreshMode;
+  dependencyHtmlRefresh: DependencyRefreshMode;
   sourceOrder: string[];
   cacheRetention: 'keep';
 }

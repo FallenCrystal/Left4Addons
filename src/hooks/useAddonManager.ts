@@ -50,6 +50,7 @@ export function useAddonManager() {
     suppressSdkUnavailableWarning: false,
     disableSteamworksSdk: false,
     forceSteamworksSdkDownload: false,
+    dependencyMissingBehavior: 'ask',
     workshopSourceSettings: DEFAULT_WORKSHOP_SOURCE_SETTINGS,
   });
   const [loading, setLoading] = useState(true);
@@ -160,6 +161,7 @@ export function useAddonManager() {
     backgroundTasks: managedBackgroundTasks,
     enqueueDownloads,
     enqueueWorkshopCrawl,
+    enqueueDependencyCheck,
     recordSeenItems,
     cancelTask,
     retryTask,
@@ -508,6 +510,7 @@ export function useAddonManager() {
     disableSteamworksSdk: boolean,
     forceSteamworksSdkDownload: boolean,
     maxDownloadRetries: number,
+    dependencyMissingBehavior?: string,
     workshopSourceSettings?: WorkshopSourceSettings,
   ) => {
     if (isSubmitting) return;
@@ -522,6 +525,7 @@ export function useAddonManager() {
           disableSteamworksSdk,
           forceSteamworksSdkDownload,
           maxDownloadRetries,
+          dependencyMissingBehavior,
           workshopSourceSettings,
         },
       });
@@ -757,10 +761,28 @@ export function useAddonManager() {
     });
   };
 
+  const downloadAddons = async (
+    items: (string | { workshopId: string; title?: string; imagePath?: string })[],
+    source = 'batch-download',
+  ) => {
+    const workshopIds = items
+      .map((item) => typeof item === 'string' ? item : item.workshopId)
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (workshopIds.length === 0) return;
+    setDownloadProgress((prev) => {
+      const next = { ...prev };
+      workshopIds.forEach((workshopId) => {
+        next[workshopId] = next[workshopId] ?? 0;
+      });
+      return next;
+    });
+    enqueueDownloads(items, source);
+  };
+
   // Download addon
   const downloadAddon = async (workshopId: string, title?: string, imagePath?: string) => {
-    setDownloadProgress(prev => ({ ...prev, [workshopId]: 0 }));
-    enqueueDownloads([{ workshopId, title, imagePath }], 'single-download');
+    await downloadAddons([{ workshopId, title, imagePath }], 'single-download');
   };
 
   // Delete addon(s)
@@ -1201,14 +1223,7 @@ export function useAddonManager() {
   // Batch download uninstalled addons
   const handleBatchDownload = async (workshopIds: string[]) => {
     if (workshopIds.length === 0) return;
-    setDownloadProgress(prev => {
-      const next = { ...prev };
-      workshopIds.forEach((wId) => {
-        next[wId] = next[wId] ?? 0;
-      });
-      return next;
-    });
-    enqueueDownloads(workshopIds, 'batch-download');
+    await downloadAddons(workshopIds, 'batch-download');
     addToast(t('toasts.batchDownloadSuccess', { count: workshopIds.length }), 'success');
   };
 
@@ -1530,10 +1545,12 @@ export function useAddonManager() {
     handleBatchAddToGroup,
     handleFilterTabChange,
     downloadAddon,
+    downloadAddons,
     deleteAddons,
     executeRealDelete,
     handleBatchDownload,
     enqueueWorkshopCrawl,
+    enqueueDependencyCheck,
     recordSeenItems,
     cancelTask,
     retryTask,

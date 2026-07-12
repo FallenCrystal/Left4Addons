@@ -61,6 +61,8 @@ describe('useAddonManager', () => {
       allowSteamCommunityHtml: true,
       allowSdkHtmlHybrid: false,
       sdkHtmlScope: 'search',
+      dependencySdkRefresh: 'always',
+      dependencyHtmlRefresh: 'cache-missing',
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     },
