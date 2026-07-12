@@ -120,6 +120,7 @@ function App() {
     backgroundTasks,
     cancelTask,
     retryTask,
+    removeTask,
     clearFinishedTasks,
 
     // Master Collection handlers
@@ -641,6 +642,7 @@ function App() {
         onSyncSteam={syncSteamDetails}
         onCancelTask={cancelTask}
         onRetryTask={retryTask}
+        onRemoveTask={removeTask}
         onClearFinishedTasks={clearFinishedTasks}
         workshopSourceSettings={settings.workshopSourceSettings}
       />

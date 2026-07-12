@@ -165,7 +165,10 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
       pendingDependencyEvaluationRef.current = true;
       if (scansFinished) {
         backgroundTasks
-          .filter((task) => task.kind === 'dependency-check' && task.status === 'completed')
+          .filter((task) => (
+            task.kind === 'dependency-check' &&
+            (task.status === 'completed' || task.status === 'failed')
+          ))
           .flatMap((task) => task.dependencyCheck?.discoveredDependencies || [])
           .forEach((dependency) => {
             const workshopId = dependency.workshopId?.trim();

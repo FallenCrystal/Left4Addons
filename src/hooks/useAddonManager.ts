@@ -165,6 +165,7 @@ export function useAddonManager() {
     recordSeenItems,
     cancelTask,
     retryTask,
+    removeTask,
     clearFinishedTasks,
     upsertWarningTask,
   } = useBackgroundTasks({
@@ -1554,6 +1555,7 @@ export function useAddonManager() {
     recordSeenItems,
     cancelTask,
     retryTask,
+    removeTask,
     clearFinishedTasks,
 
     // Master Collection handlers

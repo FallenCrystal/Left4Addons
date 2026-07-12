@@ -75,6 +75,65 @@ describe('useBackgroundTasks dependency checks', () => {
     expect(updateLocalState).toHaveBeenCalledTimes(1);
   });
 
+  test('retries and removes a failed dependency check', async () => {
+    let attempts = 0;
+    mockFetchDependencySnapshot.mockImplementation(async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error('temporary dependency lookup failure');
+      }
+      return {
+        imageGallery: [],
+        tags: [],
+        parentCollections: [],
+        requiredItems: [],
+      };
+    });
+
+    const { result } = renderHook(() => useBackgroundTasks({
+      enabled: true,
+      downloadConcurrency: 1,
+      addons: {},
+      knownUninstalledAddons: {},
+      updateLocalState: vi.fn(),
+      onDownloadSuccess: vi.fn(),
+      onDownloadCancelled: vi.fn(),
+      onTaskError: vi.fn(),
+    }));
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith('get_background_tasks', undefined));
+    act(() => {
+      result.current.enqueueDependencyCheck(['A'], 'test');
+    });
+
+    let taskId = '';
+    await waitFor(() => {
+      const task = result.current.backgroundTasks.find((candidate) => candidate.kind === 'dependency-check');
+      expect(task?.status).toBe('failed');
+      expect(task?.dependencyCheck?.failedNodes).toEqual([
+        expect.objectContaining({ workshopId: 'A' }),
+      ]);
+      taskId = task!.id;
+    });
+
+    act(() => {
+      result.current.retryTask(taskId);
+    });
+
+    await waitFor(() => {
+      const task = result.current.backgroundTasks.find((candidate) => candidate.id === taskId);
+      expect(task?.status).toBe('completed');
+      expect(task?.dependencyCheck?.failedNodes).toEqual([]);
+    });
+    expect(mockFetchDependencySnapshot).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      result.current.removeTask(taskId);
+    });
+
+    expect(result.current.backgroundTasks).not.toContainEqual(expect.objectContaining({ id: taskId }));
+  });
+
   test('restores a persisted download only once under StrictMode', async () => {
     let resolveDownload: (() => void) | undefined;
     const downloadPromise = new Promise<void>((resolve) => {

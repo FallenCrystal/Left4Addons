@@ -13,6 +13,7 @@ interface TaskCenterModalProps {
   onSyncSteam: () => void;
   onCancelTask: (id: string) => void;
   onRetryTask: (id: string) => void;
+  onRemoveTask: (id: string) => void;
   onClearFinishedTasks: () => void;
   workshopSourceSettings?: WorkshopSourceSettings;
 }
@@ -26,6 +27,7 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
   onSyncSteam,
   onCancelTask,
   onRetryTask,
+  onRemoveTask,
   onClearFinishedTasks,
   workshopSourceSettings,
 }) => {
@@ -400,6 +402,7 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                         {!isWarningTask && (
                           <div style={{ display: 'flex', gap: '4px' }}>
                             <button
+                              type="button"
                               className="btn btn-secondary"
                               onClick={() => onRetryTask(task.id)}
                               title={t('taskCenter.retry', '重新尝试')}
@@ -416,8 +419,9 @@ export const TaskCenterModal: React.FC<TaskCenterModalProps> = ({
                               <RotateCw size={14} />
                             </button>
                             <button
+                              type="button"
                               className="btn btn-secondary"
-                              onClick={() => onCancelTask(task.id)}
+                              onClick={() => onRemoveTask(task.id)}
                               title={t('taskCenter.clear', '移除通知')}
                               style={{
                                 width: '32px',

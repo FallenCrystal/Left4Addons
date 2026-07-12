@@ -440,7 +440,7 @@ export function useBackgroundTasks({
       const currentTask = tasksRef.current.find((candidate) => candidate.id === task.id);
       if (currentTask?.status !== 'cancelled') {
         patchTask(task.id, {
-          status: 'completed',
+          status: failedNodes.length > 0 ? 'failed' : 'completed',
           progress: 100,
           finishedAt: nowIso(),
           error: failedNodes.length > 0 ? `${failedNodes.length} dependency node(s) could not be resolved` : undefined,
@@ -621,6 +621,13 @@ export function useBackgroundTasks({
     }
   }, [patchTask]);
 
+  const removeTask = useCallback((id: string) => {
+    const task = tasksRef.current.find((candidate) => candidate.id === id);
+    if (!task) return;
+
+    commitTasks(tasksRef.current.filter((candidate) => candidate.id !== id));
+  }, [commitTasks]);
+
   const clearFinishedTasks = useCallback(() => {
     const activeTasks = tasksRef.current.filter(
       (task) => task.status === 'queued' || task.status === 'running'
@@ -637,6 +644,7 @@ export function useBackgroundTasks({
     upsertWarningTask,
     cancelTask,
     retryTask,
+    removeTask,
     clearFinishedTasks,
   };
 }
