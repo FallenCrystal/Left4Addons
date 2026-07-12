@@ -1,6 +1,5 @@
 type WorkshopLike = {
   id?: string;
-  vpkName?: string;
   workshopId?: string;
 };
 
@@ -15,16 +14,12 @@ export function findKnownWorkshopEntry<T extends WorkshopLike>(
   const id = normalizeId(workshopId);
   if (!entries || !id) return undefined;
 
-  // Read legacy ".vpk" keys, but keep workshop identity keyed by the raw
-  // publishedfileid everywhere new code can control.
-  const direct = entries[id] || entries[`${id}.vpk`];
+  const direct = entries[id];
   if (direct) return direct;
 
   return Object.values(entries).find((entry) => (
     normalizeId(entry?.workshopId) === id ||
-    normalizeId(entry?.id) === id ||
-    normalizeId(entry?.id) === `${id}.vpk` ||
-    normalizeId(entry?.vpkName) === `${id}.vpk`
+    normalizeId(entry?.id) === id
   ));
 }
 

@@ -499,12 +499,8 @@ pub async fn group_action(
         let mut new_workshop_ids: Vec<String> = Vec::new();
         if source == "workshop-import" {
             for raw_id in &raw_ids {
-                let workshop_id = raw_id.replace(".vpk", "");
-                // Check both with and without .vpk suffix
-                let vpk_key = format!("{}.vpk", workshop_id);
-                if !db.addons.contains_key(&vpk_key)
-                    && !db.known_uninstalled_addons.contains_key(&vpk_key)
-                    && !db.addons.contains_key(&workshop_id)
+                let workshop_id = raw_id.trim().to_string();
+                if !db.addons.contains_key(&workshop_id)
                     && !db.known_uninstalled_addons.contains_key(&workshop_id)
                 {
                     db.known_uninstalled_addons.insert(
@@ -570,22 +566,11 @@ pub async fn group_action(
             }
         }
 
-        let filtered_vpks: Vec<String> = ids
+        let filtered_ids: Vec<String> = ids
             .into_iter()
             .filter_map(|n| {
-                // Already a valid key
-                if db.addons.contains_key(&n)
-                    || db.known_uninstalled_addons.contains_key(&n)
-                    || n.ends_with(".vpk")
-                {
+                if db.addons.contains_key(&n) || db.known_uninstalled_addons.contains_key(&n) {
                     return Some(n);
-                }
-                // Raw workshop ID → try with .vpk suffix
-                let vpk_key = format!("{}.vpk", n);
-                if db.addons.contains_key(&vpk_key)
-                    || db.known_uninstalled_addons.contains_key(&vpk_key)
-                {
-                    return Some(vpk_key);
                 }
                 None
             })
@@ -660,7 +645,7 @@ pub async fn group_action(
         db.groups.push(Group {
             id: group_id.clone(),
             name,
-            addons: filtered_vpks,
+            addons: filtered_ids,
             tags,
             workshop_collection_id,
             master_collection_ids: if mc_ids.is_empty() {
@@ -697,17 +682,8 @@ pub async fn group_action(
         let valid_ids: Vec<String> = ids
             .into_iter()
             .filter_map(|n| {
-                if db.addons.contains_key(&n)
-                    || db.known_uninstalled_addons.contains_key(&n)
-                    || n.ends_with(".vpk")
-                {
+                if db.addons.contains_key(&n) || db.known_uninstalled_addons.contains_key(&n) {
                     return Some(n);
-                }
-                let vpk_key = format!("{}.vpk", n);
-                if db.addons.contains_key(&vpk_key)
-                    || db.known_uninstalled_addons.contains_key(&vpk_key)
-                {
-                    return Some(vpk_key);
                 }
                 None
             })
@@ -747,11 +723,11 @@ pub async fn group_action(
             group.workshop_collection_id = workshop_collection_id;
 
             if let Some(vpks) = ids {
-                let filtered_vpks: Vec<String> = vpks
+                let filtered_ids: Vec<String> = vpks
                     .into_iter()
-                    .filter(|n| valid_addon_names.contains(n) || n.ends_with(".vpk"))
+                    .filter(|id| valid_addon_names.contains(id))
                     .collect();
-                group.addons = filtered_vpks;
+                group.addons = filtered_ids;
             }
         }
     } else if action == "auto-group" {

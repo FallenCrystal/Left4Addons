@@ -494,9 +494,7 @@ fn is_known_workshop_id(known_addons_path: &Path, groups_path: &Path, workshop_i
     }
 
     let known_addons = load_known_addons(known_addons_path);
-    if known_addons.contains_key(workshop_id)
-        || known_addons.contains_key(&format!("{}.vpk", workshop_id))
-    {
+    if known_addons.contains_key(workshop_id) {
         return true;
     }
 
@@ -504,11 +502,9 @@ fn is_known_workshop_id(known_addons_path: &Path, groups_path: &Path, workshop_i
         return true;
     }
 
-    known_addons.values().any(|entry| {
-        entry.id == workshop_id
-            || entry.vpk_name == format!("{}.vpk", workshop_id)
-            || entry.workshop_id.as_deref() == Some(workshop_id)
-    })
+    known_addons
+        .values()
+        .any(|entry| entry.id == workshop_id || entry.workshop_id.as_deref() == Some(workshop_id))
 }
 
 fn ensure_background_workshop_fetch_allowed(
@@ -834,10 +830,36 @@ fn load_known_addons(known_addons_path: &Path) -> HashMap<String, KnownAddonEntr
     if known_addons_path.exists() {
         if let Ok(content) = fs::read_to_string(known_addons_path) {
             if let Ok(parsed) = serde_json::from_str::<HashMap<String, KnownAddonEntry>>(&content) {
-                return parsed
+                let mut normalized = HashMap::new();
+                for (key, mut entry) in parsed
                     .into_iter()
                     .filter(|(_, entry)| !is_dummy_addon_info(&entry.addon_info))
-                    .collect();
+                {
+                    let Some(workshop_id) = entry
+                        .workshop_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                    else {
+                        normalized.insert(key, entry);
+                        continue;
+                    };
+
+                    entry.id = workshop_id.to_string();
+                    let is_canonical_key = key == workshop_id;
+                    match normalized.entry(workshop_id.to_string()) {
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(entry);
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut slot)
+                            if is_canonical_key =>
+                        {
+                            slot.insert(entry);
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                    }
+                }
+                return normalized;
             }
         }
     }
@@ -1028,7 +1050,13 @@ fn load_known_addons_from_legacy_db(
                 if addon.is_dummy || is_dummy_addon_info(&addon.addon_info) {
                     continue;
                 }
-                let id = addon.id.clone();
+                let id = addon
+                    .workshop_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or(&addon.id)
+                    .to_string();
                 migrated.insert(
                     id.clone(),
                     KnownAddonEntry {
@@ -2297,13 +2325,7 @@ fn upsert_known_addon_entry(
         return;
     }
 
-    let legacy_key = format!("{}.vpk", workshop_id);
-    let existing = known_addons
-        .get(workshop_id)
-        .cloned()
-        .or_else(|| known_addons.get(&legacy_key).cloned());
-
-    known_addons.remove(&legacy_key);
+    let existing = known_addons.get(workshop_id).cloned();
 
     let preview_url = details
         .and_then(|value| value.get("preview_url"))
@@ -2584,7 +2606,7 @@ fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
 mod tests {
     use super::{
         ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
-        is_background_workshop_fetch_source, load_workshop_cache,
+        is_background_workshop_fetch_source, load_known_addons, load_workshop_cache,
         merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
         normalize_master_collection_group_refs, parse_content_range_start,
         persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
@@ -2823,6 +2845,31 @@ mod tests {
         assert!(allowed.is_ok());
         assert!(blocked.is_err());
         assert!(manual.is_ok());
+    }
+
+    #[test]
+    fn normalizes_known_workshop_entries_to_raw_ids() {
+        let path = write_known_addons_file(
+            "normalize-workshop-id",
+            json!({
+                "12345.vpk": {
+                    "id": "12345.vpk",
+                    "vpkName": "12345.vpk",
+                    "workshopId": "12345",
+                    "addonInfo": {},
+                    "hasImage": false,
+                    "imagePath": null,
+                    "steamDetails": null
+                }
+            }),
+        );
+
+        let entries = load_known_addons(&path);
+        fs::remove_file(&path).ok();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!entries.contains_key("12345.vpk"));
+        assert_eq!(entries["12345"].id, "12345");
     }
 
     #[test]

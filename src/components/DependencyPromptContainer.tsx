@@ -60,14 +60,13 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
       const normalizedId = String(id || '').trim();
       if (!normalizedId) return undefined;
       
-      const direct = addons[normalizedId] || addons[`${normalizedId}.vpk`] ||
-                     knownUninstalledAddons[normalizedId] || knownUninstalledAddons[`${normalizedId}.vpk`];
+      const direct = addons[normalizedId] || knownUninstalledAddons[normalizedId];
       if (direct) return direct;
 
       return Object.values(addons).find(a => 
-        a.workshopId === normalizedId || a.id === normalizedId || a.id === `${normalizedId}.vpk` || a.vpkName === `${normalizedId}.vpk`
+        a.workshopId === normalizedId || a.id === normalizedId
       ) || Object.values(knownUninstalledAddons).find(a => 
-        a.workshopId === normalizedId || a.id === normalizedId || a.id === `${normalizedId}.vpk` || a.vpkName === `${normalizedId}.vpk`
+        a.workshopId === normalizedId || a.id === normalizedId
       );
     };
 
