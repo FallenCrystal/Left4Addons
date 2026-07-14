@@ -1989,6 +1989,13 @@ async fn fetch_steam_details(workshop_ids: &[String]) -> Result<Vec<serde_json::
     fetch_steam_details_web(workshop_ids).await
 }
 
+fn direct_download_url(details: &Value) -> Option<&str> {
+    details
+        .get("file_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+}
+
 async fn fetch_steam_details_hybrid(
     workshop_service: &WorkshopService,
     workshop_ids: &[String],
@@ -2794,7 +2801,7 @@ fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_group_internal, ensure_background_workshop_fetch_allowed,
+        auto_group_internal, direct_download_url, ensure_background_workshop_fetch_allowed,
         extract_steamcommunity_error_message, is_background_workshop_fetch_source,
         load_known_addons, load_workshop_cache, looks_like_placeholder_author_name,
         merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
@@ -3344,6 +3351,16 @@ mod tests {
         let entry = cache.get("123").unwrap();
         assert!(entry.get("creatorName").is_none());
         assert!(entry.get("authorName").is_none());
+    }
+
+    #[test]
+    fn direct_download_url_requires_a_non_empty_web_api_url() {
+        assert_eq!(direct_download_url(&json!({ "file_url": "" })), None);
+        assert_eq!(direct_download_url(&json!({ "file_url": 42 })), None);
+        assert_eq!(
+            direct_download_url(&json!({ "file_url": "https://example.test/addon.vpk" })),
+            Some("https://example.test/addon.vpk")
+        );
     }
 
     #[test]

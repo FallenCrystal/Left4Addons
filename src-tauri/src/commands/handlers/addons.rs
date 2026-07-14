@@ -1098,16 +1098,30 @@ pub async fn download_addon(
         if details_list.is_empty() {
             return Err("Failed to retrieve details for workshop item".to_string());
         }
-        let details = details_list[0].clone();
+        let mut details = details_list[0].clone();
+
+        // Steamworks can return valid item metadata without a direct download URL. When
+        // direct downloads are enabled, query the Web API before treating that as a
+        // reason to fall back to the less reliable SDK installation path.
+        if !force_sdk_download
+            && source_policy.allow_web_api()
+            && direct_download_url(&details).is_none()
+        {
+            if let Ok(web_details) = fetch_steam_details(std::slice::from_ref(&workshop_id)).await {
+                if let Some(web_details) = web_details
+                    .into_iter()
+                    .find(|detail| direct_download_url(detail).is_some())
+                {
+                    details = web_details;
+                }
+            }
+        }
 
         let title = details
             .get("title")
             .and_then(|t| t.as_str())
             .unwrap_or("Workshop Item");
-        let file_url = details
-            .get("file_url")
-            .and_then(|u| u.as_str())
-            .map(|s| s.to_string());
+        let file_url = direct_download_url(&details).map(str::to_string);
         let prefer_sdk_download = force_sdk_download || file_url.is_none();
 
         if !workshop_dir.exists() {
