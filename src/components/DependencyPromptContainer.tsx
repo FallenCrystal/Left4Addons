@@ -41,7 +41,7 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
   const prevDownloadCountRef = useRef(0);
   const prevScanCountRef = useRef(0);
   const pendingDependencyEvaluationRef = useRef(false);
-  const pendingDependencyCandidatesRef = useRef<Map<string, DiscoveredDependency>>(new Map());
+  const pendingDependencyCandidatesRef = useRef<Map<string, DiscoveredDependency & { rootIds?: string[] }>>(new Map());
   
   // To avoid repeatedly prompting for the same missing dependencies if user clicks "Cancel" or "Ignore",
   // we can maintain a Set of ignored workshop IDs per session.
@@ -56,7 +56,7 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
   const currentlyScanning = currentScanCount > 0;
 
   // Compute missing dependencies globally
-  const calculateMissingDependencies = (taskDependencies: DiscoveredDependency[] = []) => {
+  const calculateMissingDependencies = (taskDependencies: (DiscoveredDependency & { rootIds?: string[] })[] = []) => {
     const missingIds = new Set<string>();
     
     // Check requiredItems of all addons we have (installed, disabled, downloading, or in knownUninstalled)
@@ -108,7 +108,16 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
     taskDependencies.forEach((dependency) => {
       const workshopId = dependency.workshopId?.trim();
       if (workshopId) {
-        requiredItems.set(workshopId, { ...dependency, workshopId });
+        // Only include if at least one of the rootIds is still in ownedAddons, or if rootIds is empty/not provided
+        const hasRootIds = dependency.rootIds && dependency.rootIds.length > 0;
+        const isRootOwned = !hasRootIds || dependency.rootIds!.some(rootId => {
+          const normalized = rootId.trim();
+          return Array.from(ownedAddons).some(a => a.id === normalized || a.workshopId === normalized);
+        });
+
+        if (isRootOwned) {
+          requiredItems.set(workshopId, { ...dependency, workshopId });
+        }
       }
     });
 
@@ -169,17 +178,23 @@ export const DependencyPromptContainer: React.FC<DependencyPromptContainerProps>
             task.kind === 'dependency-check' &&
             (task.status === 'completed' || task.status === 'failed')
           ))
-          .flatMap((task) => task.dependencyCheck?.discoveredDependencies || [])
-          .forEach((dependency) => {
-            const workshopId = dependency.workshopId?.trim();
-            if (workshopId) {
-              pendingDependencyCandidatesRef.current.set(workshopId, {
-                workshopId,
-                title: dependency.title,
-                previewUrl: dependency.previewUrl,
-                creatorName: dependency.creatorName,
-              });
-            }
+          .forEach((task) => {
+            const rootIds = task.dependencyCheck?.rootIds || [];
+            (task.dependencyCheck?.discoveredDependencies || []).forEach((dependency) => {
+              const workshopId = dependency.workshopId?.trim();
+              if (workshopId) {
+                const existing = pendingDependencyCandidatesRef.current.get(workshopId);
+                const existingRootIds = existing?.rootIds || [];
+                const mergedRootIds = Array.from(new Set([...existingRootIds, ...rootIds]));
+                pendingDependencyCandidatesRef.current.set(workshopId, {
+                  workshopId,
+                  title: dependency.title,
+                  previewUrl: dependency.previewUrl,
+                  creatorName: dependency.creatorName,
+                  rootIds: mergedRootIds,
+                });
+              }
+            });
           });
       }
     }
