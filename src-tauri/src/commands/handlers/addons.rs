@@ -23,6 +23,29 @@ fn emit_sdk_download_warning(app_handle: &AppHandle, workshop_id: &str, title: &
     );
 }
 
+pub(super) fn format_workshop_vpk_name(workshop_id: &str, title: &str) -> String {
+    let clean_title_step1 = title.replace(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'), "_");
+    let mut clean_title = clean_title_step1.trim();
+    if clean_title.to_lowercase().ends_with(".vpk") {
+        clean_title = &clean_title[..clean_title.len() - 4];
+    }
+    let mut clean_title = clean_title.trim();
+    while clean_title.starts_with('[') {
+        if let Some(end_idx) = clean_title.find(']') {
+            clean_title = clean_title[end_idx + 1..].trim();
+        } else {
+            break;
+        }
+    }
+    let clean_title = clean_title.trim();
+    let final_title = if clean_title.is_empty() {
+        "Workshop Item"
+    } else {
+        clean_title
+    };
+    format!("[{}]{}.vpk", workshop_id, final_title)
+}
+
 #[tauri::command]
 pub async fn move_addons(
     ids: Vec<String>,
@@ -1079,10 +1102,10 @@ pub async fn download_addon(
     clear_download_cancellation(&state, &workshop_id)?;
 
     let result = async {
-        let (workshop_dir, source_policy, force_sdk_download) = {
+        let (loading_dir, source_policy, force_sdk_download) = {
             let db = state.db.lock().await;
             (
-                PathBuf::from(&db.settings.workshop_dir),
+                PathBuf::from(&db.settings.loading_dir),
                 SourcePolicy::from_settings(&db.settings),
                 db.settings.force_steamworks_sdk_download,
             )
@@ -1124,8 +1147,8 @@ pub async fn download_addon(
         let file_url = direct_download_url(&details).map(str::to_string);
         let prefer_sdk_download = force_sdk_download || file_url.is_none();
 
-        if !workshop_dir.exists() {
-            fs::create_dir_all(&workshop_dir).map_err(|e| e.to_string())?;
+        if !loading_dir.exists() {
+            fs::create_dir_all(&loading_dir).map_err(|e| e.to_string())?;
         }
         if !state.download_cache_dir.exists() {
             fs::create_dir_all(&state.download_cache_dir).map_err(|e| {
@@ -1137,8 +1160,8 @@ pub async fn download_addon(
             })?;
         }
 
-        let dest_filename = format!("{}.vpk", workshop_id);
-        let dest_path = workshop_dir.join(&dest_filename);
+        let dest_filename = format_workshop_vpk_name(&workshop_id, title);
+        let dest_path = loading_dir.join(&dest_filename);
         let partial_path = partial_download_path(&state.download_cache_dir, &workshop_id);
         let partial_metadata_path =
             partial_download_metadata_path(&state.download_cache_dir, &workshop_id);
@@ -1168,7 +1191,8 @@ pub async fn download_addon(
                 &state,
                 &state.workshop_service,
                 &workshop_id,
-                &workshop_dir,
+                &loading_dir,
+                &dest_filename,
                 &app_handle,
                 source_policy.allow_bridge(),
             )
@@ -1176,6 +1200,17 @@ pub async fn download_addon(
             {
                 Ok(true) => {
                     let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
+                    let (enable_dummy_bypass, w_dir) = {
+                        let db = state.db.lock().await;
+                        (db.settings.enable_dummy_bypass, PathBuf::from(&db.settings.workshop_dir))
+                    };
+                    if enable_dummy_bypass {
+                        let dummy_vpk_path = w_dir.join(format!("{}.vpk", workshop_id));
+                        if !w_dir.exists() {
+                            let _ = fs::create_dir_all(&w_dir);
+                        }
+                        let _ = generate_dummy_vpk(&dest_path, &dummy_vpk_path);
+                    }
                     crate::watcher::suppress_internal_refresh(&state);
                     let mut db = state.db.lock().await;
                     scan_addons_internal(
@@ -1212,7 +1247,8 @@ pub async fn download_addon(
                     &state,
                     &state.workshop_service,
                     &workshop_id,
-                    &workshop_dir,
+                    &loading_dir,
+                    &dest_filename,
                     &app_handle,
                     source_policy.allow_bridge(),
                 )
@@ -1220,6 +1256,17 @@ pub async fn download_addon(
                 {
                     Ok(true) => {
                         let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
+                        let (enable_dummy_bypass, w_dir) = {
+                            let db = state.db.lock().await;
+                            (db.settings.enable_dummy_bypass, PathBuf::from(&db.settings.workshop_dir))
+                        };
+                        if enable_dummy_bypass {
+                            let dummy_vpk_path = w_dir.join(format!("{}.vpk", workshop_id));
+                            if !w_dir.exists() {
+                                  let _ = fs::create_dir_all(&w_dir);
+                            }
+                            let _ = generate_dummy_vpk(&dest_path, &dummy_vpk_path);
+                        }
                         crate::watcher::suppress_internal_refresh(&state);
                         let mut db = state.db.lock().await;
                         scan_addons_internal(
@@ -1315,7 +1362,8 @@ pub async fn download_addon(
                     &state,
                     &state.workshop_service,
                     &workshop_id,
-                    &workshop_dir,
+                    &loading_dir,
+                    &dest_filename,
                     &app_handle,
                     source_policy.allow_bridge(),
                 )
@@ -1323,6 +1371,17 @@ pub async fn download_addon(
                 {
                     Ok(true) => {
                         let _ = cleanup_partial_download(&state.download_cache_dir, &workshop_id);
+                        let (enable_dummy_bypass, w_dir) = {
+                            let db = state.db.lock().await;
+                            (db.settings.enable_dummy_bypass, PathBuf::from(&db.settings.workshop_dir))
+                        };
+                        if enable_dummy_bypass {
+                            let dummy_vpk_path = w_dir.join(format!("{}.vpk", workshop_id));
+                            if !w_dir.exists() {
+                                let _ = fs::create_dir_all(&w_dir);
+                            }
+                            let _ = generate_dummy_vpk(&dest_path, &dummy_vpk_path);
+                        }
                         crate::watcher::suppress_internal_refresh(&state);
                         let mut db = state.db.lock().await;
                         scan_addons_internal(
@@ -1495,6 +1554,18 @@ pub async fn download_addon(
         move_or_copy_file(&partial_path, &dest_path)
             .map_err(|e| format!("Failed to finalize downloaded file: {}", e))?;
         let _ = fs::remove_file(&partial_metadata_path);
+
+        let (enable_dummy_bypass, w_dir) = {
+            let db = state.db.lock().await;
+            (db.settings.enable_dummy_bypass, PathBuf::from(&db.settings.workshop_dir))
+        };
+        if enable_dummy_bypass {
+            let dummy_vpk_path = w_dir.join(format!("{}.vpk", workshop_id));
+            if !w_dir.exists() {
+                let _ = fs::create_dir_all(&w_dir);
+            }
+            let _ = generate_dummy_vpk(&dest_path, &dummy_vpk_path);
+        }
 
         let _ = app_handle.emit(
             "download-progress",

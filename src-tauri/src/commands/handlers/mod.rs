@@ -295,21 +295,21 @@ fn find_sdk_installed_workshop_file(install_folder: &Path) -> Result<Option<Path
 
 fn import_sdk_workshop_file(
     source_path: &Path,
-    workshop_id: &str,
-    workshop_dir: &Path,
+    dest_dir: &Path,
+    dest_filename: &str,
 ) -> Result<PathBuf, String> {
-    if !workshop_dir.exists() {
-        fs::create_dir_all(workshop_dir).map_err(|e| {
+    if !dest_dir.exists() {
+        fs::create_dir_all(dest_dir).map_err(|e| {
             format!(
-                "Failed to create workshop directory {}: {}",
-                workshop_dir.display(),
+                "Failed to create target directory {}: {}",
+                dest_dir.display(),
                 e
             )
         })?;
     }
 
-    let dest_path = workshop_dir.join(format!("{}.vpk", workshop_id));
-    let temp_dest_path = workshop_dir.join(format!("{}.vpk.download", workshop_id));
+    let dest_path = dest_dir.join(dest_filename);
+    let temp_dest_path = dest_dir.join(format!("{}.download", dest_filename));
 
     remove_dummy_workshop_targets(&dest_path)?;
 
@@ -2084,7 +2084,8 @@ async fn attempt_bridge_download(
     state: &crate::AppState,
     workshop_service: &WorkshopService,
     workshop_id: &str,
-    workshop_dir: &Path,
+    dest_dir: &Path,
+    dest_filename: &str,
     app_handle: &AppHandle,
     allow_bridge: bool,
 ) -> Result<bool, String> {
@@ -2105,8 +2106,8 @@ async fn attempt_bridge_download(
         phase: String,
     }
 
-    let expected_path = workshop_dir.join(format!("{}.vpk", workshop_id));
-    let expected_disabled_path = workshop_dir.join(format!("{}.vpk.disabled", workshop_id));
+    let expected_path = dest_dir.join(dest_filename);
+    let expected_disabled_path = dest_dir.join(format!("{}.disabled", dest_filename));
     let started_at = Instant::now();
     let timeout = Duration::from_secs(120);
     let mut saw_download_activity = false;
@@ -2220,7 +2221,7 @@ async fn attempt_bridge_download(
                     state,
                     Duration::from_millis(DOWNLOAD_FINALIZE_SUPPRESS_MS),
                 );
-                import_sdk_workshop_file(&source_path, workshop_id, workshop_dir)?;
+                import_sdk_workshop_file(&source_path, dest_dir, dest_filename)?;
                 let final_total = status.total.unwrap_or_else(|| {
                     fs::metadata(&source_path)
                         .map(|meta| meta.len())
@@ -4032,5 +4033,38 @@ mod tests {
 
         fs::remove_file(&dst).ok();
         fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_format_workshop_vpk_name() {
+        use super::addons::format_workshop_vpk_name;
+
+        assert_eq!(
+            format_workshop_vpk_name("12345", "Awesome Campaign"),
+            "[12345]Awesome Campaign.vpk"
+        );
+        assert_eq!(
+            format_workshop_vpk_name("12345", "Awesome Campaign.vpk"),
+            "[12345]Awesome Campaign.vpk"
+        );
+        // Strips leading bracket prefixes
+        assert_eq!(
+            format_workshop_vpk_name("12345", "[Group] Awesome Campaign"),
+            "[12345]Awesome Campaign.vpk"
+        );
+        assert_eq!(
+            format_workshop_vpk_name("12345", "[Group1][Group2] Awesome Campaign"),
+            "[12345]Awesome Campaign.vpk"
+        );
+        // Replaces invalid file name characters
+        assert_eq!(
+            format_workshop_vpk_name("12345", "Awesome: Campaign?"),
+            "[12345]Awesome_ Campaign_.vpk"
+        );
+        // Handles empty title fallback
+        assert_eq!(
+            format_workshop_vpk_name("12345", ""),
+            "[12345]Workshop Item.vpk"
+        );
     }
 }
