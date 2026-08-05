@@ -1245,7 +1245,11 @@ export function useAddonManager() {
         const title = (item.steamDetails?.title || getAddonInfoValue(item, 'addontitle') || '').toLowerCase();
         const desc = (item.steamDetails?.description || getAddonInfoValue(item, 'addondescription') || getAddonInfoValue(item, 'addontagline') || '').toLowerCase();
         const author = getAddonAuthor(item).toLowerCase();
-        return title.includes(q) || desc.includes(q) || author.includes(q) || item.id.toLowerCase().includes(q) || (item.workshopId || '').includes(q);
+        const matchesMap = item.maps?.some(map => 
+          map.code.toLowerCase().includes(q) || 
+          map.name.toLowerCase().includes(q)
+        );
+        return title.includes(q) || desc.includes(q) || author.includes(q) || item.id.toLowerCase().includes(q) || (item.workshopId || '').includes(q) || matchesMap;
       });
     }
 

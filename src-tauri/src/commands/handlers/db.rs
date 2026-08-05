@@ -386,6 +386,8 @@ pub fn load_db(
                     steam_details: entry.steam_details.clone(),
                     workshop_details: None,
                     is_dummy: false,
+                    maps: entry.maps.clone(),
+                    maps_scanned: entry.maps_scanned,
                 },
             );
         }
@@ -471,6 +473,8 @@ pub fn save_db_internal(
                 has_image: addon.has_image,
                 image_path: addon.image_path.clone(),
                 steam_details: addon.steam_details.clone(),
+                maps: addon.maps.clone(),
+                maps_scanned: addon.maps_scanned,
             },
         );
     }
@@ -493,6 +497,8 @@ pub fn save_db_internal(
                 has_image: addon.has_image,
                 image_path: addon.image_path.clone(),
                 steam_details: addon.steam_details.clone(),
+                maps: addon.maps.clone(),
+                maps_scanned: addon.maps_scanned,
             },
         );
     }
@@ -645,6 +651,7 @@ pub async fn scan_addons_internal(
                             p.starts_with("/cache/")
                                 && !cache_dir.join(p.trim_start_matches("/cache/")).exists()
                         }))
+                    || addon.maps_scanned.is_none()
             }
             None => true,
         };
@@ -752,6 +759,8 @@ pub async fn scan_addons_internal(
                 steam_details,
                 workshop_details: None,
                 is_dummy: false,
+                maps: meta.maps.clone(),
+                maps_scanned: meta.maps_scanned,
             };
 
             known_addons.insert(
@@ -768,6 +777,8 @@ pub async fn scan_addons_internal(
                     has_image: addon.has_image,
                     image_path: addon.image_path.clone(),
                     steam_details: addon.steam_details.clone(),
+                    maps: addon.maps.clone(),
+                    maps_scanned: addon.maps_scanned,
                 },
             );
 
@@ -848,6 +859,8 @@ pub async fn scan_addons_internal(
                                 has_image: addon.has_image,
                                 image_path: addon.image_path.clone(),
                                 steam_details: addon.steam_details.clone(),
+                                maps: addon.maps.clone(),
+                                maps_scanned: addon.maps_scanned,
                             },
                         );
                     }
@@ -884,6 +897,8 @@ pub async fn scan_addons_internal(
                     steam_details: entry.steam_details.clone(),
                     workshop_details: None,
                     is_dummy: false,
+                    maps: entry.maps.clone(),
+                    maps_scanned: entry.maps_scanned,
                 },
             );
         }
@@ -981,6 +996,8 @@ mod tests {
             steam_details: None,
             workshop_details: None,
             is_dummy: false,
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         }
     }
 

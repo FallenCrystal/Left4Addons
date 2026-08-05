@@ -543,6 +543,8 @@ pub async fn group_action(
                             steam_details: None,
                             workshop_details: None,
                             is_dummy: false,
+                            maps: Vec::new(),
+                            maps_scanned: Some(true),
                         },
                     );
                     new_workshop_ids.push(workshop_id);
@@ -1602,6 +1604,8 @@ pub async fn download_addon(
                 has_image,
                 image_path,
                 steam_details: Some(details.clone()),
+                maps: Vec::new(),
+                maps_scanned: Some(true),
             },
         );
 

@@ -20,7 +20,8 @@
     "error": "Error",
     "success": "Success",
     "unknownAuthor": "Unknown author",
-    "search": "Search"
+    "search": "Search",
+    "copy": "Copy"
   },
   "categories": {
     "All": "All",
@@ -228,13 +229,17 @@
     "version": "Version: {{version}}",
     "belongsToGroup": "Group: {{name}}",
     "descriptionLabel": "Description:",
+    "descriptionTab": "Description",
     "openInSteam": "Open in Steam",
     "webViewOfficial": "View in Browser",
     "mirrorWebView": "Mirror Web View",
     "visitSource": "Visit Source Webpage",
     "disableAddon": "Disable Addon",
     "enableAddon": "Enable Addon",
-    "moveToManual": "Move to Manual"
+    "moveToManual": "Move to Manual",
+    "mapCodesLabel": "Map Code",
+    "viewMapsCount": "View Maps ({{count}})",
+    "mapsList": "Maps List"
   },
   "moveWarningModal": {
     "title": "Move Workshop Addon Warning",

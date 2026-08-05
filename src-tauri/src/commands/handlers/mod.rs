@@ -1079,6 +1079,8 @@ fn load_known_addons_from_legacy_db(
                         has_image: addon.has_image,
                         image_path: addon.image_path,
                         steam_details: addon.steam_details,
+                        maps: addon.maps,
+                        maps_scanned: addon.maps_scanned,
                     },
                 );
             }
@@ -2356,6 +2358,13 @@ fn upsert_known_addon_entry(
         .map(|value| value.to_string())
         .or_else(|| existing.as_ref().and_then(|entry| entry.image_path.clone()));
 
+    let maps_scanned = existing
+        .as_ref()
+        .and_then(|entry| entry.maps_scanned);
+    let maps = existing
+        .as_ref()
+        .map(|entry| entry.maps.clone())
+        .unwrap_or_default();
     let addon_info = existing
         .as_ref()
         .map(|entry| entry.addon_info.clone())
@@ -2385,6 +2394,8 @@ fn upsert_known_addon_entry(
             steam_details: details
                 .cloned()
                 .or_else(|| existing.and_then(|entry| entry.steam_details)),
+            maps,
+            maps_scanned,
         },
     );
 }
@@ -2844,6 +2855,8 @@ mod tests {
             steam_details: Some(json!({ "title": title, "tags": tags })),
             workshop_details: None,
             is_dummy: false,
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         }
     }
 
@@ -3946,6 +3959,8 @@ mod tests {
             steam_details: None,
             workshop_details: None,
             is_dummy: false,
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         };
 
         assert!(!move_requires_dir_change(&addon, "loading"));
@@ -3974,6 +3989,8 @@ mod tests {
             steam_details: None,
             workshop_details: None,
             is_dummy: false,
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         };
 
         assert!(!toggle_requires_state_change(&addon, true));
@@ -4002,6 +4019,8 @@ mod tests {
             steam_details: None,
             workshop_details: None,
             is_dummy: false,
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         };
 
         assert!(!rename_requires_name_change(

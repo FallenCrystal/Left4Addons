@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::vpk::MapEntry;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -231,6 +232,10 @@ pub struct Addon {
     pub workshop_details: Option<serde_json::Value>,
     #[serde(rename = "isDummy", default)]
     pub is_dummy: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<MapEntry>,
+    #[serde(rename = "mapsScanned", default)]
+    pub maps_scanned: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -289,6 +294,10 @@ pub struct KnownAddonEntry {
     pub image_path: Option<String>,
     #[serde(rename = "steamDetails")]
     pub steam_details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<MapEntry>,
+    #[serde(rename = "mapsScanned", default)]
+    pub maps_scanned: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]

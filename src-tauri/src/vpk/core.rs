@@ -391,6 +391,139 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
         }
     }
 
+    // Find all bsp files under maps/
+    let mut maps = Vec::new();
+    let mut bsp_keys = Vec::new();
+    for key in files.keys() {
+        let lower = key.to_lowercase();
+        if (lower.starts_with("maps/") || lower.contains("/maps/") || lower.contains("\\maps\\"))
+            && lower.ends_with(".bsp")
+        {
+            bsp_keys.push(key);
+        }
+    }
+    bsp_keys.sort();
+
+    // Find all mission files under missions/
+    let mut mission_keys = Vec::new();
+    for key in files.keys() {
+        let lower = key.to_lowercase();
+        if (lower.starts_with("missions/") || lower.contains("/missions/") || lower.contains("\\missions\\"))
+            && lower.ends_with(".txt")
+        {
+            mission_keys.push(key);
+        }
+    }
+
+    // Parse missions to get map display names
+    let mut map_names: HashMap<String, String> = HashMap::new();
+    for key in &mission_keys {
+        if let Some(entry) = files.get(*key) {
+            if let Ok(content_bytes) = get_file_content(&mut file, entry) {
+                let text = String::from_utf8_lossy(&content_bytes);
+                let kv = parse_key_values(&text);
+                extract_map_names_from_kv(&kv, &mut map_names);
+            }
+        }
+    }
+
+    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+
+    for key in bsp_keys {
+        let stem = Path::new(key)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let stem_lower = stem.to_lowercase();
+        let display_name = map_names.get(&stem_lower).cloned().unwrap_or_else(|| stem.clone());
+
+        let mut map_image_path = None;
+
+        // Candidate paths for map VTFs/images
+        let candidates = vec![
+            format!("materials/vgui/maps/{}.vtf", stem_lower),
+            format!("materials/vgui/loading_screen_{}.vtf", stem_lower),
+            format!("materials/vgui/maps/{}.jpg", stem_lower),
+            format!("materials/vgui/maps/{}.jpeg", stem_lower),
+            format!("materials/vgui/maps/{}.png", stem_lower),
+            format!("materials/vgui/loading_screen_{}.jpg", stem_lower),
+            format!("materials/vgui/loading_screen_{}.jpeg", stem_lower),
+            format!("materials/vgui/loading_screen_{}.png", stem_lower),
+        ];
+
+        let mut image_key = None;
+        for c in &candidates {
+            if let Some(k) = files_lower.get(c) {
+                image_key = Some(*k);
+                break;
+            }
+        }
+
+        if image_key.is_none() {
+            for c in &candidates {
+                let normalized_c = c.replace('/', "\\");
+                if let Some(k) = files_lower.get(&normalized_c) {
+                    image_key = Some(*k);
+                    break;
+                }
+                
+                let suffix = format!("\\{}", normalized_c);
+                if let Some(k) = files.keys().find(|k| k.to_lowercase().ends_with(&suffix)) {
+                    image_key = Some(k);
+                    break;
+                }
+            }
+        }
+
+        if let Some(k) = image_key {
+            if let Some(entry) = files.get(k) {
+                if let Ok(img_bytes) = get_file_content(&mut file, entry) {
+                    let mut hasher = Md5::new();
+                    hasher.update(clean_vpk_name.as_bytes());
+                    hasher.update(stem_lower.as_bytes());
+                    let map_hash = format!("{:x}", hasher.finalize());
+                    
+                    let cache_filename = format!("{}_map.jpg", map_hash);
+                    let full_cache_path = cache_dir.as_ref().join(&cache_filename);
+
+                    if !cache_dir.as_ref().exists() {
+                        let _ = std::fs::create_dir_all(&cache_dir);
+                    }
+
+                    if k.to_lowercase().ends_with(".vtf") {
+                        if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
+                            if let Ok(decoded) = vtf.highres_image.decode(0) {
+                                if decoded
+                                    .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                    .is_ok()
+                                {
+                                    map_image_path = Some(format!("/cache/{}", cache_filename));
+                                }
+                            }
+                        }
+                    } else {
+                        if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                            if cache_file.write_all(&img_bytes).is_ok() {
+                                map_image_path = Some(format!("/cache/{}", cache_filename));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        maps.push(super::types::MapEntry {
+            code: stem,
+            name: display_name,
+            image: map_image_path,
+        });
+    }
+
+    result.maps = maps;
+    result.maps_scanned = Some(true);
+
     result
 }
 
@@ -596,3 +729,24 @@ pub fn generate_dummy_vpk<P: AsRef<Path>, Q: AsRef<Path>>(
 
     Ok(())
 }
+
+fn extract_map_names_from_kv(val: &serde_json::Value, map_names: &mut HashMap<String, String>) {
+    if let Some(obj) = val.as_object() {
+        if let (Some(map_val), Some(name_val)) = (
+            obj.get("map"),
+            obj.get("displayname").or_else(|| obj.get("name")),
+        ) {
+            if let (Some(map_str), Some(name_str)) = (map_val.as_str(), name_val.as_str()) {
+                map_names.insert(map_str.to_lowercase(), name_str.to_string());
+            }
+        }
+        for (_, sub_val) in obj {
+            extract_map_names_from_kv(sub_val, map_names);
+        }
+    } else if let Some(arr) = val.as_array() {
+        for sub_val in arr {
+            extract_map_names_from_kv(sub_val, map_names);
+        }
+    }
+}
+

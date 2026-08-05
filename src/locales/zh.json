@@ -20,7 +20,8 @@
     "error": "错误",
     "success": "成功",
     "unknownAuthor": "未知作者",
-    "search": "搜索"
+    "search": "搜索",
+    "copy": "复制"
   },
   "categories": {
     "All": "全部",
@@ -228,13 +229,17 @@
     "version": "版本: {{version}}",
     "belongsToGroup": "所属分组: {{name}}",
     "descriptionLabel": "组件描述:",
+    "descriptionTab": "组件描述",
     "openInSteam": "在 Steam 打开",
     "webViewOfficial": "在浏览器中查看",
     "mirrorWebView": "国内网页镜像",
     "visitSource": "访问来源网页",
     "disableAddon": "禁用组件",
     "enableAddon": "启用组件",
-    "moveToManual": "移动到手动安装"
+    "moveToManual": "移动到手动安装",
+    "mapCodesLabel": "地图代码",
+    "viewMapsCount": "查看地图 ({{count}})",
+    "mapsList": "地图列表"
   },
   "moveWarningModal": {
     "title": "移动创意工坊附件提示",

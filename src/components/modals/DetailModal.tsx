@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { X, ExternalLink, Move, FolderPlus, Loader2, Download } from 'lucide-react';
 import { Addon, DatabasePayload, Group } from '../../types/addon';
+import { CacheImage } from '../common/CacheImage';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue, isPlaceholderAuthorName } from '../../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 import { WorkshopPageDetails } from '../workshop/types';
@@ -46,6 +47,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
 
   const [pageDetails, setPageDetails] = useState<WorkshopPageDetails | null>(null);
   const [pageDetailsLoading, setPageDetailsLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<'desc' | 'maps'>('desc');
   const pageDetailsRequestRef = useRef(0);
 
   const fetchPageDetails = useCallback(async (workshopId: string) => {
@@ -96,6 +98,10 @@ export const DetailModal: React.FC<DetailModalProps> = ({
       setPageDetailsLoading(false);
     }
   }, [open, addon?.workshopId, fetchPageDetails]);
+
+  useEffect(() => {
+    setActiveTab('desc');
+  }, [open, addon?.id]);
 
   if (!open || !addon) return null;
 
@@ -220,6 +226,32 @@ export const DetailModal: React.FC<DetailModalProps> = ({
                   <span className="detail-meta-value">{addon.workshopId}</span>
                 </div>
               )}
+              {addon.maps && addon.maps.length > 0 && (
+                <div className="detail-meta-item">
+                  <span className="detail-meta-label">{t('detailModal.mapCodesLabel', '地图代码')}</span>
+                  <span className="detail-meta-value">
+                    <button
+                      onClick={() => setActiveTab('maps')}
+                      className="btn btn-text"
+                      style={{
+                        padding: 0,
+                        color: 'var(--md-sys-color-primary)',
+                        textDecoration: 'underline',
+                        border: 'none',
+                        background: 'none',
+                        cursor: 'pointer',
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '4px',
+                        font: 'inherit',
+                        height: 'auto'
+                      }}
+                    >
+                      {t('detailModal.viewMapsCount', '查看地图 ({{count}})', { count: addon.maps.length })}
+                    </button>
+                  </span>
+                </div>
+              )}
               {addonUrl && (
                 <div className="detail-meta-item">
                   <span className="detail-meta-label">{t('detailModal.relatedLink')}</span>
@@ -277,16 +309,139 @@ export const DetailModal: React.FC<DetailModalProps> = ({
               ))}
             </div>
 
-            <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('detailModal.descriptionLabel')}</div>
-            <div className="description-block">{renderTextWithLinks(desc, onItemNavigate, onOpenLink)}</div>
+            {addon.maps && addon.maps.length > 0 ? (
+              <div className="detail-tabs" style={{ display: 'flex', gap: '16px', borderBottom: '1px solid var(--md-sys-color-outline-variant)', marginBottom: '12px' }}>
+                <button
+                  className={`detail-tab-btn ${activeTab === 'desc' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('desc')}
+                  style={{
+                    padding: '8px 4px',
+                    background: 'none',
+                    border: 'none',
+                    color: activeTab === 'desc' ? 'var(--md-sys-color-primary)' : 'var(--md-sys-color-outline)',
+                    borderBottom: activeTab === 'desc' ? '2px solid var(--md-sys-color-primary)' : '2px solid transparent',
+                    cursor: 'pointer',
+                    fontWeight: '600',
+                    fontSize: '14px'
+                  }}
+                >
+                  {t('detailModal.descriptionTab', '组件描述')}
+                </button>
+                <button
+                  className={`detail-tab-btn ${activeTab === 'maps' ? 'active' : ''}`}
+                  onClick={() => setActiveTab('maps')}
+                  style={{
+                    padding: '8px 4px',
+                    background: 'none',
+                    border: 'none',
+                    color: activeTab === 'maps' ? 'var(--md-sys-color-primary)' : 'var(--md-sys-color-outline)',
+                    borderBottom: activeTab === 'maps' ? '2px solid var(--md-sys-color-primary)' : '2px solid transparent',
+                    cursor: 'pointer',
+                    fontWeight: '600',
+                    fontSize: '14px'
+                  }}
+                >
+                  {t('detailModal.mapsList', '地图列表')} ({addon.maps.length})
+                </button>
+              </div>
+            ) : (
+              <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('detailModal.descriptionLabel')}</div>
+            )}
 
-            {/* Required items */}
-            <RequiredItems
-              requiredItems={requiredItems}
-              addons={addons}
-              knownUninstalledAddons={knownUninstalledAddons}
-              onItemNavigate={onItemNavigate}
-            />
+            {activeTab === 'desc' ? (
+              <>
+                <div className="description-block">{renderTextWithLinks(desc, onItemNavigate, onOpenLink)}</div>
+
+                {/* Required items */}
+                <RequiredItems
+                  requiredItems={requiredItems}
+                  addons={addons}
+                  knownUninstalledAddons={knownUninstalledAddons}
+                  onItemNavigate={onItemNavigate}
+                />
+              </>
+            ) : (
+              <div 
+                className="maps-list-container" 
+                style={{ 
+                  display: 'flex', 
+                  flexDirection: 'column', 
+                  gap: '12px', 
+                  maxHeight: '350px', 
+                  overflowY: 'auto',
+                  paddingRight: '4px',
+                  marginTop: '8px'
+                }}
+              >
+                {addon.maps?.map((map) => (
+                  <div 
+                    key={map.code} 
+                    className="map-item-card" 
+                    style={{ 
+                      display: 'flex', 
+                      gap: '12px', 
+                      padding: '10px', 
+                      borderRadius: '8px', 
+                      background: 'rgba(255, 255, 255, 0.05)',
+                      border: '1px solid rgba(255, 255, 255, 0.08)',
+                      alignItems: 'center'
+                    }}
+                  >
+                    <div 
+                      className="map-thumbnail-container" 
+                      style={{ 
+                        width: '120px', 
+                        height: '68px', 
+                        borderRadius: '4px', 
+                        overflow: 'hidden', 
+                        background: 'rgba(0, 0, 0, 0.2)',
+                        flexShrink: 0,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center'
+                      }}
+                    >
+                      <CacheImage
+                        srcPath={map.image || addon.imagePath}
+                        style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                        fallback={
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-secondary"><polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/><line x1="9" y1="3" x2="9" y2="18"/><line x1="15" y1="6" x2="15" y2="21"/></svg>
+                          </div>
+                        }
+                      />
+                    </div>
+                    <div style={{ flexGrow: 1, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      <div style={{ fontWeight: '600', color: '#fff', fontSize: '14px' }}>{map.name}</div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <span 
+                          style={{ 
+                            fontSize: '11px', 
+                            fontFamily: 'monospace', 
+                            padding: '2px 6px', 
+                            borderRadius: '4px', 
+                            background: 'rgba(255, 255, 255, 0.1)', 
+                            color: 'var(--md-sys-color-primary)' 
+                          }}
+                        >
+                          {map.code}
+                        </span>
+                        <button
+                          onClick={() => {
+                            navigator.clipboard.writeText(map.code);
+                          }}
+                          className="btn btn-text"
+                          style={{ padding: '2px', height: 'auto', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', opacity: 0.6 }}
+                          title={t('common.copy', 'Copy')}
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* Loading indicator for page details */}
             {pageDetailsLoading && (

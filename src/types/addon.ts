@@ -108,6 +108,14 @@ export interface Addon {
   steamDetails?: SteamDetails;
   workshopDetails?: WorkshopDetails;
   isDummy?: boolean;
+  maps?: MapEntry[];
+  mapsScanned?: boolean;
+}
+
+export interface MapEntry {
+  code: string;
+  name: string;
+  image?: string;
 }
 
 export interface BackgroundTask {

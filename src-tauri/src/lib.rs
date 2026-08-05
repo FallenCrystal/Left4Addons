@@ -330,6 +330,8 @@ fn migrate_legacy_db_file(
                             has_image: addon.has_image,
                             image_path: addon.image_path,
                             steam_details: addon.steam_details,
+                            maps: addon.maps,
+                            maps_scanned: addon.maps_scanned,
                         },
                     );
                 }

@@ -12,6 +12,14 @@ pub struct VpkEntry {
     pub tree_size: u32,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct MapEntry {
+    pub code: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AddonMetadata {
     #[serde(rename = "addonInfo")]
@@ -26,6 +34,10 @@ pub struct AddonMetadata {
     pub error: Option<String>,
     #[serde(default)]
     pub hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub maps: Vec<MapEntry>,
+    #[serde(rename = "mapsScanned", default)]
+    pub maps_scanned: Option<bool>,
 }
 
 #[derive(Debug, Clone)]

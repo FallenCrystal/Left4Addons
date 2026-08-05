@@ -723,6 +723,8 @@ pub async fn add_known_addon(
             has_image,
             image_path,
             steam_details: details.clone(),
+            maps: Vec::new(),
+            maps_scanned: Some(true),
         },
     );
 

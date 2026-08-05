@@ -31,6 +31,7 @@ import {
   fetchWorkshopHome,
   fetchWorkshopItem,
   fetchWorkshopItems,
+  fetchWorkshopPageDetails,
   mapSteamDetailToWorkshopItem,
   setWorkshopWarningReporter,
 } from '../../services/workshopClient';
@@ -194,7 +195,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const [detailHistory, setDetailHistory] = useState<Array<{ item: any; collection: any }>>([]);
 
   const navigateToDetail = useCallback((newItem: any, newCollection: any) => {
-    setSelectedItem((currItem) => {
+    setSelectedItem((currItem: any) => {
       setSelectedCollection((currCol) => {
         if (currItem || currCol) {
           setDetailHistory((prev) => [...prev, { item: currItem, collection: currCol }]);
