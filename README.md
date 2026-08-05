@@ -104,7 +104,7 @@ npm run tauri:build
 
 ```bash
 rustup target add x86_64-pc-windows-gnu
-npm run tauri:build:win-gnu
+npm run tauri:build -- --target x86_64-pc-windows-gnu
 ```
 
 构建完成后，Windows 产物位于 `src-tauri/target/x86_64-pc-windows-gnu/release/`。
