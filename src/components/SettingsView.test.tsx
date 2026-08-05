@@ -44,7 +44,6 @@ describe('SettingsView', () => {
     const disableSdkCheckbox = disableSdkRow?.querySelector('input[type="checkbox"]');
     expect(disableSdkCheckbox).toBeTruthy();
     fireEvent.click(disableSdkCheckbox as HTMLInputElement);
-    fireEvent.click(screen.getByText('保存并重新扫描'));
 
     await waitFor(() => {
       expect(onConfirm).toHaveBeenCalledWith(
@@ -77,7 +76,6 @@ describe('SettingsView', () => {
     const input = screen.getAllByRole('spinbutton')[0] as HTMLInputElement;
     fireEvent.change(input, { target: { value: '99' } });
     fireEvent.blur(input);
-    fireEvent.click(screen.getByText('保存并重新扫描'));
 
     await waitFor(() => {
       expect(onConfirm).toHaveBeenCalledWith(
@@ -108,7 +106,6 @@ describe('SettingsView', () => {
     fireEvent.click(screen.getByText('数据来源'));
     fireEvent.click(screen.getByText('创意工坊搜索'));
     fireEvent.click(screen.getByText('允许所有'));
-    fireEvent.click(screen.getByText('保存并重新扫描'));
 
     await waitFor(() => {
       expect(onConfirm).toHaveBeenCalledWith(
