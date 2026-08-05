@@ -6,6 +6,7 @@ import { useTranslation } from 'react-i18next';
 import { WorkshopPageDetails } from '../workshop/types';
 import { Gallery } from '../addons/Gallery';
 import { RequiredItems } from '../workshop/WorkshopCommon';
+import { renderTextWithLinks } from '../workshop/linkHelper';
 import { fetchWorkshopPageDetails, getWorkshopPageSnapshot, persistWorkshopPageDetails } from '../../services/workshopClient';
 
 interface DetailModalProps {
@@ -277,7 +278,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
             </div>
 
             <div style={{ fontWeight: '600', fontSize: '14px', color: '#fff', marginTop: '8px' }}>{t('detailModal.descriptionLabel')}</div>
-            <div className="description-block">{desc}</div>
+            <div className="description-block">{renderTextWithLinks(desc, onItemNavigate, onOpenLink)}</div>
 
             {/* Required items */}
             <RequiredItems
@@ -323,6 +324,7 @@ export const DetailModal: React.FC<DetailModalProps> = ({
                   className="btn btn-text"
                   style={{ display: 'inline-flex', gap: '6px' }}
                 >
+                  <ExternalLink size={14} />
                   <span>{t('detailModal.webViewOfficial')}</span>
                 </a>
               </>

@@ -104,6 +104,28 @@ const WorkshopSearchBarComponent: React.FC<WorkshopSearchBarProps> = ({
 
 const WorkshopSearchBar = React.memo(WorkshopSearchBarComponent);
 
+// ── Workshop ID parser ────────────────────────────────────────────────────────
+function parseWorkshopId(input: string): string | null {
+  const trimmed = input.trim();
+  
+  // If it's a URL/URI structure containing an ID, extract it regardless of length
+  const idMatch = trimmed.match(/[?&]id=(\d+)/i);
+  if (idMatch) {
+    return idMatch[1];
+  }
+  const pathMatch = trimmed.match(/CommunityFilePage\/(\d+)/i);
+  if (pathMatch) {
+    return pathMatch[1];
+  }
+
+  // If it's just a number, require it to be at least 8 digits to be treated as a workshop ID
+  if (/^\d{8,15}$/.test(trimmed)) {
+    return trimmed;
+  }
+  
+  return null;
+}
+
 // ── Main Component ────────────────────────────────────────────────────────────
 
 export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
@@ -156,7 +178,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const searchRequestRef = useRef(0);
   const homepageRequestRef = useRef(0);
 
-  // Detail modal
+  // Detail modal / view
   const [selectedItem, setSelectedItem] = useState<any | null>(null);
   const [selectedCollection, setSelectedCollection] = useState<{
     title: string;
@@ -167,6 +189,36 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     items: WorkshopItem[];
     workshopId?: string;
   } | null>(null);
+  
+  // History stack for detail navigation
+  const [detailHistory, setDetailHistory] = useState<Array<{ item: any; collection: any }>>([]);
+
+  const navigateToDetail = useCallback((newItem: any, newCollection: any) => {
+    setSelectedItem((currItem) => {
+      setSelectedCollection((currCol) => {
+        if (currItem || currCol) {
+          setDetailHistory((prev) => [...prev, { item: currItem, collection: currCol }]);
+        } else {
+          setDetailHistory([]);
+        }
+        return newCollection;
+      });
+      return newItem;
+    });
+  }, []);
+
+  const handleBack = useCallback(() => {
+    if (detailHistory.length > 0) {
+      const prev = detailHistory[detailHistory.length - 1];
+      setDetailHistory((prevStack) => prevStack.slice(0, prevStack.length - 1));
+      setSelectedItem(prev.item);
+      setSelectedCollection(prev.collection);
+    } else {
+      setSelectedItem(null);
+      setSelectedCollection(null);
+    }
+  }, [detailHistory]);
+
   const [tagModalOpen, setTagModalOpen] = useState(false);
   const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
   const [alertInfo, setAlertInfo] = useState<{ open: boolean; title: string; message: string }>({
@@ -276,6 +328,73 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setPage(1); setSort('trend'); setSection('readytouseitems');
   }, []);
 
+  const handleDirectNavigation = useCallback(async (workshopId: string) => {
+    setLoadingDetailId(workshopId);
+    try {
+      const data = await fetchWorkshopItem(workshopId);
+      
+      let isCollection = false;
+      
+      // Check if it's a collection based on SDK/cached details first
+      if (data.item) {
+        const anyItem = data.item as any;
+        if (anyItem.childItemIds && anyItem.childItemIds.length > 0) {
+          isCollection = true;
+        } else if (anyItem.childCount && anyItem.childCount > 0) {
+          isCollection = true;
+        }
+      }
+
+      // Check scraped details as backup/supplement
+      try {
+        const pageDetails = await fetchWorkshopPageDetails(workshopId, 'workshop-direct-nav');
+        if (pageDetails.collectionItems && pageDetails.collectionItems.length > 0) {
+          isCollection = true;
+        } else if (pageDetails.childItemIds && pageDetails.childItemIds.length > 0) {
+          isCollection = true;
+        } else if (pageDetails.fileType === 'Collection' || pageDetails.fileType?.toLowerCase().includes('collection')) {
+          isCollection = true;
+        }
+      } catch (e) {
+        console.warn('Failed to fetch page details during direct nav check:', e);
+      }
+
+      if (isCollection) {
+        const colData = await fetchWorkshopCollection(workshopId);
+        const raw = colData.collection;
+        const collectionItems = colData.items;
+        if (raw && raw.publishedfileid) {
+          const collectionItem = mapSteamDetailToWorkshopItem(raw, colData.source);
+          navigateToDetail(null, {
+            title: collectionItem.title,
+            description: raw.description || '',
+            imagePath: collectionItem.imagePath,
+            creatorName: collectionItem.authorName,
+            creatorId: collectionItem.authorId,
+            items: collectionItems,
+            workshopId: raw.publishedfileid,
+          });
+          onRecordSeenItems?.([collectionItem, ...collectionItems], 'workshop-collection');
+        }
+      } else {
+        if (data.item && data.item.workshopId) {
+          navigateToDetail(data.item, null);
+          onRecordSeenItems?.([data.item], 'workshop-item-detail');
+        } else {
+          throw new Error('Item details not found');
+        }
+      }
+    } catch (err) {
+      setAlertInfo({
+        open: true,
+        title: t('common.error') || '错误',
+        message: t('workshop.detail.fetchFailed', { err: String(err) }),
+      });
+    } finally {
+      setLoadingDetailId(null);
+    }
+  }, [navigateToDetail, onRecordSeenItems, t]);
+
   const handleSearchSubmit = useCallback((submittedVal: string) => {
     const trimmed = submittedVal.trim();
     setQuery(trimmed);
@@ -287,8 +406,18 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         setViewMode('browse');
         setPage(1);
       }
+      setSelectedItem(null);
+      setSelectedCollection(null);
+      setDetailHistory([]);
       return;
     }
+
+    const parsedId = parseWorkshopId(trimmed);
+    if (parsedId) {
+      handleDirectNavigation(parsedId);
+      return;
+    }
+
     setCreatorId(null);
     setCreatorName(null);
     setActiveTag(null);
@@ -298,7 +427,12 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setPage(1);
     setCommittedQuery(trimmed);
     setViewMode('search');
-  }, [viewMode]);
+
+    // Close details view to show search results
+    setSelectedItem(null);
+    setSelectedCollection(null);
+    setDetailHistory([]);
+  }, [viewMode, handleDirectNavigation, setSelectedItem, setSelectedCollection, setDetailHistory]);
 
   const handleSearchClear = useCallback(() => {
     setQuery('');
@@ -307,7 +441,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       setViewMode('browse');
       setPage(1);
     }
-  }, [viewMode]);
+    // Close details view
+    setSelectedItem(null);
+    setSelectedCollection(null);
+    setDetailHistory([]);
+  }, [viewMode, setSelectedItem, setSelectedCollection, setDetailHistory]);
 
   const handleSearchFocus = useCallback(() => {
     if (viewMode === 'home') {
@@ -344,9 +482,8 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const data = await fetchWorkshopItem(workshopId);
       if (data.item && data.item.workshopId) {
         const item = data.item;
-        setSelectedItem(item);
+        navigateToDetail(item, null);
         onRecordSeenItems?.([item], 'workshop-item-detail');
-        setSelectedCollection(null);
       }
     } catch (err) {
       setAlertInfo({
@@ -357,7 +494,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     } finally {
       setLoadingDetailId(null);
     }
-  }, [onRecordSeenItems, t]);
+  }, [navigateToDetail, onRecordSeenItems, t]);
 
   const viewCollectionDetails = useCallback(async (collectionId: string) => {
     setLoadingDetailId(collectionId);
@@ -367,7 +504,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       const collectionItems = data.items;
       if (raw && raw.publishedfileid) {
         const collectionItem = mapSteamDetailToWorkshopItem(raw, data.source);
-        setSelectedCollection({
+        navigateToDetail(null, {
           title: collectionItem.title,
           description: raw.description || '',
           imagePath: collectionItem.imagePath,
@@ -377,7 +514,6 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           workshopId: raw.publishedfileid,
         });
         onRecordSeenItems?.([collectionItem, ...collectionItems], 'workshop-collection');
-        setSelectedItem(null);
       }
     } catch (err) {
       setAlertInfo({
@@ -388,7 +524,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     } finally {
       setLoadingDetailId(null);
     }
-  }, [onRecordSeenItems, t]);
+  }, [navigateToDetail, onRecordSeenItems, t]);
 
   const handleItemClick = useCallback((item: WorkshopItem) => {
     if (section === 'collections') {
@@ -534,16 +670,16 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
       <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '16px 24px', borderBottom: '1px solid var(--md-sys-color-outline-variant)', flexShrink: 0 }}>
         <div style={{ display: 'flex', borderRadius: '100px', backgroundColor: 'var(--md-sys-color-surface-container-high)', padding: '4px' }}>
           <button
-            className={`btn ${viewMode === 'home' ? 'btn-primary' : ''}`}
-            onClick={() => { setViewMode('home'); setPage(1); }}
-            style={{ borderRadius: '100px', padding: '6px 16px', border: 'none', boxShadow: 'none', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', background: viewMode === 'home' ? undefined : 'transparent', color: viewMode === 'home' ? undefined : 'var(--md-sys-color-on-surface)' }}
+            className={`btn ${viewMode === 'home' && !selectedItem && !selectedCollection ? 'btn-primary' : ''}`}
+            onClick={() => { setViewMode('home'); setPage(1); setSelectedItem(null); setSelectedCollection(null); setDetailHistory([]); }}
+            style={{ borderRadius: '100px', padding: '6px 16px', border: 'none', boxShadow: 'none', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', background: viewMode === 'home' && !selectedItem && !selectedCollection ? undefined : 'transparent', color: viewMode === 'home' && !selectedItem && !selectedCollection ? undefined : 'var(--md-sys-color-on-surface)' }}
           >
             <Home size={14} /> {t('workshop.nav.home')}
           </button>
           <button
-            className={`btn ${viewMode === 'browse' ? 'btn-primary' : ''}`}
-            onClick={enterBrowseMode}
-            style={{ borderRadius: '100px', padding: '6px 16px', border: 'none', boxShadow: 'none', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', background: viewMode === 'browse' ? undefined : 'transparent', color: viewMode === 'browse' ? undefined : 'var(--md-sys-color-on-surface)' }}
+            className={`btn ${viewMode === 'browse' && !selectedItem && !selectedCollection ? 'btn-primary' : ''}`}
+            onClick={() => { enterBrowseMode(); setSelectedItem(null); setSelectedCollection(null); setDetailHistory([]); }}
+            style={{ borderRadius: '100px', padding: '6px 16px', border: 'none', boxShadow: 'none', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px', background: viewMode === 'browse' && !selectedItem && !selectedCollection ? undefined : 'transparent', color: viewMode === 'browse' && !selectedItem && !selectedCollection ? undefined : 'var(--md-sys-color-on-surface)' }}
           >
             <Compass size={14} /> {t('workshop.nav.browse')}
           </button>
@@ -558,7 +694,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           onFocus={handleSearchFocus}
         />
 
-        {(viewMode === 'browse' || viewMode === 'search') && !creatorId && (
+        {(viewMode === 'browse' || viewMode === 'search') && !creatorId && !selectedItem && !selectedCollection && (
           <>
             <CustomSelect
               options={SORT_OPTIONS.map((opt) => ({
@@ -590,7 +726,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         )}
 
         {/* Tag browser button */}
-        {tagCategories.length > 0 && (
+        {tagCategories.length > 0 && !selectedItem && !selectedCollection && (
           <button
             className={`btn ${activeTag ? 'btn-primary' : 'btn-secondary'}`}
             onClick={() => setTagModalOpen(true)}
@@ -601,7 +737,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           </button>
         )}
 
-        <div style={{ marginLeft: tagCategories.length > 0 ? '0' : 'auto' }}>
+        <div style={{ marginLeft: (tagCategories.length > 0 && !selectedItem && !selectedCollection) ? '0' : 'auto' }}>
           <TaskCenterButton
             syncingSteam={syncingSteam}
             backgroundTasks={backgroundTasks}
@@ -617,29 +753,33 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         onWheelCapture={markScrollInteraction}
         onScroll={markScrollInteraction}
       >
-        {viewMode === 'home' ? renderHomepage() : renderBrowseView()}
+        {selectedItem || selectedCollection ? (
+          <WorkshopDetailModal
+            open={!!(selectedItem || selectedCollection)}
+            item={selectedItem}
+            collection={selectedCollection}
+            onClose={handleBack}
+            onDownload={onDownload}
+            onDownloadMany={onDownloadMany}
+            onOpenLink={onOpenLink}
+            onImportCollection={onImportCollection}
+            onItemNavigate={viewItemDetails}
+            onCollectionNavigate={viewCollectionDetails}
+            onDirectNavigate={handleDirectNavigation}
+            addons={addons}
+            knownUninstalledAddons={knownUninstalledAddons}
+            downloadProgress={downloadProgress}
+            isSubmitting={isSubmitting}
+            groups={groups}
+            isLoading={!!loadingDetailId}
+            onDatabaseUpdate={onDatabaseUpdate}
+          />
+        ) : viewMode === 'home' ? (
+          renderHomepage()
+        ) : (
+          renderBrowseView()
+        )}
       </div>
-
-      {/* Detail modal */}
-      <WorkshopDetailModal
-        open={!!(selectedItem || selectedCollection)}
-        item={selectedItem}
-        collection={selectedCollection}
-        onClose={() => { setSelectedItem(null); setSelectedCollection(null); }}
-        onDownload={onDownload}
-        onDownloadMany={onDownloadMany}
-        onOpenLink={onOpenLink}
-        onImportCollection={onImportCollection}
-        onItemNavigate={viewItemDetails}
-        onCollectionNavigate={viewCollectionDetails}
-        addons={addons}
-        knownUninstalledAddons={knownUninstalledAddons}
-        downloadProgress={downloadProgress}
-        isSubmitting={isSubmitting}
-        groups={groups}
-        isLoading={!!loadingDetailId}
-        onDatabaseUpdate={onDatabaseUpdate}
-      />
 
       {/* Tag browser modal */}
       <TagBrowserModal

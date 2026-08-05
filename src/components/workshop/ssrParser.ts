@@ -638,11 +638,14 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
       }
     }
 
+    const seenTags = new Set<string>();
     all('.rightDetailsBlock .workshopTags').forEach((node) => {
       const category = (node.querySelector('.workshopTagsTitle')?.textContent || '').replace(/:$/, '').trim();
       node.querySelectorAll('a').forEach((a) => {
         const name = (a.textContent || '').trim();
-        if (name) {
+        const key = `${category}:${name}`;
+        if (name && !seenTags.has(key)) {
+          seenTags.add(key);
           result.tags.push({ category, name });
         }
       });
