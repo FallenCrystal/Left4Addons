@@ -95,6 +95,9 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   const [homepageError, setHomepageError] = useState<string | null>(null);
   const [tagCategories, setTagCategories] = useState<TagCategory[]>([]);
 
+  const searchRequestRef = useRef(0);
+  const homepageRequestRef = useRef(0);
+
   // Detail modal
   const [selectedItem, setSelectedItem] = useState<any | null>(null);
   const [selectedCollection, setSelectedCollection] = useState<{
@@ -144,30 +147,38 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
   // ── Fetch homepage ─────────────────────────────────────────────────────────
 
   const fetchHomepage = useCallback(async () => {
+    const requestId = ++homepageRequestRef.current;
     setHomepageLoading(true);
     setHomepageError(null);
     try {
       const data = await fetchWorkshopHome();
+      if (requestId !== homepageRequestRef.current) return;
       setHomepageSections(data.sections);
       onRecordSeenItems?.(data.sections.flatMap((sec: { items: WorkshopItem[] }) => sec.items), 'workshop-home');
       setTagCategories(data.tagCategories);
     } catch (err) {
+      if (requestId !== homepageRequestRef.current) return;
       console.error('Failed to fetch homepage:', err);
       setHomepageSections([]);
       setTagCategories([]);
       setHomepageError(String(err));
     } finally {
-      setHomepageLoading(false);
+      if (requestId === homepageRequestRef.current) {
+        setHomepageLoading(false);
+      }
     }
   }, [onRecordSeenItems]);
 
   useEffect(() => {
-    if (viewMode === 'home') fetchHomepage();
-  }, [viewMode, fetchHomepage]);
+    if (viewMode === 'home' && homepageSections.length === 0 && !homepageLoading) {
+      fetchHomepage();
+    }
+  }, [viewMode, fetchHomepage, homepageSections.length, homepageLoading]);
 
   // ── Fetch browse items ─────────────────────────────────────────────────────
 
   const fetchItems = useCallback(async () => {
+    const requestId = ++searchRequestRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -180,13 +191,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
         activeTag,
         activeTagName,
       });
+      if (requestId !== searchRequestRef.current) return;
       setItems(data.items);
       onRecordSeenItems?.(data.items, creatorId ? 'workshop-creator' : committedQuery ? 'workshop-search' : 'workshop-browse');
     } catch (err) {
+      if (requestId !== searchRequestRef.current) return;
       console.error(err);
       setError(`${t('common.error')}: ${err}`);
     } finally {
-      setLoading(false);
+      if (requestId === searchRequestRef.current) {
+        setLoading(false);
+      }
     }
   }, [committedQuery, sort, section, page, creatorId, activeTag, activeTagName, onRecordSeenItems, t]);
 
