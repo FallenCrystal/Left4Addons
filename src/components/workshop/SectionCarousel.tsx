@@ -26,7 +26,7 @@ interface SectionCarouselProps {
   loadingDetailId?: string | null;
 }
 
-export const SectionCarousel: React.FC<SectionCarouselProps> = ({
+const SectionCarouselComponent: React.FC<SectionCarouselProps> = ({
   section,
   sectionType,
   addons,
@@ -109,7 +109,7 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
             addons={addons}
             knownUninstalledAddons={knownUninstalledAddons}
             knownCollectionIds={knownCollectionIds}
-            onClick={() => onItemClick(item)}
+            onClick={onItemClick}
             isLoading={loadingDetailId === item.workshopId}
           />
         ))}
@@ -117,3 +117,5 @@ export const SectionCarousel: React.FC<SectionCarouselProps> = ({
     </div>
   );
 };
+
+export const SectionCarousel = React.memo(SectionCarouselComponent);

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import i18n from '../i18n';
 import {
   HomepageSection,
   TagCategory,
@@ -683,10 +684,10 @@ export async function fetchWorkshopHome() {
         tagCategories: [],
       };
     }
-    const html = await invoke<string>('fetch_workshop_html', {
-      url: 'https://steamcommunity.com/app/550/workshop/',
-      source: 'workshop-home',
-    });
+    const html = await fetchWorkshopHtml(
+      'https://steamcommunity.com/app/550/workshop/',
+      'workshop-home',
+    );
     const htmlSections = await Promise.all(parseHomepageSections(html).map(async (section) => ({
       ...section,
       items: rememberWorkshopItems(await enrichItemsFromSnapshot(section.items)),
@@ -704,10 +705,10 @@ export async function fetchWorkshopHome() {
   let tagCategories: TagCategory[] = [];
   let htmlSections: HomepageSection[] = [];
   if (allowHtml) try {
-    const html = await invoke<string>('fetch_workshop_html', {
-      url: 'https://steamcommunity.com/app/550/workshop/',
-      source: 'workshop-home',
-    });
+    const html = await fetchWorkshopHtml(
+      'https://steamcommunity.com/app/550/workshop/',
+      'workshop-home',
+    );
     htmlSections = await Promise.all(parseHomepageSections(html).map(async (section) => ({
       ...section,
       items: rememberWorkshopItems(await enrichItemsFromSnapshot(section.items)),
@@ -756,10 +757,10 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
           capabilities,
         )) {
           try {
-            const html: string = await invoke('fetch_workshop_html', {
-              url: buildBrowseUrl(input),
-              source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
-            });
+            const html = await fetchWorkshopHtml(
+              buildBrowseUrl(input),
+              input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+            );
             items = enrichWorkshopItems(items, parseSSRItems(html, 'workshop_query'));
           } catch (err) {
             console.warn('Steam SDK browse HTML enrichment failed:', err);
@@ -788,10 +789,10 @@ export async function fetchWorkshopItems(input: FetchWorkshopItemsInput) {
 
   const url = buildBrowseUrl(input);
   try {
-    const html: string = await invoke('fetch_workshop_html', {
+    const html = await fetchWorkshopHtml(
       url,
-      source: input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
-    });
+      input.creatorId ? 'workshop-creator' : input.query ? 'workshop-search' : 'workshop-browse',
+    );
     const items = await enrichItemsFromSnapshot(parseSSRItems(html, 'workshop_query'));
     const result = {
       source: 'web-fallback',
@@ -920,8 +921,16 @@ export async function fetchWorkshopCollection(workshopId: string) {
   }
 }
 
+function getSteamLanguageUrl(url: string): string {
+  const lang = i18n.language?.startsWith('zh') ? 'schinese' : 'english';
+  if (url.includes('l=')) return url;
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}l=${lang}`;
+}
+
 export async function fetchWorkshopHtml(url: string, source: string) {
-  return invoke<string>('fetch_workshop_html', { url, source });
+  const finalUrl = getSteamLanguageUrl(url);
+  return invoke<string>('fetch_workshop_html', { url: finalUrl, source });
 }
 
 export async function fetchWorkshopPageDetails(workshopId: string, source: string) {

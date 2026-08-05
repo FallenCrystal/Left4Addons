@@ -6,7 +6,7 @@
  *   • Browse    — filterable grid with tag sidebar
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Search, ChevronLeft, ChevronRight, Loader2,
@@ -46,6 +46,64 @@ const SORT_OPTIONS = [
   { value: 'lastupdated', labelKey: 'workshop.browse.sortLastUpdated' },
 ] as const;
 
+// ── Search Bar Component ───────────────────────────────────────────────────────
+
+interface WorkshopSearchBarProps {
+  initialValue: string;
+  placeholder: string;
+  searchLabel: string;
+  onSubmit: (val: string) => void;
+  onClear: () => void;
+  onFocus: () => void;
+}
+
+const WorkshopSearchBarComponent: React.FC<WorkshopSearchBarProps> = ({
+  initialValue,
+  placeholder,
+  searchLabel,
+  onSubmit,
+  onClear,
+  onFocus,
+}) => {
+  const [localQuery, setLocalQuery] = useState(initialValue);
+
+  useEffect(() => {
+    setLocalQuery(initialValue);
+  }, [initialValue]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSubmit(localQuery);
+  };
+
+  return (
+    <form onSubmit={handleSubmit} style={{ display: 'flex', gap: '8px', flex: 1, maxWidth: '480px' }}>
+      <div style={{ position: 'relative', flex: 1 }}>
+        <Search size={16} style={{ position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)', color: 'var(--md-sys-color-outline)' }} />
+        <input
+          type="text"
+          placeholder={placeholder}
+          value={localQuery}
+          onChange={(e) => {
+            const val = e.target.value;
+            setLocalQuery(val);
+            if (val.trim() === '') {
+              onClear();
+            }
+          }}
+          onFocus={onFocus}
+          style={{ width: '100%', padding: '8px 14px 8px 40px', borderRadius: '100px', border: '1px solid var(--md-sys-color-outline-variant)', backgroundColor: 'var(--md-sys-color-surface-container-high)', color: 'var(--md-sys-color-on-surface)', outline: 'none', fontSize: '13px' }}
+        />
+      </div>
+      <button type="submit" className="btn btn-primary" style={{ borderRadius: '100px', padding: '0 20px', fontSize: '13px' }}>
+        {searchLabel}
+      </button>
+    </form>
+  );
+};
+
+const WorkshopSearchBar = React.memo(WorkshopSearchBarComponent);
+
 // ── Main Component ────────────────────────────────────────────────────────────
 
 export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
@@ -68,11 +126,11 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 }) => {
   const { t } = useTranslation();
   const scrollIdleTimerRef = useRef<number | null>(null);
-  const knownCollectionIds = new Set(
+  const knownCollectionIds = useMemo(() => new Set(
     (groups || [])
       .map((group) => group.workshopCollectionId?.trim())
       .filter((id): id is string => !!id),
-  );
+  ), [groups]);
 
   // View mode
   const [viewMode, setViewMode] = useState<'home' | 'browse' | 'search'>('home');
@@ -211,9 +269,17 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
 
   // ── Navigation helpers ─────────────────────────────────────────────────────
 
-  const handleSearchSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!query.trim()) {
+  const enterBrowseMode = useCallback(() => {
+    setViewMode('browse');
+    setCreatorId(null); setCreatorName(null);
+    setActiveTag(null); setActiveTagName(null);
+    setPage(1); setSort('trend'); setSection('readytouseitems');
+  }, []);
+
+  const handleSearchSubmit = useCallback((submittedVal: string) => {
+    const trimmed = submittedVal.trim();
+    setQuery(trimmed);
+    if (!trimmed) {
       setCommittedQuery('');
       if (viewMode === 'search') {
         setSort('trend');
@@ -230,10 +296,24 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setSection('readytouseitems');
     setSort('textsearch');
     setPage(1);
-    setCommittedQuery(query.trim());
+    setCommittedQuery(trimmed);
     setViewMode('search');
-  };
+  }, [viewMode]);
 
+  const handleSearchClear = useCallback(() => {
+    setQuery('');
+    if (viewMode === 'search') {
+      setCommittedQuery('');
+      setViewMode('browse');
+      setPage(1);
+    }
+  }, [viewMode]);
+
+  const handleSearchFocus = useCallback(() => {
+    if (viewMode === 'home') {
+      enterBrowseMode();
+    }
+  }, [viewMode, enterBrowseMode]);
 
   const handleClearCreator = () => { setCreatorId(null); setCreatorName(null); setPage(1); };
   const handleClearTag = () => { setActiveTag(null); setActiveTagName(null); setPage(1); };
@@ -247,25 +327,18 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     setViewMode('browse');
   };
 
-  const handleViewAllSection = (sec: HomepageSection) => {
+  const handleViewAllSection = useCallback((sec: HomepageSection) => {
     setSort(sec.browseParams.sort);
     setSection(sec.browseParams.section);
     setPage(1);
     setCreatorId(null); setCreatorName(null);
     setActiveTag(null); setActiveTagName(null);
     setViewMode('browse');
-  };
-
-  const enterBrowseMode = () => {
-    setViewMode('browse');
-    setCreatorId(null); setCreatorName(null);
-    setActiveTag(null); setActiveTagName(null);
-    setPage(1); setSort('trend'); setSection('readytouseitems');
-  };
+  }, []);
 
   // ── Detail helpers ─────────────────────────────────────────────────────────
 
-  const viewItemDetails = async (workshopId: string) => {
+  const viewItemDetails = useCallback(async (workshopId: string) => {
     setLoadingDetailId(workshopId);
     try {
       const data = await fetchWorkshopItem(workshopId);
@@ -284,9 +357,9 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     } finally {
       setLoadingDetailId(null);
     }
-  };
+  }, [onRecordSeenItems, t]);
 
-  const viewCollectionDetails = async (collectionId: string) => {
+  const viewCollectionDetails = useCallback(async (collectionId: string) => {
     setLoadingDetailId(collectionId);
     try {
       const data = await fetchWorkshopCollection(collectionId);
@@ -315,7 +388,19 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
     } finally {
       setLoadingDetailId(null);
     }
-  };
+  }, [onRecordSeenItems, t]);
+
+  const handleItemClick = useCallback((item: WorkshopItem) => {
+    if (section === 'collections') {
+      viewCollectionDetails(item.workshopId);
+    } else {
+      viewItemDetails(item.workshopId);
+    }
+  }, [section, viewCollectionDetails, viewItemDetails]);
+
+  const handleCarouselItemClick = useCallback((item: WorkshopItem) => {
+    viewItemDetails(item.workshopId);
+  }, [viewItemDetails]);
 
   // ── Render: Homepage ───────────────────────────────────────────────────────
 
@@ -351,7 +436,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
             addons={addons}
             knownUninstalledAddons={knownUninstalledAddons}
             knownCollectionIds={knownCollectionIds}
-            onItemClick={(item) => viewItemDetails(item.workshopId)}
+            onItemClick={handleCarouselItemClick}
             onViewAll={handleViewAllSection}
             loadingDetailId={loadingDetailId}
           />
@@ -421,7 +506,7 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
                   addons={addons}
                   knownUninstalledAddons={knownUninstalledAddons}
                   knownCollectionIds={knownCollectionIds}
-                  onClick={() => section === 'collections' ? viewCollectionDetails(item.workshopId) : viewItemDetails(item.workshopId)}
+                  onClick={handleItemClick}
                   isLoading={loadingDetailId === item.workshopId}
                 />
               ))}
@@ -464,34 +549,14 @@ export const WorkshopBrowser: React.FC<WorkshopBrowserProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSearchSubmit} style={{ display: 'flex', gap: '8px', flex: 1, maxWidth: '480px' }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <Search size={16} style={{ position: 'absolute', left: '14px', top: '50%', transform: 'translateY(-50%)', color: 'var(--md-sys-color-outline)' }} />
-            <input
-              type="text"
-              placeholder={t('workshop.nav.searchPlaceholder')}
-              value={query}
-              onChange={(e) => {
-                const val = e.target.value;
-                setQuery(val);
-                if (val.trim() === '' && viewMode === 'search') {
-                  setCommittedQuery('');
-                  setViewMode('browse');
-                  setPage(1);
-                }
-              }}
-              onFocus={() => {
-                if (viewMode === 'home') {
-                  enterBrowseMode();
-                }
-              }}
-              style={{ width: '100%', padding: '8px 14px 8px 40px', borderRadius: '100px', border: '1px solid var(--md-sys-color-outline-variant)', backgroundColor: 'var(--md-sys-color-surface-container-high)', color: 'var(--md-sys-color-on-surface)', outline: 'none', fontSize: '13px' }}
-            />
-          </div>
-          <button type="submit" className="btn btn-primary" style={{ borderRadius: '100px', padding: '0 20px', fontSize: '13px' }}>
-            {t('common.search')}
-          </button>
-        </form>
+        <WorkshopSearchBar
+          initialValue={query}
+          placeholder={t('workshop.nav.searchPlaceholder')}
+          searchLabel={t('common.search')}
+          onSubmit={handleSearchSubmit}
+          onClear={handleSearchClear}
+          onFocus={handleSearchFocus}
+        />
 
         {(viewMode === 'browse' || viewMode === 'search') && !creatorId && (
           <>

@@ -13,11 +13,11 @@ interface ItemCardProps {
   addons: Record<string, any>;
   knownUninstalledAddons: Record<string, any>;
   knownCollectionIds?: Set<string>;
-  onClick: () => void;
+  onClick: (item: WorkshopItem) => void;
   isLoading?: boolean;
 }
 
-export const ItemCard: React.FC<ItemCardProps> = ({
+const ItemCardComponent: React.FC<ItemCardProps> = ({
   item,
   section,
   addons,
@@ -34,7 +34,7 @@ export const ItemCard: React.FC<ItemCardProps> = ({
   const shouldCacheRemote = isDownloaded || isKnownEntry;
 
   return (
-    <div className="addon-card" style={{ cursor: isLoading ? 'wait' : 'pointer' }} onClick={isLoading ? undefined : onClick}>
+    <div className="addon-card" style={{ cursor: isLoading ? 'wait' : 'pointer' }} onClick={isLoading ? undefined : () => onClick(item)}>
       {isLoading && (
         <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: '28px', backdropFilter: 'blur(2px)' }}>
           <Loader2 size={32} color="var(--md-sys-color-primary)" className="animate-spin" />
@@ -145,3 +145,5 @@ export const ItemCard: React.FC<ItemCardProps> = ({
     </div>
   );
 };
+
+export const ItemCard = React.memo(ItemCardComponent);
