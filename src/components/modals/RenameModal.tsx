@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Addon, Group } from '../../types/addon';
-import { getSuggestedVpkName } from '../../utils/addonHelpers';
+import { Addon, Group, RenameSettings } from '../../types/addon';
+import { getSuggestedVpkName, sanitizeVpkName } from '../../utils/addonHelpers';
 import { useTranslation } from 'react-i18next';
 
 interface RenameModalProps {
@@ -11,6 +11,7 @@ interface RenameModalProps {
   addon: Addon | undefined;
   itemGroup: Group | undefined;
   addons: Record<string, Addon>;
+  renameSettings: RenameSettings | undefined;
   onCancel: () => void;
   onConfirm: (currentName: string, newVpkName: string) => void;
   isSubmitting?: boolean;
@@ -24,6 +25,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
   addon,
   itemGroup,
   addons,
+  renameSettings,
   onCancel,
   onConfirm,
   isSubmitting = false,
@@ -41,7 +43,7 @@ export const RenameModal: React.FC<RenameModalProps> = ({
 
   const handleApplyTitle = () => {
     if (addon) {
-      const name = getSuggestedVpkName(addon, itemGroup?.name, addons);
+      const name = getSuggestedVpkName(addon, itemGroup?.name, addons, renameSettings);
       setVpkName(name);
     }
   };
@@ -49,7 +51,8 @@ export const RenameModal: React.FC<RenameModalProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onConfirm(currentName, vpkName);
+    const finalName = sanitizeVpkName(vpkName, renameSettings);
+    onConfirm(currentName, finalName);
   };
 
   return (

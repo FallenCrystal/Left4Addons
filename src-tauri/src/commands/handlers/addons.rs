@@ -255,17 +255,7 @@ pub async fn rename_addon(
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
 
-    let sanitize_filename = |name: &str| {
-        let re = Regex::new(r"[\\/:*?<>|]").unwrap();
-        let s = re.replace_all(name, "_").trim().to_string();
-        if s.ends_with(".vpk") {
-            s
-        } else {
-            format!("{}.vpk", s)
-        }
-    };
-
-    let sanitized = sanitize_filename(&new_vpk_name);
+    let sanitized = sanitize_vpk_filename(&new_vpk_name, &db.settings.rename_settings);
 
     if let Some(addon) = db.addons.get(&id).cloned() {
         let current_path = PathBuf::from(&addon.current_path);
@@ -345,17 +335,6 @@ pub async fn rename_addons(
     state: State<'_, crate::AppState>,
 ) -> Result<Database, String> {
     let mut db = state.db.lock().await;
-
-    let sanitize_filename = |name: &str| {
-        let re = Regex::new(r"[\\/:*?<>|]").unwrap();
-        let s = re.replace_all(name, "_").trim().to_string();
-        if s.ends_with(".vpk") {
-            s
-        } else {
-            format!("{}.vpk", s)
-        }
-    };
-
     struct RenamePlan {
         id: String,
         current_path: PathBuf,
@@ -369,7 +348,7 @@ pub async fn rename_addons(
     let mut destination_paths = HashSet::new();
 
     for item in renames {
-        let sanitized = sanitize_filename(&item.new_vpk_name);
+        let sanitized = sanitize_vpk_filename(&item.new_vpk_name, &db.settings.rename_settings);
 
         let Some(addon) = db.addons.get(&item.id).cloned() else {
             errors.push(format!("Addon not found: {}", item.id));

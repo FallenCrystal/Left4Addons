@@ -15,6 +15,7 @@ pub struct SaveSettingsPayload {
     #[serde(default = "crate::commands::types::default_dependency_missing_behavior")]
     dependency_missing_behavior: String,
     workshop_source_settings: Option<WorkshopSourceSettings>,
+    rename_settings: Option<RenameSettings>,
 }
 
 #[tauri::command]
@@ -39,6 +40,7 @@ pub async fn save_settings(
         max_download_retries,
         dependency_missing_behavior,
         workshop_source_settings,
+        rename_settings,
     } = payload;
 
     let mut db = state.db.lock().await;
@@ -59,6 +61,9 @@ pub async fn save_settings(
     };
     if let Some(workshop_source_settings) = workshop_source_settings {
         db.settings.workshop_source_settings = workshop_source_settings;
+    }
+    if let Some(rename_settings) = rename_settings {
+        db.settings.rename_settings = rename_settings;
     }
     if disable_steamworks_sdk {
         state.workshop_service.shutdown();

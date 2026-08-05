@@ -17,7 +17,8 @@ use tauri::{AppHandle, Emitter};
 
 use super::types::{
     is_dummy_addon_info, Addon, Database, Group, KnownAddonEntry, MasterCollection, RenameItem,
-    Settings, SettingsStore, WorkshopSeenItem, WorkshopSourceSettings,
+    Settings, SettingsStore, WorkshopSeenItem, WorkshopSourceSettings, RenameSettings,
+    sanitize_vpk_filename,
 };
 
 pub mod addons;
@@ -4084,6 +4085,46 @@ mod tests {
         assert_eq!(
             format_workshop_vpk_name("12345", ""),
             "[12345]Workshop Item.vpk"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_vpk_filename() {
+        use crate::commands::types::RenameSettings;
+
+        let settings = RenameSettings {
+            enable_workshop_id_prefix: true,
+            enable_group_prefix: true,
+            clean_special_chars: true,
+            invalid_char_replace: "underscore".to_string(),
+            max_filename_length: 30,
+            enable_trim: true,
+            enable_remove_double_spaces: true,
+        };
+
+        // Filter special chars, trim, remove double spaces, truncate to 30
+        assert_eq!(
+            super::sanitize_vpk_filename("Cool. Campaign.  Map! Extra Details.vpk", &settings),
+            "Cool_ Campaign_ Map_ Extra.vpk"
+        );
+
+        let settings_no_len = RenameSettings {
+            max_filename_length: 0,
+            ..settings
+        };
+        assert_eq!(
+            super::sanitize_vpk_filename("Cool. Campaign.  Map! Extra Details.vpk", &settings_no_len),
+            "Cool_ Campaign_ Map_ Extra Details.vpk"
+        );
+
+        // Case-insensitivity and double quote tests
+        assert_eq!(
+            super::sanitize_vpk_filename("Double \"Quote\" Test.VPK", &settings_no_len),
+            "Double _Quote_ Test.vpk"
+        );
+        assert_eq!(
+            super::sanitize_vpk_filename("Cool Map.VPK.DISABLED", &settings_no_len),
+            "Cool Map.vpk"
         );
     }
 }

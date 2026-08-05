@@ -493,6 +493,7 @@ function App() {
         addon={renameAddonObj}
         itemGroup={renameGroupObj}
         addons={addons}
+        renameSettings={settings.renameSettings}
         isSubmitting={isSubmitting}
         onCancel={() => {
           setRenameModal({ open: false, currentName: '', title: '', suggestedName: '' });

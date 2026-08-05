@@ -7,6 +7,7 @@ import {
   getAddonAuthor,
   getSuggestedVpkName,
   sortAddonsDownloadedFirst,
+  sanitizeVpkName,
 } from './addonHelpers';
 import { Addon } from '../types/addon';
 
@@ -273,6 +274,58 @@ describe('addonHelpers', () => {
       const suggested = getSuggestedVpkName(addon, undefined, existing);
       expect(suggested).toBe('[123]Cool Map_1.vpk');
     });
+
+    test('should respect renameSettings options', () => {
+      const addon: Addon = {
+        id: '2938529557.vpk', vpkName: '2938529557.vpk',
+        dirType: 'workshop',
+        isEnabled: true,
+        fileSize: 100,
+        filesCount: 1,
+        workshopId: '2938529557',
+        steamDetails: {
+          title: 'Cool. Campaign.  Map! ',
+        },
+      };
+
+      // Test 1: Disable workshopId and group prefixes
+      const sug1 = getSuggestedVpkName(addon, 'Campaigns', {}, {
+        enableWorkshopIdPrefix: false,
+        enableGroupPrefix: false,
+        cleanSpecialChars: false,
+        invalidCharReplace: 'underscore',
+        maxFilenameLength: 0,
+        enableTrim: true,
+        enableRemoveDoubleSpaces: true,
+      });
+      expect(sug1).toBe('Cool. Campaign. Map!.vpk');
+
+      // Test 2: Clean special chars, replace with underscore
+      const sug2 = getSuggestedVpkName(addon, 'Campaigns', {}, {
+        enableWorkshopIdPrefix: true,
+        enableGroupPrefix: true,
+        cleanSpecialChars: true,
+        invalidCharReplace: 'underscore',
+        maxFilenameLength: 0,
+        enableTrim: true,
+        enableRemoveDoubleSpaces: true,
+      });
+      // '.' and '!' are replaced with '_'. Trailing space is trimmed. Double space is merged.
+      expect(sug2).toBe('[2938529557][Campaigns]Cool_ Campaign_ Map_.vpk');
+
+      // Test 3: Truncate to maximum length of 30 characters
+      const sug3 = getSuggestedVpkName(addon, 'Campaigns', {}, {
+        enableWorkshopIdPrefix: true,
+        enableGroupPrefix: true,
+        cleanSpecialChars: true,
+        invalidCharReplace: 'underscore',
+        maxFilenameLength: 35,
+        enableTrim: true,
+        enableRemoveDoubleSpaces: true,
+      });
+      expect(sug3.length).toBeLessThanOrEqual(35);
+      expect(sug3.endsWith('.vpk')).toBe(true);
+    });
   });
 
   describe('sortAddonsDownloadedFirst', () => {
@@ -318,6 +371,32 @@ describe('addonHelpers', () => {
         'missing-1',
         'missing-2',
       ]);
+    });
+  });
+
+  describe('sanitizeVpkName', () => {
+    test('should replace double quotes and handle case-insensitive suffixes', () => {
+      const sanitized = sanitizeVpkName('Double "Quote" Test.VPK');
+      expect(sanitized).toBe('Double _Quote_ Test.vpk');
+    });
+
+    test('should handle disabled suffix casing', () => {
+      const sanitized = sanitizeVpkName('Cool Map.VPK.DISABLED');
+      expect(sanitized).toBe('Cool Map.vpk');
+    });
+
+    test('should clean special characters if cleanSpecialChars is true', () => {
+      const settings = {
+        enableWorkshopIdPrefix: true,
+        enableGroupPrefix: true,
+        cleanSpecialChars: true,
+        invalidCharReplace: 'space' as const,
+        maxFilenameLength: 0,
+        enableTrim: true,
+        enableRemoveDoubleSpaces: true,
+      };
+      const sanitized = sanitizeVpkName('Map/With/Backslash & Ampersand.vpk', settings);
+      expect(sanitized).toBe('Map_With_Backslash Ampersand.vpk');
     });
   });
 });

@@ -170,6 +170,16 @@ export type DependencyMissingBehavior = 'always' | 'ask' | 'ignore';
 export type WorkshopSdkHtmlScope = 'disabled' | 'search' | 'navigation' | 'all';
 export type DependencyRefreshMode = 'always' | 'cache-missing';
 
+export interface RenameSettings {
+  enableWorkshopIdPrefix: boolean;
+  enableGroupPrefix: boolean;
+  cleanSpecialChars: boolean;
+  invalidCharReplace: 'space' | 'underscore' | 'empty';
+  maxFilenameLength: number; // 0 for unlimited
+  enableTrim: boolean;
+  enableRemoveDoubleSpaces: boolean;
+}
+
 export interface Settings {
   workshopDir: string;
   loadingDir: string;
@@ -181,6 +191,7 @@ export interface Settings {
   maxDownloadRetries?: number;
   dependencyMissingBehavior?: DependencyMissingBehavior;
   workshopSourceSettings?: WorkshopSourceSettings;
+  renameSettings?: RenameSettings;
 }
 
 export interface WorkshopSourceSettings {

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle } from 'lucide-react';
-import { DependencyRefreshMode, Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings, DependencyMissingBehavior } from '../../types/addon';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle, SpellCheck } from 'lucide-react';
+import { DependencyRefreshMode, Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings, DependencyMissingBehavior, RenameSettings } from '../../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from '../common/TransHTML';
 import { DEFAULT_WORKSHOP_SOURCE_SETTINGS, normalizeWorkshopSourceSettings } from '../../utils/workshopSourceSettings';
@@ -22,6 +22,7 @@ interface SettingsViewProps {
     maxDownloadRetries: number,
     dependencyMissingBehavior: DependencyMissingBehavior,
     workshopSourceSettings: WorkshopSourceSettings,
+    renameSettings: RenameSettings,
   ) => Promise<void>;
 }
 
@@ -47,7 +48,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onConfirm,
 }) => {
   const { t, i18n } = useTranslation();
-  const [activeTab, setActiveTab] = useState<'path' | 'download' | 'language' | 'experimental' | 'sdk' | 'sources' | 'about'>('path');
+  const [activeTab, setActiveTab] = useState<'path' | 'download' | 'rename' | 'language' | 'experimental' | 'sdk' | 'sources' | 'about'>('path');
   const [loadingDir, setLoadingDir] = useState('');
   const [downloadConcurrencyInput, setDownloadConcurrencyInput] = useState('2');
   const [enableDummyBypass, setEnableDummyBypass] = useState(false);
@@ -57,6 +58,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [maxDownloadRetriesInput, setMaxDownloadRetriesInput] = useState('3');
   const [dependencyMissingBehavior, setDependencyMissingBehavior] = useState<DependencyMissingBehavior>('ask');
   const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_WORKSHOP_SOURCE_SETTINGS);
+
+  // Rename settings states
+  const [enableWorkshopIdPrefix, setEnableWorkshopIdPrefix] = useState(true);
+  const [enableGroupPrefix, setEnableGroupPrefix] = useState(true);
+  const [cleanSpecialChars, setCleanSpecialChars] = useState(false);
+  const [invalidCharReplace, setInvalidCharReplace] = useState<'space' | 'underscore' | 'empty'>('underscore');
+  const [maxFilenameLength, setMaxFilenameLength] = useState<number>(0);
+  const [enableTrim, setEnableTrim] = useState(true);
+  const [enableRemoveDoubleSpaces, setEnableRemoveDoubleSpaces] = useState(true);
 
   useEffect(() => {
     setLoadingDir(settings.loadingDir || '');
@@ -68,6 +78,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setMaxDownloadRetriesInput(String(settings.maxDownloadRetries ?? 3));
     setDependencyMissingBehavior(settings.dependencyMissingBehavior || 'ask');
     setWorkshopSourceSettings(normalizeWorkshopSourceSettings(settings.workshopSourceSettings));
+
+    // Load rename settings
+    const rs = settings.renameSettings || {
+      enableWorkshopIdPrefix: true,
+      enableGroupPrefix: true,
+      cleanSpecialChars: false,
+      invalidCharReplace: 'underscore' as const,
+      maxFilenameLength: 0,
+      enableTrim: true,
+      enableRemoveDoubleSpaces: true,
+    };
+    setEnableWorkshopIdPrefix(rs.enableWorkshopIdPrefix);
+    setEnableGroupPrefix(rs.enableGroupPrefix);
+    setCleanSpecialChars(rs.cleanSpecialChars);
+    setInvalidCharReplace(rs.invalidCharReplace);
+    setMaxFilenameLength(rs.maxFilenameLength);
+    setEnableTrim(rs.enableTrim);
+    setEnableRemoveDoubleSpaces(rs.enableRemoveDoubleSpaces);
   }, [settings]);
 
   const triggerSave = async (patch: {
@@ -80,6 +108,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     maxDownloadRetries?: number;
     dependencyMissingBehavior?: DependencyMissingBehavior;
     workshopSourceSettings?: WorkshopSourceSettings;
+    renameSettings?: Partial<RenameSettings>;
   }) => {
     if (isSubmitting) return;
 
@@ -103,6 +132,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     const nextDependencyMissingBehavior = patch.dependencyMissingBehavior !== undefined ? patch.dependencyMissingBehavior : dependencyMissingBehavior;
     const nextWorkshopSourceSettings = patch.workshopSourceSettings !== undefined ? patch.workshopSourceSettings : workshopSourceSettings;
 
+    const nextRenameSettings: RenameSettings = {
+      enableWorkshopIdPrefix: patch.renameSettings?.enableWorkshopIdPrefix !== undefined 
+        ? patch.renameSettings.enableWorkshopIdPrefix 
+        : enableWorkshopIdPrefix,
+      enableGroupPrefix: patch.renameSettings?.enableGroupPrefix !== undefined 
+        ? patch.renameSettings.enableGroupPrefix 
+        : enableGroupPrefix,
+      cleanSpecialChars: patch.renameSettings?.cleanSpecialChars !== undefined 
+        ? patch.renameSettings.cleanSpecialChars 
+        : cleanSpecialChars,
+      invalidCharReplace: patch.renameSettings?.invalidCharReplace !== undefined 
+        ? patch.renameSettings.invalidCharReplace 
+        : invalidCharReplace,
+      maxFilenameLength: patch.renameSettings?.maxFilenameLength !== undefined 
+        ? patch.renameSettings.maxFilenameLength 
+        : maxFilenameLength,
+      enableTrim: patch.renameSettings?.enableTrim !== undefined 
+        ? patch.renameSettings.enableTrim 
+        : enableTrim,
+      enableRemoveDoubleSpaces: patch.renameSettings?.enableRemoveDoubleSpaces !== undefined 
+        ? patch.renameSettings.enableRemoveDoubleSpaces 
+        : enableRemoveDoubleSpaces,
+    };
+
     await onConfirm(
       nextLoadingDir.trim(),
       nextDownloadConcurrency,
@@ -113,6 +166,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       nextMaxDownloadRetries,
       nextDependencyMissingBehavior,
       nextWorkshopSourceSettings,
+      nextRenameSettings,
     );
   };
 
@@ -245,6 +299,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         >
           <Download size={18} />
           <span>{t('settings.download')}</span>
+        </button>
+        <button
+          className={`settings-nav-item ${activeTab === 'rename' ? 'active' : ''}`}
+          onClick={() => setActiveTab('rename')}
+          type="button"
+        >
+          <SpellCheck size={18} />
+          <span>{t('settings.renameRules', 'Rename Rules')}</span>
         </button>
         <button
           className={`settings-nav-item ${activeTab === 'language' ? 'active' : ''}`}
@@ -479,6 +541,190 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px', lineHeight: '1.5' }}>
                   {t('settings.downloadTempDirHelp')}
                 </span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'rename' && (
+          <div>
+            <h2 className="settings-title">{t('settings.renameRules', 'Rename Rules')}</h2>
+            <p style={{ fontSize: '13px', color: 'var(--md-sys-color-outline)', marginBottom: '20px', lineHeight: '1.6' }}>
+              {t('settings.renameDesc', 'Customize rules for renaming VPK attachment files.')}
+            </p>
+            <div className="settings-section">
+              {/* Workshop ID prefix */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                <div style={{ paddingRight: '20px' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.enableWorkshopIdPrefixTitle', 'Add Workshop ID Prefix')}
+                  </label>
+                  <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                    {t('settings.enableWorkshopIdPrefixDesc', 'Add [WorkshopID] prefix to the renamed file, e.g. [2938529557]title.vpk')}
+                  </div>
+                </div>
+                <label className="switch" style={{ flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={enableWorkshopIdPrefix}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableWorkshopIdPrefix(checked);
+                      triggerSave({ renameSettings: { enableWorkshopIdPrefix: checked } });
+                    }}
+                    disabled={isSubmitting}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
+
+              {/* Group prefix */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                <div style={{ paddingRight: '20px' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.enableGroupPrefixTitle', 'Add Group Prefix')}
+                  </label>
+                  <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                    {t('settings.enableGroupPrefixDesc', 'Add [GroupName] prefix to the renamed file if it belongs to a group')}
+                  </div>
+                </div>
+                <label className="switch" style={{ flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={enableGroupPrefix}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableGroupPrefix(checked);
+                      triggerSave({ renameSettings: { enableGroupPrefix: checked } });
+                    }}
+                    disabled={isSubmitting}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
+
+              {/* Clean special characters */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                <div style={{ paddingRight: '20px' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.cleanSpecialCharsTitle', 'Filter Unsupported Special Characters')}
+                  </label>
+                  <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                    {t('settings.cleanSpecialCharsDesc', 'L4D fails to load paths/filenames with special characters (like \'.\') on non-Windows platforms. Keep only 0-9, [], a-z, A-Z, _, and space.')}
+                  </div>
+                </div>
+                <label className="switch" style={{ flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={cleanSpecialChars}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setCleanSpecialChars(checked);
+                      triggerSave({ renameSettings: { cleanSpecialChars: checked } });
+                    }}
+                    disabled={isSubmitting}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
+
+              {/* Invalid character replacement strategy */}
+              {cleanSpecialChars && (
+                <div style={{ padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                  <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                    {t('settings.invalidCharReplaceLabel', 'Replace Special Characters With')}
+                  </label>
+                  <CustomSelect
+                    options={[
+                      { value: 'underscore', label: t('settings.replaceUnderscore', 'Underscore (_)') },
+                      { value: 'space', label: t('settings.replaceSpace', 'Space ( )') },
+                      { value: 'empty', label: t('settings.replaceEmpty', 'Empty / Filter out') },
+                    ]}
+                    value={invalidCharReplace}
+                    onChange={(val) => {
+                      const mode = val as 'space' | 'underscore' | 'empty';
+                      setInvalidCharReplace(mode);
+                      triggerSave({ renameSettings: { invalidCharReplace: mode } });
+                    }}
+                    minWidth="100%"
+                    style={{ width: '100%', pointerEvents: isSubmitting ? 'none' : 'auto', opacity: isSubmitting ? 0.6 : 1 }}
+                  />
+                </div>
+              )}
+
+              {/* Max filename length */}
+              <div style={{ padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
+                  {t('settings.maxFilenameLengthLabel', 'Max Filename Length (Characters)')}
+                </label>
+                <input
+                  type="number"
+                  className="form-input"
+                  value={maxFilenameLength}
+                  onChange={(e) => setMaxFilenameLength(Number(e.target.value))}
+                  onBlur={() => {
+                    let val = Math.max(0, maxFilenameLength);
+                    setMaxFilenameLength(val);
+                    triggerSave({ renameSettings: { maxFilenameLength: val } });
+                  }}
+                  min={0}
+                  inputMode="numeric"
+                  disabled={isSubmitting}
+                  style={{ width: '180px' }}
+                />
+                <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
+                  {t('settings.maxFilenameLengthHelp', 'VPK filenames that are too long may cause L4D crashes. Set to 0 to disable length check/truncation.')}
+                </span>
+              </div>
+
+              {/* Trim whitespace */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: '1px solid var(--md-sys-color-outline-variant)' }}>
+                <div style={{ paddingRight: '20px' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.enableTrimTitle', 'Trim Whitespace')}
+                  </label>
+                  <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                    {t('settings.enableTrimDesc', 'Automatically remove leading and trailing spaces from filenames')}
+                  </div>
+                </div>
+                <label className="switch" style={{ flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={enableTrim}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableTrim(checked);
+                      triggerSave({ renameSettings: { enableTrim: checked } });
+                    }}
+                    disabled={isSubmitting}
+                  />
+                  <span className="slider"></span>
+                </label>
+              </div>
+
+              {/* Remove double spaces */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0', borderBottom: 'none' }}>
+                <div style={{ paddingRight: '20px' }}>
+                  <label style={{ fontWeight: '600', display: 'block', fontSize: '14px', marginBottom: '4px' }}>
+                    {t('settings.enableRemoveDoubleSpacesTitle', 'Merge Multiple Spaces')}
+                  </label>
+                  <div style={{ fontSize: '12px', color: 'var(--md-sys-color-outline)', lineHeight: '1.5', display: 'block' }}>
+                    {t('settings.enableRemoveDoubleSpacesDesc', 'Automatically replace multiple consecutive spaces with a single space')}
+                  </div>
+                </div>
+                <label className="switch" style={{ flexShrink: 0 }}>
+                  <input
+                    type="checkbox"
+                    checked={enableRemoveDoubleSpaces}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setEnableRemoveDoubleSpaces(checked);
+                      triggerSave({ renameSettings: { enableRemoveDoubleSpaces: checked } });
+                    }}
+                    disabled={isSubmitting}
+                  />
+                  <span className="slider"></span>
+                </label>
               </div>
             </div>
           </div>

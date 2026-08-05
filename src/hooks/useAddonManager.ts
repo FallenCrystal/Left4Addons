@@ -513,6 +513,7 @@ export function useAddonManager() {
     maxDownloadRetries: number,
     dependencyMissingBehavior?: string,
     workshopSourceSettings?: WorkshopSourceSettings,
+    renameSettings?: RenameSettings,
   ) => {
     if (isSubmitting) return;
     setIsSubmitting(true);
@@ -528,6 +529,7 @@ export function useAddonManager() {
           maxDownloadRetries,
           dependencyMissingBehavior,
           workshopSourceSettings,
+          renameSettings,
         },
       });
       updateLocalState(data);
@@ -751,7 +753,7 @@ export function useAddonManager() {
   // Helper to suggest workshop title for rename
   const triggerRenameModal = (addon: Addon) => {
     const itemGroup = groups.find(g => g.addons.includes(addon.id));
-    const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, addons);
+    const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, addons, settings.renameSettings);
     const steamTitle = addon.steamDetails?.title || getAddonInfoValue(addon, 'addontitle') || addon.vpkName;
 
     setRenameModal({
@@ -1042,7 +1044,7 @@ export function useAddonManager() {
       if (!addon) continue;
       
       const itemGroup = groups.find(g => g.addons.includes(id));
-      const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, currentAddonsMap);
+      const suggestedVpkName = getSuggestedVpkName(addon, itemGroup?.name, currentAddonsMap, settings.renameSettings);
       
       if (suggestedVpkName !== addon.vpkName) {
         renamesList.push({

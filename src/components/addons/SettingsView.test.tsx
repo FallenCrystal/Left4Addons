@@ -25,6 +25,15 @@ describe('SettingsView', () => {
       sourceOrder: ['steamworks-sdk', 'steam-web-api', 'steamcommunity-html'],
       cacheRetention: 'keep',
     },
+    renameSettings: {
+      enableWorkshopIdPrefix: true,
+      enableGroupPrefix: true,
+      cleanSpecialChars: false,
+      invalidCharReplace: 'underscore',
+      maxFilenameLength: 0,
+      enableTrim: true,
+      enableRemoveDoubleSpaces: true,
+    },
   };
 
   test('submits the Steamworks SDK disable toggle from the SDK tab', async () => {
@@ -56,6 +65,7 @@ describe('SettingsView', () => {
         3,
         'ask',
         baseSettings.workshopSourceSettings,
+        expect.any(Object),
       );
     });
   });
@@ -88,6 +98,7 @@ describe('SettingsView', () => {
         3,
         'ask',
         baseSettings.workshopSourceSettings,
+        expect.any(Object),
       );
     });
   });
@@ -121,6 +132,7 @@ describe('SettingsView', () => {
           preset: 'hybrid',
           sdkHtmlScope: 'all',
         }),
+        expect.any(Object),
       );
     });
   });

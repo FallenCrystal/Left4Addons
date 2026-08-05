@@ -1,6 +1,102 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::vpk::MapEntry;
+use regex::Regex;
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameSettings {
+    #[serde(rename = "enableWorkshopIdPrefix", default = "default_true")]
+    pub enable_workshop_id_prefix: bool,
+    #[serde(rename = "enableGroupPrefix", default = "default_true")]
+    pub enable_group_prefix: bool,
+    #[serde(rename = "cleanSpecialChars", default)]
+    pub clean_special_chars: bool,
+    #[serde(rename = "invalidCharReplace", default = "default_invalid_char_replace")]
+    pub invalid_char_replace: String, // "space" | "underscore" | "empty"
+    #[serde(rename = "maxFilenameLength", default)]
+    pub max_filename_length: u32,
+    #[serde(rename = "enableTrim", default = "default_true")]
+    pub enable_trim: bool,
+    #[serde(rename = "enableRemoveDoubleSpaces", default = "default_true")]
+    pub enable_remove_double_spaces: bool,
+}
+
+fn default_invalid_char_replace() -> String {
+    "underscore".to_string()
+}
+
+impl Default for RenameSettings {
+    fn default() -> Self {
+        Self {
+            enable_workshop_id_prefix: true,
+            enable_group_prefix: true,
+            clean_special_chars: false,
+            invalid_char_replace: default_invalid_char_replace(),
+            max_filename_length: 0,
+            enable_trim: true,
+            enable_remove_double_spaces: true,
+        }
+    }
+}
+
+pub fn sanitize_vpk_filename(name: &str, settings: &RenameSettings) -> String {
+    let mut base = name;
+    let name_lower = name.to_lowercase();
+    if name_lower.ends_with(".vpk.disabled") {
+        base = &name[..name.len() - ".vpk.disabled".len()];
+    } else if name_lower.ends_with(".disabled") {
+        base = &name[..name.len() - ".disabled".len()];
+    } else if name_lower.ends_with(".vpk") {
+        base = &name[..name.len() - ".vpk".len()];
+    }
+
+    let win_re = Regex::new(r#"[\\/:*?"<>|]"#).unwrap();
+    let mut base_str = win_re.replace_all(base, "_").to_string();
+
+    if settings.clean_special_chars {
+        let replace_with = match settings.invalid_char_replace.as_str() {
+            "space" => " ",
+            "empty" => "",
+            _ => "_",
+        };
+
+        let mut next_str = String::with_capacity(base_str.len());
+        for c in base_str.chars() {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '[' || c == ']' || c == ' ' {
+                next_str.push(c);
+            } else {
+                next_str.push_str(replace_with);
+            }
+        }
+        base_str = next_str;
+    }
+
+    if settings.enable_trim {
+        base_str = base_str.trim().to_string();
+    }
+
+    if settings.enable_remove_double_spaces {
+        while base_str.contains("  ") {
+            base_str = base_str.replace("  ", " ");
+        }
+    }
+
+    if settings.max_filename_length > 0 {
+        let max_len = settings.max_filename_length as usize;
+        let max_base_len = if max_len > 4 { max_len - 4 } else { 1 };
+        if base_str.chars().count() > max_base_len {
+            let chars: Vec<char> = base_str.chars().collect();
+            base_str = chars[..max_base_len].iter().collect();
+        }
+    }
+
+    if settings.enable_trim {
+        base_str = base_str.trim().to_string();
+    }
+
+    format!("{}.vpk", base_str)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct Settings {
@@ -33,6 +129,8 @@ pub struct Settings {
     pub dependency_missing_behavior: String,
     #[serde(rename = "workshopSourceSettings", default)]
     pub workshop_source_settings: WorkshopSourceSettings,
+    #[serde(rename = "renameSettings", default)]
+    pub rename_settings: RenameSettings,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

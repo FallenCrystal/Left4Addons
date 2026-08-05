@@ -283,6 +283,7 @@ pub fn load_db(
             max_download_retries: 3,
             dependency_missing_behavior: "ask".to_string(),
             workshop_source_settings: WorkshopSourceSettings::default(),
+            rename_settings: RenameSettings::default(),
         },
         addons: HashMap::new(),
         groups: Vec::new(),

@@ -1,4 +1,4 @@
-import { Addon } from '../types/addon';
+import { Addon, RenameSettings } from '../types/addon';
 
 // Format bytes helper
 export function formatBytes(bytes: number, decimals: number = 2): string {
@@ -185,52 +185,163 @@ export function sortAddonsDownloadedFirst(addons: Addon[]): Addon[] {
  * Both will prefix with group name if grouped, and workshop items prefix with workshop ID.
  * Appends a numeric counter if the name still conflicts with other addons.
  */
+/**
+ * Helper to sanitize a VPK filename based on RenameSettings rules.
+ */
+export function sanitizeVpkName(
+  name: string,
+  renameSettings?: RenameSettings
+): string {
+  const settings = renameSettings || {
+    enableWorkshopIdPrefix: true,
+    enableGroupPrefix: true,
+    cleanSpecialChars: false,
+    invalidCharReplace: 'underscore' as const,
+    maxFilenameLength: 0,
+    enableTrim: true,
+    enableRemoveDoubleSpaces: true,
+  };
+
+  // Strip extension
+  let baseName = name;
+  if (name.toLowerCase().endsWith('.vpk.disabled')) {
+    baseName = name.slice(0, -13);
+  } else if (name.toLowerCase().endsWith('.disabled')) {
+    baseName = name.slice(0, -9);
+  } else if (name.toLowerCase().endsWith('.vpk')) {
+    baseName = name.slice(0, -4);
+  }
+
+  // Windows invalid chars
+  let baseSuggestedName = baseName.replace(/[\\/:*?"<>|]/g, '_');
+
+  // Clean special characters (only allow 0-9, [], a-z, A-Z, _, space) if cleanSpecialChars is true
+  if (settings.cleanSpecialChars) {
+    const replaceWith = settings.invalidCharReplace === 'space' 
+      ? ' ' 
+      : (settings.invalidCharReplace === 'empty' ? '' : '_');
+    
+    let nextStr = '';
+    for (let i = 0; i < baseSuggestedName.length; i++) {
+      const c = baseSuggestedName[i];
+      if (/^[a-zA-Z0-9_\[\] ]$/.test(c)) {
+        nextStr += c;
+      } else {
+        nextStr += replaceWith;
+      }
+    }
+    baseSuggestedName = nextStr;
+  }
+
+  // Trim if enabled
+  if (settings.enableTrim) {
+    baseSuggestedName = baseSuggestedName.trim();
+  }
+
+  // Replace double spaces if enabled
+  if (settings.enableRemoveDoubleSpaces) {
+    while (baseSuggestedName.indexOf('  ') !== -1) {
+      baseSuggestedName = baseSuggestedName.replace(/  /g, ' ');
+    }
+  }
+
+  // Max filename length check
+  if (settings.maxFilenameLength && settings.maxFilenameLength > 0) {
+    const maxLen = settings.maxFilenameLength;
+    const maxBaseLen = maxLen > 4 ? maxLen - 4 : 1;
+    const chars = Array.from(baseSuggestedName);
+    if (chars.length > maxBaseLen) {
+      baseSuggestedName = chars.slice(0, maxBaseLen).join('');
+    }
+  }
+
+  // Re-trim after truncation just in case
+  if (settings.enableTrim) {
+    baseSuggestedName = baseSuggestedName.trim();
+  }
+
+  return `${baseSuggestedName}.vpk`;
+}
+
+/**
+ * Helper to suggest a unique VPK name for an addon, avoiding name conflicts.
+ * Workshop items use the Steam title / addonInfo title.
+ * Non-workshop items keep their original filename (stripped of old bracket prefixes).
+ * Both will prefix with group name if grouped, and workshop items prefix with workshop ID.
+ * Appends a numeric counter if the name still conflicts with other addons.
+ */
 export function getSuggestedVpkName(
   addon: Addon,
   groupName: string | undefined,
-  addons: Record<string, Addon>
+  addons: Record<string, Addon>,
+  renameSettings?: RenameSettings
 ): string {
-  let cleanName = '';
+  const settings = renameSettings || {
+    enableWorkshopIdPrefix: true,
+    enableGroupPrefix: true,
+    cleanSpecialChars: false,
+    invalidCharReplace: 'underscore' as const,
+    maxFilenameLength: 0,
+    enableTrim: true,
+    enableRemoveDoubleSpaces: true,
+  };
+
+  let cleanTitle = '';
   let prefix = '';
 
   if (addon.workshopId) {
     // Workshop item: use Steam title or addon title
     const steamTitle = addon.steamDetails?.title || addon.addonInfo?.addontitle || addon.vpkName;
-    let cleanTitle = steamTitle.replace(/[\\/:*?"<>|]/g, '_').trim();
-    if (cleanTitle.endsWith('.vpk')) {
+    cleanTitle = steamTitle;
+    if (cleanTitle.toLowerCase().endsWith('.vpk')) {
       cleanTitle = cleanTitle.slice(0, -4);
     }
-    cleanTitle = cleanTitle.replace(/^(?:\[[^\]]+\])*/g, '').trim();
-    
-    prefix += `[${addon.workshopId}]`;
-    if (groupName) {
+    cleanTitle = cleanTitle.replace(/^(?:\[[^\]]+\])*/g, '');
+
+    if (settings.enableWorkshopIdPrefix) {
+      prefix += `[${addon.workshopId}]`;
+    }
+    if (groupName && settings.enableGroupPrefix) {
       prefix += `[${groupName}]`;
     }
-    cleanName = `${cleanTitle}.vpk`;
   } else {
     // Non-workshop item: use original VPK filename (stripped of old bracket prefixes)
     let origBase = addon.vpkName.replace(/\.vpk(\.disabled)?$/i, '');
     origBase = origBase.replace(/\.disabled$/i, '');
     // Strip leading bracket prefixes like [Group] or [OldGroup]
-    origBase = origBase.replace(/^(?:\[[^\]]+\])*/g, '').trim();
+    origBase = origBase.replace(/^(?:\[[^\]]+\])*/g, '');
     
-    if (groupName) {
+    if (groupName && settings.enableGroupPrefix) {
       prefix += `[${groupName}]`;
     }
-    cleanName = `${origBase}.vpk`;
+    cleanTitle = origBase;
   }
 
-  const baseSuggestedName = `${prefix}${cleanName}`;
+  const rawSuggestedName = `${prefix}${cleanTitle}.vpk`;
+  const baseSuggestedName = sanitizeVpkName(rawSuggestedName, settings).slice(0, -4);
 
   // De-duplicate if the name conflicts with other addons
   let counter = 1;
-  let finalName = baseSuggestedName;
+  let finalName = `${baseSuggestedName}.vpk`;
   while (
-    Object.keys(addons).some(key => key.toLowerCase() === finalName.toLowerCase() && key !== addon.id)
+    Object.keys(addons).some(key => {
+      const existingAddon = addons[key];
+      return existingAddon.vpkName.toLowerCase() === finalName.toLowerCase() && existingAddon.id !== addon.id;
+    })
   ) {
-    const dotIndex = baseSuggestedName.lastIndexOf('.vpk');
-    const nameWithoutExt = baseSuggestedName.slice(0, dotIndex);
-    finalName = `${nameWithoutExt}_${counter}.vpk`;
+    const counterStr = `_${counter}`;
+    let truncatedBase = baseSuggestedName;
+
+    if (settings.maxFilenameLength && settings.maxFilenameLength > 0) {
+      const maxLen = settings.maxFilenameLength;
+      const maxBaseLen = maxLen > (counterStr.length + 4) ? maxLen - (counterStr.length + 4) : 1;
+      const chars = Array.from(baseSuggestedName);
+      if (chars.length > maxBaseLen) {
+        truncatedBase = chars.slice(0, maxBaseLen).join('');
+      }
+    }
+
+    finalName = `${truncatedBase}_${counter}.vpk`;
     counter++;
   }
 
