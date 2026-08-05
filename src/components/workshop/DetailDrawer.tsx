@@ -2,10 +2,10 @@
 
 import React, { useState } from 'react';
 import { Download, Globe, FolderPlus, Loader2, FileText } from 'lucide-react';
-import { CacheImage } from '../CacheImage';
+import { CacheImage } from '../common/CacheImage';
 import { useTranslation } from 'react-i18next';
 import { CollectionData } from './types';
-import { AlertModal } from '../AlertModal';
+import { AlertModal } from '../modals/AlertModal';
 
 interface DetailDrawerProps {
   selectedItem: any | null;

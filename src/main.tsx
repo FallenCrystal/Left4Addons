@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import './i18n'
 import App from './App'
-import { ErrorBoundary } from './components/ErrorBoundary'
+import { ErrorBoundary } from './components/common/ErrorBoundary'
 
 // 禁用浏览器默认的右键菜单
 document.addEventListener('contextmenu', (e) => {

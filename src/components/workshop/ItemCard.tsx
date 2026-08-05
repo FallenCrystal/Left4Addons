@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { Star, Loader2, Package, FileText } from 'lucide-react';
-import { CacheImage } from '../CacheImage';
+import { CacheImage } from '../common/CacheImage';
 import { useTranslation } from 'react-i18next';
 import { WorkshopItem } from './types';
 import { isKnownWorkshopItem } from '../../utils/workshopKnown';
