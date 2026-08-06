@@ -163,6 +163,7 @@ pub fn run() {
             commands::handlers::tasks::save_background_task_snapshot,
             commands::handlers::tasks::cancel_download,
             commands::handlers::tasks::append_workshop_crawl_log,
+            commands::handlers::settings::auto_detect_addons_path,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

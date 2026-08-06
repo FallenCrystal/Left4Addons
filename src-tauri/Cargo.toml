@@ -34,3 +34,5 @@ vtf = "0.4"
 md-5 = "0.10.6"
 libloading = "0.8"
 notify = "6.1"
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

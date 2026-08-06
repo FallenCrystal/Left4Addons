@@ -3,6 +3,11 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { SettingsView } from './SettingsView';
 import type { Settings } from '../../types/addon';
 
+const mockInvoke = vi.fn();
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: (cmd: string, args?: Record<string, unknown>) => mockInvoke(cmd, args),
+}));
+
 describe('SettingsView', () => {
   const baseSettings: Settings = {
     workshopDir: '/game/addons/workshop',
@@ -136,4 +141,26 @@ describe('SettingsView', () => {
       );
     });
   });
+
+  test('handles auto detect path successfully', async () => {
+    mockInvoke.mockResolvedValueOnce('/auto/detected/l4d2/addons');
+
+    render(
+      <SettingsView
+        settings={baseSettings}
+        isSubmitting={false}
+        onConfirm={vi.fn()}
+      />
+    );
+
+    const autoDetectBtn = screen.getByText('自动查找');
+    fireEvent.click(autoDetectBtn);
+
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith('auto_detect_addons_path', undefined);
+      expect((screen.getByDisplayValue('/auto/detected/l4d2/addons') as HTMLInputElement).value).toBe('/auto/detected/l4d2/addons');
+      expect(screen.getByText('已自动找到 Left 4 Dead 2 路径！')).toBeDefined();
+    });
+  });
 });
+

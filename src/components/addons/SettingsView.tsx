@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle, SpellCheck } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { FolderOpen, Info, RefreshCw, FlaskConical, Languages, Check, Cpu, Database, Download, AlertTriangle, SpellCheck, Search } from 'lucide-react';
 import { DependencyRefreshMode, Settings, WorkshopSdkHtmlScope, WorkshopSourceSettings, DependencyMissingBehavior, RenameSettings } from '../../types/addon';
 import { useTranslation } from 'react-i18next';
 import { TransHTML } from '../common/TransHTML';
@@ -24,6 +25,7 @@ interface SettingsViewProps {
     workshopSourceSettings: WorkshopSourceSettings,
     renameSettings: RenameSettings,
   ) => Promise<void>;
+  onShowToast?: (message: string, type?: 'success' | 'error') => void;
 }
 
 const SOURCE_LABEL_KEYS: Record<string, string> = {
@@ -46,6 +48,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   isSubmitting,
   onConfirm,
+  onShowToast,
 }) => {
   const { t, i18n } = useTranslation();
   const [activeTab, setActiveTab] = useState<'path' | 'download' | 'rename' | 'language' | 'experimental' | 'sdk' | 'sources' | 'about'>('path');
@@ -58,6 +61,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [maxDownloadRetriesInput, setMaxDownloadRetriesInput] = useState('3');
   const [dependencyMissingBehavior, setDependencyMissingBehavior] = useState<DependencyMissingBehavior>('ask');
   const [workshopSourceSettings, setWorkshopSourceSettings] = useState<WorkshopSourceSettings>(DEFAULT_WORKSHOP_SOURCE_SETTINGS);
+
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [detectMessage, setDetectMessage] = useState<{ text: string; isError: boolean } | null>(null);
+
+  const handleAutoDetect = async () => {
+    setIsDetecting(true);
+    setDetectMessage(null);
+    try {
+      const detectedPath = await invoke<string | null>('auto_detect_addons_path');
+      if (detectedPath) {
+        setLoadingDir(detectedPath);
+        const msg = t('settings.autoDetectSuccess');
+        setDetectMessage({ text: msg, isError: false });
+        onShowToast?.(msg, 'success');
+      } else {
+        const msg = t('settings.autoDetectFailed');
+        setDetectMessage({ text: msg, isError: true });
+        onShowToast?.(msg, 'error');
+      }
+    } catch (err) {
+      const msg = t('settings.autoDetectFailed');
+      setDetectMessage({ text: msg, isError: true });
+      onShowToast?.(msg, 'error');
+    } finally {
+      setIsDetecting(false);
+    }
+  };
 
   // Rename settings states
   const [enableWorkshopIdPrefix, setEnableWorkshopIdPrefix] = useState(true);
@@ -364,16 +394,57 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <label className="form-label" style={{ fontWeight: '600', marginBottom: '8px', display: 'block' }}>
                   {t('settings.addonsPathLabel')}
                 </label>
-                <input
-                  type="text"
-                  className="form-input"
-                  value={loadingDir}
-                  onChange={(e) => setLoadingDir(e.target.value)}
-                  placeholder={t('settings.addonsPathPlaceholder')}
-                  style={{ width: '100%' }}
-                  required
-                  disabled={isSubmitting}
-                />
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                  <input
+                    type="text"
+                    className="form-input"
+                    value={loadingDir}
+                    onChange={(e) => setLoadingDir(e.target.value)}
+                    placeholder={t('settings.addonsPathPlaceholder')}
+                    style={{ flex: 1 }}
+                    required
+                    disabled={isSubmitting || isDetecting}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    onClick={handleAutoDetect}
+                    disabled={isSubmitting || isDetecting}
+                    style={{
+                      whiteSpace: 'nowrap',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px',
+                      height: '38px',
+                      padding: '0 16px',
+                    }}
+                  >
+                    {isDetecting ? (
+                      <>
+                        <RefreshCw className="animate-spin" size={16} />
+                        <span>{t('settings.autoDetecting')}</span>
+                      </>
+                    ) : (
+                      <>
+                        <Search size={16} />
+                        <span>{t('settings.autoDetect')}</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+                {detectMessage && (
+                  <span
+                    style={{
+                      fontSize: '12px',
+                      color: detectMessage.isError ? 'var(--md-sys-color-error)' : 'var(--md-sys-color-primary)',
+                      display: 'block',
+                      marginTop: '6px',
+                      fontWeight: '500',
+                    }}
+                  >
+                    {detectMessage.text}
+                  </span>
+                )}
                 <span style={{ fontSize: '11px', color: 'var(--md-sys-color-outline)', display: 'block', marginTop: '6px' }}>
                   {t('settings.addonsPathHelp')}
                 </span>

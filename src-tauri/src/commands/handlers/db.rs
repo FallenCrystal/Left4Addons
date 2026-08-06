@@ -274,10 +274,12 @@ pub fn load_db(
     runtime_dir: &Path,
     app_handle: &AppHandle,
 ) -> Database {
-    let default_loading = runtime_dir
-        .join("addons-loading")
-        .to_string_lossy()
-        .to_string();
+    let default_loading = crate::steam::detect_l4d2_addons_path().unwrap_or_else(|| {
+        runtime_dir
+            .join("addons-loading")
+            .to_string_lossy()
+            .to_string()
+    });
     let default_workshop = Path::new(&default_loading)
         .join("workshop")
         .to_string_lossy()

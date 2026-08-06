@@ -218,6 +218,7 @@ function App() {
             settings={settings}
             isSubmitting={isSubmitting}
             onConfirm={saveSettings}
+            onShowToast={addToast}
           />
         ) : currentFilterTab === 'known-uninstalled' ? (
           <KnownUninstalledView

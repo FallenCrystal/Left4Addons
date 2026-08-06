@@ -93,3 +93,8 @@ pub async fn save_settings(
         &state.known_addons_path,
     ))
 }
+
+#[tauri::command]
+pub async fn auto_detect_addons_path() -> Result<Option<String>, String> {
+    Ok(crate::steam::detect_l4d2_addons_path())
+}
