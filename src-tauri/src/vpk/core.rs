@@ -396,14 +396,17 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut mission_keys = Vec::new();
     for key in files.keys() {
         let lower = key.to_lowercase();
-        if (lower.starts_with("missions/") || lower.contains("/missions/") || lower.contains("\\missions\\"))
+        if (lower.starts_with("missions/")
+            || lower.contains("/missions/")
+            || lower.contains("\\missions\\"))
             && lower.ends_with(".txt")
         {
             mission_keys.push(key);
         }
     }
 
-    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+    let files_lower: HashMap<String, &String> =
+        files.keys().map(|k| (k.to_lowercase(), k)).collect();
 
     // Parse missions to get structured map entries and cover image hint
     let mut mission_maps: Vec<MissionMapInfo> = Vec::new();
@@ -421,7 +424,10 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
                     cover_hint = hint;
                 }
                 for m in parsed_maps {
-                    if !mission_maps.iter().any(|x| x.code.eq_ignore_ascii_case(&m.code)) {
+                    if !mission_maps
+                        .iter()
+                        .any(|x| x.code.eq_ignore_ascii_case(&m.code))
+                    {
                         mission_maps.push(m);
                     }
                 }
@@ -442,11 +448,15 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
                             if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
                                 if let Ok(decoded) = vtf.highres_image.decode(0) {
                                     if decoded
-                                        .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                        .save_with_format(
+                                            &full_cache_path,
+                                            image::ImageFormat::Jpeg,
+                                        )
                                         .is_ok()
                                     {
                                         result.has_image = true;
-                                        result.image_path = Some(format!("/cache/{}", cache_filename));
+                                        result.image_path =
+                                            Some(format!("/cache/{}", cache_filename));
                                     }
                                 }
                             }
@@ -545,7 +555,10 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
         let stem_lower = stem.to_lowercase();
         if !added_codes.contains(&stem_lower) {
             added_codes.insert(stem_lower.clone());
-            let display_name = map_names.get(&stem_lower).cloned().unwrap_or_else(|| stem.clone());
+            let display_name = map_names
+                .get(&stem_lower)
+                .cloned()
+                .unwrap_or_else(|| stem.clone());
 
             let image_key = find_vpk_image_key(&stem_lower, &files_lower, &files);
             let mut map_image_path = None;
@@ -569,7 +582,10 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
                             if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
                                 if let Ok(decoded) = vtf.highres_image.decode(0) {
                                     if decoded
-                                        .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                        .save_with_format(
+                                            &full_cache_path,
+                                            image::ImageFormat::Jpeg,
+                                        )
                                         .is_ok()
                                     {
                                         map_image_path = Some(format!("/cache/{}", cache_filename));
@@ -832,7 +848,9 @@ pub struct MissionMapInfo {
     pub image_hint: Option<String>,
 }
 
-pub fn extract_mission_info_from_kv(kv: &serde_json::Value) -> (Vec<MissionMapInfo>, Option<String>) {
+pub fn extract_mission_info_from_kv(
+    kv: &serde_json::Value,
+) -> (Vec<MissionMapInfo>, Option<String>) {
     let mut maps = Vec::new();
     let mut cover_hint = None;
     let mut seen_codes = std::collections::HashSet::new();
@@ -1071,5 +1089,3 @@ pub fn find_vpk_image_key<'a>(
 
     None
 }
-
-

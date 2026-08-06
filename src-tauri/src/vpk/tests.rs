@@ -203,7 +203,8 @@ fn test_find_vpk_image_key() {
     };
     files.insert("materials/vgui/maps/ls_fsl.vtf".to_string(), vpk_entry);
 
-    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+    let files_lower: HashMap<String, &String> =
+        files.keys().map(|k| (k.to_lowercase(), k)).collect();
 
     let found = super::find_vpk_image_key("maps/LS_FSL", &files_lower, &files);
     assert_eq!(found, Some(&"materials/vgui/maps/ls_fsl.vtf".to_string()));
@@ -212,7 +213,8 @@ fn test_find_vpk_image_key() {
 #[test]
 fn test_real_l4d2server_vpks() {
     use std::path::Path;
-    let lingshan_path = Path::new("/home/akkariin/桌面/L4D2Server/l4d2/left4dead2/addons/lingshan_main.vpk");
+    let lingshan_path =
+        Path::new("/home/akkariin/桌面/L4D2Server/l4d2/left4dead2/addons/lingshan_main.vpk");
     if lingshan_path.exists() {
         let temp_cache_dir = std::env::temp_dir().join("l4a_test_lingshan_cache");
         let meta = extract_addon_metadata(lingshan_path, &temp_cache_dir);
@@ -223,5 +225,3 @@ fn test_real_l4d2server_vpks() {
         assert_eq!(meta.maps[0].image_hint, Some("maps/LS_FSL".to_string()));
     }
 }
-
-

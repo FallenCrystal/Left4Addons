@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 use super::types::{
-    is_dummy_addon_info, Addon, Database, Group, KnownAddonEntry, MasterCollection, RenameItem,
-    Settings, SettingsStore, WorkshopSeenItem, WorkshopSourceSettings, RenameSettings,
-    sanitize_vpk_filename,
+    is_dummy_addon_info, sanitize_vpk_filename, Addon, Database, Group, KnownAddonEntry,
+    MasterCollection, RenameItem, RenameSettings, Settings, SettingsStore, WorkshopSeenItem,
+    WorkshopSourceSettings,
 };
 
 pub mod addons;
@@ -2363,9 +2363,7 @@ fn upsert_known_addon_entry(
         .map(|value| value.to_string())
         .or_else(|| existing.as_ref().and_then(|entry| entry.image_path.clone()));
 
-    let maps_scanned = existing
-        .as_ref()
-        .and_then(|entry| entry.maps_scanned);
+    let maps_scanned = existing.as_ref().and_then(|entry| entry.maps_scanned);
     let maps = existing
         .as_ref()
         .map(|entry| entry.maps.clone())
@@ -2874,10 +2872,7 @@ pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
         // 3. Resolve missing map images cross-part
         for map_entry in &mut aggregated_maps {
             if map_entry.image.is_none() {
-                let search_hint = map_entry
-                    .image_hint
-                    .as_deref()
-                    .unwrap_or(&map_entry.code);
+                let search_hint = map_entry.image_hint.as_deref().unwrap_or(&map_entry.code);
 
                 for (_vpk_id, vpk_path) in &group_vpk_paths {
                     if !vpk_path.exists() {
@@ -2927,7 +2922,9 @@ pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
                                                 }
                                             }
                                         }
-                                    } else if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                    } else if let Ok(mut cache_file) =
+                                        File::create(&full_cache_path)
+                                    {
                                         if cache_file.write_all(&img_bytes).is_ok() {
                                             saved = true;
                                         }
@@ -2947,9 +2944,9 @@ pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
         }
 
         // 4. Resolve missing cover image cross-part
-        let group_cover_image = group_addon_ids.iter().find_map(|id| {
-            db.addons.get(id).and_then(|a| a.image_path.clone())
-        });
+        let group_cover_image = group_addon_ids
+            .iter()
+            .find_map(|id| db.addons.get(id).and_then(|a| a.image_path.clone()));
 
         let mut resolved_group_cover = group_cover_image;
 
@@ -3004,8 +3001,7 @@ pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
                                         let mut hasher = Md5::new();
                                         hasher.update(clean_vpk_name.as_bytes());
                                         let hash_result = hasher.finalize();
-                                        let cache_filename =
-                                            format!("{:x}_image.jpg", hash_result);
+                                        let cache_filename = format!("{:x}_image.jpg", hash_result);
                                         let full_cache_path = cache_dir.join(&cache_filename);
 
                                         if !cache_dir.exists() {
@@ -3027,7 +3023,9 @@ pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
                                                     }
                                                 }
                                             }
-                                        } else if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                        } else if let Ok(mut cache_file) =
+                                            File::create(&full_cache_path)
+                                        {
                                             if cache_file.write_all(&img_bytes).is_ok() {
                                                 saved = true;
                                             }
@@ -3088,15 +3086,15 @@ fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_group_internal, direct_download_url, enrich_grouped_addons_maps, ensure_background_workshop_fetch_allowed,
-        extract_steamcommunity_error_message, is_background_workshop_fetch_source,
-        load_known_addons, load_workshop_cache, looks_like_placeholder_author_name,
-        merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
-        normalize_master_collection_group_refs, parse_content_range_start,
-        persist_seen_workshop_item_entry, persist_workshop_page_details_entry,
-        propagate_author_names, remove_dummy_workshop_targets, rename_requires_name_change,
-        save_workshop_cache, toggle_requires_state_change, workshop_cache_with_known_addons,
-        SourcePolicy,
+        auto_group_internal, direct_download_url, enrich_grouped_addons_maps,
+        ensure_background_workshop_fetch_allowed, extract_steamcommunity_error_message,
+        is_background_workshop_fetch_source, load_known_addons, load_workshop_cache,
+        looks_like_placeholder_author_name, merge_known_addon_snapshots_into_cache,
+        move_or_copy_file, move_requires_dir_change, normalize_master_collection_group_refs,
+        parse_content_range_start, persist_seen_workshop_item_entry,
+        persist_workshop_page_details_entry, propagate_author_names, remove_dummy_workshop_targets,
+        rename_requires_name_change, save_workshop_cache, toggle_requires_state_change,
+        workshop_cache_with_known_addons, SourcePolicy,
     };
     use crate::commands::types::{Addon, Database, Group, MasterCollection, WorkshopSeenItem};
     use crate::vpk::{generate_dummy_vpk, MapEntry};
@@ -3371,28 +3369,34 @@ mod tests {
                 (first.id.clone(), first),
                 (second.id.clone(), second),
             ]),
-            groups: vec![Group {
-                id: "uninstalled-auto".to_string(),
-                name: "Campaign".to_string(),
-                addons: vec!["part-1".to_string(), "part-2".to_string()],
-                tags: None,
-                workshop_collection_id: None,
-                master_collection_ids: Some(vec!["campaigns".to_string()]),
-                source: Some("auto-group".to_string()),
-            }, Group {
-                id: "downloaded-auto".to_string(),
-                name: "Downloaded Campaign".to_string(),
-                addons: vec!["downloaded".to_string()],
-                tags: None,
-                workshop_collection_id: None,
-                master_collection_ids: Some(vec!["campaigns".to_string()]),
-                source: Some("auto-group".to_string()),
-            }],
+            groups: vec![
+                Group {
+                    id: "uninstalled-auto".to_string(),
+                    name: "Campaign".to_string(),
+                    addons: vec!["part-1".to_string(), "part-2".to_string()],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: Some(vec!["campaigns".to_string()]),
+                    source: Some("auto-group".to_string()),
+                },
+                Group {
+                    id: "downloaded-auto".to_string(),
+                    name: "Downloaded Campaign".to_string(),
+                    addons: vec!["downloaded".to_string()],
+                    tags: None,
+                    workshop_collection_id: None,
+                    master_collection_ids: Some(vec!["campaigns".to_string()]),
+                    source: Some("auto-group".to_string()),
+                },
+            ],
             master_collections: vec![MasterCollection {
                 id: "campaigns".to_string(),
                 name: "Campaigns".to_string(),
                 name_key: Some("masterCollections.systemCampaignAuto".to_string()),
-                group_ids: vec!["uninstalled-auto".to_string(), "downloaded-auto".to_string()],
+                group_ids: vec![
+                    "uninstalled-auto".to_string(),
+                    "downloaded-auto".to_string(),
+                ],
                 is_system: true,
                 icon: None,
             }],
@@ -4451,7 +4455,10 @@ mod tests {
             ..settings
         };
         assert_eq!(
-            super::sanitize_vpk_filename("Cool. Campaign.  Map! Extra Details.vpk", &settings_no_len),
+            super::sanitize_vpk_filename(
+                "Cool. Campaign.  Map! Extra Details.vpk",
+                &settings_no_len
+            ),
             "Cool_ Campaign_ Map_ Extra Details.vpk"
         );
 
@@ -4495,14 +4502,12 @@ mod tests {
         let part2 = Addon {
             id: "part2".to_string(),
             vpk_name: "part2.vpk".to_string(),
-            maps: vec![
-                MapEntry {
-                    code: "m3".to_string(),
-                    name: "Map 3".to_string(),
-                    image: None,
-                    image_hint: Some("maps/m3_thumb".to_string()),
-                },
-            ],
+            maps: vec![MapEntry {
+                code: "m3".to_string(),
+                name: "Map 3".to_string(),
+                image: None,
+                image_hint: Some("maps/m3_thumb".to_string()),
+            }],
             maps_scanned: Some(true),
             current_path: "/nonexistent/part2.vpk".to_string(),
             ..Addon::default()

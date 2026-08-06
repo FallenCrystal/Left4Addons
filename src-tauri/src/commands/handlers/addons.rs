@@ -24,7 +24,10 @@ fn emit_sdk_download_warning(app_handle: &AppHandle, workshop_id: &str, title: &
 }
 
 pub(super) fn format_workshop_vpk_name(workshop_id: &str, title: &str) -> String {
-    let clean_title_step1 = title.replace(|c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'), "_");
+    let clean_title_step1 = title.replace(
+        |c| matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|'),
+        "_",
+    );
     let mut clean_title = clean_title_step1.trim();
     if clean_title.to_lowercase().ends_with(".vpk") {
         clean_title = &clean_title[..clean_title.len() - 4];

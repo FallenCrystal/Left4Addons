@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use crate::vpk::MapEntry;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -12,7 +12,10 @@ pub struct RenameSettings {
     pub enable_group_prefix: bool,
     #[serde(rename = "cleanSpecialChars", default)]
     pub clean_special_chars: bool,
-    #[serde(rename = "invalidCharReplace", default = "default_invalid_char_replace")]
+    #[serde(
+        rename = "invalidCharReplace",
+        default = "default_invalid_char_replace"
+    )]
     pub invalid_char_replace: String, // "space" | "underscore" | "empty"
     #[serde(rename = "maxFilenameLength", default)]
     pub max_filename_length: u32,
