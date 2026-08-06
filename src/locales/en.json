@@ -144,7 +144,8 @@
     "noGroups": "No Groups",
     "exitBatch": "Exit Batch",
     "download": "Download",
-    "batchDelete": "Batch Delete"
+    "batchDelete": "Batch Delete",
+    "removeFromKnown": "Remove from Known List"
   },
   "groupCard": {
     "partiallyEnabled": "Partially Enabled",

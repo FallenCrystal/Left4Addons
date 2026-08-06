@@ -144,7 +144,8 @@
     "noGroups": "无分组",
     "exitBatch": "退出批量",
     "download": "下载",
-    "batchDelete": "批量删除"
+    "batchDelete": "批量删除",
+    "removeFromKnown": "从已知列表中删除"
   },
   "groupCard": {
     "partiallyEnabled": "部分启用",

@@ -685,6 +685,9 @@ function App() {
             const items = ids.map(id => addons[id] || knownUninstalledAddons[id]).filter(Boolean);
             setDeleteConfirmModal({ open: true, addons: items, removeFromKnown: false });
           }}
+          onBatchRemoveFromKnown={(ids) => {
+            deleteAddons(ids, false, true);
+          }}
           onClearSelection={handleClearSelection}
           isSubmitting={isSubmitting}
         />

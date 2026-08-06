@@ -19,6 +19,7 @@ interface BatchActionBarProps {
   onBatchAddToMasterCollection?: () => void;
   onBatchDownload?: (ids: string[]) => void;
   onBatchDelete?: (ids: string[]) => void;
+  onBatchRemoveFromKnown?: (ids: string[]) => void;
   onClearSelection: () => void;
   isSubmitting?: boolean;
 }
@@ -40,6 +41,7 @@ export function BatchActionBar({
   onBatchAddToMasterCollection,
   onBatchDownload,
   onBatchDelete,
+  onBatchRemoveFromKnown,
   onClearSelection,
   isSubmitting = false,
 }: BatchActionBarProps) {
@@ -55,16 +57,16 @@ export function BatchActionBar({
     .filter((addon): addon is Addon => Boolean(addon));
 
   // If any uninstalled addon is selected, certain actions shouldn't be available
-  const allInstalled = selectedAddons.every((addon) => addon.dirType !== 'none');
+  const uninstalledIds = selectedAddons.filter(a => a.dirType === 'none').map(a => a.id);
+  const installedIds = selectedAddons.filter(a => a.dirType !== 'none').map(a => a.id);
+  const allInstalled = selectedAddons.length > 0 && selectedAddons.every((addon) => addon.dirType !== 'none');
   
   const canBatchEnable = allInstalled && selectedAddons.some((addon) => !addon.isEnabled);
   const canBatchDisable = allInstalled && selectedAddons.some((addon) => addon.isEnabled);
   const canBatchMove = allInstalled && selectedAddons.some((addon) => addon.dirType === 'workshop');
   const canBatchRename = allInstalled && selectedAddons.length > 0;
-  const canBatchDelete = allInstalled && selectedAddons.length > 0;
-  
-  const uninstalledIds = selectedAddons.filter(a => a.dirType === 'none').map(a => a.id);
-  const installedIds = selectedAddons.filter(a => a.dirType !== 'none').map(a => a.id);
+  const canBatchDelete = installedIds.length > 0;
+  const canBatchRemoveFromKnown = uninstalledIds.length > 0;
   const canBatchDownload = uninstalledIds.length > 0;
 
   // Check if we're in master collection view (only groups selected)
@@ -195,6 +197,18 @@ export function BatchActionBar({
               >
                 <Trash2 size={14} />
                 <span>{t('batchActionBar.batchDelete')}</span>
+              </button>
+            )}
+
+            {canBatchRemoveFromKnown && onBatchRemoveFromKnown && (
+              <button
+                className="btn btn-secondary"
+                style={{ padding: '6px 12px', fontSize: '12px', display: 'flex', alignItems: 'center', gap: '6px', color: 'var(--md-sys-color-error)' }}
+                onClick={() => onBatchRemoveFromKnown(uninstalledIds)}
+                disabled={isSubmitting}
+              >
+                <Trash2 size={14} />
+                <span>{t('batchActionBar.removeFromKnown')}</span>
               </button>
             )}
 

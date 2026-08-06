@@ -133,4 +133,34 @@ describe('BatchActionBar', () => {
     expect(screen.queryByText('启用')).toBeNull();
     expect((screen.getByText('禁用').closest('button') as HTMLButtonElement).disabled).toBe(false);
   });
+
+  test('shows removeFromKnown button when uninstalled addons are selected and fires callback', () => {
+    const knownUninstalledAddons: Record<string, Addon> = {
+      'uninstalled1': { id: 'uninstalled1', vpkName: 'uninstalled1.vpk', dirType: 'none', isEnabled: false, fileSize: 0, filesCount: 0 }
+    };
+    const onBatchRemoveFromKnown = vi.fn();
+
+    render(
+      <BatchActionBar
+        selectedIds={['uninstalled1']}
+        filteredItems={Object.values(knownUninstalledAddons)}
+        addons={{}}
+        knownUninstalledAddons={knownUninstalledAddons}
+        groups={[]}
+        onSelectAll={vi.fn()}
+        onBatchToggle={vi.fn()}
+        onBatchMove={vi.fn()}
+        onBatchRename={vi.fn()}
+        onBatchAddToGroup={vi.fn()}
+        onBatchRemoveFromKnown={onBatchRemoveFromKnown}
+        onClearSelection={vi.fn()}
+      />
+    );
+
+    const btn = screen.getByText('从已知列表中删除');
+    expect(btn).toBeDefined();
+
+    fireEvent.click(btn);
+    expect(onBatchRemoveFromKnown).toHaveBeenCalledWith(['uninstalled1']);
+  });
 });
