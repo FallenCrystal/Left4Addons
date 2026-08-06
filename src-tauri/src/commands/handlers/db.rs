@@ -74,6 +74,18 @@ fn is_valid_workshop_item_detail(candidate: &str, details: &Value) -> bool {
         && !is_collection_detail(details)
 }
 
+fn cached_verified_workshop_id(cached: Option<&Addon>, candidate: Option<&str>) -> Option<String> {
+    if candidate.is_some() {
+        return None;
+    }
+
+    cached
+        .filter(|addon| {
+            addon.workshop_id_validation_status.as_deref() == Some(WORKSHOP_ID_STATUS_VERIFIED)
+        })
+        .and_then(|addon| addon.workshop_id.clone())
+}
+
 fn workshop_id_candidate_is_due(
     addon: &Addon,
     force: bool,
@@ -681,7 +693,7 @@ pub async fn scan_addons_internal(
                             == Some(WORKSHOP_ID_STATUS_REJECTED)
                 })
             });
-            let (candidate, source) = if filename_rejected {
+            let (mut candidate, mut source) = if filename_rejected {
                 url_workshop_id
                     .clone()
                     .map(|id| (id, WORKSHOP_ID_SOURCE_ADDON_URL.to_string()))
@@ -696,6 +708,16 @@ pub async fn scan_addons_internal(
                     })
             }
             .unzip();
+            // A rename can intentionally remove the workshop ID from the filename. Keep a
+            // previously verified cached identity when no new filename/URL candidate exists.
+            let cached_verified_id =
+                cached_verified_workshop_id(cached.as_ref(), candidate.as_deref());
+            if let Some(workshop_id) = cached_verified_id.as_ref() {
+                candidate = Some(workshop_id.clone());
+                source = cached
+                    .as_ref()
+                    .and_then(|addon| addon.workshop_id_source.clone());
+            }
             let candidate_matches = cached.as_ref().is_some_and(|addon| {
                 addon.workshop_id_candidate == candidate
                     && addon.workshop_id_source.as_deref() == source.as_deref()
@@ -705,7 +727,8 @@ pub async fn scan_addons_internal(
                     addon.workshop_id_validation_status.as_deref()
                         == Some(WORKSHOP_ID_STATUS_VERIFIED)
                         && addon.workshop_id == candidate
-                });
+                })
+                || cached_verified_id.is_some();
             let workshop_id = if candidate_verified {
                 candidate.clone()
             } else {
@@ -968,13 +991,15 @@ pub async fn get_addons(state: State<'_, crate::AppState>) -> Result<Database, S
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_workshop_id_validation, extract_workshop_id_from_vpk_filename,
-        is_valid_workshop_item_detail, WORKSHOP_ID_SOURCE_ADDON_URL, WORKSHOP_ID_SOURCE_FILENAME,
+        apply_workshop_id_validation, cached_verified_workshop_id,
+        extract_workshop_id_from_vpk_filename, is_valid_workshop_item_detail, load_known_addons,
+        save_db_internal, WORKSHOP_ID_SOURCE_ADDON_URL, WORKSHOP_ID_SOURCE_FILENAME,
         WORKSHOP_ID_STATUS_PENDING, WORKSHOP_ID_STATUS_REJECTED, WORKSHOP_ID_STATUS_VERIFIED,
     };
-    use crate::commands::types::Addon;
+    use crate::commands::types::{Addon, Database};
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+    use std::fs;
 
     fn addon(id: &str, candidate: &str) -> Addon {
         Addon {
@@ -1082,6 +1107,75 @@ mod tests {
         assert_eq!(
             migrations.get("local-hash").map(String::as_str),
             Some("3560883926")
+        );
+    }
+
+    #[test]
+    fn preserves_verified_workshop_identity_when_rename_removes_filename_id() {
+        let mut renamed = addon("3560883926", "3560883926");
+        renamed.vpk_name = "Creative Campaign.vpk".to_string();
+        renamed.workshop_id = Some("3560883926".to_string());
+        renamed.workshop_id_validation_status = Some(WORKSHOP_ID_STATUS_VERIFIED.to_string());
+
+        assert_eq!(
+            cached_verified_workshop_id(Some(&renamed), None),
+            Some("3560883926".to_string())
+        );
+        assert_eq!(
+            cached_verified_workshop_id(Some(&renamed), Some("999999999")),
+            None
+        );
+    }
+
+    #[test]
+    fn persists_verified_workshop_identity_after_renaming_without_filename_id() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "left4addons-rename-workshop-id-{}",
+            std::process::id()
+        ));
+        fs::remove_dir_all(&temp_dir).ok();
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let settings_path = temp_dir.join("settings.json");
+        let groups_path = temp_dir.join("groups.json");
+        let known_addons_path = temp_dir.join("known_addons.json");
+        let workshop_id = "3560883926";
+        fs::write(
+            &known_addons_path,
+            r#"{
+                "3560883926": {
+                    "id": "3560883926",
+                    "vpkName": "[3560883926] Creative Campaign.vpk",
+                    "workshopId": "3560883926",
+                    "addonInfo": {},
+                    "hasImage": false,
+                    "imagePath": null,
+                    "steamDetails": null
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut renamed = addon(workshop_id, workshop_id);
+        renamed.vpk_name = "Creative Campaign.vpk".to_string();
+        renamed.workshop_id = Some(workshop_id.to_string());
+        renamed.workshop_id_validation_status = Some(WORKSHOP_ID_STATUS_VERIFIED.to_string());
+        let db = Database {
+            addons: HashMap::from([(workshop_id.to_string(), renamed)]),
+            ..Database::default()
+        };
+
+        save_db_internal(&settings_path, &groups_path, &known_addons_path, &db);
+        let reloaded = load_known_addons(&known_addons_path);
+
+        fs::remove_dir_all(&temp_dir).ok();
+
+        let persisted = reloaded.get(workshop_id).unwrap();
+        assert_eq!(persisted.vpk_name, "Creative Campaign.vpk");
+        assert_eq!(persisted.workshop_id.as_deref(), Some(workshop_id));
+        assert_eq!(
+            persisted.workshop_id_validation_status.as_deref(),
+            Some(WORKSHOP_ID_STATUS_VERIFIED)
         );
     }
 
