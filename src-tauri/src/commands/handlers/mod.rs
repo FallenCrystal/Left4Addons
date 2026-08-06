@@ -2442,7 +2442,16 @@ fn clear_auto_groups(db: &mut Database) {
     let auto_group_ids: HashSet<String> = db
         .groups
         .iter()
-        .filter(|group| group.source.as_deref() == Some("auto-group"))
+        // An automatic regroup only has enough information to rebuild groups that
+        // still contain a downloaded addon. Keep groups made entirely of known,
+        // uninstalled addons so a rescan cannot make them disappear.
+        .filter(|group| {
+            group.source.as_deref() == Some("auto-group")
+                && group
+                    .addons
+                    .iter()
+                    .any(|addon_id| db.addons.contains_key(addon_id))
+        })
         .map(|group| group.id.clone())
         .collect();
     if auto_group_ids.is_empty() {
@@ -2450,7 +2459,7 @@ fn clear_auto_groups(db: &mut Database) {
     }
 
     db.groups
-        .retain(|group| group.source.as_deref() != Some("auto-group"));
+        .retain(|group| !auto_group_ids.contains(&group.id));
     for collection in &mut db.master_collections {
         collection
             .group_ids
@@ -3029,7 +3038,7 @@ mod tests {
                 Group {
                     id: "old-auto".to_string(),
                     name: "Campaign Pack".to_string(),
-                    addons: vec!["script".to_string()],
+                    addons: vec!["base".to_string()],
                     tags: None,
                     workshop_collection_id: None,
                     master_collection_ids: None,
@@ -3069,6 +3078,70 @@ mod tests {
         assert!(db.groups.iter().any(|group| group.id == "manual"));
         assert!(!db.groups.iter().any(|group| group.id == "old-auto"));
         assert!(db.master_collections[0].group_ids.is_empty());
+    }
+
+    #[test]
+    fn auto_group_keeps_groups_with_only_uninstalled_addons() {
+        let first = auto_group_addon(
+            "part-1",
+            "Campaign Part 1",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        let second = auto_group_addon(
+            "part-2",
+            "Campaign Part 2",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        let downloaded = auto_group_addon(
+            "downloaded",
+            "Downloaded Campaign",
+            json!({ "addoncontent_campaign": "1" }),
+            json!([]),
+        );
+        let mut db = Database {
+            addons: HashMap::from([(downloaded.id.clone(), downloaded)]),
+            known_uninstalled_addons: HashMap::from([
+                (first.id.clone(), first),
+                (second.id.clone(), second),
+            ]),
+            groups: vec![Group {
+                id: "uninstalled-auto".to_string(),
+                name: "Campaign".to_string(),
+                addons: vec!["part-1".to_string(), "part-2".to_string()],
+                tags: None,
+                workshop_collection_id: None,
+                master_collection_ids: Some(vec!["campaigns".to_string()]),
+                source: Some("auto-group".to_string()),
+            }, Group {
+                id: "downloaded-auto".to_string(),
+                name: "Downloaded Campaign".to_string(),
+                addons: vec!["downloaded".to_string()],
+                tags: None,
+                workshop_collection_id: None,
+                master_collection_ids: Some(vec!["campaigns".to_string()]),
+                source: Some("auto-group".to_string()),
+            }],
+            master_collections: vec![MasterCollection {
+                id: "campaigns".to_string(),
+                name: "Campaigns".to_string(),
+                name_key: Some("masterCollections.systemCampaignAuto".to_string()),
+                group_ids: vec!["uninstalled-auto".to_string(), "downloaded-auto".to_string()],
+                is_system: true,
+                icon: None,
+            }],
+            ..Database::default()
+        };
+
+        auto_group_internal(&mut db);
+
+        assert_eq!(db.groups.len(), 1);
+        assert_eq!(db.groups[0].id, "uninstalled-auto");
+        assert_eq!(
+            db.master_collections[0].group_ids,
+            vec!["uninstalled-auto".to_string()]
+        );
     }
 
     #[test]
