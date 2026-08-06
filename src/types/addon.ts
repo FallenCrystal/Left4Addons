@@ -110,6 +110,7 @@ export interface Addon {
   isDummy?: boolean;
   maps?: MapEntry[];
   mapsScanned?: boolean;
+  currentPath?: string;
 }
 
 export interface MapEntry {

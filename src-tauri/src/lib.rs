@@ -143,6 +143,7 @@ pub fn run() {
             commands::handlers::addons::group_action,
             commands::handlers::workshop::open_workshop,
             commands::handlers::workshop::open_url,
+            commands::handlers::workshop::open_in_file_manager,
             commands::handlers::workshop::steam_sync,
             commands::handlers::workshop::get_workshop_capabilities,
             commands::handlers::workshop::query_workshop_home,

@@ -122,7 +122,8 @@
     "openBuiltInSource": "打开组件内置来源网页",
     "moveToManual": "移动到手动安装目录 (Addons)",
     "renameAddon": "重命名附件文件",
-    "deleteAddon": "删除此组件"
+    "deleteAddon": "删除此组件",
+    "openInFileManager": "在文件管理器中打开"
   },
   "batchActionBar": {
     "selectedCount": "已选择 {{count}} 个组件",
@@ -157,6 +158,8 @@
     "totalSize": "总大小: {{size}}",
     "toggleAll": "启用/禁用此分组内所有组件",
     "viewDetails": "查看分组详情",
+    "openInFileManager": "在文件管理器中打开",
+    "noInstalledAddons": "无已安装组件",
     "deselectGroup": "取消选择整个分组",
     "selectGroup": "选中整个分组"
   },
@@ -411,6 +414,7 @@
     "totalAddons": "共 {{count}} 个组件"
   },
   "toasts": {
+    "openFileManagerFailed": "打开文件管理器失败: {{err}}",
     "autoMoveFailed": "自动移动附件失败: {{err}}",
     "dbRefreshSuccess": "数据库刷新成功",
     "autoRefreshSuccess": "检测到外部组件变更，已自动刷新",

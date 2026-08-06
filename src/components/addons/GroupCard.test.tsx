@@ -166,4 +166,24 @@ describe('GroupCard', () => {
     // Since mockAddons are allEnabled=true, clicking the checkbox triggers onChange which does onToggleGroup(addons, false)
     expect(onToggleGroup).toHaveBeenCalledWith(mockAddons, false);
   });
+
+  test('calls onOpenInFileManager when folder button is clicked on group card', () => {
+    const onOpenInFileManager = vi.fn();
+    const addonsWithPath: Addon[] = [
+      { ...mockAddons[0], currentPath: '/path/to/addon1.vpk' },
+    ];
+    render(
+      <GroupCard
+        group={mockGroup}
+        addons={addonsWithPath}
+        onToggleGroup={vi.fn()}
+        onViewGroupDetails={vi.fn()}
+        onOpenInFileManager={onOpenInFileManager}
+      />
+    );
+
+    const openBtn = screen.getByTitle('在文件管理器中打开');
+    fireEvent.click(openBtn);
+    expect(onOpenInFileManager).toHaveBeenCalledWith('/path/to/addon1.vpk');
+  });
 });

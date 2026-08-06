@@ -19,6 +19,146 @@ pub async fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+fn clean_canonical_path(path: &Path) -> PathBuf {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let s = canonical.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", stripped))
+    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        canonical
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn path_to_file_url(path: &Path) -> String {
+    let path_str = path.to_string_lossy();
+    let mut url = String::from("file://");
+    for ch in path_str.chars() {
+        match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' => url.push(ch),
+            _ => {
+                let mut buf = [0; 4];
+                for byte in ch.encode_utf8(&mut buf).bytes() {
+                    url.push_str(&format!("%{:02X}", byte));
+                }
+            }
+        }
+    }
+    url
+}
+
+pub fn show_in_folder(path: &Path) -> Result<(), String> {
+    let canonical = clean_canonical_path(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = std::process::Command::new("explorer");
+        let path_str = canonical.to_string_lossy();
+        if canonical.is_file() {
+            cmd.raw_arg(format!(r#"/select,"{}""#, path_str));
+        } else {
+            cmd.raw_arg(format!(r#""{}""#, path_str));
+        }
+        cmd.spawn()
+            .map_err(|e| format!("Failed to open explorer: {}", e))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("open");
+        if canonical.is_file() {
+            cmd.arg("-R").arg(&canonical);
+        } else {
+            cmd.arg(&canonical);
+        }
+        cmd.spawn()
+            .map_err(|e| format!("Failed to open Finder: {}", e))?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        if canonical.is_file() {
+            let file_url = path_to_file_url(&canonical);
+            if let Ok(status) = std::process::Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    &format!("array:string:{}", file_url),
+                    "string:",
+                ])
+                .status()
+            {
+                if status.success() {
+                    return Ok(());
+                }
+            }
+
+            if let Ok(status) = std::process::Command::new("busctl")
+                .args([
+                    "--user",
+                    "call",
+                    "org.freedesktop.FileManager1",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1",
+                    "ShowItems",
+                    "as",
+                    "1",
+                    &file_url,
+                    "s",
+                    "",
+                ])
+                .status()
+            {
+                if status.success() {
+                    return Ok(());
+                }
+            }
+
+            for fm in [
+                "nautilus",
+                "dolphin",
+                "thunar",
+                "nemo",
+                "pcmanfm-qt",
+                "dde-file-manager",
+            ] {
+                if let Ok(_child) = std::process::Command::new(fm)
+                    .arg("--select")
+                    .arg(&canonical)
+                    .spawn()
+                {
+                    return Ok(());
+                }
+            }
+
+            if let Some(parent) = canonical.parent() {
+                open::that(parent).map_err(|e| format!("Failed to open directory: {}", e))?;
+                return Ok(());
+            }
+        }
+
+        open::that(&canonical).map_err(|e| format!("Failed to open file manager: {}", e))?;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub async fn open_in_file_manager(path: String) -> Result<(), String> {
+    let path_buf = PathBuf::from(&path);
+    if !path_buf.exists() {
+        return Err(format!("File or directory does not exist: {}", path));
+    }
+    show_in_folder(&path_buf)
+}
+
 #[tauri::command]
 pub async fn get_workshop_capabilities(
     state: State<'_, crate::AppState>,

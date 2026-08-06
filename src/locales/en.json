@@ -122,7 +122,8 @@
     "openBuiltInSource": "Open built-in source page",
     "moveToManual": "Move to Manual (Addons)",
     "renameAddon": "Rename Addon File",
-    "deleteAddon": "Delete this Addon"
+    "deleteAddon": "Delete this Addon",
+    "openInFileManager": "Open in File Manager"
   },
   "batchActionBar": {
     "selectedCount": "{{count}} addons selected",
@@ -157,6 +158,8 @@
     "totalSize": "Total Size: {{size}}",
     "toggleAll": "Enable/Disable all addons in group",
     "viewDetails": "View Group Details",
+    "openInFileManager": "Open in File Manager",
+    "noInstalledAddons": "No Installed Addons",
     "deselectGroup": "Deselect whole group",
     "selectGroup": "Select whole group"
   },
@@ -411,6 +414,7 @@
     "totalAddons": "{{count}} addons total"
   },
   "toasts": {
+    "openFileManagerFailed": "Failed to open file manager: {{err}}",
     "autoMoveFailed": "Auto move failed: {{err}}",
     "dbRefreshSuccess": "Database refreshed successfully",
     "autoRefreshSuccess": "External addon changes detected and refreshed automatically",

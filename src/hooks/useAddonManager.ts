@@ -387,6 +387,15 @@ export function useAddonManager() {
     }
   };
 
+  const handleOpenInFileManager = async (path?: string) => {
+    if (!path) return;
+    try {
+      await invoke('open_in_file_manager', { path });
+    } catch (err) {
+      addToast(t('toasts.openFileManagerFailed', { err: String(err) }), 'error');
+    }
+  };
+
   // Toggle addon enable/disable status
   const toggleAddon = async (id: string, currentStatus: boolean) => {
     if (isSubmitting) return;
@@ -1526,6 +1535,7 @@ export function useAddonManager() {
     applyDatabaseUpdate: updateLocalState,
     addToast,
     handleOpenLink,
+    handleOpenInFileManager,
     toggleAddon,
     toggleGroupAddons,
     moveAddon,

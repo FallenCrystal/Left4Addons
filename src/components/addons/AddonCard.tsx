@@ -1,5 +1,5 @@
 import React from 'react';
-import { FolderPlus, ExternalLink, Move, Edit3, FileText, Download, Trash2 } from 'lucide-react';
+import { Folder, FolderPlus, ExternalLink, Move, Edit3, FileText, Download, Trash2 } from 'lucide-react';
 import { Addon, Group } from '../../types/addon';
 import { formatBytes, getAddonCategories, getAddonUrl, getAddonAuthor, getAddonInfoValue } from '../../utils/addonHelpers';
 import { CacheImage } from '../common/CacheImage';
@@ -11,6 +11,7 @@ interface AddonCardProps {
   onToggle: (id: string, isEnabled: boolean) => void;
   onAddToGroup: (id: string) => void;
   onOpenLink: (url: string) => void;
+  onOpenInFileManager?: (path?: string) => void;
   onMoveClick: (addon: Addon) => void;
   onRenameClick: (addon: Addon) => void;
   onDetailClick: (addon: Addon) => void;
@@ -29,6 +30,7 @@ export const AddonCard: React.FC<AddonCardProps> = ({
   onToggle,
   onAddToGroup,
   onOpenLink,
+  onOpenInFileManager,
   onMoveClick,
   onRenameClick,
   onDetailClick,
@@ -219,6 +221,22 @@ export const AddonCard: React.FC<AddonCardProps> = ({
                 >
                   <FolderPlus size={14} />
                 </button>
+
+                {onOpenInFileManager && (
+                  <button
+                    className="btn btn-secondary btn-icon-only"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (addon.currentPath) {
+                        onOpenInFileManager(addon.currentPath);
+                      }
+                    }}
+                    disabled={isSubmitting || !addon.currentPath}
+                    title={t('addonCard.openInFileManager')}
+                  >
+                    <Folder size={14} />
+                  </button>
+                )}
 
                 {addon.workshopId ? (
                   <button

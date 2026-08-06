@@ -85,6 +85,7 @@ function App() {
     fetchData,
     applyDatabaseUpdate,
     handleOpenLink,
+    handleOpenInFileManager,
     toggleAddon,
     toggleGroupAddons,
     moveAddon,
@@ -374,6 +375,7 @@ function App() {
                           onViewGroupDetails={(groupId) => {
                             handleFilterTabChange('groups', groupId);
                           }}
+                          onOpenInFileManager={handleOpenInFileManager}
                           onDownloadUninstalled={handleBatchDownload}
                           isSelectMode={isSelectMode}
                           isGroupSelected={isGroupSelected}
@@ -395,6 +397,7 @@ function App() {
                             setAddToGroupModal(true);
                           }}
                           onOpenLink={handleOpenLink}
+                          onOpenInFileManager={handleOpenInFileManager}
                           onMoveClick={handleMoveClick}
                           onRenameClick={triggerRenameModal}
                           onDetailClick={(addon) => setDetailModal({ open: true, addon })}

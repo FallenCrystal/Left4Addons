@@ -11,6 +11,7 @@ interface GroupCardProps {
   allGroupAddons?: Addon[];
   onToggleGroup: (addonsList: Addon[], enabled: boolean) => void;
   onViewGroupDetails: (groupId: string) => void;
+  onOpenInFileManager?: (path?: string) => void;
   onDownloadUninstalled?: (workshopIds: string[]) => void;
   isSelectMode?: boolean;
   isGroupSelected?: boolean;
@@ -24,6 +25,7 @@ export const GroupCard: React.FC<GroupCardProps> = ({
   addons,
   onToggleGroup,
   onViewGroupDetails,
+  onOpenInFileManager,
   onDownloadUninstalled,
   isSelectMode = false,
   isGroupSelected = false,
@@ -192,8 +194,19 @@ export const GroupCard: React.FC<GroupCardProps> = ({
             )}
             <button
               className="btn btn-secondary btn-icon-only"
-              onClick={() => onViewGroupDetails(group.id)}
-              title={t('groupCard.viewDetails')}
+              onClick={(e) => {
+                e.stopPropagation();
+                const addonWithPath = installedAddons.find((ad) => ad.currentPath);
+                if (addonWithPath?.currentPath) {
+                  onOpenInFileManager?.(addonWithPath.currentPath);
+                }
+              }}
+              disabled={isSubmitting || !installedAddons.some((ad) => ad.currentPath)}
+              title={
+                !installedAddons.some((ad) => ad.currentPath)
+                  ? t('groupCard.noInstalledAddons')
+                  : t('groupCard.openInFileManager')
+              }
             >
               <FolderOpen size={14} />
             </button>
