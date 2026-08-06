@@ -964,6 +964,7 @@ pub async fn scan_addons_internal(
             .collect();
     }
     normalize_master_collection_group_refs(db);
+    enrich_grouped_addons_maps(db, cache_dir);
 
     save_db_internal(settings_path, groups_path, known_addons_path, db);
     Ok(())

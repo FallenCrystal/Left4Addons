@@ -992,6 +992,7 @@ pub async fn group_action(
     }
 
     normalize_master_collection_group_refs(&mut db);
+    enrich_grouped_addons_maps(&mut db, &state.cache_dir);
 
     save_db_internal(
         &state.settings_path,

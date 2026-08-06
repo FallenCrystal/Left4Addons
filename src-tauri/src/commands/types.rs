@@ -290,7 +290,7 @@ pub struct MasterCollection {
     pub icon: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct Addon {
     #[serde(default)]
     pub id: String,

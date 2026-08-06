@@ -3,7 +3,11 @@ use crate::steam::{
     WorkshopBrowseQuery, WorkshopCapabilities, WorkshopCollectionResponse, WorkshopHomeResponse,
     WorkshopItemResponse, WorkshopItemsResponse, WorkshopService,
 };
-use crate::vpk::{extract_addon_metadata, generate_dummy_vpk};
+use crate::vpk::{
+    extract_addon_metadata, extract_mission_info_from_kv, find_vpk_image_key, generate_dummy_vpk,
+    get_file_content, parse_key_values, parse_vpk, MapEntry,
+};
+use md5::{Digest, Md5};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2808,6 +2812,267 @@ fn auto_group_internal(db: &mut Database) {
     }
 }
 
+pub fn enrich_grouped_addons_maps(db: &mut Database, cache_dir: &Path) {
+    use std::fs::File;
+
+    for group in &db.groups {
+        if group.addons.is_empty() {
+            continue;
+        }
+
+        let group_addon_ids = group.addons.clone();
+
+        // 1. Merge maps from all addons in this group
+        let mut aggregated_maps: Vec<MapEntry> = Vec::new();
+        let mut seen_codes = HashSet::new();
+
+        for addon_id in &group_addon_ids {
+            let addon_maps = db
+                .addons
+                .get(addon_id)
+                .map(|a| &a.maps)
+                .or_else(|| db.known_uninstalled_addons.get(addon_id).map(|a| &a.maps));
+
+            if let Some(maps) = addon_maps {
+                for m in maps {
+                    let code_lower = m.code.to_lowercase();
+                    if !seen_codes.contains(&code_lower) {
+                        seen_codes.insert(code_lower);
+                        aggregated_maps.push(m.clone());
+                    } else if let Some(existing) = aggregated_maps
+                        .iter_mut()
+                        .find(|x| x.code.to_lowercase() == code_lower)
+                    {
+                        if existing.name == existing.code && m.name != m.code {
+                            existing.name = m.name.clone();
+                        }
+                        if existing.image_hint.is_none() && m.image_hint.is_some() {
+                            existing.image_hint = m.image_hint.clone();
+                        }
+                        if existing.image.is_none() && m.image.is_some() {
+                            existing.image = m.image.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        if aggregated_maps.is_empty() {
+            continue;
+        }
+
+        // 2. Collect active VPK paths in this group
+        let group_vpk_paths: Vec<(String, PathBuf)> = group_addon_ids
+            .iter()
+            .filter_map(|id| {
+                db.addons
+                    .get(id)
+                    .map(|a| (id.clone(), PathBuf::from(&a.current_path)))
+            })
+            .collect();
+
+        // 3. Resolve missing map images cross-part
+        for map_entry in &mut aggregated_maps {
+            if map_entry.image.is_none() {
+                let search_hint = map_entry
+                    .image_hint
+                    .as_deref()
+                    .unwrap_or(&map_entry.code);
+
+                for (_vpk_id, vpk_path) in &group_vpk_paths {
+                    if !vpk_path.exists() {
+                        continue;
+                    }
+                    if let Ok((files, mut file)) = parse_vpk(vpk_path) {
+                        let files_lower: HashMap<String, &String> =
+                            files.keys().map(|k| (k.to_lowercase(), k)).collect();
+
+                        let image_key = find_vpk_image_key(search_hint, &files_lower, &files)
+                            .or_else(|| find_vpk_image_key(&map_entry.code, &files_lower, &files));
+
+                        if let Some(k) = image_key {
+                            if let Some(entry) = files.get(k) {
+                                if let Ok(img_bytes) = get_file_content(&mut file, entry) {
+                                    let clean_vpk_name = vpk_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("")
+                                        .replace(".disabled", "")
+                                        .replace(".vpk", "");
+
+                                    let mut hasher = Md5::new();
+                                    hasher.update(clean_vpk_name.as_bytes());
+                                    hasher.update(map_entry.code.to_lowercase().as_bytes());
+                                    let map_hash = format!("{:x}", hasher.finalize());
+
+                                    let cache_filename = format!("{}_map.jpg", map_hash);
+                                    let full_cache_path = cache_dir.join(&cache_filename);
+
+                                    if !cache_dir.exists() {
+                                        let _ = std::fs::create_dir_all(cache_dir);
+                                    }
+
+                                    let mut saved = false;
+                                    if k.to_lowercase().ends_with(".vtf") {
+                                        if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
+                                            if let Ok(decoded) = vtf.highres_image.decode(0) {
+                                                if decoded
+                                                    .save_with_format(
+                                                        &full_cache_path,
+                                                        image::ImageFormat::Jpeg,
+                                                    )
+                                                    .is_ok()
+                                                {
+                                                    saved = true;
+                                                }
+                                            }
+                                        }
+                                    } else if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                        if cache_file.write_all(&img_bytes).is_ok() {
+                                            saved = true;
+                                        }
+                                    }
+
+                                    if saved {
+                                        map_entry.image =
+                                            Some(format!("/cache/{}", cache_filename));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Resolve missing cover image cross-part
+        let group_cover_image = group_addon_ids.iter().find_map(|id| {
+            db.addons.get(id).and_then(|a| a.image_path.clone())
+        });
+
+        let mut resolved_group_cover = group_cover_image;
+
+        if resolved_group_cover.is_none() {
+            for (_vpk_id, vpk_path) in &group_vpk_paths {
+                if !vpk_path.exists() {
+                    continue;
+                }
+                if let Ok((files, mut file)) = parse_vpk(vpk_path) {
+                    let files_lower: HashMap<String, &String> =
+                        files.keys().map(|k| (k.to_lowercase(), k)).collect();
+
+                    let mut cover_hint = None;
+                    let mission_key = files.keys().find(|k| {
+                        let l = k.to_lowercase();
+                        l.ends_with(".txt")
+                            && (l.starts_with("missions/")
+                                || l.contains("/missions/")
+                                || l.contains("\\missions\\"))
+                    });
+                    if let Some(mk) = mission_key {
+                        if let Some(entry) = files.get(mk) {
+                            if let Ok(content_bytes) = get_file_content(&mut file, entry) {
+                                let text = String::from_utf8_lossy(&content_bytes);
+                                let kv = parse_key_values(&text);
+                                let (_, hint) = extract_mission_info_from_kv(&kv);
+                                cover_hint = hint;
+                            }
+                        }
+                    }
+
+                    let candidates_to_try = vec![
+                        cover_hint,
+                        Some("addonimage.jpg".to_string()),
+                        Some("addonimage.vtf".to_string()),
+                        aggregated_maps.first().and_then(|m| m.image_hint.clone()),
+                        aggregated_maps.first().map(|m| m.code.clone()),
+                    ];
+
+                    for candidate_opt in candidates_to_try {
+                        if let Some(cand) = candidate_opt {
+                            if let Some(k) = find_vpk_image_key(&cand, &files_lower, &files) {
+                                if let Some(entry) = files.get(k) {
+                                    if let Ok(img_bytes) = get_file_content(&mut file, entry) {
+                                        let clean_vpk_name = vpk_path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("")
+                                            .replace(".disabled", "")
+                                            .replace(".vpk", "");
+
+                                        let mut hasher = Md5::new();
+                                        hasher.update(clean_vpk_name.as_bytes());
+                                        let hash_result = hasher.finalize();
+                                        let cache_filename =
+                                            format!("{:x}_image.jpg", hash_result);
+                                        let full_cache_path = cache_dir.join(&cache_filename);
+
+                                        if !cache_dir.exists() {
+                                            let _ = std::fs::create_dir_all(cache_dir);
+                                        }
+
+                                        let mut saved = false;
+                                        if k.to_lowercase().ends_with(".vtf") {
+                                            if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
+                                                if let Ok(decoded) = vtf.highres_image.decode(0) {
+                                                    if decoded
+                                                        .save_with_format(
+                                                            &full_cache_path,
+                                                            image::ImageFormat::Jpeg,
+                                                        )
+                                                        .is_ok()
+                                                    {
+                                                        saved = true;
+                                                    }
+                                                }
+                                            }
+                                        } else if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                            if cache_file.write_all(&img_bytes).is_ok() {
+                                                saved = true;
+                                            }
+                                        }
+
+                                        if saved {
+                                            resolved_group_cover =
+                                                Some(format!("/cache/{}", cache_filename));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if resolved_group_cover.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 5. Update maps and cover images for all addons in the group
+        for addon_id in &group_addon_ids {
+            if let Some(addon) = db.addons.get_mut(addon_id) {
+                addon.maps = aggregated_maps.clone();
+                addon.maps_scanned = Some(true);
+                if addon.image_path.is_none() && resolved_group_cover.is_some() {
+                    addon.image_path = resolved_group_cover.clone();
+                    addon.has_image = true;
+                }
+            }
+            if let Some(addon) = db.known_uninstalled_addons.get_mut(addon_id) {
+                addon.maps = aggregated_maps.clone();
+                addon.maps_scanned = Some(true);
+                if addon.image_path.is_none() && resolved_group_cover.is_some() {
+                    addon.image_path = resolved_group_cover.clone();
+                    addon.has_image = true;
+                }
+            }
+        }
+    }
+}
+
 fn move_requires_dir_change(addon: &Addon, target_dir_type: &str) -> bool {
     addon.dir_type != target_dir_type
 }
@@ -2823,7 +3088,7 @@ fn rename_requires_name_change(addon: &Addon, sanitized: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_group_internal, direct_download_url, ensure_background_workshop_fetch_allowed,
+        auto_group_internal, direct_download_url, enrich_grouped_addons_maps, ensure_background_workshop_fetch_allowed,
         extract_steamcommunity_error_message, is_background_workshop_fetch_source,
         load_known_addons, load_workshop_cache, looks_like_placeholder_author_name,
         merge_known_addon_snapshots_into_cache, move_or_copy_file, move_requires_dir_change,
@@ -2834,7 +3099,7 @@ mod tests {
         SourcePolicy,
     };
     use crate::commands::types::{Addon, Database, Group, MasterCollection, WorkshopSeenItem};
-    use crate::vpk::generate_dummy_vpk;
+    use crate::vpk::{generate_dummy_vpk, MapEntry};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
@@ -4199,5 +4464,73 @@ mod tests {
             super::sanitize_vpk_filename("Cool Map.VPK.DISABLED", &settings_no_len),
             "Cool Map.vpk"
         );
+    }
+
+    #[test]
+    fn test_enrich_grouped_addons_maps_aggregates_across_parts() {
+        let mut db = Database::default();
+
+        let part1 = Addon {
+            id: "part1".to_string(),
+            vpk_name: "part1.vpk".to_string(),
+            maps: vec![
+                MapEntry {
+                    code: "m1".to_string(),
+                    name: "Map 1".to_string(),
+                    image: None,
+                    image_hint: Some("maps/m1_thumb".to_string()),
+                },
+                MapEntry {
+                    code: "m2".to_string(),
+                    name: "Map 2".to_string(),
+                    image: None,
+                    image_hint: Some("maps/m2_thumb".to_string()),
+                },
+            ],
+            maps_scanned: Some(true),
+            current_path: "/nonexistent/part1.vpk".to_string(),
+            ..Addon::default()
+        };
+
+        let part2 = Addon {
+            id: "part2".to_string(),
+            vpk_name: "part2.vpk".to_string(),
+            maps: vec![
+                MapEntry {
+                    code: "m3".to_string(),
+                    name: "Map 3".to_string(),
+                    image: None,
+                    image_hint: Some("maps/m3_thumb".to_string()),
+                },
+            ],
+            maps_scanned: Some(true),
+            current_path: "/nonexistent/part2.vpk".to_string(),
+            ..Addon::default()
+        };
+
+        db.addons.insert("part1".to_string(), part1);
+        db.addons.insert("part2".to_string(), part2);
+
+        db.groups.push(Group {
+            id: "group1".to_string(),
+            name: "Campaign Group".to_string(),
+            addons: vec!["part1".to_string(), "part2".to_string()],
+            tags: None,
+            workshop_collection_id: None,
+            master_collection_ids: None,
+            source: Some("auto-group".to_string()),
+        });
+
+        let cache_dir = std::env::temp_dir().join("l4a_test_cache");
+        enrich_grouped_addons_maps(&mut db, &cache_dir);
+
+        let p1 = db.addons.get("part1").unwrap();
+        let p2 = db.addons.get("part2").unwrap();
+
+        assert_eq!(p1.maps.len(), 3);
+        assert_eq!(p2.maps.len(), 3);
+        assert_eq!(p1.maps[0].code, "m1");
+        assert_eq!(p1.maps[1].code, "m2");
+        assert_eq!(p1.maps[2].code, "m3");
     }
 }

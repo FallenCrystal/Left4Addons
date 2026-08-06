@@ -139,6 +139,89 @@ fn test_extract_addon_metadata_mock_vpk() {
         .get("addontitle")
         .and_then(|t| t.as_str());
     assert_eq!(addon_title, Some("Mock Addon"));
-
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_extract_mission_info_from_kv() {
+    let kv = r#"
+        "mission"
+        {
+            "Name" "Test Campaign"
+            "Image" "maps/test_campaign_cover"
+            "poster"
+            {
+                "posterImage" "test_poster"
+            }
+            "modes"
+            {
+                "coop"
+                {
+                    "1"
+                    {
+                        "Map" "m1_test"
+                        "DisplayName" "Map 1 Test"
+                        "Image" "maps/m1_thumb"
+                    }
+                    "2"
+                    {
+                        "Map" "m2_test"
+                        "DisplayName" "Map 2 Test"
+                        "Image" "maps/m2_thumb"
+                    }
+                }
+            }
+        }
+    "#;
+    let parsed = parse_key_values(kv);
+    let (maps, cover_hint) = super::extract_mission_info_from_kv(&parsed);
+
+    assert_eq!(cover_hint, Some("maps/test_campaign_cover".to_string()));
+    assert_eq!(maps.len(), 2);
+    assert_eq!(maps[0].code, "m1_test");
+    assert_eq!(maps[0].name, "Map 1 Test");
+    assert_eq!(maps[0].image_hint, Some("maps/m1_thumb".to_string()));
+    assert_eq!(maps[1].code, "m2_test");
+    assert_eq!(maps[1].name, "Map 2 Test");
+    assert_eq!(maps[1].image_hint, Some("maps/m2_thumb".to_string()));
+}
+
+#[test]
+fn test_find_vpk_image_key() {
+    use std::collections::HashMap;
+
+    let mut files = HashMap::new();
+    let vpk_entry = super::VpkEntry {
+        crc: 0,
+        preload_bytes: 0,
+        archive_index: 0,
+        entry_offset: 0,
+        entry_length: 0,
+        preload_data: vec![],
+        header_size: 12,
+        tree_size: 0,
+    };
+    files.insert("materials/vgui/maps/ls_fsl.vtf".to_string(), vpk_entry);
+
+    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+
+    let found = super::find_vpk_image_key("maps/LS_FSL", &files_lower, &files);
+    assert_eq!(found, Some(&"materials/vgui/maps/ls_fsl.vtf".to_string()));
+}
+
+#[test]
+fn test_real_l4d2server_vpks() {
+    use std::path::Path;
+    let lingshan_path = Path::new("/home/akkariin/桌面/L4D2Server/l4d2/left4dead2/addons/lingshan_main.vpk");
+    if lingshan_path.exists() {
+        let temp_cache_dir = std::env::temp_dir().join("l4a_test_lingshan_cache");
+        let meta = extract_addon_metadata(lingshan_path, &temp_cache_dir);
+        assert!(meta.error.is_none());
+        assert_eq!(meta.maps.len(), 8);
+        assert_eq!(meta.maps[0].code, "M1_LS_FSL_ND");
+        assert_eq!(meta.maps[0].name, "灵城-丰收路");
+        assert_eq!(meta.maps[0].image_hint, Some("maps/LS_FSL".to_string()));
+    }
+}
+
+

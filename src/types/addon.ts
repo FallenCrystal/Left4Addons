@@ -116,6 +116,7 @@ export interface MapEntry {
   code: string;
   name: string;
   image?: string;
+  imageHint?: string;
 }
 
 export interface BackgroundTask {

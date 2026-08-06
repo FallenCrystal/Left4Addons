@@ -383,6 +383,7 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
                             {
                                 result.has_image = true;
                                 result.image_path = Some(format!("/cache/{}", cache_filename));
+                                image_saved = true;
                             }
                         }
                     }
@@ -390,19 +391,6 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
             }
         }
     }
-
-    // Find all bsp files under maps/
-    let mut maps = Vec::new();
-    let mut bsp_keys = Vec::new();
-    for key in files.keys() {
-        let lower = key.to_lowercase();
-        if (lower.starts_with("maps/") || lower.contains("/maps/") || lower.contains("\\maps\\"))
-            && lower.ends_with(".bsp")
-        {
-            bsp_keys.push(key);
-        }
-    }
-    bsp_keys.sort();
 
     // Find all mission files under missions/
     let mut mission_keys = Vec::new();
@@ -415,76 +403,89 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
         }
     }
 
-    // Parse missions to get map display names
+    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+
+    // Parse missions to get structured map entries and cover image hint
+    let mut mission_maps: Vec<MissionMapInfo> = Vec::new();
+    let mut cover_hint: Option<String> = None;
     let mut map_names: HashMap<String, String> = HashMap::new();
+
     for key in &mission_keys {
         if let Some(entry) = files.get(*key) {
             if let Ok(content_bytes) = get_file_content(&mut file, entry) {
                 let text = String::from_utf8_lossy(&content_bytes);
                 let kv = parse_key_values(&text);
                 extract_map_names_from_kv(&kv, &mut map_names);
+                let (parsed_maps, hint) = extract_mission_info_from_kv(&kv);
+                if cover_hint.is_none() {
+                    cover_hint = hint;
+                }
+                for m in parsed_maps {
+                    if !mission_maps.iter().any(|x| x.code.eq_ignore_ascii_case(&m.code)) {
+                        mission_maps.push(m);
+                    }
+                }
             }
         }
     }
 
-    let files_lower: HashMap<String, &String> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+    // Try resolving cover image from cover_hint if addonimage was not found
+    if !image_saved {
+        if let Some(ref hint) = cover_hint {
+            if let Some(k) = find_vpk_image_key(hint, &files_lower, &files) {
+                if let Some(entry) = files.get(k) {
+                    if let Ok(img_bytes) = get_file_content(&mut file, entry) {
+                        if !cache_dir.as_ref().exists() {
+                            let _ = std::fs::create_dir_all(&cache_dir);
+                        }
+                        if k.to_lowercase().ends_with(".vtf") {
+                            if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
+                                if let Ok(decoded) = vtf.highres_image.decode(0) {
+                                    if decoded
+                                        .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                        .is_ok()
+                                    {
+                                        result.has_image = true;
+                                        result.image_path = Some(format!("/cache/{}", cache_filename));
+                                    }
+                                }
+                            }
+                        } else {
+                            if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                if cache_file.write_all(&img_bytes).is_ok() {
+                                    result.has_image = true;
+                                    result.image_path = Some(format!("/cache/{}", cache_filename));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    for key in bsp_keys {
-        let stem = Path::new(key)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        
-        let stem_lower = stem.to_lowercase();
-        let display_name = map_names.get(&stem_lower).cloned().unwrap_or_else(|| stem.clone());
+    // Build map list
+    let mut maps = Vec::new();
+    let mut added_codes = std::collections::HashSet::new();
+
+    // 1. Add maps defined in missions/*.txt
+    for mm in mission_maps {
+        let code_lower = mm.code.to_lowercase();
+        added_codes.insert(code_lower.clone());
+
+        let search_term = mm.image_hint.as_deref().unwrap_or(&mm.code);
+        let image_key = find_vpk_image_key(search_term, &files_lower, &files)
+            .or_else(|| find_vpk_image_key(&mm.code, &files_lower, &files));
 
         let mut map_image_path = None;
-
-        // Candidate paths for map VTFs/images
-        let candidates = vec![
-            format!("materials/vgui/maps/{}.vtf", stem_lower),
-            format!("materials/vgui/loading_screen_{}.vtf", stem_lower),
-            format!("materials/vgui/maps/{}.jpg", stem_lower),
-            format!("materials/vgui/maps/{}.jpeg", stem_lower),
-            format!("materials/vgui/maps/{}.png", stem_lower),
-            format!("materials/vgui/loading_screen_{}.jpg", stem_lower),
-            format!("materials/vgui/loading_screen_{}.jpeg", stem_lower),
-            format!("materials/vgui/loading_screen_{}.png", stem_lower),
-        ];
-
-        let mut image_key = None;
-        for c in &candidates {
-            if let Some(k) = files_lower.get(c) {
-                image_key = Some(*k);
-                break;
-            }
-        }
-
-        if image_key.is_none() {
-            for c in &candidates {
-                let normalized_c = c.replace('/', "\\");
-                if let Some(k) = files_lower.get(&normalized_c) {
-                    image_key = Some(*k);
-                    break;
-                }
-                
-                let suffix = format!("\\{}", normalized_c);
-                if let Some(k) = files.keys().find(|k| k.to_lowercase().ends_with(&suffix)) {
-                    image_key = Some(k);
-                    break;
-                }
-            }
-        }
-
         if let Some(k) = image_key {
             if let Some(entry) = files.get(k) {
                 if let Ok(img_bytes) = get_file_content(&mut file, entry) {
                     let mut hasher = Md5::new();
                     hasher.update(clean_vpk_name.as_bytes());
-                    hasher.update(stem_lower.as_bytes());
+                    hasher.update(code_lower.as_bytes());
                     let map_hash = format!("{:x}", hasher.finalize());
-                    
+
                     let cache_filename = format!("{}_map.jpg", map_hash);
                     let full_cache_path = cache_dir.as_ref().join(&cache_filename);
 
@@ -515,10 +516,84 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
         }
 
         maps.push(super::types::MapEntry {
-            code: stem,
-            name: display_name,
+            code: mm.code,
+            name: mm.name,
             image: map_image_path,
+            image_hint: mm.image_hint,
         });
+    }
+
+    // 2. Append any extra .bsp files under maps/ that were not in missions/*.txt
+    let mut bsp_keys = Vec::new();
+    for key in files.keys() {
+        let lower = key.to_lowercase();
+        if (lower.starts_with("maps/") || lower.contains("/maps/") || lower.contains("\\maps\\"))
+            && lower.ends_with(".bsp")
+        {
+            bsp_keys.push(key);
+        }
+    }
+    bsp_keys.sort();
+
+    for key in bsp_keys {
+        let stem = Path::new(key)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let stem_lower = stem.to_lowercase();
+        if !added_codes.contains(&stem_lower) {
+            added_codes.insert(stem_lower.clone());
+            let display_name = map_names.get(&stem_lower).cloned().unwrap_or_else(|| stem.clone());
+
+            let image_key = find_vpk_image_key(&stem_lower, &files_lower, &files);
+            let mut map_image_path = None;
+
+            if let Some(k) = image_key {
+                if let Some(entry) = files.get(k) {
+                    if let Ok(img_bytes) = get_file_content(&mut file, entry) {
+                        let mut hasher = Md5::new();
+                        hasher.update(clean_vpk_name.as_bytes());
+                        hasher.update(stem_lower.as_bytes());
+                        let map_hash = format!("{:x}", hasher.finalize());
+
+                        let cache_filename = format!("{}_map.jpg", map_hash);
+                        let full_cache_path = cache_dir.as_ref().join(&cache_filename);
+
+                        if !cache_dir.as_ref().exists() {
+                            let _ = std::fs::create_dir_all(&cache_dir);
+                        }
+
+                        if k.to_lowercase().ends_with(".vtf") {
+                            if let Ok(vtf) = vtf::from_bytes(&img_bytes) {
+                                if let Ok(decoded) = vtf.highres_image.decode(0) {
+                                    if decoded
+                                        .save_with_format(&full_cache_path, image::ImageFormat::Jpeg)
+                                        .is_ok()
+                                    {
+                                        map_image_path = Some(format!("/cache/{}", cache_filename));
+                                    }
+                                }
+                            }
+                        } else {
+                            if let Ok(mut cache_file) = File::create(&full_cache_path) {
+                                if cache_file.write_all(&img_bytes).is_ok() {
+                                    map_image_path = Some(format!("/cache/{}", cache_filename));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            maps.push(super::types::MapEntry {
+                code: stem,
+                name: display_name,
+                image: map_image_path,
+                image_hint: None,
+            });
+        }
     }
 
     result.maps = maps;
@@ -749,4 +824,252 @@ fn extract_map_names_from_kv(val: &serde_json::Value, map_names: &mut HashMap<St
         }
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct MissionMapInfo {
+    pub code: String,
+    pub name: String,
+    pub image_hint: Option<String>,
+}
+
+pub fn extract_mission_info_from_kv(kv: &serde_json::Value) -> (Vec<MissionMapInfo>, Option<String>) {
+    let mut maps = Vec::new();
+    let mut cover_hint = None;
+    let mut seen_codes = std::collections::HashSet::new();
+
+    if let Some(obj) = kv.as_object() {
+        // Extract root cover image / poster hints
+        if let Some(img) = obj.get("image").and_then(|v| v.as_str()) {
+            if !img.trim().is_empty() {
+                cover_hint = Some(img.trim().to_string());
+            }
+        }
+        if cover_hint.is_none() {
+            if let Some(poster) = obj.get("poster").and_then(|v| v.as_object()) {
+                if let Some(pimg) = poster
+                    .get("posterimage_widescreen")
+                    .or_else(|| poster.get("posterimage"))
+                    .and_then(|v| v.as_str())
+                {
+                    if !pimg.trim().is_empty() {
+                        cover_hint = Some(pimg.trim().to_string());
+                    }
+                }
+            }
+        }
+        if cover_hint.is_none() {
+            if let Some(outro) = obj
+                .get("outtroimage")
+                .or_else(|| obj.get("outroimage"))
+                .and_then(|v| v.as_str())
+            {
+                if !outro.trim().is_empty() {
+                    cover_hint = Some(outro.trim().to_string());
+                }
+            }
+        }
+
+        // Extract maps from "modes"
+        if let Some(modes) = obj.get("modes").and_then(|v| v.as_object()) {
+            let mut mode_keys: Vec<&String> = modes.keys().collect();
+            mode_keys.sort_by(|a, b| {
+                let a_lower = a.to_lowercase();
+                let b_lower = b.to_lowercase();
+                if a_lower == "coop" {
+                    std::cmp::Ordering::Less
+                } else if b_lower == "coop" {
+                    std::cmp::Ordering::Greater
+                } else {
+                    a.cmp(b)
+                }
+            });
+
+            for mode_key in mode_keys {
+                if let Some(mode_obj) = modes.get(mode_key).and_then(|v| v.as_object()) {
+                    let mut step_keys: Vec<&String> = mode_obj.keys().collect();
+                    step_keys.sort_by(|a, b| {
+                        let num_a = a.parse::<u32>().ok();
+                        let num_b = b.parse::<u32>().ok();
+                        match (num_a, num_b) {
+                            (Some(na), Some(nb)) => na.cmp(&nb),
+                            _ => a.cmp(b),
+                        }
+                    });
+
+                    for step_key in step_keys {
+                        if let Some(map_obj) = mode_obj.get(step_key).and_then(|v| v.as_object()) {
+                            if let Some(map_code) = map_obj
+                                .get("map")
+                                .or_else(|| map_obj.get("mapname"))
+                                .and_then(|v| v.as_str())
+                            {
+                                let code = map_code.trim().to_string();
+                                if !code.is_empty() {
+                                    let code_lower = code.to_lowercase();
+                                    if !seen_codes.contains(&code_lower) {
+                                        seen_codes.insert(code_lower);
+
+                                        let name = map_obj
+                                            .get("displayname")
+                                            .or_else(|| map_obj.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or(&code)
+                                            .trim()
+                                            .to_string();
+
+                                        let image_hint = map_obj
+                                            .get("image")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty());
+
+                                        maps.push(MissionMapInfo {
+                                            code: code.clone(),
+                                            name: if name.is_empty() { code } else { name },
+                                            image_hint,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if maps.is_empty() {
+        extract_maps_recursive(kv, &mut maps, &mut seen_codes);
+    }
+
+    if cover_hint.is_none() {
+        if let Some(first_map) = maps.first() {
+            if let Some(hint) = &first_map.image_hint {
+                cover_hint = Some(hint.clone());
+            }
+        }
+    }
+
+    (maps, cover_hint)
+}
+
+fn extract_maps_recursive(
+    val: &serde_json::Value,
+    maps: &mut Vec<MissionMapInfo>,
+    seen_codes: &mut std::collections::HashSet<String>,
+) {
+    if let Some(obj) = val.as_object() {
+        if let Some(map_code) = obj
+            .get("map")
+            .or_else(|| obj.get("mapname"))
+            .and_then(|v| v.as_str())
+        {
+            let code = map_code.trim().to_string();
+            if !code.is_empty() {
+                let code_lower = code.to_lowercase();
+                if !seen_codes.contains(&code_lower) {
+                    seen_codes.insert(code_lower);
+
+                    let name = obj
+                        .get("displayname")
+                        .or_else(|| obj.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&code)
+                        .trim()
+                        .to_string();
+
+                    let image_hint = obj
+                        .get("image")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    maps.push(MissionMapInfo {
+                        code: code.clone(),
+                        name: if name.is_empty() { code } else { name },
+                        image_hint,
+                    });
+                }
+            }
+        }
+        for sub_val in obj.values() {
+            extract_maps_recursive(sub_val, maps, seen_codes);
+        }
+    } else if let Some(arr) = val.as_array() {
+        for sub_val in arr {
+            extract_maps_recursive(sub_val, maps, seen_codes);
+        }
+    }
+}
+
+pub fn find_vpk_image_key<'a>(
+    hint_or_stem: &str,
+    files_lower: &HashMap<String, &'a String>,
+    files: &'a HashMap<String, VpkEntry>,
+) -> Option<&'a String> {
+    let clean = hint_or_stem
+        .replace('\\', "/")
+        .trim()
+        .trim_matches('"')
+        .to_lowercase();
+
+    if clean.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+
+    let has_ext = clean.ends_with(".vtf")
+        || clean.ends_with(".jpg")
+        || clean.ends_with(".jpeg")
+        || clean.ends_with(".png");
+
+    if has_ext {
+        candidates.push(clean.clone());
+        candidates.push(format!("materials/{}", clean));
+        candidates.push(format!("materials/vgui/{}", clean));
+    } else {
+        let exts = [".vtf", ".jpg", ".jpeg", ".png"];
+        let mut bases = vec![
+            clean.clone(),
+            format!("materials/{}", clean),
+            format!("materials/vgui/{}", clean),
+        ];
+
+        if !clean.starts_with("maps/") {
+            bases.push(format!("materials/vgui/maps/{}", clean));
+        }
+
+        if !clean.starts_with("loading_screen_") && !clean.starts_with("maps/") {
+            bases.push(format!("materials/vgui/loading_screen_{}", clean));
+        }
+
+        for base in bases {
+            for ext in exts {
+                candidates.push(format!("{}{}", base, ext));
+            }
+        }
+    }
+
+    for c in &candidates {
+        if let Some(k) = files_lower.get(c) {
+            return Some(*k);
+        }
+        let win_c = c.replace('/', "\\");
+        if let Some(k) = files_lower.get(&win_c) {
+            return Some(*k);
+        }
+        let suffix_win = format!("\\{}", win_c);
+        let suffix_unix = format!("/{}", c);
+        if let Some((k, _)) = files.iter().find(|(k, _)| {
+            let kl = k.to_lowercase();
+            kl.ends_with(&suffix_win) || kl.ends_with(&suffix_unix)
+        }) {
+            return Some(k);
+        }
+    }
+
+    None
+}
+
 

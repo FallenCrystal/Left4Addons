@@ -18,6 +18,8 @@ pub struct MapEntry {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    #[serde(rename = "imageHint", default, skip_serializing_if = "Option::is_none")]
+    pub image_hint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
