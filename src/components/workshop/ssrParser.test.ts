@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest';
-import { parseWorkshopPageDetails } from './ssrParser';
+import { parseWorkshopPageDetails, parseSSRItems } from './ssrParser';
 
 describe('ssrParser', () => {
   test('preserves Steam description line breaks from rendered HTML', () => {
@@ -98,5 +98,64 @@ describe('ssrParser', () => {
       'https://images.steamusercontent.com/ugc/10303821298862575212/4771C25DD397BD581B244C8A37355A1AB7603C04/',
     );
     expect(details.imageGallery).toEqual([]);
+  });
+
+  test('correctly parses Chinese detail stats, author prefix, and tag categories', () => {
+    const html = `
+      <div class="workshopItemTitle">测试武器 MOD</div>
+      <div class="friendBlock" data-miniprofile="123456">
+        <a class="friendBlockLinkOverlay" href="https://steamcommunity.com/id/testuser"></a>
+        <div class="friendBlockContent">创作者：testuser<br><span>在线</span></div>
+      </div>
+      <div class="detailsStatsContainerLeft">
+        <div class="detailsStatLeft">文件大小</div>
+        <div class="detailsStatLeft">发表于</div>
+        <div class="detailsStatLeft">更新日期</div>
+      </div>
+      <div class="detailsStatsContainerRight">
+        <div class="detailsStatRight">12.34 MB</div>
+        <div class="detailsStatRight">8 月 1 日 上午 10:00</div>
+        <div class="detailsStatRight">8 月 10 日 下午 2:30</div>
+      </div>
+      <table class="stats_table">
+        <tr><td>1,234</td><td>不重复访客数</td></tr>
+        <tr><td>567</td><td>当前订阅者</td></tr>
+        <tr><td>89</td><td>当前收藏人数</td></tr>
+      </table>
+      <div class="rightDetailsBlock">
+        <div class="workshopTags">
+          <div class="workshopTagsTitle">游戏内容：</div>
+          <a href="#">武器</a>
+        </div>
+      </div>
+    `;
+
+    const details = parseWorkshopPageDetails(html);
+    expect(details.creatorName).toBe('testuser');
+    expect(details.fileSizeDisplay).toBe('12.34 MB');
+    expect(details.postedDateText).toBe('8 月 1 日 上午 10:00');
+    expect(details.updatedDateText).toBe('8 月 10 日 下午 2:30');
+    expect(details.uniqueVisitors).toBe(1234);
+    expect(details.currentSubscribers).toBe(567);
+    expect(details.currentFavorites).toBe(89);
+    expect(details.tags).toEqual([{ category: '游戏内容', name: '武器' }]);
+  });
+
+  test('correctly strips Chinese author prefixes from DOM cards in parseSSRItems', () => {
+    const html = `
+      <div class=" Panel">
+        <div>
+          <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=9990001">
+            <img src="https://images.steamusercontent.com/test.jpg">
+          </a>
+        </div>
+        <a href="https://steamcommunity.com/sharedfiles/filedetails/?id=9990001">Mod Title</a>
+        <a href="https://steamcommunity.com/profiles/76561198877666030/myworkshopfiles">创作者：TaNtaL1c</a>
+      </div>
+    `;
+
+    const items = parseSSRItems(html, 'workshop_browse');
+    expect(items.length).toBe(1);
+    expect(items[0].authorName).toBe('TaNtaL1c');
   });
 });

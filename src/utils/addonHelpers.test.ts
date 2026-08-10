@@ -8,10 +8,42 @@ import {
   getSuggestedVpkName,
   sortAddonsDownloadedFirst,
   sanitizeVpkName,
+  cleanAuthorName,
+  isPlaceholderAuthorName,
 } from './addonHelpers';
 import { Addon } from '../types/addon';
 
 describe('addonHelpers', () => {
+  describe('cleanAuthorName', () => {
+    test('strips prefixes across various languages', () => {
+      expect(cleanAuthorName('by AuthorA')).toBe('AuthorA');
+      expect(cleanAuthorName('创作者：AuthorB')).toBe('AuthorB');
+      expect(cleanAuthorName('创作者:AuthorB')).toBe('AuthorB');
+      expect(cleanAuthorName('創作者：AuthorC')).toBe('AuthorC');
+      expect(cleanAuthorName('作者：AuthorD')).toBe('AuthorD');
+      expect(cleanAuthorName('由 AuthorE 發表')).toBe('AuthorE');
+      expect(cleanAuthorName('제작자: AuthorF')).toBe('AuthorF');
+      expect(cleanAuthorName('От AuthorG')).toBe('AuthorG');
+      expect(cleanAuthorName('Von AuthorH')).toBe('AuthorH');
+      expect(cleanAuthorName('Par AuthorI')).toBe('AuthorI');
+      expect(cleanAuthorName('De AuthorJ')).toBe('AuthorJ');
+    });
+  });
+
+  describe('isPlaceholderAuthorName', () => {
+    test('identifies empty or placeholder author names including Chinese placeholders', () => {
+      expect(isPlaceholderAuthorName('')).toBe(true);
+      expect(isPlaceholderAuthorName('12345678')).toBe(true);
+      expect(isPlaceholderAuthorName('author_name')).toBe(true);
+      expect(isPlaceholderAuthorName('[unknown]')).toBe(true);
+      expect(isPlaceholderAuthorName('unknown author')).toBe(true);
+      expect(isPlaceholderAuthorName('未知作者')).toBe(true);
+      expect(isPlaceholderAuthorName('未知')).toBe(true);
+      expect(isPlaceholderAuthorName('创作者：未知作者')).toBe(true);
+      expect(isPlaceholderAuthorName('RealAuthor')).toBe(false);
+    });
+  });
+
   describe('formatBytes', () => {
     test('should format 0 bytes correctly', () => {
       expect(formatBytes(0)).toBe('0 Bytes');

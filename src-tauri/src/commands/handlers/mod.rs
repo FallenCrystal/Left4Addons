@@ -1778,12 +1778,56 @@ fn insert_non_empty_string(
     }
 }
 
+fn clean_author_name(name: &str) -> String {
+    let mut cleaned = name.trim();
+    if cleaned.is_empty() {
+        return String::new();
+    }
+
+    let prefixes = [
+        "creado por ", "criado por ", "créé par ",
+        "by ", "von ", "par ", "de ", "por ", "от ",
+        "创作者：", "创作者:", "創作者：", "創作者:",
+        "作者：", "作者:", "作成者：", "作成者:",
+        "投稿者：", "投稿者:", "제작자:", "제작자：",
+        "작성자:", "작성자：", "создатель:", "создатель：",
+        "由 ",
+    ];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let lower = cleaned.to_lowercase();
+        for prefix in &prefixes {
+            if lower.starts_with(prefix) {
+                cleaned = cleaned[prefix.len()..].trim();
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    let suffixes = [" 發表", " 创作", " 發表", " 創作"];
+    let lower = cleaned.to_lowercase();
+    for suffix in &suffixes {
+        if lower.ends_with(suffix) {
+            cleaned = cleaned[..cleaned.len() - suffix.len()].trim();
+            break;
+        }
+    }
+
+    cleaned.to_string()
+}
+
 fn looks_like_placeholder_author_name(name: &str, ids: &[String]) -> bool {
-    let name = name.trim();
-    if name.is_empty()
-        || name.chars().all(|c| c.is_ascii_digit())
-        || name.eq_ignore_ascii_case("AUTHOR_NAME")
-        || name.eq_ignore_ascii_case("[unknown]")
+    let cleaned = clean_author_name(name);
+    if cleaned.is_empty()
+        || cleaned.chars().all(|c| c.is_ascii_digit())
+        || cleaned.eq_ignore_ascii_case("AUTHOR_NAME")
+        || cleaned.eq_ignore_ascii_case("[unknown]")
+        || cleaned.eq_ignore_ascii_case("unknown author")
+        || cleaned == "未知作者"
+        || cleaned == "未知"
     {
         return true;
     }
@@ -1791,7 +1835,7 @@ fn looks_like_placeholder_author_name(name: &str, ids: &[String]) -> bool {
     ids.iter()
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
-        .any(|id| name.eq_ignore_ascii_case(id))
+        .any(|id| cleaned.eq_ignore_ascii_case(id))
 }
 
 fn insert_author_name_if_useful(
@@ -1799,11 +1843,12 @@ fn insert_author_name_if_useful(
     name: &str,
     ids: &[String],
 ) {
-    if looks_like_placeholder_author_name(name, ids) {
+    let cleaned = clean_author_name(name);
+    if looks_like_placeholder_author_name(&cleaned, ids) {
         return;
     }
-    insert_non_empty_string(obj, "creatorName", name);
-    insert_non_empty_string(obj, "authorName", name);
+    insert_non_empty_string(obj, "creatorName", &cleaned);
+    insert_non_empty_string(obj, "authorName", &cleaned);
 }
 
 fn insert_optional_value(
@@ -4537,5 +4582,16 @@ mod tests {
         assert_eq!(p1.maps[0].code, "m1");
         assert_eq!(p1.maps[1].code, "m2");
         assert_eq!(p1.maps[2].code, "m3");
+    }
+
+    #[test]
+    fn test_clean_author_name_rust() {
+        assert_eq!(super::clean_author_name("by AuthorA"), "AuthorA");
+        assert_eq!(super::clean_author_name("创作者：AuthorB"), "AuthorB");
+        assert_eq!(super::clean_author_name("創作者：AuthorC"), "AuthorC");
+        assert_eq!(super::clean_author_name("作者：AuthorD"), "AuthorD");
+        assert_eq!(super::clean_author_name("由 AuthorE 發表"), "AuthorE");
+        assert_eq!(super::clean_author_name("제작자: AuthorF"), "AuthorF");
+        assert_eq!(super::clean_author_name("От AuthorG"), "AuthorG");
     }
 }

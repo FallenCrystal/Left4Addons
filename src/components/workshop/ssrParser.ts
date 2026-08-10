@@ -1,6 +1,6 @@
 /** SSR parsing utilities for Steam Workshop pages */
 
-import { formatBytes } from '../../utils/addonHelpers';
+import { formatBytes, cleanAuthorName } from '../../utils/addonHelpers';
 import { WorkshopItem, HomepageSection, TagCategory, WorkshopPageDetails } from './types';
 
 interface AuthorInfo {
@@ -149,7 +149,7 @@ function extractItemsFromQuery(query: any, domMap: Map<string, AuthorInfo>): Wor
     let authorVanityId = domData.authorVanityId || '';
     let authorAccountId = domData.authorAccountId || '';
     // Prefer SSR creator_player_link_details for author info (browse page)
-    let authorName = domData.authorName;
+    let authorName = cleanAuthorName(domData.authorName);
     let authorUrl = domData.authorUrl;
     if (item.creator) {
       authorSteamId = String(item.creator);
@@ -167,7 +167,7 @@ function extractItemsFromQuery(query: any, domMap: Map<string, AuthorInfo>): Wor
       const publicData = cd?.public_data || cd;
       const privateData = cd?.private_data || {};
       if (!authorName && publicData?.persona_name) {
-        authorName = String(publicData.persona_name);
+        authorName = cleanAuthorName(String(publicData.persona_name));
       }
       if (!authorSteamId && publicData?.steamid) {
         authorSteamId = String(publicData.steamid);
@@ -243,11 +243,12 @@ function parseDOMCardMap(html: string): Map<string, AuthorInfo> {
       ".//a[contains(@href, 'myworkshopfiles')]/@href",
       card, null, XPathResult.STRING_TYPE, null,
     ).stringValue;
-    let authorName = doc.evaluate(
-      ".//a[contains(@href, 'myworkshopfiles')]/text()",
-      card, null, XPathResult.STRING_TYPE, null,
-    ).stringValue.trim();
-    if (/^by\s+/i.test(authorName)) authorName = authorName.replace(/^by\s+/i, '');
+    let authorName = cleanAuthorName(
+      doc.evaluate(
+        ".//a[contains(@href, 'myworkshopfiles')]/text()",
+        card, null, XPathResult.STRING_TYPE, null,
+      ).stringValue,
+    );
     const { steamId, vanityId } = parseProfileIdentifiers(authorUrl);
     const stars = parseInt(
       doc.evaluate("count(.//svg[contains(@class, 'SVGIcon_Star_Filled')])",
@@ -299,11 +300,12 @@ function parseDOMFallbackItems(html: string): WorkshopItem[] {
       ".//a[contains(@href, 'myworkshopfiles')]/@href",
       card, null, XPathResult.STRING_TYPE, null,
     ).stringValue;
-    let authorName = doc.evaluate(
-      ".//a[contains(@href, 'myworkshopfiles')]/text()",
-      card, null, XPathResult.STRING_TYPE, null,
-    ).stringValue.trim();
-    if (/^by\s+/i.test(authorName)) authorName = authorName.replace(/^by\s+/i, '');
+    let authorName = cleanAuthorName(
+      doc.evaluate(
+        ".//a[contains(@href, 'myworkshopfiles')]/text()",
+        card, null, XPathResult.STRING_TYPE, null,
+      ).stringValue,
+    );
     const { steamId, vanityId } = parseProfileIdentifiers(authorUrl);
     const authorId = vanityId || steamId || '';
     const stars = parseInt(
@@ -577,7 +579,7 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
     }
     const creatorNameNode = doc.querySelector('.friendBlockContent');
     if (creatorNameNode?.childNodes?.[0]?.textContent) {
-      result.creatorName = creatorNameNode.childNodes[0].textContent.trim();
+      result.creatorName = cleanAuthorName(creatorNameNode.childNodes[0].textContent);
     }
     result.creatorAccountId = attr('.friendBlock', 'data-miniprofile') || undefined;
     result.creatorSteamId = result.creatorSteamId || accountIdToSteamId(result.creatorAccountId);
@@ -587,9 +589,42 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
     detailLabels.forEach((label, index) => {
       const value = detailValues[index] || '';
       if (!value) return;
-      if (label.includes('file size')) result.fileSizeDisplay = value;
-      if (label.includes('posted')) result.postedDateText = value;
-      if (label.includes('updated')) result.updatedDateText = value;
+      if (
+        label.includes('file size') ||
+        label.includes('文件大小') ||
+        label.includes('檔案大小') ||
+        label.includes('ファイルサイズ') ||
+        label.includes('размер файла') ||
+        label.includes('dateigröße') ||
+        label.includes('taille du fichier') ||
+        label.includes('tamaño del archivo')
+      ) {
+        result.fileSizeDisplay = value;
+      }
+      if (
+        label.includes('posted') ||
+        label.includes('发表于') ||
+        label.includes('張貼於') ||
+        label.includes('公開日') ||
+        label.includes('опубликовано') ||
+        label.includes('erstellt') ||
+        label.includes('publié') ||
+        label.includes('publicado')
+      ) {
+        result.postedDateText = value;
+      }
+      if (
+        label.includes('updated') ||
+        label.includes('更新日期') ||
+        label.includes('更新於') ||
+        label.includes('更新日') ||
+        label.includes('обновлено') ||
+        label.includes('aktualisiert') ||
+        label.includes('mis à jour') ||
+        label.includes('actualizado')
+      ) {
+        result.updatedDateText = value;
+      }
     });
     result.changeNoteCount = parseCount(text('.detailsStatNumChangeNotes'));
     result.ratingCount = parseCount(text('.numRatings'));
@@ -603,9 +638,44 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
       const value = parseCount(cells[0]);
       const label = cells[1].toLowerCase();
       if (value === undefined) return;
-      if (label.includes('unique visitor')) result.uniqueVisitors = value;
-      if (label.includes('current subscriber')) result.currentSubscribers = value;
-      if (label.includes('current favorite')) result.currentFavorites = value;
+      if (
+        label.includes('unique visitor') ||
+        label.includes('不重复访客') ||
+        label.includes('不重複訪客') ||
+        label.includes('ユニークビジター') ||
+        label.includes('посетителей') ||
+        label.includes('besucher') ||
+        label.includes('visiteurs') ||
+        label.includes('visitantes')
+      ) {
+        result.uniqueVisitors = value;
+      }
+      if (
+        label.includes('current subscriber') ||
+        label.includes('subscriber') ||
+        label.includes('订阅者') ||
+        label.includes('訂閱者') ||
+        label.includes('サブスクライバー') ||
+        label.includes('подписчиков') ||
+        label.includes('abonnenten') ||
+        label.includes('abonnés') ||
+        label.includes('suscriptores')
+      ) {
+        result.currentSubscribers = value;
+      }
+      if (
+        label.includes('current favorite') ||
+        label.includes('favorite') ||
+        label.includes('收藏') ||
+        label.includes('最愛') ||
+        label.includes('お気に入り') ||
+        label.includes('избранном') ||
+        label.includes('favoriten') ||
+        label.includes('favoris') ||
+        label.includes('favoritos')
+      ) {
+        result.currentFavorites = value;
+      }
     });
 
     const fullGalleryMatch = html.match(/var\s+rgFullScreenshotURLs\s*=\s*(\[[\s\S]*?\]);/);
@@ -640,7 +710,7 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
 
     const seenTags = new Set<string>();
     all('.rightDetailsBlock .workshopTags').forEach((node) => {
-      const category = (node.querySelector('.workshopTagsTitle')?.textContent || '').replace(/:$/, '').trim();
+      const category = (node.querySelector('.workshopTagsTitle')?.textContent || '').replace(/[:：]$/, '').trim();
       node.querySelectorAll('a').forEach((a) => {
         const name = (a.textContent || '').trim();
         const key = `${category}:${name}`;
@@ -674,7 +744,7 @@ export function parseWorkshopPageDetails(html: string): WorkshopPageDetails {
       const title = (node.querySelector('.workshopItemTitle')?.textContent || '').trim();
       const imagePath = toFullSizeUrl((node.querySelector('.workshopItemPreviewImage') as HTMLImageElement | null)?.src || '');
       const authorLink = node.querySelector('.workshopItemAuthorName a') as HTMLAnchorElement | null;
-      const authorName = (authorLink?.textContent || '').trim();
+      const authorName = cleanAuthorName(authorLink?.textContent || '');
       const authorUrl = authorLink?.href || '';
       const authorIds = parseProfileIdentifiers(authorUrl);
       const shortDescription = (node.querySelector('.workshopItemShortDesc')?.textContent || '').trim();

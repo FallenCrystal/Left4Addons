@@ -1,5 +1,5 @@
 import { WorkshopItem, WorkshopPageDetails } from './types';
-import { isPlaceholderAuthorName } from '../../utils/addonHelpers';
+import { isPlaceholderAuthorName, cleanAuthorName } from '../../utils/addonHelpers';
 
 interface AuthorDirectoryEntry {
   name?: string;
@@ -81,7 +81,7 @@ function collectIdentity(input: AuthorIdentity): Required<AuthorIdentity> {
   );
 
   return {
-    authorName: normalizeValue(input.authorName),
+    authorName: normalizeValue(cleanAuthorName(input.authorName)),
     authorUrl: normalizeValue(input.authorUrl),
     authorSteamId: authorSteamId || normalizeValue(parsedFromUrl.steamId),
     authorVanityId,
@@ -170,9 +170,10 @@ export function resolveWorkshopItemAuthor(item: WorkshopItem): WorkshopItem {
     normalized.authorId,
   ].filter(Boolean);
 
-  const authorName = looksLikePlaceholderName(item.authorName, candidateIds)
+  const cleanedInputAuthor = cleanAuthorName(item.authorName);
+  const authorName = looksLikePlaceholderName(cleanedInputAuthor, candidateIds)
     ? known?.name || ''
-    : item.authorName;
+    : cleanedInputAuthor;
   const authorSteamId = item.authorSteamId || known?.steamId;
   const authorVanityId = item.authorVanityId || known?.vanityId;
   const authorAccountId = item.authorAccountId || known?.accountId;

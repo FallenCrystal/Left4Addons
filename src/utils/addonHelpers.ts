@@ -23,16 +23,44 @@ export function getAddonInfoValue(addon: Addon, key: string): any {
   return foundKey ? info[foundKey as keyof typeof info] : undefined;
 }
 
-export function isPlaceholderAuthorName(value: unknown, identities: string[] = []): boolean {
-  const name = typeof value === 'string' ? value.trim() : '';
-  if (!name) return true;
+export function cleanAuthorName(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  let cleaned = value.trim();
+  if (!cleaned) return '';
 
-  const normalized = name.toLowerCase();
-  if (/^\d+$/.test(name) || normalized === 'author_name' || normalized === '[unknown]') {
+  return cleaned
+    .replace(/^(by|von|par|de|por|от)\s+/i, '')
+    .replace(/^(creado por|criado por|créé par)\s+/i, '')
+    .replace(/^(创作者|創作者|作者|作成者|投稿者|제작자|작성자|Создатель)\s*[：:]\s*/i, '')
+    .replace(/^由\s+/, '')
+    .replace(/\s+發表$/, '')
+    .replace(/\s+创作$/, '')
+    .trim();
+}
+
+export function isPlaceholderAuthorName(value: unknown, identities: string[] = []): boolean {
+  const rawName = typeof value === 'string' ? value.trim() : '';
+  if (!rawName) return true;
+
+  const cleaned = cleanAuthorName(rawName);
+  if (!cleaned) return true;
+
+  const normalized = cleaned.toLowerCase();
+  if (
+    /^\d+$/.test(cleaned) ||
+    normalized === 'author_name' ||
+    normalized === '[unknown]' ||
+    normalized === 'unknown author' ||
+    normalized === '未知作者' ||
+    normalized === '未知'
+  ) {
     return true;
   }
 
-  return identities.some((identity) => normalized === String(identity || '').trim().toLowerCase());
+  return identities.some((identity) => {
+    const normId = String(identity || '').trim().toLowerCase();
+    return normId !== '' && (normalized === normId || rawName.toLowerCase() === normId);
+  });
 }
 
 // Category mappings from keys
@@ -146,19 +174,19 @@ export const getAddonAuthor = (addon: Addon): string => {
   if (!addon) return 'Unknown Author';
   const author = getAddonInfoValue(addon, 'addonauthor') || getAddonInfoValue(addon, 'author');
   if (typeof author === 'string' && !isPlaceholderAuthorName(author)) {
-    return author.trim();
+    return cleanAuthorName(author);
   }
   const workshopAuthor = addon.workshopDetails?.creatorName || addon.workshopDetails?.authorName;
   if (typeof workshopAuthor === 'string' && !isPlaceholderAuthorName(workshopAuthor)) {
-    return workshopAuthor.trim();
+    return cleanAuthorName(workshopAuthor);
   }
   const steamAuthor = addon.steamDetails?.creator_name;
   if (typeof steamAuthor === 'string' && !isPlaceholderAuthorName(steamAuthor)) {
-    return steamAuthor;
+    return cleanAuthorName(steamAuthor);
   }
   const steamCreator = addon.steamDetails?.creator;
   if (typeof steamCreator === 'string' && !isPlaceholderAuthorName(steamCreator)) {
-    return steamCreator;
+    return cleanAuthorName(steamCreator);
   }
   return 'Unknown Author';
 };
