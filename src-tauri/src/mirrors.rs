@@ -35,6 +35,12 @@ impl MirrorManager {
     pub fn client_builder_for(url: &str) -> reqwest::ClientBuilder {
         let rules = load_rules();
         let insecure_tls = matching_rule(url, &rules).is_some_and(|rule| rule.insecure_tls);
+        if insecure_tls {
+            log::warn!(
+                "Insecure TLS certificate validation enabled for mirror URL: {}",
+                url
+            );
+        }
 
         reqwest::Client::builder().danger_accept_invalid_certs(insecure_tls)
     }

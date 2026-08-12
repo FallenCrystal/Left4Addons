@@ -15,6 +15,24 @@ fn test_read_string() {
     let s2 = read_string(buf, &mut offset);
     assert_eq!(s2, "world");
     assert_eq!(offset, 12);
+
+    // Call past EOF should safely return empty string without panic
+    let s3 = read_string(buf, &mut offset);
+    assert_eq!(s3, "");
+    assert_eq!(offset, 12);
+}
+
+#[test]
+fn test_read_string_truncated() {
+    let buf = b"no_null_terminator";
+    let mut offset = 0;
+    let s = read_string(buf, &mut offset);
+    assert_eq!(s, "no_null_terminator");
+    assert_eq!(offset, buf.len());
+
+    // Subsequent read past end returns empty string safely
+    let s_eof = read_string(buf, &mut offset);
+    assert_eq!(s_eof, "");
 }
 
 #[test]

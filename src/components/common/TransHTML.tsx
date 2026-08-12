@@ -9,9 +9,32 @@ interface TransHTMLProps {
   style?: React.CSSProperties;
 }
 
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 export const TransHTML: React.FC<TransHTMLProps> = ({ i18nKey, values, className, style }) => {
   const { t } = useTranslation();
-  const text = t(i18nKey, values);
+
+  const sanitizedValues = React.useMemo(() => {
+    if (!values) return undefined;
+    const result: Record<string, any> = {};
+    for (const [key, val] of Object.entries(values)) {
+      if (typeof val === 'string') {
+        result[key] = escapeHtml(val);
+      } else {
+        result[key] = val;
+      }
+    }
+    return result;
+  }, [values]);
+
+  const text = t(i18nKey, sanitizedValues);
 
   if (Array.isArray(text)) {
     return (

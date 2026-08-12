@@ -4,9 +4,13 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn open_workshop(workshop_id: String) -> Result<(), String> {
+    let trimmed = workshop_id.trim();
+    if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("Invalid workshop ID: must contain digits only".to_string());
+    }
     let url = format!(
         "https://steamcommunity.com/sharedfiles/filedetails/?id={}",
-        workshop_id
+        trimmed
     );
     open::that(&url).map_err(|e| format!("Failed to open workshop URL: {}", e))?;
     Ok(())
@@ -56,7 +60,7 @@ pub fn show_in_folder(path: &Path) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         let mut cmd = std::process::Command::new("explorer");
-        let path_str = canonical.to_string_lossy();
+        let path_str = canonical.to_string_lossy().replace('"', "");
         if canonical.is_file() {
             cmd.raw_arg(format!(r#"/select,"{}""#, path_str));
         } else {

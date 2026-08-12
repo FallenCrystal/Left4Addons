@@ -7,12 +7,17 @@ use std::path::Path;
 use super::types::{AddonMetadata, VpkEntry, VpkFileToWrite};
 
 pub(crate) fn read_string(buf: &[u8], offset: &mut usize) -> String {
+    if *offset >= buf.len() {
+        return String::new();
+    }
     let start = *offset;
     while *offset < buf.len() && buf[*offset] != 0 {
         *offset += 1;
     }
     let s = String::from_utf8_lossy(&buf[start..*offset]).into_owned();
-    *offset += 1; // skip null terminator
+    if *offset < buf.len() {
+        *offset += 1; // skip null terminator if present
+    }
     s
 }
 

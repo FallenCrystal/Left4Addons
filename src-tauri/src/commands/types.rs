@@ -98,6 +98,13 @@ pub fn sanitize_vpk_filename(name: &str, settings: &RenameSettings) -> String {
         base_str = base_str.trim().to_string();
     }
 
+    let trimmed_dots = base_str.trim_matches(|c| c == '.' || c == ' ');
+    if trimmed_dots.is_empty() || trimmed_dots == ".." || trimmed_dots == "." {
+        base_str = "addon".to_string();
+    } else {
+        base_str = trimmed_dots.to_string();
+    }
+
     format!("{}.vpk", base_str)
 }
 
