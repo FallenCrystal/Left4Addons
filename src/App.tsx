@@ -1,699 +1,194 @@
-import { invoke } from '@tauri-apps/api/core';
-import { AlertCircle, CheckCircle, RefreshCw, FileText } from 'lucide-react';
-import { useAddonManager } from './hooks/useAddonManager';
-import { useTranslation } from 'react-i18next';
+import { useCallback, useEffect, useState } from 'react';
+import {
+  getDashboardSnapshot,
+  isTauriRuntime,
+  resolveReconcileIssue,
+  scanWorkspace,
+  subscribeCoreEvents,
+  syncWorkshop,
+  type DashboardSnapshot,
+  type ReconcileAction,
+  type SyncReport,
+} from './api/ipc';
 
-// Components
-import { Sidebar } from './components/layout/Sidebar';
-import { TopBar } from './components/layout/TopBar';
-import { AddonCard } from './components/addons/AddonCard';
-import { GroupCard } from './components/addons/GroupCard';
-import { ConfirmModal } from './components/modals/ConfirmModal';
-import { MoveWarningModal } from './components/modals/MoveWarningModal';
-import { LinkConfirmModal } from './components/modals/LinkConfirmModal';
-import { RenameModal } from './components/modals/RenameModal';
-import { GroupModal } from './components/modals/GroupModal';
-import { EditGroupModal } from './components/modals/EditGroupModal';
-import { SettingsView } from './components/addons/SettingsView';
-import { DetailModal } from './components/modals/DetailModal';
-import { WorkshopActionWarningModal } from './components/modals/WorkshopActionWarningModal';
-import { StatsBar } from './components/layout/StatsBar';
-import { GroupHeader } from './components/addons/GroupHeader';
-import { BatchActionBar } from './components/layout/BatchActionBar';
-import { KnownUninstalledView } from './components/addons/KnownUninstalledView';
-import { WorkshopBrowser } from './components/workshop/WorkshopBrowser';
-import { MasterCollectionModal } from './components/modals/MasterCollectionModal';
-import { DeleteConfirmModal } from './components/modals/DeleteConfirmModal';
-import { MasterCollectionHeader } from './components/addons/MasterCollectionHeader';
-import { AddToGroupModal } from './components/modals/AddToGroupModal';
-import { PromptModal } from './components/modals/PromptModal';
-import { TaskCenterModal } from './components/modals/TaskCenterModal';
-import { DependencyPromptContainer } from './components/addons/DependencyPromptContainer';
-import { useState } from 'react';
-import { sortAddonsDownloadedFirst } from './utils/addonHelpers';
-import { findKnownWorkshopEntry } from './utils/workshopKnown';
+export function App() {
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
+  const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-function App() {
-  const { t } = useTranslation();
-  const {
-    addons,
-    knownUninstalledAddons,
-    groups,
-    masterCollections,
-    settings,
-    loading,
-    searchQuery,
-    setSearchQuery,
-    currentFilterTab,
-    selectedGroupId,
-    selectedMasterCollectionId,
-    selectedCategory,
-    setSelectedCategory,
-    sortBy,
-    setSortBy,
-    toasts,
-    addToast,
-    syncingSteam,
-    autoGrouping,
-    selectedIds,
-    selectedGroupIds,
-    isSelectMode,
-    setIsSelectMode,
-    isSubmitting,
-    setIsSubmitting,
-    downloadProgress,
+  const refresh = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const next = await getDashboardSnapshot();
+      setSnapshot(next);
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    }
+  }, []);
 
-    // Modals state
-    detailModal,
-    setDetailModal,
-    moveWarningModal,
-    setMoveWarningModal,
-    renameModal,
-    setRenameModal,
-    groupModal,
-    setGroupModal,
-    editGroupModal,
-    setEditGroupModal,
-    linkConfirmModal,
-    setLinkConfirmModal,
-    confirmModal,
-    setConfirmModal,
-    workshopActionModal,
-    setWorkshopActionModal,
+  useEffect(() => {
+    if (!isTauriRuntime()) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
 
-    // Handlers
-    fetchData,
-    applyDatabaseUpdate,
-    handleOpenLink,
-    handleOpenInFileManager,
-    toggleAddon,
-    toggleGroupAddons,
-    moveAddon,
-    handleMoveClick,
-    syncSteamDetails,
-    runAutoGrouping,
-    saveSettings,
-    submitRename,
-    handleCreateGroup,
-    handleDeleteGroup,
-    handleRenameGroup,
-    groupActionBatch,
-    addAddonToGroup,
-    triggerRenameModal,
-    handleSelectToggle,
-    handleSelectGroupToggle,
-    handleSelectAll,
-    handleSelectAllGroups,
-    handleClearSelection,
-    handleBatchToggle,
-    handleBatchMove,
-    handleBatchRename,
-    handleBatchAddToGroup,
-    handleFilterTabChange,
-    downloadAddon,
-    downloadAddons,
-    deleteAddons,
-    executeRealDelete,
-    deleteConfirmModal,
-    setDeleteConfirmModal,
-    handleBatchDownload,
-    recordSeenItems,
-    backgroundTasks,
-    cancelTask,
-    retryTask,
-    removeTask,
-    clearFinishedTasks,
+    void getDashboardSnapshot()
+      .then((next) => {
+        if (!active) return;
+        setSnapshot(next);
+        setError(null);
+      })
+      .catch((err) => {
+        if (!active) return;
+        setError(String(err));
+      });
 
-    // Master Collection handlers
-    handleCreateMasterCollection,
-    handleDeleteMasterCollection,
-    handleRenameMasterCollection,
-    handleBatchAddGroupsToMasterCollection,
+    void subscribeCoreEvents((ev) => {
+      if (!active) return;
+      if (ev.type === 'snapshot_updated') {
+        void refresh();
+      } else if (ev.type === 'watch_error') {
+        setError(ev.message);
+      }
+    }).then((fn) => {
+      if (!active) {
+        fn();
+        return;
+      }
+      unlisten = fn;
+    });
 
-    // Derived values
-    filteredItems,
-    renderedItems,
-    totalAddonsCount,
-    activeCount,
-    disabledCount,
-    totalStorageSize,
-    currentGroup,
-    currentMasterCollection,
-    renameAddonObj,
-    renameGroupObj,
-  } = useAddonManager();
+    return () => {
+      active = false;
+      unlisten?.();
+    };
+  }, [refresh]);
 
-  const [masterCollectionModal, setMasterCollectionModal] = useState(false);
-  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
-  const [addToGroupModal, setAddToGroupModal] = useState(false);
-  const [singleAddToGroupAddonId, setSingleAddToGroupAddonId] = useState<string | null>(null);
-  const [addToMcModal, setAddToMcModal] = useState(false);
-  const [renameCollectionModal, setRenameCollectionModal] = useState<{ open: boolean; collectionId: string; currentName: string }>({
-    open: false,
-    collectionId: '',
-    currentName: ''
-  });
+  async function handleScan() {
+    setBusy(true);
+    try {
+      setSnapshot(await scanWorkspace());
+      setError(null);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  // Available categories list
-  const categoriesList = [
-    'All', 'Campaign', 'Survivor', 'Weapon Model', 'Script',
-    'Map', 'Skin', 'Sound/Music', 'Infected', 'UI/Textures', 'Other'
-  ];
+  async function handleSync() {
+    setBusy(true);
+    try {
+      setSyncReport(await syncWorkshop());
+      await refresh();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-  // Get all addons (installed + uninstalled) for group rendering
-  const getAllGroupAddons = (groupAddonIds: string[]) => {
-    return sortAddonsDownloadedFirst(
-      groupAddonIds
-      .map(id => addons[id] || knownUninstalledAddons[id])
-      .filter(Boolean)
-    );
-  };
-
-  // Get groups in current master collection
-  const groupsInMasterCollection = currentMasterCollection
-    ? groups.filter(g => currentMasterCollection.groupIds.includes(g.id))
-    : [];
-
-  const resolvedDetailModalAddon = detailModal.addon
-    ? addons[detailModal.addon.id]
-      || knownUninstalledAddons[detailModal.addon.id]
-      || findKnownWorkshopEntry(addons, detailModal.addon.workshopId)
-      || findKnownWorkshopEntry(knownUninstalledAddons, detailModal.addon.workshopId)
-      || detailModal.addon
-    : null;
+  async function handleResolve(issueId: string, action: ReconcileAction) {
+    setBusy(true);
+    try {
+      setSnapshot(await resolveReconcileIssue(issueId, action));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
-    <div className="app-layout">
-      {/* Toast Notification Container */}
-      <div className="toast-container">
-        {toasts.map((toast) => (
-          <div key={toast.id} className={`toast ${toast.type === 'error' ? 'toast-error' : 'toast-success'}`}>
-            {toast.type === 'error' ? <AlertCircle size={18} /> : <CheckCircle size={18} />}
-            <span>{toast.message}</span>
-          </div>
-        ))}
-      </div>
+    <main className="shell">
+      <header className="panel header">
+        <div>
+          <h1>Left4Addons v2 Core Workbench</h1>
+          <p className="muted">
+            多 Crate Rust 底座 + SQLite 引擎 + Dummy Bypass v2 对账状态机 · 前端交互壳占位
+          </p>
+        </div>
+        <div className="actions">
+          <button disabled={busy || !isTauriRuntime()} onClick={() => void handleScan()}>
+            扫描与对账
+          </button>
+          <button disabled={busy || !isTauriRuntime()} onClick={() => void handleSync()}>
+            工坊生命周期同步
+          </button>
+        </div>
+      </header>
 
-      <Sidebar
-        addons={addons}
-        groups={groups}
-        masterCollections={masterCollections}
-        currentFilterTab={currentFilterTab}
-        selectedGroupId={selectedGroupId}
-        selectedMasterCollectionId={selectedMasterCollectionId}
-        onFilterTabChange={handleFilterTabChange}
-        onOpenGroupModal={() => setGroupModal({ open: true })}
-        onOpenMasterCollectionModal={() => setMasterCollectionModal(true)}
-        onAutoGrouping={runAutoGrouping}
-        autoGrouping={autoGrouping}
-        disabledCount={disabledCount}
-        totalAddonsCount={totalAddonsCount}
-        knownUninstalledCount={Object.keys(knownUninstalledAddons).length}
-      />
-
-      {/* Main Panel */}
-      <div className="main-content">
-        {currentFilterTab === 'settings' ? (
-          <SettingsView
-            settings={settings}
-            isSubmitting={isSubmitting}
-            onConfirm={saveSettings}
-            onShowToast={addToast}
-          />
-        ) : currentFilterTab === 'known-uninstalled' ? (
-          <KnownUninstalledView
-            knownUninstalledAddons={knownUninstalledAddons}
-            downloadProgress={downloadProgress}
-            onDownload={downloadAddon}
-            onDelete={deleteAddons}
-            isSubmitting={isSubmitting}
-            onOpenLink={handleOpenLink}
-            isSelectMode={isSelectMode}
-            onToggleSelectMode={() => {
-              if (isSelectMode) {
-                handleClearSelection();
-              } else {
-                setIsSelectMode(true);
-              }
-            }}
-            selectedIds={selectedIds}
-            onSelectToggle={handleSelectToggle}
-            onSelectAll={handleSelectAll}
-            onBatchDownload={handleBatchDownload}
-            searchQuery={searchQuery}
-            onSearchQueryChange={setSearchQuery}
-            onDetailClick={(addon) => setDetailModal({ open: true, addon })}
-            backgroundTasks={backgroundTasks}
-            syncingSteam={syncingSteam}
-            onOpenTaskCenter={() => setTaskCenterOpen(true)}
-            onWarning={(message: string) => {
-              addToast(message, 'error');
-            }}
-          />
-        ) : currentFilterTab === 'workshop-browser' ? (
-          <WorkshopBrowser
-            addons={addons}
-            knownUninstalledAddons={knownUninstalledAddons}
-            downloadProgress={downloadProgress}
-            onDownload={downloadAddon}
-            onDownloadMany={downloadAddons}
-            onOpenLink={handleOpenLink}
-            onImportCollection={async (name, itemIds) => {
-              await handleCreateGroup(name, itemIds, undefined, undefined, 'workshop-import');
-            }}
-            onRecordSeenItems={recordSeenItems}
-            onDatabaseUpdate={applyDatabaseUpdate}
-            isSubmitting={isSubmitting}
-            groups={groups}
-            backgroundTasks={backgroundTasks}
-            syncingSteam={syncingSteam}
-            onOpenTaskCenter={() => setTaskCenterOpen(true)}
-            workshopSourceSettings={settings.workshopSourceSettings}
-          />
-        ) : (
-          <>
-            <TopBar
-              searchQuery={searchQuery}
-              onSearchQueryChange={setSearchQuery}
-              selectedCategory={selectedCategory}
-              onCategoryChange={setSelectedCategory}
-              sortBy={sortBy}
-              onSortByChange={setSortBy}
-              syncingSteam={syncingSteam}
-              categoriesList={categoriesList}
-              isSelectMode={isSelectMode}
-              onToggleSelectMode={() => {
-                if (isSelectMode) {
-                  handleClearSelection();
-                } else {
-                  setIsSelectMode(true);
-                }
-              }}
-              backgroundTasks={backgroundTasks}
-              onOpenTaskCenter={() => setTaskCenterOpen(true)}
-            />
-
-            {/* Content body */}
-            <div className="content-body">
-              {/* Master Collection header */}
-              {currentMasterCollection && (
-                <MasterCollectionHeader
-                  currentMasterCollection={currentMasterCollection}
-                  groupsInCollection={groupsInMasterCollection}
-                  onRenameCollection={() => {
-                    setRenameCollectionModal({
-                      open: true,
-                      collectionId: currentMasterCollection.id,
-                      currentName: currentMasterCollection.name
-                    });
-                  }}
-                  onDeleteCollection={() => handleDeleteMasterCollection(currentMasterCollection.id)}
-                />
-              )}
-
-              {/* Group details header */}
-              {currentGroup && (
-                <GroupHeader
-                  currentGroup={currentGroup}
-                  groupAddons={getAllGroupAddons(currentGroup.addons)}
-                  onRenameGroup={() => setEditGroupModal({
-                    open: true,
-                    groupId: currentGroup.id,
-                    name: currentGroup.name,
-                    tags: currentGroup.tags || [],
-                    workshopCollectionId: currentGroup.workshopCollectionId || ''
-                  })}
-                  onDeleteGroup={() => handleDeleteGroup(currentGroup.id)}
-                  onGroupActionBatch={(actionType) => groupActionBatch(currentGroup.id, actionType)}
-                  onDownloadUninstalled={handleBatchDownload}
-                  downloadProgress={downloadProgress}
-                />
-              )}
-
-              {/* Stats bar */}
-              {currentFilterTab !== 'groups' && currentFilterTab !== 'master-collection' && (
-                <StatsBar
-                  totalAddonsCount={totalAddonsCount}
-                  activeCount={activeCount}
-                  disabledCount={disabledCount}
-                  totalStorageSize={totalStorageSize}
-                />
-              )}
-
-              {/* Loading empty states */}
-              {loading ? (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '300px', color: 'var(--md-sys-color-outline)' }}>
-                  <RefreshCw className="animate-spin" size={36} />
-                  <p style={{ marginTop: '16px' }}>{t('common.parsing')}</p>
-                </div>
-              ) : renderedItems.length === 0 ? (
-                <div className="empty-state">
-                  <FileText className="empty-icon" size={64} />
-                  <div className="empty-title">{t('common.emptyStateTitle')}</div>
-                  <div className="empty-desc">
-                    {t('common.emptyStateDesc')}
-                  </div>
-                  <button className="btn btn-primary" onClick={() => fetchData(true)} disabled={loading || isSubmitting}>
-                    <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
-                    <span>{loading ? t('common.scanning') : t('common.rescan')}</span>
-                  </button>
-                </div>
-              ) : (
-                <div className="addons-grid">
-                  {renderedItems.map(renderedItem => {
-                    if (renderedItem.type === 'group') {
-                      const groupAddons = renderedItem.addons;
-                      const allGroupAddons = getAllGroupAddons(renderedItem.groupObj.addons);
-                      const isGroupSelected = currentFilterTab === 'master-collection'
-                        ? selectedGroupIds.includes(renderedItem.groupObj.id)
-                        : groupAddons.every(ad => selectedIds.includes(ad.id));
-                      return (
-                        <GroupCard
-                          key={renderedItem.id}
-                          group={renderedItem.groupObj}
-                          addons={allGroupAddons}
-                          onToggleGroup={toggleGroupAddons}
-                          onViewGroupDetails={(groupId) => {
-                            handleFilterTabChange('groups', groupId);
-                          }}
-                          onOpenInFileManager={handleOpenInFileManager}
-                          onDownloadUninstalled={handleBatchDownload}
-                          isSelectMode={isSelectMode}
-                          isGroupSelected={isGroupSelected}
-                          onSelectGroupToggle={handleSelectGroupToggle}
-                          isSubmitting={isSubmitting}
-                          downloadProgress={downloadProgress}
-                        />
-                      );
-                    } else {
-                      const addonData = renderedItem.data;
-                      return (
-                        <AddonCard
-                          key={renderedItem.id}
-                          addon={addonData}
-                          groups={groups}
-                          onToggle={toggleAddon}
-                          onAddToGroup={(addonId) => {
-                            setSingleAddToGroupAddonId(addonId);
-                            setAddToGroupModal(true);
-                          }}
-                          onOpenLink={handleOpenLink}
-                          onOpenInFileManager={handleOpenInFileManager}
-                          onMoveClick={handleMoveClick}
-                          onRenameClick={triggerRenameModal}
-                          onDetailClick={(addon) => setDetailModal({ open: true, addon })}
-                          onDeleteClick={(addon) => setDeleteConfirmModal({ open: true, addons: [addon], removeFromKnown: false })}
-                          onDownload={downloadAddon}
-                          isSelectMode={isSelectMode}
-                          isSelected={selectedIds.includes(addonData.id)}
-                          onSelectToggle={handleSelectToggle}
-                          isSubmitting={isSubmitting}
-                          downloadProgress={downloadProgress}
-                        />
-                      );
-                    }
-                  })}
-                </div>
-              )}
-            </div>
-          </>
-        )}
-      </div>
-
-      {/* Modals */}
-      <DetailModal
-        open={detailModal.open}
-        addon={resolvedDetailModalAddon}
-        groups={groups}
-        onCancel={() => setDetailModal({ open: false, addon: null })}
-        onToggle={toggleAddon}
-        onMove={handleMoveClick}
-        onOpenLink={handleOpenLink}
-        addons={addons}
-        knownUninstalledAddons={knownUninstalledAddons}
-        onDatabaseUpdate={applyDatabaseUpdate}
-        onDownload={downloadAddon}
-        downloadProgress={downloadProgress}
-        isSubmitting={isSubmitting}
-        onItemNavigate={(workshopId) => {
-          const foundAddon = Object.values(addons).find((a) => a.workshopId === workshopId) ||
-                             Object.values(knownUninstalledAddons).find((a) => a.workshopId === workshopId);
-          if (foundAddon) {
-            setDetailModal({ open: true, addon: foundAddon });
-          } else {
-            setDetailModal({
-              open: true,
-              addon: {
-                id: workshopId,
-                vpkName: workshopId,
-                workshopId: workshopId,
-                dirType: 'none',
-                isEnabled: false,
-                fileSize: 0,
-                filesCount: 0,
-              }
-            });
-          }
-        }}
-      />
-
-      <MoveWarningModal
-        open={moveWarningModal.open}
-        id={moveWarningModal.id}
-        currentDirType={moveWarningModal.currentDirType}
-        workshopId={moveWarningModal.workshopId}
-        onCancel={() => {
-          setMoveWarningModal({ open: false, id: '', currentDirType: '', workshopId: '' });
-          setIsSubmitting(false);
-        }}
-        onConfirm={async (id, currentDirType, unsubscribe) => {
-          if (unsubscribe && moveWarningModal.workshopId) {
-            await invoke('open_url', { url: `steam://url/CommunityFilePage/${moveWarningModal.workshopId}` });
-          }
-          await moveAddon(id, currentDirType);
-          setMoveWarningModal({ open: false, id: '', currentDirType: '', workshopId: '' });
-        }}
-      />
-
-      <LinkConfirmModal
-        open={linkConfirmModal.open}
-        url={linkConfirmModal.url}
-        onCancel={() => setLinkConfirmModal({ open: false, url: '' })}
-        onConfirm={async (url) => {
-          try {
-            await invoke('open_url', { url });
-          } catch (err) {
-            console.error('Failed to open link:', err);
-          }
-          setLinkConfirmModal({ open: false, url: '' });
-        }}
-      />
-
-      <RenameModal
-        open={renameModal.open}
-        currentName={renameModal.currentName}
-        title={renameModal.title}
-        suggestedName={renameModal.suggestedName}
-        addon={renameAddonObj}
-        itemGroup={renameGroupObj}
-        addons={addons}
-        renameSettings={settings.renameSettings}
-        isSubmitting={isSubmitting}
-        onCancel={() => {
-          setRenameModal({ open: false, currentName: '', title: '', suggestedName: '' });
-          setIsSubmitting(false);
-        }}
-        onConfirm={submitRename}
-      />
-
-      <GroupModal
-        open={groupModal.open}
-        isSubmitting={isSubmitting}
-        onCancel={() => {
-          setGroupModal({ open: false });
-          setIsSubmitting(false);
-        }}
-        onConfirm={(name) => handleCreateGroup(name)}
-      />
-
-      <EditGroupModal
-        open={editGroupModal.open}
-        groupId={editGroupModal.groupId}
-        currentName={editGroupModal.name}
-        currentTags={editGroupModal.tags}
-        currentCollectionId={editGroupModal.workshopCollectionId}
-        addonsInGroup={currentGroup ? getAllGroupAddons(currentGroup.addons) : []}
-        isSubmitting={isSubmitting}
-        onCancel={() => {
-          setEditGroupModal({ open: false, groupId: '', name: '', tags: [], workshopCollectionId: '' });
-          setIsSubmitting(false);
-        }}
-        onConfirm={handleRenameGroup}
-      />
-
-      <ConfirmModal
-        open={confirmModal.open}
-        title={confirmModal.title}
-        message={confirmModal.message}
-        onConfirm={confirmModal.onConfirm || (() => {})}
-        onCancel={() => {
-          setConfirmModal({ open: false, title: '', message: '', onConfirm: null });
-          setIsSubmitting(false);
-        }}
-      />
-
-      <DeleteConfirmModal
-        open={deleteConfirmModal.open}
-        addons={deleteConfirmModal.addons}
-        isSubmitting={isSubmitting}
-        onCancel={() => {
-          setDeleteConfirmModal({ open: false, addons: [], removeFromKnown: false });
-          setIsSubmitting(false);
-        }}
-        onConfirm={(deleteMode) => {
-          executeRealDelete(deleteMode, deleteConfirmModal.removeFromKnown, deleteConfirmModal.addons.map(a => a.id));
-        }}
-      />
-
-      <WorkshopActionWarningModal
-        open={workshopActionModal.open}
-        actionName={workshopActionModal.actionName}
-        addons={workshopActionModal.addons}
-        onCancel={() => {
-          setWorkshopActionModal({ open: false, actionName: '', addons: [], onProceed: null });
-          setIsSubmitting(false);
-        }}
-        onConfirm={(skipWarning) => {
-          if (skipWarning) {
-            sessionStorage.setItem('skipWorkshopWarning', 'true');
-          }
-          if (workshopActionModal.onProceed) {
-            workshopActionModal.onProceed();
-          }
-          setWorkshopActionModal({ open: false, actionName: '', addons: [], onProceed: null });
-        }}
-      />
-
-      {/* Master Collection Modal */}
-      <MasterCollectionModal
-        open={masterCollectionModal}
-        isSubmitting={isSubmitting}
-        onCancel={() => setMasterCollectionModal(false)}
-        onConfirm={async (name) => {
-          await handleCreateMasterCollection(name);
-          setMasterCollectionModal(false);
-        }}
-      />
-
-      {/* Rename Master Collection Prompt Modal */}
-      <PromptModal
-        open={renameCollectionModal.open}
-        title={t('masterCollections.renameCollection')}
-        defaultValue={renameCollectionModal.currentName}
-        placeholder={t('masterCollections.collectionNamePlaceholder')}
-        onCancel={() => setRenameCollectionModal({ open: false, collectionId: '', currentName: '' })}
-        onConfirm={async (newName) => {
-          if (newName.trim()) {
-            await handleRenameMasterCollection(renameCollectionModal.collectionId, newName.trim());
-          }
-          setRenameCollectionModal({ open: false, collectionId: '', currentName: '' });
-        }}
-      />
-
-      {/* Add to Group Modal */}
-      <AddToGroupModal
-        open={addToGroupModal}
-        groups={groups}
-        isSubmitting={isSubmitting}
-        onCancel={() => {
-          setAddToGroupModal(false);
-          setSingleAddToGroupAddonId(null);
-        }}
-        onConfirm={async (groupId) => {
-          if (singleAddToGroupAddonId) {
-            await addAddonToGroup(singleAddToGroupAddonId, groupId);
-          } else {
-            await handleBatchAddToGroup(groupId);
-          }
-          setAddToGroupModal(false);
-          setSingleAddToGroupAddonId(null);
-        }}
-      />
-
-      {/* Add to Master Collection Modal */}
-      <AddToGroupModal
-        open={addToMcModal}
-        groups={masterCollections.map(mc => ({
-          id: mc.id,
-          name: mc.nameKey ? t(mc.nameKey, mc.name) : mc.name,
-          addons: [],
-          masterCollectionIds: [],
-        }))}
-        isSubmitting={isSubmitting}
-        onCancel={() => setAddToMcModal(false)}
-        onConfirm={async (mcId) => {
-          await handleBatchAddGroupsToMasterCollection(mcId);
-          setAddToMcModal(false);
-        }}
-      />
-
-      {/* Task Center Modal */}
-      <TaskCenterModal
-        open={taskCenterOpen}
-        onCancel={() => setTaskCenterOpen(false)}
-        backgroundTasks={backgroundTasks}
-        downloadProgress={downloadProgress}
-        syncingSteam={syncingSteam}
-        onSyncSteam={syncSteamDetails}
-        onCancelTask={cancelTask}
-        onRetryTask={retryTask}
-        onRemoveTask={removeTask}
-        onClearFinishedTasks={clearFinishedTasks}
-        workshopSourceSettings={settings.workshopSourceSettings}
-      />
-
-      {/* Dependency Prompt Container */}
-      <DependencyPromptContainer
-        addons={addons}
-        knownUninstalledAddons={knownUninstalledAddons}
-        backgroundTasks={backgroundTasks}
-        settings={settings}
-        onDownload={downloadAddons}
-        onGoToSettings={() => {
-          handleFilterTabChange('settings', null);
-        }}
-      />
-
-      {/* Floating Batch Action Bar */}
-      {isSelectMode && (
-        <BatchActionBar
-          selectedIds={selectedIds}
-          filteredItems={filteredItems}
-          addons={addons}
-          knownUninstalledAddons={knownUninstalledAddons}
-          groups={groups}
-          masterCollections={masterCollections}
-          selectedGroupIds={selectedGroupIds}
-          onSelectAll={handleSelectAll}
-          onSelectAllGroups={handleSelectAllGroups}
-          onBatchToggle={handleBatchToggle}
-          onBatchMove={handleBatchMove}
-          onBatchRename={handleBatchRename}
-          onBatchAddToGroup={() => setAddToGroupModal(true)}
-          onBatchAddToMasterCollection={() => setAddToMcModal(true)}
-          onBatchDownload={handleBatchDownload}
-          onBatchDelete={(ids) => {
-            const items = ids.map(id => addons[id] || knownUninstalledAddons[id]).filter(Boolean);
-            setDeleteConfirmModal({ open: true, addons: items, removeFromKnown: false });
-          }}
-          onBatchRemoveFromKnown={(ids) => {
-            deleteAddons(ids, false, true);
-          }}
-          onClearSelection={handleClearSelection}
-          isSubmitting={isSubmitting}
-        />
+      {!isTauriRuntime() && (
+        <section className="panel notice">
+          当前运行于纯浏览器预览模式。桌面核心引擎命令需通过 <code>npm run tauri:dev</code> 启动 Tauri
+          窗口；独立后端控制台请运行 <code>npm run server:run</code> 并访问 <code>/admin</code>。
+        </section>
       )}
-    </div>
+
+      {error && <section className="panel error">{error}</section>}
+
+      {snapshot && (
+        <>
+          <section className="grid">
+            <div className="panel stat">
+              <span className="muted">已知 Addons</span>
+              <strong>{snapshot.addons.length}</strong>
+            </div>
+            <div className="panel stat">
+              <span className="muted">对账待处理告警</span>
+              <strong>{snapshot.openIssues.length}</strong>
+            </div>
+            <div className="panel stat">
+              <span className="muted">Bundle / 预设 / 自定义组</span>
+              <strong>
+                {snapshot.bundles.length} / {snapshot.profiles.length} / {snapshot.userGroups.length}
+              </strong>
+            </div>
+            <div className="panel stat">
+              <span className="muted">追踪合集</span>
+              <strong>{snapshot.collections.length}</strong>
+            </div>
+          </section>
+
+          <section className="panel">
+            <h2>Dummy Bypass v2 与目录对账告警</h2>
+            {snapshot.openIssues.length === 0 ? (
+              <p className="muted">暂无目录漂移或游戏覆写告警。</p>
+            ) : (
+              <ul className="list">
+                {snapshot.openIssues.map((issue) => (
+                  <li key={issue.id} className="list-item">
+                    <div>
+                      <strong>{issue.kind}</strong>
+                      <p className="muted">{issue.summary}</p>
+                    </div>
+                    <div className="actions">
+                      {issue.availableActions.map((act) => (
+                        <button
+                          key={act}
+                          disabled={busy}
+                          onClick={() => void handleResolve(issue.id, act)}
+                        >
+                          {act}
+                        </button>
+                      ))}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </>
+      )}
+
+      {syncReport && (
+        <section className="panel">
+          <h2>最近生命周期同步报告</h2>
+          <pre>{JSON.stringify(syncReport, null, 2)}</pre>
+        </section>
+      )}
+    </main>
   );
 }
 

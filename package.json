@@ -1,19 +1,21 @@
 {
   "name": "addon-manager",
   "private": true,
-  "version": "0.0.0",
-  "description": "Left 4 Dead 2 Addons Manager",
+  "version": "2.0.0-alpha.1",
+  "description": "Left 4 Dead 2 Addons Manager (v2)",
   "author": "akkariin",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "tauri:build:win-gnu": "npm run build && cargo build --release --target x86_64-pc-windows-gnu --manifest-path src-tauri/Cargo.toml",
     "lint": "oxlint",
     "preview": "vite preview",
+    "test": "vitest run",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "test": "vitest run"
+    "tauri:build:win-gnu": "npm run build && cargo build --release --target x86_64-pc-windows-gnu -p l4a-tauri",
+    "rust:test": "cargo test",
+    "server:run": "cargo run -p l4a-server --"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

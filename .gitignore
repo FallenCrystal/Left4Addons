@@ -22,8 +22,9 @@ left4addons.exe
 WebView2Loader.dll
 
 # Rust/Tauri Target
+target/
 src-tauri/target/
-steam-bridge/target/
+crates/*/target/
 
 # Editor directories and files
 .vscode/*
@@ -41,4 +42,10 @@ steam-bridge/target/
 known_addons.json
 /l4a
 package-lock.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+.env
+.env.*
 

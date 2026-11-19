@@ -1,0 +1,20 @@
+[package]
+name = "l4a-vpk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+l4a-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+crc32fast.workspace = true
+chrono.workspace = true
+image.workspace = true
+vtf.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

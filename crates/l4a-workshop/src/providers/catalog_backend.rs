@@ -1,0 +1,232 @@
+use crate::error::WorkshopError;
+use crate::provider::{ProviderCapabilities, WorkshopProvider};
+use async_trait::async_trait;
+use chrono::Utc;
+use l4a_mirror::MirrorRouter;
+use l4a_protocol::{
+    BatchItemsRequest, BatchItemsResponse, MetadataSource, SearchQuery, SearchResponse,
+    SubmissionBatchRequest, SubmissionBatchResponse, WorkshopCollectionRecord,
+    WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// 接入自托管 `l4a-server` 创意工坊信息管理后端的客户端 Provider。
+pub struct CatalogBackendProvider {
+    base_url: String,
+    mirror: Arc<MirrorRouter>,
+    timeout: Duration,
+}
+
+impl CatalogBackendProvider {
+    pub fn new(base_url: impl Into<String>, mirror: Arc<MirrorRouter>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            mirror,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    pub async fn submit_observations(
+        &self,
+        contributor_token: &str,
+        request: &SubmissionBatchRequest,
+    ) -> Result<SubmissionBatchResponse, WorkshopError> {
+        let url = format!("{}/api/v1/submissions", self.base_url);
+        let (client, _) = self
+            .mirror
+            .build_client_for(&url, Some(self.timeout))
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let (req, _) = self.mirror.prepare_post(&client, &url);
+        let resp = req
+            .bearer_auth(contributor_token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WorkshopError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        resp.json::<SubmissionBatchResponse>()
+            .await
+            .map_err(|e| WorkshopError::Parse(e.to_string()))
+    }
+}
+
+#[async_trait]
+impl WorkshopProvider for CatalogBackendProvider {
+    fn name(&self) -> &str {
+        "catalog-server"
+    }
+
+    fn source_kind(&self) -> MetadataSource {
+        MetadataSource::CatalogServer
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            fetch_items: true,
+            fetch_collection: true,
+            search: true,
+            provides_file_url: true,
+            provides_dependencies: true,
+            supports_status_tombstone: true,
+        }
+    }
+
+    async fn fetch_items(
+        &self,
+        ids: &[WorkshopId],
+    ) -> Result<Vec<WorkshopFetchOutcome>, WorkshopError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let url = format!("{}/api/v1/items/batch", self.base_url);
+        let (client, _) = self
+            .mirror
+            .build_client_for(&url, Some(self.timeout))
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let (req, _) = self.mirror.prepare_post(&client, &url);
+        let resp = req
+            .json(&BatchItemsRequest { ids: ids.to_vec() })
+            .send()
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WorkshopError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let batch: BatchItemsResponse = resp
+            .json()
+            .await
+            .map_err(|e| WorkshopError::Parse(e.to_string()))?;
+        let now = Utc::now();
+
+        let outcomes = batch
+            .items
+            .into_iter()
+            .map(|mut item| {
+                item.source = MetadataSource::CatalogServer;
+                match item.status {
+                    WorkshopItemStatus::Removed => WorkshopFetchOutcome::Removed {
+                        workshop_id: item.workshop_id,
+                        source: MetadataSource::CatalogServer,
+                        observed_at: now,
+                        reason: Some("Catalog Server 标记该条目已下架".to_string()),
+                    },
+                    WorkshopItemStatus::PrivateOrUnavailable => {
+                        WorkshopFetchOutcome::PrivateOrUnavailable {
+                            workshop_id: item.workshop_id,
+                            source: MetadataSource::CatalogServer,
+                            observed_at: now,
+                            reason: Some("Catalog Server 标记该条目为私密或不可用".to_string()),
+                        }
+                    }
+                    WorkshopItemStatus::Active | WorkshopItemStatus::Unknown => {
+                        WorkshopFetchOutcome::Found { item }
+                    }
+                }
+            })
+            .collect();
+
+        Ok(outcomes)
+    }
+
+    async fn fetch_collection(
+        &self,
+        collection_id: WorkshopId,
+    ) -> Result<WorkshopCollectionRecord, WorkshopError> {
+        let url = format!("{}/api/v1/collections/{collection_id}", self.base_url);
+        let (client, _) = self
+            .mirror
+            .build_client_for(&url, Some(self.timeout))
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let (req, _) = self.mirror.prepare_get(&client, &url);
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WorkshopError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        resp.json::<WorkshopCollectionRecord>()
+            .await
+            .map_err(|e| WorkshopError::Parse(e.to_string()))
+    }
+
+    async fn search(&self, query: &SearchQuery) -> Result<SearchResponse, WorkshopError> {
+        let url = format!("{}/api/v1/items/search", self.base_url);
+        let (client, _) = self
+            .mirror
+            .build_client_for(&url, Some(self.timeout))
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let mut params = vec![
+            ("page", query.page.to_string()),
+            ("pageSize", query.page_size.to_string()),
+        ];
+        if let Some(ref q) = query.query {
+            params.push(("q", q.clone()));
+        }
+        if let Some(ref tag) = query.tag {
+            params.push(("tag", tag.clone()));
+        }
+        if let Some(status) = query.status {
+            let status_str = serde_json::to_string(&status)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            if !status_str.is_empty() {
+                params.push(("status", status_str));
+            }
+        }
+        if let Some(ref sort) = query.sort {
+            if !sort.trim().is_empty() {
+                params.push(("sort", sort.clone()));
+            }
+        }
+
+        let (req, _) = self.mirror.prepare_get(&client, &url);
+        let resp = req
+            .query(&params)
+            .send()
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(WorkshopError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        resp.json::<SearchResponse>()
+            .await
+            .map_err(|e| WorkshopError::Parse(e.to_string()))
+    }
+}

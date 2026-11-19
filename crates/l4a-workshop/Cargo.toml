@@ -1,0 +1,24 @@
+[package]
+name = "l4a-workshop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+l4a-protocol.workspace = true
+l4a-mirror.workspace = true
+l4a-steam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true

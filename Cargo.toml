@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/l4a-protocol",
+    "crates/l4a-vpk",
+    "crates/l4a-mirror",
+    "crates/l4a-steam",
+    "crates/l4a-workshop",
+    "crates/l4a-core",
+    "crates/l4a-server",
+    "crates/l4a-steam-bridge",
+    "src-tauri",
+]
+default-members = [
+    "crates/l4a-protocol",
+    "crates/l4a-vpk",
+    "crates/l4a-mirror",
+    "crates/l4a-steam",
+    "crates/l4a-workshop",
+    "crates/l4a-core",
+    "crates/l4a-server",
+]
+
+[workspace.package]
+version = "2.0.0-alpha.1"
+edition = "2021"
+rust-version = "1.77.2"
+license = "MIT"
+authors = ["akkariin"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.37", features = ["bundled", "chrono", "serde_json"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+regex = "1"
+url = "2"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+crc32fast = "1"
+bytes = "1"
+futures-util = "0.3"
+tokio-util = "0.7"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+vtf = "0.4"
+libloading = "0.8"
+notify = "6.1"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
+winreg = "0.52"
+tauri = { version = "2.11.5", features = [] }
+tauri-build = { version = "2.6.3", features = [] }
+tauri-plugin-log = "2"
+
+l4a-protocol = { path = "crates/l4a-protocol" }
+l4a-vpk = { path = "crates/l4a-vpk" }
+l4a-mirror = { path = "crates/l4a-mirror" }
+l4a-steam = { path = "crates/l4a-steam" }
+l4a-workshop = { path = "crates/l4a-workshop" }
+l4a-core = { path = "crates/l4a-core" }
+l4a-server = { path = "crates/l4a-server" }

@@ -1,36 +1,50 @@
-use std::collections::HashSet;
+mod commands;
+
+use l4a_core::{EventSink, L4aEngine};
+use l4a_protocol::CoreEvent;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex as StdMutex;
-use tauri::async_runtime::Mutex;
-use tauri::Manager;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager};
 
-pub mod commands;
-pub mod mirrors;
-pub mod steam;
-pub mod vpk;
-pub mod watcher;
-
-pub struct AppState {
-    pub settings_path: PathBuf,
-    pub groups_path: PathBuf,
-    pub known_addons_path: PathBuf,
-    pub workshop_cache_path: PathBuf,
-    pub workshop_crawl_log_path: PathBuf,
-    pub background_tasks_path: PathBuf,
-    pub cache_dir: PathBuf,
-    pub download_cache_dir: PathBuf,
-    pub workshop_service: steam::WorkshopService,
-    pub db: Mutex<commands::Database>,
-    pub workshop_cache_write_lock: StdMutex<()>,
-    pub addon_watcher: StdMutex<watcher::AddonWatcherController>,
-    pub cancelled_downloads: StdMutex<HashSet<String>>,
-    pub runtime_dir: PathBuf,
+pub struct TauriState {
+    pub engine: Arc<L4aEngine>,
 }
 
-impl Drop for AppState {
-    fn drop(&mut self) {
-        self.workshop_service.shutdown();
+struct TauriEventSink {
+    app_handle: AppHandle,
+}
+
+impl EventSink for TauriEventSink {
+    fn emit(&self, event: CoreEvent) {
+        let _ = self.app_handle.emit("l4a-core-event", event);
     }
+}
+
+fn dir_is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".l4a_write_probe_{}", std::process::id()));
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn resolve_writable_runtime_dir(app: &tauri::App, preferred: PathBuf) -> PathBuf {
+    if dir_is_writable(&preferred) {
+        return preferred;
+    }
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let fallback = app_data.join("l4a");
+        if dir_is_writable(&fallback) {
+            return fallback;
+        }
+    }
+    preferred
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -39,337 +53,88 @@ pub fn run() {
         .setup(|app| {
             let mut host_runtime_dir = std::env::current_exe()
                 .ok()
-                .and_then(|p| {
-                    p.parent().map(|d| {
-                        let is_target = d.iter().any(|c| c == "target");
-                        if cfg!(debug_assertions) && is_target {
-                            std::env::current_dir().unwrap_or_else(|_| d.to_path_buf())
-                        } else {
-                            d.to_path_buf()
-                        }
-                    })
-                })
+                .and_then(|p| p.parent().map(PathBuf::from))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-            if cfg!(debug_assertions) && host_runtime_dir.ends_with("src-tauri") {
-                if let Some(parent) = host_runtime_dir.parent() {
-                    host_runtime_dir = parent.to_path_buf();
+            if cfg!(debug_assertions) && host_runtime_dir.iter().any(|c| c == "target") {
+                host_runtime_dir = std::env::current_dir().unwrap_or(host_runtime_dir);
+                if host_runtime_dir.ends_with("src-tauri") {
+                    if let Some(parent) = host_runtime_dir.parent() {
+                        host_runtime_dir = parent.to_path_buf();
+                    }
                 }
             }
 
-            let runtime_dir = if host_runtime_dir.ends_with("l4a") {
-                host_runtime_dir.clone()
+            let preferred_dir = if host_runtime_dir.ends_with("l4a") {
+                host_runtime_dir
             } else {
                 host_runtime_dir.join("l4a")
             };
-            crate::mirrors::RUNTIME_DIR.set(runtime_dir.clone()).ok();
-            let config_dir = runtime_dir.join("config");
-            let cache_root_dir = runtime_dir.join("cache");
-            let cache_dir = cache_root_dir.join("images");
-            let download_cache_dir = cache_root_dir.join("downloading");
+            let runtime_dir = resolve_writable_runtime_dir(app, preferred_dir);
 
-            let _ = std::fs::create_dir_all(&config_dir);
-            let _ = std::fs::create_dir_all(&cache_root_dir);
-            let _ = std::fs::create_dir_all(&cache_dir);
-            let _ = std::fs::create_dir_all(&download_cache_dir);
-
-            migrate_data(
-                app.path().app_data_dir().ok().as_deref(),
-                &host_runtime_dir,
-                &runtime_dir,
-            );
-
-            let settings_path = config_dir.join("settings.json");
-            let groups_path = config_dir.join("groups.json");
-            let known_addons_path = config_dir.join("known_addons.json");
-            let workshop_cache_path = cache_root_dir.join("workshop_cache.json");
-            let workshop_crawl_log_path = cache_root_dir.join("workshop_crawl_log.jsonl");
-            let background_tasks_path = cache_root_dir.join("background_tasks.json");
-            let bridge_base_dir = std::env::current_exe()
-                .ok()
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| host_runtime_dir.clone());
-            let db = commands::load_db(
-                &settings_path,
-                &groups_path,
-                &known_addons_path,
-                &runtime_dir,
-                app.handle(),
-            );
-            let initial_loading_dir = db.settings.loading_dir.clone();
-
-            app.manage(AppState {
-                settings_path,
-                groups_path,
-                known_addons_path,
-                workshop_cache_path,
-                workshop_crawl_log_path,
-                background_tasks_path,
-                cache_dir,
-                download_cache_dir,
-                workshop_service: steam::WorkshopService::new(&bridge_base_dir),
-                db: Mutex::new(db),
-                workshop_cache_write_lock: StdMutex::new(()),
-                addon_watcher: StdMutex::new(watcher::AddonWatcherController::default()),
-                cancelled_downloads: StdMutex::new(HashSet::new()),
-                runtime_dir: runtime_dir.clone(),
+            let sink = Arc::new(TauriEventSink {
+                app_handle: app.handle().clone(),
             });
+            let engine = Arc::new(
+                L4aEngine::open_default(&runtime_dir, sink.clone())
+                    .map_err(|e| format!("初始化 L4A v2 引擎失败: {e}"))?,
+            );
 
-            if let Err(err) =
-                watcher::rebind_addon_watcher(app.handle(), Path::new(&initial_loading_dir))
-            {
-                watcher::emit_watch_error(app.handle(), &err);
+            let watcher_engine = engine.clone();
+            if let Err(err) = engine.start_watcher(Arc::new(move || {
+                let _ = watcher_engine.scan_external();
+            })) {
+                let message = format!("启动模组目录监听失败: {err}");
+                eprintln!("{message}");
+                sink.emit(CoreEvent::WatchError { message });
             }
+
+            app.manage(TauriState { engine });
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
+                        .level(tauri_plugin_log::log::LevelFilter::Info)
                         .build(),
                 )?;
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::handlers::settings::get_settings,
-            commands::handlers::settings::save_settings,
-            commands::handlers::db::get_addons,
-            commands::handlers::cache::get_cache_image,
-            commands::handlers::cache::cache_remote_image,
-            commands::handlers::addons::move_addons,
-            commands::handlers::addons::toggle_addons,
-            commands::handlers::addons::rename_addon,
-            commands::handlers::addons::rename_addons,
-            commands::handlers::addons::group_action,
-            commands::handlers::workshop::open_workshop,
-            commands::handlers::workshop::open_url,
-            commands::handlers::workshop::open_in_file_manager,
-            commands::handlers::workshop::steam_sync,
-            commands::handlers::workshop::get_workshop_capabilities,
-            commands::handlers::workshop::query_workshop_home,
-            commands::handlers::workshop::query_workshop_items,
-            commands::handlers::workshop::query_workshop_item,
-            commands::handlers::workshop::query_workshop_details,
-            commands::handlers::workshop::query_workshop_collection,
-            commands::handlers::workshop::fetch_workshop_html,
-            commands::handlers::addons::delete_addons,
-            commands::handlers::addons::download_addon,
-            commands::handlers::workshop::fetch_collection,
-            commands::handlers::workshop::add_known_addon,
-            commands::handlers::workshop::get_workshop_cache,
-            commands::handlers::workshop::record_workshop_items_seen,
-            commands::handlers::workshop::persist_workshop_page_details,
-            commands::handlers::tasks::get_background_tasks,
-            commands::handlers::tasks::save_background_task_snapshot,
-            commands::handlers::tasks::cancel_download,
-            commands::handlers::tasks::append_workshop_crawl_log,
-            commands::handlers::settings::auto_detect_addons_path,
+            commands::get_dashboard_snapshot,
+            commands::scan_workspace,
+            commands::save_config,
+            commands::detect_game_addons_path,
+            commands::get_steam_capabilities,
+            commands::sync_workshop,
+            commands::search_workshop,
+            commands::download_workshop_item,
+            commands::cancel_download,
+            commands::resolve_reconcile_issue,
+            commands::move_addons,
+            commands::toggle_addons,
+            commands::preview_rename,
+            commands::apply_renames,
+            commands::delete_addons,
+            commands::rebuild_bundles,
+            commands::create_manual_bundle,
+            commands::set_bundle_locked,
+            commands::track_collection,
+            commands::untrack_collection,
+            commands::save_user_group,
+            commands::delete_user_group,
+            commands::save_profile,
+            commands::delete_profile,
+            commands::apply_profile,
+            commands::search_by_map_code,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
-        if matches!(
-            event,
-            tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
-        ) {
-            app_handle.state::<AppState>().workshop_service.shutdown();
+        if matches!(event, tauri::RunEvent::Exit) {
+            let engine = app_handle.state::<TauriState>().engine.clone();
+            tauri::async_runtime::block_on(engine.shutdown());
         }
     });
-}
-
-fn migrate_data(app_data_dir: Option<&Path>, legacy_runtime_dir: &Path, runtime_dir: &Path) {
-    if let Some(app_data_dir) = app_data_dir {
-        if app_data_dir != runtime_dir {
-            migrate_from_root(app_data_dir, runtime_dir);
-        }
-    }
-
-    if legacy_runtime_dir != runtime_dir {
-        migrate_from_root(legacy_runtime_dir, runtime_dir);
-    }
-}
-
-fn migrate_from_root(src_root: &Path, runtime_dir: &Path) {
-    if src_root == runtime_dir {
-        return;
-    }
-
-    let target_config_dir = runtime_dir.join("config");
-    let target_cache_dir = runtime_dir.join("cache");
-    let target_image_cache_dir = target_cache_dir.join("images");
-    let target_loading_dir = runtime_dir.join("addons-loading");
-
-    let _ = std::fs::create_dir_all(&target_config_dir);
-    let _ = std::fs::create_dir_all(&target_cache_dir);
-
-    migrate_legacy_db_file(
-        &src_root.join("db.json"),
-        &target_config_dir.join("settings.json"),
-        &target_config_dir.join("groups.json"),
-        &target_config_dir.join("known_addons.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("settings.json"),
-        &target_config_dir.join("settings.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("groups.json"),
-        &target_config_dir.join("groups.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("known_addons.json"),
-        &target_config_dir.join("known_addons.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("workshop_cache.json"),
-        &target_cache_dir.join("workshop_cache.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("background_tasks.json"),
-        &target_cache_dir.join("background_tasks.json"),
-    );
-    move_file_if_missing(
-        &src_root.join("workshop_crawl_log.jsonl"),
-        &target_cache_dir.join("workshop_crawl_log.jsonl"),
-    );
-
-    let old_cache = src_root.join("cache");
-    if old_cache.exists() {
-        let _ = move_or_copy_dir(&old_cache, &target_image_cache_dir);
-    }
-
-    let old_loading = src_root.join("addons-loading");
-    if old_loading.exists() {
-        let _ = move_or_copy_dir(&old_loading, &target_loading_dir);
-    }
-}
-
-fn move_file_if_missing(src: &Path, dst: &Path) {
-    if !src.exists() || dst.exists() {
-        return;
-    }
-
-    if let Some(parent) = dst.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    if std::fs::rename(src, dst).is_ok() {
-        return;
-    }
-
-    if std::fs::copy(src, dst).is_ok() {
-        let _ = std::fs::remove_file(src);
-    }
-}
-
-fn migrate_legacy_db_file(
-    legacy_db_path: &Path,
-    settings_path: &Path,
-    groups_path: &Path,
-    known_addons_path: &Path,
-) {
-    if !legacy_db_path.exists() {
-        return;
-    }
-
-    let Ok(content) = std::fs::read_to_string(legacy_db_path) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
-
-    if !settings_path.exists() {
-        let settings = commands::SettingsStore {
-            settings: serde_json::from_value(value.get("settings").cloned().unwrap_or_default())
-                .unwrap_or_default(),
-            master_collections: serde_json::from_value(
-                value.get("masterCollections").cloned().unwrap_or_default(),
-            )
-            .unwrap_or_default(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&settings) {
-            let _ = std::fs::write(settings_path, json);
-        }
-    }
-
-    if !groups_path.exists() {
-        let groups: Vec<commands::Group> =
-            serde_json::from_value(value.get("groups").cloned().unwrap_or_default())
-                .unwrap_or_default();
-        if let Ok(json) = serde_json::to_string_pretty(&groups) {
-            let _ = std::fs::write(groups_path, json);
-        }
-    }
-
-    if !known_addons_path.exists() {
-        let mut known_addons = std::collections::HashMap::new();
-        if let Some(addons) = value.get("addons").and_then(|v| v.as_object()) {
-            for item in addons.values() {
-                if let Ok(mut addon) = serde_json::from_value::<commands::Addon>(item.clone()) {
-                    if addon.id.is_empty() {
-                        addon.id = addon
-                            .workshop_id
-                            .clone()
-                            .unwrap_or_else(|| addon.vpk_name.clone());
-                    }
-                    if addon.is_dummy || commands::is_dummy_addon_info(&addon.addon_info) {
-                        continue;
-                    }
-                    let id = addon.id.clone();
-                    known_addons.insert(
-                        id.clone(),
-                        commands::KnownAddonEntry {
-                            id,
-                            vpk_name: addon.vpk_name.clone(),
-                            workshop_id: addon.workshop_id.clone(),
-                            workshop_id_candidate: addon.workshop_id_candidate,
-                            workshop_id_source: addon.workshop_id_source,
-                            workshop_id_validation_status: addon.workshop_id_validation_status,
-                            workshop_id_last_attempt_at: addon.workshop_id_last_attempt_at,
-                            addon_info: addon.addon_info,
-                            has_image: addon.has_image,
-                            image_path: addon.image_path,
-                            steam_details: addon.steam_details,
-                            maps: addon.maps,
-                            maps_scanned: addon.maps_scanned,
-                        },
-                    );
-                }
-            }
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&known_addons) {
-            let _ = std::fs::write(known_addons_path, json);
-        }
-    }
-
-    if settings_path.exists() && groups_path.exists() && known_addons_path.exists() {
-        let _ = std::fs::remove_file(legacy_db_path);
-    }
-}
-
-fn move_or_copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if !src.exists() {
-        return Ok(());
-    }
-
-    if !dst.exists() && std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            move_or_copy_dir(&src_path, &dst_path)?;
-        } else if !dst_path.exists() {
-            std::fs::copy(&src_path, &dst_path)?;
-        }
-    }
-    let _ = std::fs::remove_dir_all(src);
-    Ok(())
 }

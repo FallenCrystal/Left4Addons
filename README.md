@@ -1,127 +1,77 @@
 <div style="text-align: center;">
 
-  # Left 4 Addons  
+  # Left 4 Addons v2
 
-(可能是) 强大的《求生之路 2》(Left 4 Dead 2) 创意工坊模组 (Addons) 管理器。
+  **《求生之路 2》(Left 4 Dead 2) 创意工坊模组与本地插件管理器（v2 架构重构分支）**
+
 </div>
 
-<div style="text-align: center;">
-  <img src="https://img.shields.io/badge/Developed%20with-AI%20(Antigravity)-blueviolet?style=for-the-badge&logo=google-gemini" alt="Developed with AI (Antigravity)">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-</div>
-
-![Screenshot](/preview/2026-07-05-224321.png)
-
-> 佩萨罗 (Pesaro) 和 切尔诺贝利 (Chernobyl) 封面可能含有令人不适的内容.  
-> 对此处理造成的观感问题, 十分抱歉.
+> 原 `v1` 代码与发行逻辑完整保留在 `main` 分支；当前 `v2` 分支专注于可长期演进的 **多 Crate Workspace + 本地 SQLite 核心引擎 + 独立信息缓存后端 (`l4a-server`) + 全链路自动化测试底座**。
 
 ---
 
-## 生成式 AI 声明 (Developed with AI)
+## v2 核心架构改进
 
-> [!IMPORTANT]
-> **本项目的大部分核心代码 架构重构以及功能模块均由 AI 辅助/编写完成.**
-> 
-> Antigravity 并没有我想象中的那么难用, 但是就想闲暇之余蹬一下额度而已.  
-> 我只做了找bug和UI/UX反馈, 没有对其进行代码Review.  
-> 环境:  
-> - Antigravity + Gemini 3.5 Flash / 3.1 Pro (High)
-> - Codex + GPT 5.4 / 5.5 / 5.6 Terra (xHigh / High)
----
+1. **清晰的职责分层（8 个 Workspace Crates + 瘦身 Tauri 壳）**
+   - `l4a-protocol`: 跨端共享的纯数据结构、强类型 ID（`WorkshopId`, `AddonId`）与事件契约。
+   - `l4a-vpk`: VPK v1/v2 读写、KeyValues 解析、SHA-256 内容指纹、地图/VTF 封面提取与 **Dummy v2 自描述元信息**。
+   - `l4a-mirror`: 无全局状态的 `MirrorRouter`，100% 兼容 `mirrors.json` 三种规则语法。
+   - `l4a-steam` & `l4a-steam-bridge`: 路径自动探测 + `SteamBridge` Trait 隔离（含 `NullSteamBridge` / `DynamicSteamBridge` / `MockSteamBridge`）。
+   - `l4a-workshop`: 多源 `WorkshopResolver`、断点续传下载器 (`ResilientDownloader`)，以及 **显式保留占位符的 `WorkshopWebScraper` Trait / `WebScraperPlaceholderProvider`**。
+   - `l4a-core`: 本地 SQLite 引擎、物理/逻辑分离扫描器、Dummy Bypass v2 对账状态机、远程生命周期同步与四层正交分组模型。
+   - `l4a-server`: 独立可自托管的创意工坊信息管理与缓存服务（Axum + SQLite + 可信玩家 Token + 冲突裁决 + 内置 `/admin` 管理页 + 服务端爬虫占位符）。
+   - `src-tauri`: 仅负责初始化 `L4aEngine` 与 IPC 转发的薄壳。
 
-## 特色功能
+2. **Dummy Bypass v2 显式对账**
+   - 游戏更新覆写 `workshop/<id>.vpk` 时自动检出 `DummyOverwrittenByGameUpdate`，支持 **`AdoptWorkshopUpdate`**（保留用户自定义文件名、禁用状态与分组，替换包体并重建 Dummy v2）。
+   - 游戏自动下载新组件进入 `workshop/` 时自动检出 `NewWorkshopAutoDownload`，支持一键按命名规则迁入 `loading/` 并生成 Dummy v2。
 
-- (批量) 重命名: 自动重命名为可读名称, 避免在创意工坊 ID 列表里大海捞针
-- 快速移动: 将想要的附加组件从创意工坊内移动到 `addons` 文件夹下.   
-  (但是不支持自动取消订阅)
-- 快速切换: 快速启用或禁用特定的附加组件.  
-  (不支持还未移动到 `addons` 文件夹下的组件)
-- Dummy Bypass (实验性): 通过一个空的合法 `.vpk` 文件,  
-  允许在不取消订阅的情况下将附件移出创意工坊并绕过创意工坊更新检查.
-- 内置创意工坊 & 下载: 无需订阅, 无需启动游戏 一键下载并加载组件!   
-  自动解析组件依赖关系(创意工坊), 自动重试断点续传和并发下载等.
-- 一键抓取现有 Steam 创意工坊订阅 (需要启用 Steamworks SDK)
-- 为高级用户准备的 [mirror.json](docs/mirrors-configuration.md), 修改 HTTP 请求头, 自配置CDN等..
-- 支持直接查看建图代码或通过建图代码查找对应地图的组件
+3. **远程生命周期同步与多父依赖安全判定**
+   - 检测上游更新、下架/私密 Tombstone（不误删用户本地 `.vpk`）。
+   - 父模组更新移除分包时，跨全部已安装父模组计算剩余入度，仅在无其他地图依赖时标记 `can_safely_remove = true`。
 
-## 局限性
-- Dummy Bypass:
-  - 创意工坊更新时 Dummy 可能会被替换掉更新后的真实附件.
-  - L4D2 本身有bug可能会导致触发全量重新下载
-  - 游戏内的附加内容会看到两份相同的附件   
-    一份是创意工坊名 一份是附件内 `addoninfo.txt` 的名  
-    尽管创意工坊侧的 Dummy 附件不添加任何游戏内容.
-- Steamworks SDK 集成:
-  - 使用 Steamworks SDK 会让 Left 4 Addons 伪造成“求生之路”游戏, 以通过 Steam 访问其创意工坊内容.
-  - Left 4 Addons 使用 Steamworks SDK 时,  
-    启动《求生之路》会导致游戏本体不被 VAC 信任. (但不会导致 VAC 封禁)  
-    启动游戏时应先关闭 L4A.
-  - 更完整的 SDK 搜索/下载限制与实现细节见 [文档](docs/steamworks-sdk-details.md).
-- 内置下载:
-  - 更高的并发限制可能会导致得到 Too many requests, 下载限速/暂停等问题. 在共享网络/加速器上更为常见.  
-    如果默认的2并发限制仍然遇到下载问题, 请调整为1或等待自动重试和断点续传
+4. **四层正交分组模型**
+   - `BundleRecord`（多包聚合与地图/封面跨包补全，支持 `locked` 防覆盖）
+   - `TrackedCollectionRecord`（上游合集追踪与增删 Diff）
+   - `UserGroup`（多对多自由分类与标签）
+   - `LoadoutProfile`（一键切换启用方案，仅操作 `loading/` 托管文件）
 
 ---
 
-## 技术栈
+## 文档蓝图
 
-- **Frontend**: React 19, Vite, TypeScript, Lucide Icons
-- **Backend/Native**: Tauri v2, Rust
-- **Linter**: Oxlint
+完整架构设计、状态机、API 契约与 ADR 决策记录位于 [docs/README.md](docs/README.md)：
+- [01. 总体架构与 Crate 分层](docs/architecture/01-overview.md)
+- [02. 领域模型与本地 SQLite 设计](docs/architecture/02-domain-model.md)
+- [03. 创意工坊多源管道与 Web Scraper 占位符](docs/architecture/03-workshop-sources.md)
+- [04. Dummy Bypass v2 对账状态机](docs/architecture/04-dummy-bypass-v2.md)
+- [05. 远程生命周期同步与依赖淘汰检测](docs/architecture/05-lifecycle-sync.md)
+- [06. 新分组模型](docs/architecture/06-grouping-model.md)
+- [07. `l4a-server` 后端设计与管理控制台](docs/architecture/07-catalog-backend.md)
+- [08. 测试策略与校验命令](docs/architecture/08-testing-strategy.md)
+- [Catalog Server REST API 规范](docs/api/catalog-server-api.md)
 
 ---
 
-## 快速开始
-
-### 前提条件
-
-你需要安装以下环境以进行本地开发或构建：
-
-1. **Rust / Cargo** (可通过 [rustup](https://rustup.rs/) 安装)
-2. **Node.js** (推荐 v18+)
-
-### 安装依赖
+## 快速验证与开发
 
 ```bash
+# 1. 运行 Rust 工作区全部单元测试与集成测试（零外部 Steam/网络依赖）
+cargo test
+
+# 2. 启动独立的创意工坊信息管理/缓存后端（管理页位于 http://127.0.0.1:8787/admin）
+L4A_SERVER_ADMIN_TOKEN=dev-secret cargo run -p l4a-server
+
+# 3. 安装前端依赖并运行前端校验/测试/构建
 npm install
+npm run lint
+npm test
+npm run build
+
+# 4. Linux 上交叉检查 Windows GNU 目标的 Tauri 薄壳
+cargo check --target x86_64-pc-windows-gnu -p l4a-tauri
 ```
-
-### 启动开发环境
-
-```bash
-# 启动 Tauri 开发调试器（会同时运行前端 Vite 并拉起 Tauri 窗口）
-npm run tauri:dev
-```
-
-### 构建打包
-
-```bash
-# 构建生产版本可执行程序
-npm run tauri:build
-```
-
-构建完成后，你可以在 `src-tauri/target/release/` 下找到生成的可执行文件。
-
-### Linux 上交叉构建 Windows 版本
-
-如果你当前在 Linux 上开发，推荐先使用 `x86_64-pc-windows-gnu` 目标：
-
-```bash
-rustup target add x86_64-pc-windows-gnu
-npm run tauri:build -- --target x86_64-pc-windows-gnu
-```
-
-构建完成后，Windows 产物位于 `src-tauri/target/x86_64-pc-windows-gnu/release/`。
-
-其中 Steamworks bridge 运行时文件会自动放到 `src-tauri/target/x86_64-pc-windows-gnu/release/steam/`：
-
-- `l4a-steam-bridge.dll`
-- `steam_api64.dll`
-
-这样无需再手动复制 Steam bridge 相关 DLL。
-
----
 
 ## 许可证
 
-本项目基于 **[MIT License](file:///home/akkariin/文档/Left4Addons/LICENSE)** 开源。你可以自由地使用、修改和分发。
+基于 [MIT License](LICENSE) 开源。
