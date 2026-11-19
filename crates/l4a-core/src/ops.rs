@@ -1,10 +1,12 @@
 use crate::db::LocalDb;
 use crate::error::CoreError;
+use crate::file_changes::{occupied, take_matching_dummy, FileChanges};
+use crate::scanner::scan_and_commit;
 use l4a_protocol::{
     AddonDirType, AddonId, AddonSummary, AppConfig, InstallState, InvalidCharReplace,
     RenamePreviewItem, RenameRuleConfig, WorkshopId,
 };
-use l4a_vpk::{extract_addon_metadata, generate_dummy_vpk, inspect_dummy_vpk, DummyInspection, DummySpec};
+use l4a_vpk::{inspect_dummy_vpk, DummyInspection, DummySpec};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -32,45 +34,6 @@ pub(crate) fn strip_suffix_ascii_case<'a>(input: &'a str, suffix: &str) -> Optio
     } else {
         None
     }
-}
-
-pub(crate) fn write_dummy_atomically(
-    original_vpk_path: &Path,
-    dummy_vpk_path: &Path,
-    spec: &DummySpec,
-) -> Result<(), CoreError> {
-    if let Some(parent) = dummy_vpk_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let tmp = append_os_suffix(dummy_vpk_path, ".l4a_tmp");
-    if tmp.exists() {
-        let _ = fs::remove_file(&tmp);
-    }
-    if let Err(err) = generate_dummy_vpk(original_vpk_path, &tmp, spec) {
-        let _ = fs::remove_file(&tmp);
-        return Err(CoreError::Vpk(err));
-    }
-    let bak = append_os_suffix(dummy_vpk_path, ".l4a_bak");
-    if bak.exists() {
-        let _ = fs::remove_file(&bak);
-    }
-    let had_dst = dummy_vpk_path.exists();
-    if had_dst {
-        fs::rename(dummy_vpk_path, &bak)?;
-    }
-    if let Err(err) = fs::rename(&tmp, dummy_vpk_path) {
-        if had_dst && bak.exists() {
-            let _ = fs::rename(&bak, dummy_vpk_path);
-        }
-        let _ = fs::remove_file(&tmp);
-        return Err(err.into());
-    }
-    if had_dst && bak.exists() {
-        let _ = fs::remove_file(&bak);
-    }
-    Ok(())
 }
 
 fn is_windows_reserved_name(stem: &str) -> bool {
@@ -192,7 +155,9 @@ pub fn preview_batch_rename(
     let mut first_group_by_addon: HashMap<AddonId, String> = HashMap::new();
     for g in groups {
         for aid in g.addon_ids {
-            first_group_by_addon.entry(aid).or_insert_with(|| g.name.clone());
+            first_group_by_addon
+                .entry(aid)
+                .or_insert_with(|| g.name.clone());
         }
     }
 
@@ -214,7 +179,8 @@ pub fn preview_batch_rename(
             continue;
         };
         let group_prefix = first_group_by_addon.get(&addon.id).map(String::as_str);
-        let target_vpk = build_target_vpk_name(addon.workshop_id, group_prefix, &addon.title, rules);
+        let target_vpk =
+            build_target_vpk_name(addon.workshop_id, group_prefix, &addon.title, rules);
         let target_disk_name = if addon.enabled {
             target_vpk.clone()
         } else {
@@ -228,8 +194,11 @@ pub fn preview_batch_rename(
 
         let mut conflict = None;
         if addon.primary_dir == Some(AddonDirType::Workshop) {
-            conflict = Some("位于 workshop/ 目录的模组禁止直接重命名，请先移至 loading/".to_string());
-        } else if let Some(prev) = seen_targets.get(&(dir_key.clone(), target_disk_name.to_ascii_lowercase())) {
+            conflict =
+                Some("位于 workshop/ 目录的模组禁止直接重命名，请先移至 loading/".to_string());
+        } else if let Some(prev) =
+            seen_targets.get(&(dir_key.clone(), target_disk_name.to_ascii_lowercase()))
+        {
             conflict = Some(format!("与 {prev} 重命名目标冲突"));
         } else {
             seen_targets.insert(
@@ -239,7 +208,8 @@ pub fn preview_batch_rename(
             let dest = Path::new(&dir_key).join(&target_disk_name);
             let sibling_enabled = Path::new(&dir_key).join(&target_vpk);
             let sibling_disabled = append_os_suffix(&sibling_enabled, ".disabled");
-            let case_only_self = !cur_name.eq(&target_vpk) && cur_name.eq_ignore_ascii_case(&target_vpk);
+            let case_only_self =
+                !cur_name.eq(&target_vpk) && cur_name.eq_ignore_ascii_case(&target_vpk);
             if target_vpk != *cur_name
                 && !case_only_self
                 && (dest.exists() || sibling_enabled.exists() || sibling_disabled.exists())
@@ -358,6 +328,37 @@ pub fn move_addons(
     addon_ids: &[AddonId],
     target_dir_type: AddonDirType,
 ) -> Result<usize, CoreError> {
+    let mut moved_addons = Vec::new();
+    let result = move_addons_inner(db, config, addon_ids, target_dir_type, &mut moved_addons);
+    let moved_to_workshop: Vec<_> = moved_addons
+        .iter()
+        .filter(|addon| addon.primary_dir == Some(AddonDirType::Workshop))
+        .filter_map(|addon| addon.workshop_id)
+        .collect();
+    let refreshed = scan_and_commit(db, config, image_cache_dir, moved_addons, |tx, _| {
+        for wid in moved_to_workshop {
+            LocalDb::mark_issue_resolved_tx(tx, &l4a_protocol::IssueId(format!("new_ws_{wid}")))?;
+        }
+        Ok(())
+    });
+    match result {
+        Ok(count) => refreshed.map(|_| count),
+        Err(error) => {
+            if let Err(scan_error) = refreshed {
+                tracing::warn!(error = %scan_error, "批量移动失败后重新扫描目录失败");
+            }
+            Err(error)
+        }
+    }
+}
+
+fn move_addons_inner(
+    db: &LocalDb,
+    config: &AppConfig,
+    addon_ids: &[AddonId],
+    target_dir_type: AddonDirType,
+    moved_addons: &mut Vec<AddonSummary>,
+) -> Result<usize, CoreError> {
     let target_dir = match target_dir_type {
         AddonDirType::Loading => Path::new(&config.loading_dir),
         AddonDirType::Workshop => Path::new(&config.workshop_dir),
@@ -374,7 +375,11 @@ pub fn move_addons(
         .collect();
 
     let mut moved = 0usize;
+    let mut seen = HashSet::new();
     for aid in addon_ids {
+        if !seen.insert(aid) {
+            continue;
+        }
         let addon = addons
             .get(aid)
             .ok_or_else(|| CoreError::NotFound(format!("未找到 Addon: {aid}")))?;
@@ -382,7 +387,9 @@ pub fn move_addons(
             continue;
         }
         let Some(ref cur_path) = addon.current_path else {
-            return Err(CoreError::InvalidInput(format!("Addon 未在磁盘安装: {aid}")));
+            return Err(CoreError::InvalidInput(format!(
+                "Addon 未在磁盘安装: {aid}"
+            )));
         };
         let src = PathBuf::from(cur_path);
         let orig_name = src
@@ -390,7 +397,7 @@ pub fn move_addons(
             .and_then(|s| s.to_str())
             .ok_or_else(|| CoreError::InvalidInput("无效源文件名".into()))?;
 
-        let (dst, next_enabled, next_vpk_name) = match target_dir_type {
+        let (dst, sibling, next_enabled, next_vpk_name) = match target_dir_type {
             AddonDirType::Workshop => {
                 let target_vpk = match addon.workshop_id {
                     Some(wid) => format!("{wid}.vpk"),
@@ -400,13 +407,7 @@ pub fn move_addons(
                 };
                 let dst = target_dir.join(&target_vpk);
                 let disabled_sibling = append_os_suffix(&dst, ".disabled");
-                if disabled_sibling.exists() {
-                    return Err(CoreError::Conflict(format!(
-                        "目标目录已存在禁用态冲突文件: {}",
-                        disabled_sibling.display()
-                    )));
-                }
-                (dst, true, target_vpk)
+                (dst, disabled_sibling, true, target_vpk)
             }
             AddonDirType::Loading => {
                 let dst = target_dir.join(orig_name);
@@ -418,74 +419,97 @@ pub fn move_addons(
                 } else {
                     target_dir.join(&clean_vpk)
                 };
-                if sibling.exists() {
-                    return Err(CoreError::Conflict(format!(
-                        "目标目录已存在同名启/禁用文件: {}",
-                        sibling.display()
-                    )));
-                }
-                (dst, addon.enabled, clean_vpk)
+                (dst, sibling, addon.enabled, clean_vpk)
             }
         };
 
-        if dst.exists() {
-            let removable_dummy = target_dir_type == AddonDirType::Workshop
-                && matches!(inspect_dummy_vpk(&dst), DummyInspection::Dummy(_));
-            if removable_dummy {
-                fs::remove_file(&dst)?;
-            } else {
+        let check_sibling = || {
+            if occupied(&sibling)? {
                 return Err(CoreError::Conflict(format!(
-                    "目标文件已存在: {}",
-                    dst.display()
+                    "目标目录已有同名启用或禁用文件: {}",
+                    sibling.display()
                 )));
             }
+            Ok(())
+        };
+        check_sibling()?;
+        let source_dir = match addon.primary_dir {
+            Some(AddonDirType::Loading) => &config.loading_dir,
+            Some(AddonDirType::Workshop) => &config.workshop_dir,
+            None => return Err(CoreError::Conflict("模组目录已变化，请重新扫描".into())),
+        };
+        if source_dir.is_empty()
+            || src.parent() != Some(Path::new(source_dir))
+            || fs::canonicalize(source_dir)? == fs::canonicalize(target_dir)?
+        {
+            return Err(CoreError::Conflict("源目录与目标目录冲突或已变化".into()));
         }
 
-        if fs::rename(&src, &dst).is_err() {
-            let tmp = append_os_suffix(&dst, ".l4a_tmp");
-            fs::copy(&src, &tmp)?;
-            if let Err(err) = fs::rename(&tmp, &dst) {
-                let _ = fs::remove_file(&tmp);
-                return Err(err.into());
+        let updated = FileChanges::run(|changes| {
+            if occupied(&dst)? {
+                let wid = addon
+                    .workshop_id
+                    .filter(|_| target_dir_type == AddonDirType::Workshop)
+                    .ok_or_else(|| {
+                        CoreError::Conflict(format!("目标文件已存在: {}", dst.display()))
+                    })?;
+                take_matching_dummy(changes, &dst, wid)?;
             }
-            fs::remove_file(&src)?;
-        }
+            let backup = changes.take(&src)?;
+            let (content_hash, size) = match inspect_dummy_vpk(&backup) {
+                DummyInspection::RealVpk {
+                    content_hash,
+                    file_size,
+                    ..
+                } if addon.content_hash.as_ref() == Some(&content_hash) => {
+                    (content_hash, file_size)
+                }
+                _ => {
+                    return Err(CoreError::Conflict(format!(
+                        "源文件已变化: {}",
+                        src.display()
+                    )))
+                }
+            };
+            changes.publish_copy(&backup, &dst)?;
 
-        let mut has_dummy = false;
-        if target_dir_type == AddonDirType::Loading && config.enable_dummy_bypass {
-            if let Some(wid) = addon.workshop_id {
+            let mut has_dummy = false;
+            if let Some(wid) = addon
+                .workshop_id
+                .filter(|_| target_dir_type == AddonDirType::Loading && config.enable_dummy_bypass)
+            {
                 if config.workshop_dir.trim().is_empty() {
-                    return Err(CoreError::InvalidInput("已启用 Dummy Bypass，但未配置 workshop_dir".into()));
+                    return Err(CoreError::InvalidInput(
+                        "已启用 Dummy Bypass，但未配置 workshop_dir".into(),
+                    ));
                 }
                 let dummy_path = Path::new(&config.workshop_dir).join(format!("{wid}.vpk"));
-                let content_hash = addon.content_hash.clone().unwrap_or_else(|| {
-                    extract_addon_metadata(&dst, image_cache_dir).content_hash
-                });
-                let size = fs::metadata(&dst)?.len();
-                let ts = db
-                    .get_workshop_snapshot(wid)?
-                    .and_then(|s| s.time_updated);
-                write_dummy_atomically(
+                take_matching_dummy(changes, &dummy_path, wid)?;
+                changes.publish_dummy(
                     &dst,
                     &dummy_path,
                     &DummySpec {
                         workshop_id: wid,
                         original_hash: content_hash,
                         original_size: size,
-                        original_time_updated: ts,
+                        original_time_updated: addon.remote_time_updated,
                     },
                 )?;
                 has_dummy = true;
             }
-        }
 
-        let mut updated = addon.clone();
-        updated.primary_dir = Some(target_dir_type);
-        updated.enabled = next_enabled;
-        updated.current_file_name = Some(next_vpk_name);
-        updated.current_path = Some(dst.to_string_lossy().into_owned());
-        updated.has_dummy_bypass = has_dummy;
-        db.upsert_addon(&updated)?;
+            let mut updated = addon.clone();
+            updated.primary_dir = Some(target_dir_type);
+            updated.enabled = next_enabled;
+            updated.current_file_name = Some(next_vpk_name);
+            updated.current_path = Some(dst.to_string_lossy().into_owned());
+            updated.has_dummy_bypass = has_dummy;
+            changes.verify()?;
+            check_sibling()?;
+            db.upsert_addon(&updated)?;
+            Ok(updated)
+        })?;
+        moved_addons.push(updated);
         moved += 1;
     }
 

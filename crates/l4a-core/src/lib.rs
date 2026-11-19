@@ -2,6 +2,7 @@ pub mod config;
 pub mod db;
 pub mod engine;
 pub mod error;
+mod file_changes;
 pub mod grouping;
 pub mod lifecycle;
 pub mod ops;

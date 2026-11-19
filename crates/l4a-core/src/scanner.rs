@@ -28,6 +28,16 @@ pub fn scan_workspace(
     config: &AppConfig,
     image_cache_dir: &Path,
 ) -> Result<ScanResult, CoreError> {
+    scan_and_commit(db, config, image_cache_dir, None, |_, _| Ok(())).map(|(scan, ())| scan)
+}
+
+pub(crate) fn scan_and_commit<T>(
+    db: &LocalDb,
+    config: &AppConfig,
+    image_cache_dir: &Path,
+    seeds: impl IntoIterator<Item = AddonSummary>,
+    finish: impl FnOnce(&rusqlite::Connection, &HashMap<AddonId, AddonSummary>) -> Result<T, CoreError>,
+) -> Result<(ScanResult, T), CoreError> {
     let loading_dir = Path::new(&config.loading_dir);
     let workshop_dir = Path::new(&config.workshop_dir);
 
@@ -44,11 +54,19 @@ pub fn scan_workspace(
         .into_iter()
         .map(|row| (row.record.path.clone(), row))
         .collect();
-    let existing_addons: HashMap<AddonId, AddonSummary> = db
+    let mut existing_addons: HashMap<AddonId, AddonSummary> = db
         .list_addons()?
         .into_iter()
         .map(|a| (a.id.clone(), a))
         .collect();
+
+    let mut seeds_by_path = HashMap::new();
+    for addon in seeds {
+        if let Some(path) = &addon.current_path {
+            seeds_by_path.insert(path.clone(), addon.clone());
+        }
+        existing_addons.insert(addon.id.clone(), addon);
+    }
 
     let mut disk_entries: Vec<(PathBuf, AddonDirType, String, bool, u64, i64)> = Vec::new();
     for (dir, dir_type) in [
@@ -58,10 +76,9 @@ pub fn scan_workspace(
         if dir.as_os_str().is_empty() || !dir.is_dir() {
             continue;
         }
-        for entry in fs::read_dir(dir)?.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
             if !ft.is_file() {
                 continue;
             }
@@ -81,12 +98,7 @@ pub fn scan_workspace(
 
             let meta = entry.metadata()?;
             let file_size = meta.len();
-            let modified_at = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
+            let modified_at = modified_at(&meta);
 
             disk_entries.push((
                 path,
@@ -99,6 +111,7 @@ pub fn scan_workspace(
         }
     }
 
+    disk_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut physical_rows = Vec::with_capacity(disk_entries.len());
     let mut real_addons_by_id: HashMap<AddonId, AddonSummary> = HashMap::new();
     let mut dummy_workshop_ids: HashSet<WorkshopId> = HashSet::new();
@@ -106,12 +119,14 @@ pub fn scan_workspace(
     for (path, dir_type, vpk_name, enabled, file_size, modified_at) in disk_entries {
         let path_str = path.to_string_lossy().into_owned();
         let prev = existing_files.get(&path_str);
-        let unchanged = prev.is_some_and(|p| {
-            p.record.file_size == file_size
-                && p.record.modified_at == modified_at
-                && p.record.enabled == enabled
-                && p.record.dir_type == dir_type
-        });
+        let seed = seeds_by_path.get(&path_str);
+        let unchanged = seed.is_none()
+            && prev.is_some_and(|p| {
+                p.record.file_size == file_size
+                    && p.record.modified_at == modified_at
+                    && p.record.enabled == enabled
+                    && p.record.dir_type == dir_type
+            });
 
         let (role, workshop_id, content_hash, dummy_original_hash, dummy_original_ts, meta_opt) =
             if unchanged {
@@ -120,9 +135,9 @@ pub fn scan_workspace(
                 let need_reparse = matches!(p.record.role, FileRole::RealAddon)
                     && (cached_addon.is_none()
                         || cached_addon.is_some_and(|a| {
-                            a.cover_image
-                                .as_ref()
-                                .is_some_and(|c| !c.starts_with("http") && !image_cache_dir.join(c).exists())
+                            a.cover_image.as_ref().is_some_and(|c| {
+                                !c.starts_with("http") && !image_cache_dir.join(c).exists()
+                            })
                         }));
                 if !need_reparse {
                     (
@@ -141,6 +156,7 @@ pub fn scan_workspace(
                         db,
                         &existing_addons,
                         &existing_files,
+                        seed,
                     )?
                 }
             } else {
@@ -151,11 +167,13 @@ pub fn scan_workspace(
                     db,
                     &existing_addons,
                     &existing_files,
+                    seed,
                 )?
             };
 
         if matches!(role, FileRole::DummyV1 | FileRole::DummyV2) {
-            if let Some(wid) = workshop_id.or_else(|| extract_workshop_id_from_filename(&vpk_name)) {
+            if let Some(wid) = workshop_id.or_else(|| extract_workshop_id_from_filename(&vpk_name))
+            {
                 dummy_workshop_ids.insert(wid);
             }
             physical_rows.push(PhysicalFileRow {
@@ -165,7 +183,8 @@ pub fn scan_workspace(
                     file_name: vpk_name,
                     enabled,
                     role,
-                    workshop_id: workshop_id.or_else(|| extract_workshop_id_from_filename(&raw_name_fallback(&path))),
+                    workshop_id: workshop_id
+                        .or_else(|| extract_workshop_id_from_filename(&raw_name_fallback(&path))),
                     content_hash,
                     dummy_original_hash,
                     dummy_original_time_updated: dummy_original_ts,
@@ -271,27 +290,44 @@ pub fn scan_workspace(
         addon.has_dummy_bypass = addon
             .workshop_id
             .is_some_and(|w| dummy_workshop_ids.contains(&w));
-        db.upsert_addon(addon)?;
     }
 
-    for old_id in existing_addons.keys() {
-        if !real_addons_by_id.contains_key(old_id) {
-            db.mark_addon_uninstalled(old_id)?;
-        }
-    }
-
-    let dummy_count = physical_rows
+    let dummy_files_found = physical_rows
         .iter()
         .filter(|r| matches!(r.record.role, FileRole::DummyV1 | FileRole::DummyV2))
         .count();
-    let files_scanned = physical_rows.len();
-    db.replace_physical_files(&physical_rows)?;
+    let issues = crate::reconcile::collect_issues(&physical_rows, config);
+    let value = db.write(|tx| {
+        for addon in real_addons_by_id.values() {
+            LocalDb::upsert_addon_tx(tx, addon)?;
+        }
+        for old_id in existing_addons.keys() {
+            if !real_addons_by_id.contains_key(old_id) {
+                LocalDb::mark_addon_uninstalled_tx(tx, old_id)?;
+            }
+        }
+        LocalDb::replace_physical_files_tx(tx, &physical_rows)?;
+        LocalDb::replace_open_reconcile_issues_tx(tx, &issues)?;
+        finish(tx, &real_addons_by_id)
+    })?;
 
-    Ok(ScanResult {
-        files_scanned,
-        real_addons_active: real_addons_by_id.len(),
-        dummy_files_found: dummy_count,
-    })
+    Ok((
+        ScanResult {
+            files_scanned: physical_rows.len(),
+            real_addons_active: real_addons_by_id.len(),
+            dummy_files_found,
+        },
+        value,
+    ))
+}
+
+pub(crate) fn modified_at(metadata: &fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn strip_suffix_ascii_case<'a>(input: &'a str, suffix: &str) -> &'a str {
@@ -317,6 +353,7 @@ fn inspect_disk_vpk(
     db: &LocalDb,
     existing_addons: &HashMap<AddonId, AddonSummary>,
     existing_files: &HashMap<String, PhysicalFileRow>,
+    seed: Option<&AddonSummary>,
 ) -> Result<
     (
         FileRole,
@@ -353,14 +390,20 @@ fn inspect_disk_vpk(
             let prev_addon_wid = existing_files
                 .get(&path.to_string_lossy().into_owned())
                 .and_then(|p| p.record.workshop_id);
-            let real_id = resolve_workshop_id(
-                vpk_name,
-                &meta.addon_info,
-                &content_hash,
-                prev_addon_wid,
-                db,
-                existing_addons,
-            );
+            let real_id = if let Some(addon) =
+                seed.filter(|addon| addon.content_hash.as_ref() == Some(&content_hash))
+            {
+                addon.workshop_id
+            } else {
+                resolve_workshop_id(
+                    vpk_name,
+                    &meta.addon_info,
+                    &content_hash,
+                    prev_addon_wid,
+                    db,
+                    existing_addons,
+                )
+            };
             Ok((
                 FileRole::RealAddon,
                 real_id,
@@ -384,7 +427,10 @@ fn resolve_workshop_id(
     if let Some(wid) = extract_workshop_id_from_filename(vpk_name) {
         return Some(wid);
     }
-    if let Some(url) = addon_info.get("addonurl0").or_else(|| addon_info.get("addonurl")) {
+    if let Some(url) = addon_info
+        .get("addonurl0")
+        .or_else(|| addon_info.get("addonurl"))
+    {
         if let Some(wid) = extract_workshop_id_from_url(url) {
             return Some(wid);
         }
@@ -457,7 +503,9 @@ fn build_addon_summary(
         content_hash: Some(meta.content_hash),
         file_size,
         files_count: meta.files_count,
-        cover_image: meta.image_path.or_else(|| prev.and_then(|p| p.cover_image.clone())),
+        cover_image: meta
+            .image_path
+            .or_else(|| prev.and_then(|p| p.cover_image.clone())),
         categories,
         maps: meta.maps,
         has_dummy_bypass: false,

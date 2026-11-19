@@ -56,6 +56,17 @@ impl LocalDb {
             .map_err(|_| CoreError::InvalidInput("本地数据库互斥锁异常".into()))
     }
 
+    pub(crate) fn write<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, CoreError>,
+    ) -> Result<T, CoreError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let result = operation(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
     pub fn list_physical_files(&self) -> Result<Vec<PhysicalFileRow>, CoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
@@ -93,8 +104,13 @@ impl LocalDb {
     }
 
     pub fn replace_physical_files(&self, rows: &[PhysicalFileRow]) -> Result<(), CoreError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
+        self.write(|tx| Self::replace_physical_files_tx(tx, rows))
+    }
+
+    pub(crate) fn replace_physical_files_tx(
+        tx: &Connection,
+        rows: &[PhysicalFileRow],
+    ) -> Result<(), CoreError> {
         tx.execute("DELETE FROM physical_files", [])?;
         for row in rows {
             let f = &row.record;
@@ -121,7 +137,6 @@ impl LocalDb {
                 ],
             )?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -148,7 +163,9 @@ impl LocalDb {
 
             let install_state = parse_enum(&state_str, InstallState::Installed);
             let snap = wid.and_then(|w| snapshots.get(&w));
-            let remote_status = snap.map(|s| s.status).unwrap_or(WorkshopItemStatus::Unknown);
+            let remote_status = snap
+                .map(|s| s.status)
+                .unwrap_or(WorkshopItemStatus::Unknown);
             let remote_ts = snap.and_then(|s| s.time_updated);
             let update_available = match (install_state, local_ts, remote_ts) {
                 (InstallState::Installed, Some(l), Some(rt)) => rt > l,
@@ -195,7 +212,10 @@ impl LocalDb {
         Ok(self.list_addons()?.into_iter().find(|a| &a.id == id))
     }
 
-    pub fn get_addon_by_workshop_id(&self, wid: WorkshopId) -> Result<Option<AddonSummary>, CoreError> {
+    pub fn get_addon_by_workshop_id(
+        &self,
+        wid: WorkshopId,
+    ) -> Result<Option<AddonSummary>, CoreError> {
         Ok(self
             .list_addons()?
             .into_iter()
@@ -204,6 +224,13 @@ impl LocalDb {
 
     pub fn upsert_addon(&self, addon: &AddonSummary) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
+        Self::upsert_addon_tx(&conn, addon)
+    }
+
+    pub(crate) fn upsert_addon_tx(
+        conn: &Connection,
+        addon: &AddonSummary,
+    ) -> Result<(), CoreError> {
         let now = Utc::now().to_rfc3339();
         conn.execute(
             r#"
@@ -262,6 +289,13 @@ impl LocalDb {
 
     pub fn mark_addon_uninstalled(&self, id: &AddonId) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
+        Self::mark_addon_uninstalled_tx(&conn, id)
+    }
+
+    pub(crate) fn mark_addon_uninstalled_tx(
+        conn: &Connection,
+        id: &AddonId,
+    ) -> Result<(), CoreError> {
         conn.execute(
             "UPDATE addons SET install_state = 'uninstalled_known', primary_dir = NULL, current_path = NULL, enabled = 0, has_dummy_bypass = 0, updated_at = ?2 WHERE id = ?1",
             params![id.as_str(), Utc::now().to_rfc3339()],
@@ -272,9 +306,18 @@ impl LocalDb {
     pub fn delete_addon_record(&self, id: &AddonId) -> Result<(), CoreError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM user_group_addons WHERE addon_id = ?1", params![id.as_str()])?;
-        tx.execute("DELETE FROM profile_addons WHERE addon_id = ?1", params![id.as_str()])?;
-        tx.execute("DELETE FROM bundle_members WHERE addon_id = ?1", params![id.as_str()])?;
+        tx.execute(
+            "DELETE FROM user_group_addons WHERE addon_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM profile_addons WHERE addon_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.execute(
+            "DELETE FROM bundle_members WHERE addon_id = ?1",
+            params![id.as_str()],
+        )?;
         tx.execute("DELETE FROM addons WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(())
@@ -298,8 +341,14 @@ impl LocalDb {
         item: &WorkshopItemRecord,
         replace_deps: bool,
     ) -> Result<(), CoreError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
+        self.write(|tx| Self::upsert_workshop_snapshot_tx(tx, item, replace_deps))
+    }
+
+    pub(crate) fn upsert_workshop_snapshot_tx(
+        tx: &Connection,
+        item: &WorkshopItemRecord,
+        replace_deps: bool,
+    ) -> Result<(), CoreError> {
         let wid = item.workshop_id.as_u64() as i64;
         let now = Utc::now().to_rfc3339();
         let removed_at = matches!(
@@ -382,7 +431,6 @@ impl LocalDb {
             }
         }
 
-        tx.commit()?;
         Ok(())
     }
 
@@ -416,13 +464,19 @@ impl LocalDb {
         Ok(())
     }
 
-    pub fn get_workshop_snapshot(&self, wid: WorkshopId) -> Result<Option<WorkshopItemRecord>, CoreError> {
+    pub fn get_workshop_snapshot(
+        &self,
+        wid: WorkshopId,
+    ) -> Result<Option<WorkshopItemRecord>, CoreError> {
         let conn = self.lock_conn()?;
         let mut map = Self::load_snapshots_map(&conn)?;
         Ok(map.remove(&wid))
     }
 
-    pub fn list_active_dependencies(&self, parent: WorkshopId) -> Result<Vec<WorkshopDependency>, CoreError> {
+    pub fn list_active_dependencies(
+        &self,
+        parent: WorkshopId,
+    ) -> Result<Vec<WorkshopDependency>, CoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT dep_workshop_id, dep_title, required FROM workshop_dependencies WHERE parent_workshop_id = ?1 AND status = 'active' ORDER BY dep_workshop_id ASC",
@@ -442,7 +496,9 @@ impl LocalDb {
         Ok(out)
     }
 
-    pub fn list_all_active_dependency_edges(&self) -> Result<Vec<(WorkshopId, WorkshopId)>, CoreError> {
+    pub fn list_all_active_dependency_edges(
+        &self,
+    ) -> Result<Vec<(WorkshopId, WorkshopId)>, CoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT parent_workshop_id, dep_workshop_id FROM workshop_dependencies WHERE status = 'active'",
@@ -462,7 +518,9 @@ impl LocalDb {
         Ok(out)
     }
 
-    fn load_snapshots_map(conn: &Connection) -> Result<HashMap<WorkshopId, WorkshopItemRecord>, CoreError> {
+    fn load_snapshots_map(
+        conn: &Connection,
+    ) -> Result<HashMap<WorkshopId, WorkshopItemRecord>, CoreError> {
         let mut stmt = conn.prepare(
             "SELECT workshop_id, file_type, status, title, description, creator_steam_id, creator_name,
                     preview_url, file_url, file_size, time_created, time_updated, tags_json,
@@ -536,15 +594,19 @@ impl LocalDb {
         &self,
         detected: &[(ReconcileIssue, String)],
     ) -> Result<(), CoreError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
+        self.write(|tx| Self::replace_open_reconcile_issues_tx(tx, detected))
+    }
 
+    pub(crate) fn replace_open_reconcile_issues_tx(
+        tx: &Connection,
+        detected: &[(ReconcileIssue, String)],
+    ) -> Result<(), CoreError> {
         let mut resolved_fps: HashMap<String, String> = HashMap::new();
         {
-            let mut stmt = tx.prepare(
-                "SELECT id, state_fingerprint FROM reconcile_issues WHERE resolved = 1",
-            )?;
-            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut stmt = tx
+                .prepare("SELECT id, state_fingerprint FROM reconcile_issues WHERE resolved = 1")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (id, fp) = row?;
                 resolved_fps.insert(id, fp);
@@ -587,11 +649,13 @@ impl LocalDb {
 
         for old_id in resolved_fps.keys() {
             if !current_ids.contains(old_id.as_str()) {
-                tx.execute("DELETE FROM reconcile_issues WHERE id = ?1", params![old_id])?;
+                tx.execute(
+                    "DELETE FROM reconcile_issues WHERE id = ?1",
+                    params![old_id],
+                )?;
             }
         }
 
-        tx.commit()?;
         Ok(())
     }
 
@@ -599,7 +663,7 @@ impl LocalDb {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, kind, workshop_id, addon_id, loading_path, workshop_path, summary,
-                    recommended_action, available_actions_json, resolved, detected_at
+                    recommended_action, available_actions_json, resolved, detected_at, state_fingerprint
              FROM reconcile_issues WHERE resolved = 0 ORDER BY detected_at DESC, id ASC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -610,7 +674,11 @@ impl LocalDb {
             let avail_json: String = r.get(8)?;
             let det_str: String = r.get(10)?;
             Ok(ReconcileIssue {
-                id: IssueId(r.get(0)?),
+                id: IssueId(format!(
+                    "{}@{}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(11)?
+                )),
                 kind: parse_enum(&kind_str, ReconcileIssueKind::OrphanDummy),
                 workshop_id: wid_raw.and_then(|v| WorkshopId::new(v as u64).ok()),
                 addon_id: addon_raw.map(AddonId),
@@ -633,11 +701,24 @@ impl LocalDb {
     }
 
     pub fn mark_issue_resolved(&self, id: &IssueId) -> Result<(), CoreError> {
-        let conn = self.lock_conn()?;
-        conn.execute(
-            "UPDATE reconcile_issues SET resolved = 1 WHERE id = ?1",
-            params![id.as_str()],
-        )?;
+        self.write(|tx| Self::mark_issue_resolved_tx(tx, id))
+    }
+
+    pub(crate) fn mark_issue_resolved_tx(conn: &Connection, id: &IssueId) -> Result<(), CoreError> {
+        if let Some((key, fingerprint)) = id.as_str().rsplit_once('@') {
+            let affected = conn.execute(
+                "UPDATE reconcile_issues SET resolved = 1 WHERE id = ?1 AND state_fingerprint = ?2 AND resolved = 0",
+                params![key, fingerprint],
+            )?;
+            if affected == 0 {
+                return Err(CoreError::Conflict("对账问题已变化，请刷新后重试".into()));
+            }
+        } else {
+            conn.execute(
+                "UPDATE reconcile_issues SET resolved = 1 WHERE id = ?1",
+                params![id.as_str()],
+            )?;
+        }
         Ok(())
     }
 
@@ -809,7 +890,10 @@ impl LocalDb {
                 col.last_synced_at.map(|d| d.to_rfc3339()),
             ],
         )?;
-        tx.execute("DELETE FROM collection_items WHERE collection_id = ?1", params![cid])?;
+        tx.execute(
+            "DELETE FROM collection_items WHERE collection_id = ?1",
+            params![cid],
+        )?;
         let mut seen = HashSet::new();
         let mut pos = 0i64;
         for wid in &col.member_workshop_ids {
@@ -898,7 +982,10 @@ impl LocalDb {
 
     pub fn delete_user_group(&self, id: &GroupId) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
-        conn.execute("DELETE FROM user_groups WHERE id = ?1", params![id.as_str()])?;
+        conn.execute(
+            "DELETE FROM user_groups WHERE id = ?1",
+            params![id.as_str()],
+        )?;
         Ok(())
     }
 
@@ -967,6 +1054,10 @@ impl LocalDb {
 
     pub fn save_task(&self, task: &TaskRecord) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
+        Self::save_task_tx(&conn, task)
+    }
+
+    pub(crate) fn save_task_tx(conn: &Connection, task: &TaskRecord) -> Result<(), CoreError> {
         conn.execute(
             r#"
             INSERT INTO tasks (id, kind, status, target_id, progress_percent, message, error, created_at, updated_at)
@@ -1027,7 +1118,10 @@ impl LocalDb {
         Ok(out)
     }
 
-    pub fn lookup_addon_workshop_id_by_hash(&self, hash: &str) -> Result<Option<WorkshopId>, CoreError> {
+    pub fn lookup_addon_workshop_id_by_hash(
+        &self,
+        hash: &str,
+    ) -> Result<Option<WorkshopId>, CoreError> {
         let conn = self.lock_conn()?;
         let raw: Option<i64> = conn
             .query_row(
@@ -1039,7 +1133,9 @@ impl LocalDb {
         Ok(raw.and_then(|v| WorkshopId::new(v as u64).ok()))
     }
 
-    pub fn lookup_addon_title_and_groups(&self) -> Result<HashMap<AddonId, (String, Vec<String>)>, CoreError> {
+    pub fn lookup_addon_title_and_groups(
+        &self,
+    ) -> Result<HashMap<AddonId, (String, Vec<String>)>, CoreError> {
         let addons = self.list_addons()?;
         let groups = self.list_user_groups()?;
         let mut group_names: HashMap<AddonId, Vec<String>> = HashMap::new();
@@ -1086,7 +1182,11 @@ pub fn derive_categories_from_info(addon_info: &BTreeMap<String, String>) -> Vec
     if flag(&["addoncontent_survivor"]) {
         cats.push("Survivor".into());
     }
-    if flag(&["addoncontent_weaponmodel", "content_weaponmodel", "content_weapon"]) {
+    if flag(&[
+        "addoncontent_weaponmodel",
+        "content_weaponmodel",
+        "content_weapon",
+    ]) {
         cats.push("Weapon".into());
     }
     if flag(&["addoncontent_skin"]) {

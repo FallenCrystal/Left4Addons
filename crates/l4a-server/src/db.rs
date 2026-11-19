@@ -67,7 +67,7 @@ impl ServerRepo {
         f: impl FnOnce(&Transaction<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let result = f(&tx)?;
         tx.commit()?;
         Ok(result)
@@ -267,7 +267,10 @@ impl ServerRepo {
         Ok(out)
     }
 
-    pub fn get_batch(&self, ids: &[WorkshopId]) -> anyhow::Result<(Vec<WorkshopItemRecord>, Vec<WorkshopId>)> {
+    pub fn get_batch(
+        &self,
+        ids: &[WorkshopId],
+    ) -> anyhow::Result<(Vec<WorkshopItemRecord>, Vec<WorkshopId>)> {
         let conn = self.lock_conn()?;
         let mut items = Vec::new();
         let mut missing = Vec::new();
@@ -464,7 +467,13 @@ impl ServerRepo {
         let mut stmt = conn.prepare(&page_sql)?;
         let page_ids: Vec<WorkshopId> = stmt
             .query_map(
-                params![q_filter, tag_filter, status_filter, i64::from(page_size), offset],
+                params![
+                    q_filter,
+                    tag_filter,
+                    status_filter,
+                    i64::from(page_size),
+                    offset
+                ],
                 |r| {
                     let raw: i64 = r.get(0)?;
                     parse_workshop_id_col(0, raw)
@@ -562,7 +571,13 @@ impl ServerRepo {
         &self,
         token_hash: &str,
     ) -> anyhow::Result<Option<ContributorAuthRecord>> {
-        let conn = self.lock_conn()?;
+        self.with_transaction(|tx| Self::find_contributor_tx(tx, token_hash))
+    }
+
+    pub(crate) fn find_contributor_tx(
+        conn: &Connection,
+        token_hash: &str,
+    ) -> anyhow::Result<Option<ContributorAuthRecord>> {
         let mut stmt = conn.prepare(
             "SELECT id, name, trust_tier, trust_weight, enabled FROM contributors WHERE token_hash = ?1",
         )?;
@@ -581,10 +596,10 @@ impl ServerRepo {
             .optional()?;
         if let Some(ref c) = row {
             if c.enabled {
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE contributors SET last_seen_at = ?2 WHERE id = ?1",
                     params![c.id.as_str(), Utc::now().to_rfc3339()],
-                );
+                )?;
             }
         }
         Ok(row)
@@ -750,7 +765,10 @@ impl ServerRepo {
         Ok(out)
     }
 
-    pub fn list_revisions(&self, workshop_id: WorkshopId) -> anyhow::Result<Vec<(String, Option<i64>, String)>> {
+    pub fn list_revisions(
+        &self,
+        workshop_id: WorkshopId,
+    ) -> anyhow::Result<Vec<(String, Option<i64>, String)>> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
             "SELECT status, time_updated, dependencies_json FROM workshop_item_revisions WHERE workshop_id = ?1 ORDER BY id ASC",

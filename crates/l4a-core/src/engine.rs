@@ -1,6 +1,7 @@
 use crate::config::{load_config, save_config, AppPaths};
 use crate::db::LocalDb;
 use crate::error::CoreError;
+use crate::file_changes::{occupied, take_matching_dummy, FileChanges};
 use crate::grouping::{
     apply_profile, create_manual_bundle, delete_profile, delete_user_group, rebuild_auto_bundles,
     save_profile, save_user_group, set_bundle_locked, track_workshop_collection,
@@ -9,10 +10,10 @@ use crate::grouping::{
 use crate::lifecycle::sync_lifecycle;
 use crate::ops::{
     append_os_suffix, apply_renames, build_target_vpk_name, delete_addons, move_addons,
-    preview_batch_rename, search_by_map_code, toggle_addons, write_dummy_atomically,
+    preview_batch_rename, search_by_map_code, toggle_addons,
 };
-use crate::reconcile::{auto_resolve_by_policy, detect_reconcile_issues, resolve_reconcile_issue};
-use crate::scanner::scan_workspace;
+use crate::reconcile::{auto_resolve_by_policy, resolve_reconcile_issue};
+use crate::scanner::{scan_and_commit, scan_workspace};
 use crate::tasks::{create_task, update_task};
 use crate::watcher::AddonWatcher;
 use l4a_mirror::MirrorRouter;
@@ -24,7 +25,7 @@ use l4a_protocol::{
     WorkshopId,
 };
 use l4a_steam::{DynamicSteamBridge, SteamBridge, SteamCapabilities};
-use l4a_vpk::{extract_addon_metadata, DummySpec};
+use l4a_vpk::{extract_addon_metadata, inspect_dummy_vpk, DummyInspection, DummySpec};
 use l4a_workshop::{
     CatalogBackendProvider, DownloadProgress, DownloadRequest, ResilientDownloader,
     SourceRoutingPolicy, SteamBridgeProvider, SteamWebApiProvider, WebScraperPlaceholderProvider,
@@ -65,10 +66,14 @@ pub struct L4aEngine {
     watcher_rescan_cb: Mutex<Option<RescanCallback>>,
     events: Arc<dyn EventSink>,
     active_cancellations: Mutex<HashMap<WorkshopId, CancellationToken>>,
+    workspace: Mutex<()>,
 }
 
 impl L4aEngine {
-    pub fn open_default(runtime_dir: impl AsRef<Path>, events: Arc<dyn EventSink>) -> Result<Self, CoreError> {
+    pub fn open_default(
+        runtime_dir: impl AsRef<Path>,
+        events: Arc<dyn EventSink>,
+    ) -> Result<Self, CoreError> {
         let paths = AppPaths::from_runtime_dir(runtime_dir);
         paths.ensure_dirs()?;
 
@@ -80,15 +85,17 @@ impl L4aEngine {
                 config.loading_dir = detected;
             } else {
                 let default_loading = paths.runtime_dir.join("addons-loading");
-                config.workshop_dir = default_loading.join("workshop").to_string_lossy().into_owned();
+                config.workshop_dir = default_loading
+                    .join("workshop")
+                    .to_string_lossy()
+                    .into_owned();
                 config.loading_dir = default_loading.to_string_lossy().into_owned();
             }
             save_config(&paths.settings_path, &config)?;
         }
 
         let mirror = Arc::new(
-            MirrorRouter::from_file(&paths.mirrors_path)
-                .unwrap_or_else(|_| MirrorRouter::empty()),
+            MirrorRouter::from_file(&paths.mirrors_path).unwrap_or_else(|_| MirrorRouter::empty()),
         );
         let exe_dir = std::env::current_exe()
             .ok()
@@ -101,7 +108,8 @@ impl L4aEngine {
         let steam_bridge: Arc<dyn SteamBridge> = dynamic_bridge.clone();
 
         let db = Arc::new(LocalDb::open(&paths.db_path)?);
-        let (resolver, reporter) = build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
+        let (resolver, reporter) =
+            build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -117,6 +125,7 @@ impl L4aEngine {
             watcher_rescan_cb: Mutex::new(None),
             events,
             active_cancellations: Mutex::new(HashMap::new()),
+            workspace: Mutex::new(()),
         })
     }
 
@@ -146,6 +155,7 @@ impl L4aEngine {
             watcher_rescan_cb: Mutex::new(None),
             events,
             active_cancellations: Mutex::new(HashMap::new()),
+            workspace: Mutex::new(()),
         })
     }
 
@@ -157,7 +167,14 @@ impl L4aEngine {
         self.config.read().unwrap().clone()
     }
 
+    fn lock_workspace(&self) -> Result<std::sync::MutexGuard<'_, ()>, CoreError> {
+        self.workspace
+            .lock()
+            .map_err(|_| CoreError::Conflict("工作区锁状态异常".into()))
+    }
+
     pub fn save_config(&self, mut next: AppConfig) -> Result<AppConfig, CoreError> {
+        let workspace = self.lock_workspace()?;
         if next.workshop_dir.is_empty() && !next.loading_dir.is_empty() {
             next.workshop_dir = Path::new(&next.loading_dir)
                 .join("workshop")
@@ -181,15 +198,17 @@ impl L4aEngine {
         *self.resolver.write().unwrap() = new_resolver;
         *self.catalog_reporter.write().unwrap() = new_reporter;
 
-        if dirs_changed {
-            let cb_opt = self.watcher_rescan_cb.lock().unwrap().clone();
-            if let Some(cb) = cb_opt {
-                if let Err(err) = self.start_watcher(cb) {
-                    self.events.emit(CoreEvent::WatchError {
-                        message: format!("重新绑定目录监听失败: {err}"),
-                    });
-                }
-            }
+        let watch_error = if dirs_changed {
+            let callback = self.watcher_rescan_cb.lock().unwrap().clone();
+            callback.and_then(|cb| self.start_watcher(cb).err())
+        } else {
+            None
+        };
+        drop(workspace);
+        if let Some(err) = watch_error {
+            self.events.emit(CoreEvent::WatchError {
+                message: format!("重新绑定目录监听失败: {err}"),
+            });
         }
         Ok(next)
     }
@@ -203,25 +222,29 @@ impl L4aEngine {
     }
 
     fn scan_internal(&self, external_change: bool) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        let issues = detect_reconcile_issues(&self.db, &cfg)?;
-        let resolved = auto_resolve_by_policy(&self.db, &cfg, &self.paths.image_cache_dir, &issues)?;
-        if resolved > 0 {
-            scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-            detect_reconcile_issues(&self.db, &cfg)?;
-        }
-        let open_issues = self.db.list_open_reconcile_issues()?;
-        if !open_issues.is_empty() {
+        let issues = self.db.list_open_reconcile_issues()?;
+        auto_resolve_by_policy(&self.db, &cfg, &self.paths.image_cache_dir, &issues)?;
+        let snapshot = self.snapshot_locked()?;
+        drop(workspace);
+        if !snapshot.open_issues.is_empty() {
             self.events.emit(CoreEvent::ReconcileIssuesDetected {
-                count: open_issues.len(),
+                count: snapshot.open_issues.len(),
             });
         }
-        self.events.emit(CoreEvent::SnapshotUpdated { external_change });
-        self.snapshot()
+        self.events
+            .emit(CoreEvent::SnapshotUpdated { external_change });
+        Ok(snapshot)
     }
 
     pub fn snapshot(&self) -> Result<DashboardSnapshot, CoreError> {
+        let _workspace = self.lock_workspace()?;
+        self.snapshot_locked()
+    }
+
+    fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {
         Ok(DashboardSnapshot {
             config: self.config(),
             addons: self.db.list_addons()?,
@@ -234,27 +257,28 @@ impl L4aEngine {
         })
     }
 
-    pub fn resolve_issue(&self, issue_id: &IssueId, action: ReconcileAction) -> Result<DashboardSnapshot, CoreError> {
+    pub fn resolve_issue(
+        &self,
+        issue_id: &IssueId,
+        action: ReconcileAction,
+    ) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
-        let target_wid = self
-            .db
-            .list_open_reconcile_issues()?
-            .into_iter()
-            .find(|i| &i.id == issue_id)
-            .and_then(|i| i.workshop_id);
         self.suppress_watcher();
-        resolve_reconcile_issue(&self.db, &cfg, &self.paths.image_cache_dir, issue_id, action)?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        detect_reconcile_issues(&self.db, &cfg)?;
-        if action == ReconcileAction::KeepWorkshopDeleteLoading {
-            if let Some(wid) = target_wid {
-                let _ = self.db.mark_issue_resolved(&IssueId(format!("new_ws_{wid}")));
-            }
+        let result = resolve_reconcile_issue(
+            &self.db,
+            &cfg,
+            &self.paths.image_cache_dir,
+            issue_id,
+            action,
+        );
+        if result.is_err() {
+            self.refresh_after_error(&cfg);
         }
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
-        self.snapshot()
+        let snapshot = result.and_then(|()| self.snapshot_locked());
+        drop(workspace);
+        self.emit_workspace_update();
+        snapshot
     }
 
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
@@ -301,7 +325,10 @@ impl L4aEngine {
         Ok(resp)
     }
 
-    pub async fn download_workshop_item(&self, workshop_id: WorkshopId) -> Result<AddonSummary, CoreError> {
+    pub async fn download_workshop_item(
+        &self,
+        workshop_id: WorkshopId,
+    ) -> Result<AddonSummary, CoreError> {
         struct ActiveDownloadGuard<'a> {
             map: &'a Mutex<HashMap<WorkshopId, CancellationToken>>,
             wid: WorkshopId,
@@ -318,7 +345,9 @@ impl L4aEngine {
         {
             let mut guard = self.active_cancellations.lock().unwrap();
             if guard.contains_key(&workshop_id) {
-                return Err(CoreError::Conflict(format!("条目 {workshop_id} 正在下载中")));
+                return Err(CoreError::Conflict(format!(
+                    "条目 {workshop_id} 正在下载中"
+                )));
             }
             guard.insert(workshop_id, cancel.clone());
         }
@@ -327,87 +356,186 @@ impl L4aEngine {
             wid: workshop_id,
         };
 
-        let cfg = self.config();
+        let (cfg, resolver) = {
+            let _workspace = self.lock_workspace()?;
+            (self.config(), self.resolver.read().unwrap().clone())
+        };
         if cfg.loading_dir.trim().is_empty() {
             return Err(CoreError::InvalidInput("未配置 loading_dir".into()));
         }
 
-        let resolver = self.resolver.read().unwrap().clone();
-        let (outcomes, _) = resolver.fetch_items(&[workshop_id]).await?;
-        let item = outcomes
-            .into_iter()
-            .find_map(|o| match o {
-                WorkshopFetchOutcome::Found { item } => Some(item),
-                _ => None,
-            })
-            .ok_or_else(|| CoreError::NotFound(format!("工坊条目不可用或已下架: {workshop_id}")))?;
-
-        let file_url = item
-            .file_url
-            .clone()
-            .ok_or_else(|| CoreError::InvalidInput(format!("条目 {workshop_id} 无可用下载直链")))?;
-
-        let dest_name = build_target_vpk_name(Some(workshop_id), None, &item.title, &cfg.rename_rules);
-        let dest_path = Path::new(&cfg.loading_dir).join(&dest_name);
-        let disabled_dest = append_os_suffix(&dest_path, ".disabled");
-        if dest_path.exists() || disabled_dest.exists() {
-            return Err(CoreError::Conflict(format!("文件已存在: {}", dest_path.display())));
-        }
-
         let mut task = create_task(&self.db, TaskKind::Download, workshop_id.to_string())?;
-        update_task(&self.db, &mut task, TaskStatus::Running, 0, Some(item.title.clone()), None)?;
+        update_task(&self.db, &mut task, TaskStatus::Running, 0, None, None)?;
+        let result = async {
+            let requested = [workshop_id];
+            let (outcomes, _) = tokio::select! {
+                _ = cancel.cancelled() => return Err(l4a_workshop::WorkshopError::Cancelled.into()),
+                result = resolver.fetch_items(&requested) => result?,
+            };
+            let item = outcomes
+                .into_iter()
+                .find_map(|outcome| match outcome {
+                    WorkshopFetchOutcome::Found { item } => Some(item),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    CoreError::NotFound(format!("工坊条目不可用或已下架: {workshop_id}"))
+                })?;
+            let file_url = item.file_url.clone().ok_or_else(|| {
+                CoreError::InvalidInput(format!("条目 {workshop_id} 无可用下载直链"))
+            })?;
+            let dest_name =
+                build_target_vpk_name(Some(workshop_id), None, &item.title, &cfg.rename_rules);
+            let loading_dir = Path::new(&cfg.loading_dir);
+            let dest = loading_dir.join(&dest_name);
+            check_download_target(&self.db, &cfg, workshop_id, &dest)?;
 
-        let events = self.events.clone();
-        let task_id = task.id.clone();
-        let sink = Arc::new(move |p: DownloadProgress| {
-            events.emit(CoreEvent::DownloadProgress {
-                task_id: task_id.clone(),
-                workshop_id: p.workshop_id,
-                downloaded: p.downloaded,
-                total: p.total,
-                percent: p.percent,
-            });
-        });
-
-        self.suppress_watcher();
-        let dl_res = self
-            .downloader
-            .download(
-                &DownloadRequest {
-                    workshop_id,
-                    url: file_url,
-                    dest_path: dest_path.clone(),
-                    max_retries: cfg.max_download_retries,
-                },
-                cancel,
-                Some(sink),
-            )
-            .await;
-
-        match dl_res {
-            Ok(_) => {
-                self.suppress_watcher();
-                db_save_downloaded_item(&self.db, &cfg, &self.paths.image_cache_dir, &item, &dest_path)?;
-                scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-                detect_reconcile_issues(&self.db, &cfg)?;
-                update_task(&self.db, &mut task, TaskStatus::Completed, 100, Some("下载完成".into()), None)?;
-                self.events.emit(CoreEvent::SnapshotUpdated {
-                    external_change: false,
+            let staged = tempfile::Builder::new()
+                .prefix(".l4a-download-")
+                .tempdir_in(&self.paths.download_cache_dir)?;
+            let staged_path = staged.path().join(dest_name);
+            let events = self.events.clone();
+            let task_id = task.id.clone();
+            let sink = Arc::new(move |p: DownloadProgress| {
+                events.emit(CoreEvent::DownloadProgress {
+                    task_id: task_id.clone(),
+                    workshop_id: p.workshop_id,
+                    downloaded: p.downloaded,
+                    total: p.total,
+                    percent: p.percent.min(99),
                 });
-                self.db
-                    .get_addon_by_workshop_id(workshop_id)?
-                    .ok_or_else(|| CoreError::NotFound("下载入库后未找到记录".into()))
-            }
-            Err(err) => {
-                let status = if matches!(err, l4a_workshop::WorkshopError::Cancelled) {
-                    TaskStatus::Cancelled
-                } else {
-                    TaskStatus::Failed
-                };
-                update_task(&self.db, &mut task, status, 0, None, Some(err.to_string()))?;
-                Err(CoreError::Workshop(err))
+            });
+            let transfer = self
+                .downloader
+                .download(
+                    &DownloadRequest {
+                        workshop_id,
+                        url: file_url,
+                        dest_path: staged_path.clone(),
+                        max_retries: cfg.max_download_retries,
+                    },
+                    cancel.clone(),
+                    Some(sink),
+                )
+                .await?;
+
+            let summary = {
+                let _workspace = self.lock_workspace()?;
+                let current = self.config();
+                if cfg.loading_dir != current.loading_dir
+                    || cfg.workshop_dir != current.workshop_dir
+                    || cfg.rename_rules != current.rename_rules
+                    || cfg.enable_dummy_bypass != current.enable_dummy_bypass
+                {
+                    return Err(CoreError::Conflict(
+                        "下载期间工作区配置已变化，请重试".into(),
+                    ));
+                }
+                check_download_target(&self.db, &cfg, workshop_id, &dest)?;
+                self.suppress_watcher();
+                let mut completed = task.clone();
+                completed.status = TaskStatus::Completed;
+                completed.progress_percent = 100;
+                completed.message = Some("下载完成".into());
+                completed.updated_at = chrono::Utc::now();
+                FileChanges::run(|changes| {
+                    if cancel.is_cancelled() {
+                        return Err(l4a_workshop::WorkshopError::Cancelled.into());
+                    }
+                    if !matches!(
+                        inspect_dummy_vpk(&staged_path),
+                        DummyInspection::RealVpk { .. }
+                    ) {
+                        return Err(CoreError::Vpk("下载内容不是有效的真实 VPK".into()));
+                    }
+                    let seed = downloaded_summary(
+                        &cfg,
+                        &self.paths.image_cache_dir,
+                        &item,
+                        &staged_path,
+                        &dest,
+                    )?;
+                    changes.publish_copy(&staged_path, &dest)?;
+                    if cfg.enable_dummy_bypass {
+                        let dummy = Path::new(&cfg.workshop_dir).join(format!("{workshop_id}.vpk"));
+                        take_matching_dummy(changes, &dummy, workshop_id)?;
+                        changes.publish_dummy(
+                            &dest,
+                            &dummy,
+                            &DummySpec {
+                                workshop_id,
+                                original_hash: seed.content_hash.clone().unwrap_or_default(),
+                                original_size: seed.file_size,
+                                original_time_updated: item.time_updated,
+                            },
+                        )?;
+                    }
+                    let aid = seed.id.clone();
+                    let (_, addon) = scan_and_commit(
+                        &self.db,
+                        &cfg,
+                        &self.paths.image_cache_dir,
+                        Some(seed),
+                        |tx, addons| {
+                            changes.verify()?;
+                            if occupied(&append_os_suffix(&dest, ".disabled"))? {
+                                return Err(CoreError::Conflict(
+                                    "下载期间禁用文件路径已被占用".into(),
+                                ));
+                            }
+                            if cancel.is_cancelled() {
+                                return Err(l4a_workshop::WorkshopError::Cancelled.into());
+                            }
+                            let mut addon = addons
+                                .get(&aid)
+                                .filter(|addon| addon.current_path.as_deref() == dest.to_str())
+                                .cloned()
+                                .ok_or_else(|| {
+                                    CoreError::Conflict("下载文件发布后已变化".into())
+                                })?;
+                            LocalDb::upsert_workshop_snapshot_tx(
+                                tx,
+                                &item,
+                                !item.dependencies.is_empty(),
+                            )?;
+                            LocalDb::save_task_tx(tx, &completed)?;
+                            addon.remote_status = item.status;
+                            addon.remote_time_updated = item.time_updated;
+                            addon.update_available = false;
+                            Ok(addon)
+                        },
+                    )?;
+                    Ok(addon)
+                })?
+            };
+            self.events.emit(CoreEvent::DownloadProgress {
+                task_id: task.id.clone(),
+                workshop_id,
+                downloaded: transfer.bytes_written,
+                total: Some(transfer.bytes_written),
+                percent: 100,
+            });
+            Ok(summary)
+        }
+        .await;
+
+        if let Err(err) = &result {
+            let status = if matches!(
+                err,
+                CoreError::Workshop(l4a_workshop::WorkshopError::Cancelled)
+            ) {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::Failed
+            };
+            if let Err(update_error) =
+                update_task(&self.db, &mut task, status, 0, None, Some(err.to_string()))
+            {
+                tracing::error!(error = %update_error, "保存下载任务终态失败");
             }
         }
+        self.emit_workspace_update();
+        result
     }
 
     pub fn cancel_download(&self, workshop_id: WorkshopId) -> bool {
@@ -424,34 +552,20 @@ impl L4aEngine {
         addon_ids: &[AddonId],
         target_dir_type: AddonDirType,
     ) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
-        let moved_wids: Vec<WorkshopId> = if target_dir_type == AddonDirType::Workshop {
-            addon_ids
-                .iter()
-                .filter_map(|aid| {
-                    self.db
-                        .get_addon(aid)
-                        .ok()
-                        .flatten()
-                        .and_then(|a| a.workshop_id)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
         self.suppress_watcher();
-        move_addons(&self.db, &cfg, &self.paths.image_cache_dir, addon_ids, target_dir_type)?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        detect_reconcile_issues(&self.db, &cfg)?;
-        if target_dir_type == AddonDirType::Workshop {
-            for wid in moved_wids {
-                let _ = self.db.mark_issue_resolved(&IssueId(format!("new_ws_{wid}")));
-            }
-        }
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
-        self.snapshot()
+        let result = move_addons(
+            &self.db,
+            &cfg,
+            &self.paths.image_cache_dir,
+            addon_ids,
+            target_dir_type,
+        );
+        let snapshot = result.and_then(|_| self.snapshot_locked());
+        drop(workspace);
+        self.emit_workspace_update();
+        snapshot
     }
 
     pub fn toggle_addons(
@@ -460,6 +574,7 @@ impl L4aEngine {
         enabled: bool,
         allow_workshop_dir: bool,
     ) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
         toggle_addons(
@@ -471,10 +586,10 @@ impl L4aEngine {
             allow_workshop_dir,
         )?;
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
-        self.snapshot()
+        let snapshot = self.snapshot_locked();
+        drop(workspace);
+        self.emit_workspace_update();
+        snapshot
     }
 
     pub fn preview_rename(
@@ -485,15 +600,19 @@ impl L4aEngine {
         preview_batch_rename(&self.db, rules, addon_ids)
     }
 
-    pub fn apply_renames(&self, renames: &[(AddonId, String)]) -> Result<DashboardSnapshot, CoreError> {
+    pub fn apply_renames(
+        &self,
+        renames: &[(AddonId, String)],
+    ) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
         apply_renames(&self.db, renames, &cfg.rename_rules)?;
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
-        self.snapshot()
+        let snapshot = self.snapshot_locked();
+        drop(workspace);
+        self.emit_workspace_update();
+        snapshot
     }
 
     pub fn delete_addons(
@@ -502,15 +621,21 @@ impl L4aEngine {
         delete_disk_file: bool,
         purge_known_record: bool,
     ) -> Result<DashboardSnapshot, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
-        delete_addons(&self.db, &cfg, addon_ids, delete_disk_file, purge_known_record)?;
+        delete_addons(
+            &self.db,
+            &cfg,
+            addon_ids,
+            delete_disk_file,
+            purge_known_record,
+        )?;
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        detect_reconcile_issues(&self.db, &cfg)?;
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
-        self.snapshot()
+        let snapshot = self.snapshot_locked();
+        drop(workspace);
+        self.emit_workspace_update();
+        snapshot
     }
 
     pub fn rebuild_bundles(&self) -> Result<Vec<BundleRecord>, CoreError> {
@@ -563,13 +688,13 @@ impl L4aEngine {
     }
 
     pub fn apply_profile(&self, id: &ProfileId) -> Result<ProfileApplyReport, CoreError> {
+        let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
         let report = apply_profile(&self.db, id, &self.paths.image_cache_dir, &cfg)?;
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        self.events.emit(CoreEvent::SnapshotUpdated {
-            external_change: false,
-        });
+        drop(workspace);
+        self.emit_workspace_update();
         Ok(report)
     }
 
@@ -585,7 +710,10 @@ impl L4aEngine {
         self.steam_bridge.shutdown().await;
     }
 
-    pub fn start_watcher(&self, on_external_rescan: Arc<dyn Fn() + Send + Sync>) -> Result<(), CoreError> {
+    pub fn start_watcher(
+        &self,
+        on_external_rescan: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), CoreError> {
         *self.watcher_rescan_cb.lock().unwrap() = Some(on_external_rescan.clone());
         let cfg = self.config();
         let events_err = self.events.clone();
@@ -606,6 +734,18 @@ impl L4aEngine {
             .map_err(CoreError::InvalidInput)
     }
 
+    fn refresh_after_error(&self, cfg: &AppConfig) {
+        if let Err(err) = scan_workspace(&self.db, cfg, &self.paths.image_cache_dir) {
+            tracing::warn!(error = %err, "操作失败后重新扫描目录失败");
+        }
+    }
+
+    fn emit_workspace_update(&self) {
+        self.events.emit(CoreEvent::SnapshotUpdated {
+            external_change: false,
+        });
+    }
+
     fn suppress_watcher(&self) {
         if let Ok(guard) = self.watcher.lock() {
             guard.suppress_internal();
@@ -613,39 +753,78 @@ impl L4aEngine {
     }
 }
 
-fn db_save_downloaded_item(
+fn check_download_target(
     db: &LocalDb,
+    config: &AppConfig,
+    wid: WorkshopId,
+    dest: &Path,
+) -> Result<(), CoreError> {
+    if config.enable_dummy_bypass && config.workshop_dir.trim().is_empty() {
+        return Err(CoreError::InvalidInput(
+            "已启用 Dummy Bypass，但未配置 workshop_dir".into(),
+        ));
+    }
+    let recorded_file = db
+        .get_addon_by_workshop_id(wid)?
+        .filter(|addon| addon.install_state == InstallState::Installed)
+        .and_then(|addon| addon.current_path);
+    let installed_here = if let Some(path) =
+        recorded_file.as_deref().map(Path::new).filter(|path| {
+            [&config.loading_dir, &config.workshop_dir]
+                .into_iter()
+                .any(|dir| !dir.is_empty() && path.parent() == Some(Path::new(dir)))
+        }) {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                metadata.is_file()
+                    && matches!(inspect_dummy_vpk(path), DummyInspection::RealVpk { .. })
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+            Err(err) => return Err(err.into()),
+        }
+    } else {
+        false
+    };
+    if occupied(dest)? || occupied(&append_os_suffix(dest, ".disabled"))? || installed_here {
+        return Err(CoreError::Conflict(format!(
+            "模组或目标文件已存在: {}",
+            dest.display()
+        )));
+    }
+    if !config.workshop_dir.is_empty() {
+        let workshop = Path::new(&config.workshop_dir).join(format!("{wid}.vpk"));
+        let disabled = append_os_suffix(&workshop, ".disabled");
+        let has_other_file = if occupied(&workshop)? {
+            crate::file_changes::regular_file(&workshop)?;
+            !matches!(inspect_dummy_vpk(&workshop), DummyInspection::Dummy(meta)
+                if meta.workshop_id.is_none_or(|id| id == wid))
+        } else {
+            false
+        };
+        if occupied(&disabled)? || has_other_file {
+            return Err(CoreError::Conflict(format!(
+                "Workshop 目录已有其他文件: {}",
+                workshop.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn downloaded_summary(
     config: &AppConfig,
     image_cache_dir: &Path,
     item: &l4a_protocol::WorkshopItemRecord,
+    staged_path: &Path,
     dest_path: &Path,
-) -> Result<(), CoreError> {
+) -> Result<AddonSummary, CoreError> {
     let wid = item.workshop_id;
-    let meta = extract_addon_metadata(dest_path, image_cache_dir);
+    let meta = extract_addon_metadata(staged_path, image_cache_dir);
     if let Some(err) = meta.error {
         return Err(CoreError::Vpk(err));
     }
-    db.upsert_workshop_snapshot(item, !item.dependencies.is_empty())?;
-    let size = fs::metadata(dest_path)?.len();
+    let size = fs::metadata(staged_path)?.len();
     let aid = AddonId::from_workshop_id(wid);
-
-    if config.enable_dummy_bypass {
-        if config.workshop_dir.trim().is_empty() {
-            return Err(CoreError::InvalidInput("已启用 Dummy Bypass，但未配置 workshop_dir".into()));
-        }
-        let dummy_path = Path::new(&config.workshop_dir).join(format!("{wid}.vpk"));
-        write_dummy_atomically(
-            dest_path,
-            &dummy_path,
-            &DummySpec {
-                workshop_id: wid,
-                original_hash: meta.content_hash.clone(),
-                original_size: size,
-                original_time_updated: item.time_updated,
-            },
-        )?;
-    }
-
     let summary = AddonSummary {
         id: aid.clone(),
         workshop_id: Some(wid),
@@ -681,7 +860,7 @@ fn db_save_downloaded_item(
         update_available: false,
         addon_info: meta.addon_info,
     };
-    db.upsert_addon(&summary)
+    Ok(summary)
 }
 
 fn build_resolver_from_config(
@@ -726,7 +905,10 @@ fn build_resolver_from_config(
     }
 
     (
-        Arc::new(WorkshopResolver::new(providers, SourceRoutingPolicy::default())),
+        Arc::new(WorkshopResolver::new(
+            providers,
+            SourceRoutingPolicy::default(),
+        )),
         reporter,
     )
 }

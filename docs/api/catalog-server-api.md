@@ -50,6 +50,8 @@
 ```
 响应中每个条目返回 `decision`：`accepted` / `merged` / `rejected_lower_trust` / `rejected_stale` / `flagged_for_review`。
 
+单次请求按输入顺序裁决，业务拒收仍返回逐条回执。数据库错误返回 `500`，该请求的条目、依赖、修订、审计和贡献者最近活动时间一并回滚。
+
 ---
 
 ## 3. 管理员接口 (需要 `X-Admin-Token: <admin_token>`)
@@ -61,3 +63,5 @@
 - `GET /api/v1/admin/audit` — 查看最近 200 条提交与冲突裁决审计日志
 - `POST /api/v1/admin/items/{workshop_id}/override` — 强制覆写某条目的状态/标题/下载链接/依赖
 - `GET /api/v1/admin/scraper/status` — 查看服务端爬虫占位状态 (`implemented: false`)
+
+管理员覆写与审计日志在同一个事务中保存。省略 `dependencies` 时保留现有依赖，显式传入空数组时清空依赖。

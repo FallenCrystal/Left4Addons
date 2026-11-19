@@ -28,6 +28,7 @@ url.workspace = true
 image.workspace = true
 vtf.workspace = true
 
+tempfile.workspace = true
+
 [dev-dependencies]
 axum.workspace = true
-tempfile.workspace = true

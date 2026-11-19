@@ -6,11 +6,10 @@ use chrono::Utc;
 use http_body_util::BodyExt;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
-    AuditLogEntry, BatchItemsResponse, CatalogStats, ConflictDecision,
-    CreateContributorRequest, CreateContributorResponse, ItemSubmission, MetadataSource,
-    ScraperPlaceholderStatus, SubmissionBatchRequest, SubmissionBatchResponse, TrustTier,
-    WorkshopDependency, WorkshopFileType, WorkshopFetchOutcome, WorkshopId, WorkshopItemRecord,
-    WorkshopItemStatus,
+    AuditLogEntry, BatchItemsResponse, CatalogStats, ConflictDecision, CreateContributorRequest,
+    CreateContributorResponse, ItemSubmission, MetadataSource, ScraperPlaceholderStatus,
+    SubmissionBatchRequest, SubmissionBatchResponse, TrustTier, WorkshopDependency,
+    WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use l4a_server::{build_router, ServerState};
 use l4a_workshop::{CatalogBackendProvider, WorkshopProvider};
@@ -41,7 +40,13 @@ async fn json_request(
 
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, bytes)
 }
 
@@ -73,13 +78,15 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/admin/contributors",
         vec![("X-Admin-Token", "super-secret-admin")],
-        Some(serde_json::to_value(CreateContributorRequest {
-            name: "TrustedAlice".into(),
-            steam_id: Some("76561198000000100".into()),
-            trust_tier: TrustTier::TrustedPlayer,
-            trust_weight: None,
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(CreateContributorRequest {
+                name: "TrustedAlice".into(),
+                steam_id: Some("76561198000000100".into()),
+                trust_tier: TrustTier::TrustedPlayer,
+                trust_weight: None,
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -90,13 +97,15 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/admin/contributors",
         vec![("X-Admin-Token", "super-secret-admin")],
-        Some(serde_json::to_value(CreateContributorRequest {
-            name: "CommunityBob".into(),
-            steam_id: None,
-            trust_tier: TrustTier::Community,
-            trust_weight: None,
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(CreateContributorRequest {
+                name: "CommunityBob".into(),
+                steam_id: None,
+                trust_tier: TrustTier::Community,
+                trust_weight: None,
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -114,34 +123,36 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &alice_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Dark Carnival Remix".into(),
-                description: Some("First snapshot".into()),
-                creator_steam_id: Some("76561198000000999".into()),
-                creator_name: Some("Mapper".into()),
-                preview_url: None,
-                file_url: None,
-                file_size: Some(12345),
-                time_created: Some(1700000000),
-                time_updated: Some(1700001000),
-                tags: vec!["Campaign".into()],
-                dependencies: vec![WorkshopDependency {
-                    workshop_id: dep1,
-                    title: Some("Asset Pack 1".into()),
-                    required: true,
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Dark Carnival Remix".into(),
+                    description: Some("First snapshot".into()),
+                    creator_steam_id: Some("76561198000000999".into()),
+                    creator_name: Some("Mapper".into()),
+                    preview_url: None,
+                    file_url: None,
+                    file_size: Some(12345),
+                    time_created: Some(1700000000),
+                    time_updated: Some(1700001000),
+                    tags: vec!["Campaign".into()],
+                    dependencies: vec![WorkshopDependency {
+                        workshop_id: dep1,
+                        title: Some("Asset Pack 1".into()),
+                        required: true,
+                    }],
+                    collection_children: vec![],
+                    subscriptions: Some(500),
+                    favorites: Some(100),
+                    observed_source: MetadataSource::SteamworksSdk,
+                    observed_at: Utc::now(),
                 }],
-                collection_children: vec![],
-                subscriptions: Some(500),
-                favorites: Some(100),
-                observed_source: MetadataSource::SteamworksSdk,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -154,35 +165,40 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &bob_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Removed,
-                title: "Hijacked Title".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: None,
-                file_size: None,
-                time_created: None,
-                time_updated: Some(1700002000),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::UserContribution,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Removed,
+                    title: "Hijacked Title".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(1700002000),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::UserContribution,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let resp: SubmissionBatchResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(resp.receipts[0].decision, ConflictDecision::FlaggedForReview);
+    assert_eq!(
+        resp.receipts[0].decision,
+        ConflictDecision::FlaggedForReview
+    );
 
     // 5a. CommunityBob tries poisoning non-allowlisted file_url -> FlaggedForReview, file_url untouched!
     let (status, bytes) = json_request(
@@ -190,35 +206,40 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &bob_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Should Not Overwrite".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: Some("https://evil.example/1001.vpk".into()),
-                file_size: None,
-                time_created: None,
-                time_updated: Some(1700001000),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::SteamWebApi,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Should Not Overwrite".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: Some("https://evil.example/1001.vpk".into()),
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(1700001000),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::SteamWebApi,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let resp: SubmissionBatchResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(resp.receipts[0].decision, ConflictDecision::FlaggedForReview);
+    assert_eq!(
+        resp.receipts[0].decision,
+        ConflictDecision::FlaggedForReview
+    );
 
     // 5b. CommunityBob tries injecting allowlisted file_url -> RejectedLowerTrust (cannot poison file_url/deps)!
     let (status, bytes) = json_request(
@@ -226,35 +247,40 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &bob_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Should Not Overwrite".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: Some("https://steamusercontent.com/ugc/1001.vpk".into()),
-                file_size: None,
-                time_created: None,
-                time_updated: Some(1700001000),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::SteamWebApi,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Should Not Overwrite".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: Some("https://steamusercontent.com/ugc/1001.vpk".into()),
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(1700001000),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::SteamWebApi,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let resp: SubmissionBatchResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(resp.receipts[0].decision, ConflictDecision::RejectedLowerTrust);
+    assert_eq!(
+        resp.receipts[0].decision,
+        ConflictDecision::RejectedLowerTrust
+    );
 
     // 5c. CommunityBob enriches missing benign preview_url (Steam CDN allowlisted) -> Merged without overwriting title/file_url!
     let (status, bytes) = json_request(
@@ -262,30 +288,34 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &bob_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Should Not Overwrite".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: Some("https://steamuserimages-a.akamaihd.net/ugc/1001/preview.jpg".into()),
-                file_url: None,
-                file_size: None,
-                time_created: None,
-                time_updated: Some(1700001000),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::UserContribution,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Should Not Overwrite".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: Some(
+                        "https://steamuserimages-a.akamaihd.net/ugc/1001/preview.jpg".into(),
+                    ),
+                    file_url: None,
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(1700001000),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::UserContribution,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -309,34 +339,36 @@ async fn catalog_server_handles_trust_conflict_resolution_dependencies_and_admin
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &alice_auth)],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Dark Carnival Remix v2".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: None,
-                file_size: Some(22345),
-                time_created: None,
-                time_updated: Some(1700005000),
-                tags: vec!["Campaign".into()],
-                dependencies: vec![WorkshopDependency {
-                    workshop_id: dep2,
-                    title: Some("Asset Pack 2".into()),
-                    required: true,
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Dark Carnival Remix v2".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: Some(22345),
+                    time_created: None,
+                    time_updated: Some(1700005000),
+                    tags: vec!["Campaign".into()],
+                    dependencies: vec![WorkshopDependency {
+                        workshop_id: dep2,
+                        title: Some("Asset Pack 2".into()),
+                        required: true,
+                    }],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::SteamworksSdk,
+                    observed_at: Utc::now(),
                 }],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::SteamworksSdk,
-                observed_at: Utc::now(),
-            }],
-        })
-        .unwrap()),
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -535,12 +567,15 @@ async fn server_security_search_collection_batch_limit_and_conflict_regressions(
                 "POST",
                 "/api/v1/admin/contributors",
                 vec![("X-Admin-Token", "strong-admin-token")],
-                Some(serde_json::to_value(CreateContributorRequest {
-                    name,
-                    steam_id: None,
-                    trust_tier: tier,
-                    trust_weight: None,
-                }).unwrap()),
+                Some(
+                    serde_json::to_value(CreateContributorRequest {
+                        name,
+                        steam_id: None,
+                        trust_tier: tier,
+                        trust_weight: None,
+                    })
+                    .unwrap(),
+                ),
             )
             .await;
             assert_eq!(st, StatusCode::OK);
@@ -560,33 +595,36 @@ async fn server_security_search_collection_batch_limit_and_conflict_regressions(
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &format!("Bearer {}", comm1.token))],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Community Campaign".into(),
-                description: Some("Test 100% match".into()),
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: None,
-                file_size: None,
-                time_created: Some(100),
-                time_updated: Some(200),
-                tags: vec!["Campaign".into(), "Coop".into()],
-                dependencies: vec![WorkshopDependency {
-                    workshop_id: dep,
-                    title: None,
-                    required: true,
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Community Campaign".into(),
+                    description: Some("Test 100% match".into()),
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: None,
+                    time_created: Some(100),
+                    time_updated: Some(200),
+                    tags: vec!["Campaign".into(), "Coop".into()],
+                    dependencies: vec![WorkshopDependency {
+                        workshop_id: dep,
+                        title: None,
+                        required: true,
+                    }],
+                    collection_children: vec![],
+                    subscriptions: Some(42),
+                    favorites: None,
+                    observed_source: MetadataSource::SteamworksSdk,
+                    observed_at: Utc::now(),
                 }],
-                collection_children: vec![],
-                subscriptions: Some(42),
-                favorites: None,
-                observed_source: MetadataSource::SteamworksSdk,
-                observed_at: Utc::now(),
-            }],
-        }).unwrap()),
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -597,34 +635,40 @@ async fn server_security_search_collection_batch_limit_and_conflict_regressions(
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &format!("Bearer {}", comm2.token))],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Removed,
-                title: "Community Campaign".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: None,
-                file_size: None,
-                time_created: None,
-                time_updated: Some(300),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::UserContribution,
-                observed_at: Utc::now(),
-            }],
-        }).unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Removed,
+                    title: "Community Campaign".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(300),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::UserContribution,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let delist_resp: SubmissionBatchResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(delist_resp.receipts[0].decision, ConflictDecision::FlaggedForReview);
+    assert_eq!(
+        delist_resp.receipts[0].decision,
+        ConflictDecision::FlaggedForReview
+    );
 
     // 4. SteamWebApi update with newer time_updated and empty dependencies preserves existing deps!
     let (status, _) = json_request(
@@ -632,29 +676,32 @@ async fn server_security_search_collection_batch_limit_and_conflict_regressions(
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &format!("Bearer {}", official.token))],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Community Campaign Updated".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: Some("https://steamusercontent.com/ugc/8001.vpk".into()),
-                file_size: None,
-                time_created: None,
-                time_updated: Some(400),
-                tags: vec!["Campaign".into()],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::SteamWebApi,
-                observed_at: Utc::now(),
-            }],
-        }).unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Community Campaign Updated".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: Some("https://steamusercontent.com/ugc/8001.vpk".into()),
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(400),
+                    tags: vec!["Campaign".into()],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::SteamWebApi,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -708,32 +755,204 @@ async fn server_security_search_collection_batch_limit_and_conflict_regressions(
         "POST",
         "/api/v1/submissions",
         vec![("Authorization", &format!("Bearer {}", official.token))],
-        Some(serde_json::to_value(SubmissionBatchRequest {
-            items: vec![ItemSubmission {
-                workshop_id: wid,
-                file_type: WorkshopFileType::Item,
-                status: WorkshopItemStatus::Active,
-                title: "Official Overwrite Attempt".into(),
-                description: None,
-                creator_steam_id: None,
-                creator_name: None,
-                preview_url: None,
-                file_url: None,
-                file_size: None,
-                time_created: None,
-                time_updated: Some(999999),
-                tags: vec![],
-                dependencies: vec![],
-                collection_children: vec![],
-                subscriptions: None,
-                favorites: None,
-                observed_source: MetadataSource::SteamworksSdk,
-                observed_at: Utc::now(),
-            }],
-        }).unwrap()),
+        Some(
+            serde_json::to_value(SubmissionBatchRequest {
+                items: vec![ItemSubmission {
+                    workshop_id: wid,
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: "Official Overwrite Attempt".into(),
+                    description: None,
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: None,
+                    time_created: None,
+                    time_updated: Some(999999),
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions: None,
+                    favorites: None,
+                    observed_source: MetadataSource::SteamworksSdk,
+                    observed_at: Utc::now(),
+                }],
+            })
+            .unwrap(),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let ov_attempt: SubmissionBatchResponse = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(ov_attempt.receipts[0].decision, ConflictDecision::RejectedLowerTrust);
+    assert_eq!(
+        ov_attempt.receipts[0].decision,
+        ConflictDecision::RejectedLowerTrust
+    );
+}
+
+#[tokio::test]
+async fn catalog_write_errors_roll_back_batches_and_admin_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let state = ServerState::open(&l4a_server::ServerConfig {
+        bind_addr: "127.0.0.1:0".into(),
+        db_path: path.clone(),
+        admin_token: "admin-token".into(),
+    })
+    .unwrap();
+    let contributor = l4a_protocol::ContributorId::generate();
+    state
+        .repo
+        .create_contributor(
+            &contributor,
+            "Tester",
+            None,
+            &l4a_server::auth::hash_token("fixture-token"),
+            TrustTier::Community,
+            20,
+        )
+        .unwrap();
+    let sql = rusqlite::Connection::open(path).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_audit BEFORE INSERT ON submission_audit_log
+         WHEN NEW.workshop_id = 102 BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+    )
+    .unwrap();
+    let app = build_router(state.clone());
+    let batch = json!({"items": [
+        {"workshopId": "101", "title": "First", "status": "active",
+         "observedSource": "steamworks_sdk", "observedAt": Utc::now(),
+         "dependencies": [{"workshopId": "103", "required": true}]},
+        {"workshopId": "102", "title": "Second", "status": "active",
+         "observedSource": "steamworks_sdk", "observedAt": Utc::now()}
+    ]});
+    let headers = vec![("authorization", "Bearer fixture-token")];
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/submissions",
+        headers.clone(),
+        Some(batch.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    for table in [
+        "workshop_items",
+        "workshop_item_dependencies",
+        "workshop_item_revisions",
+        "submission_audit_log",
+    ] {
+        let count: i64 = sql
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table}");
+    }
+    assert!(state.repo.list_contributors().unwrap()[0]
+        .last_seen_at
+        .is_none());
+
+    sql.execute_batch("DROP TRIGGER fail_audit").unwrap();
+    let (status, body) = json_request(
+        &app,
+        "POST",
+        "/api/v1/submissions",
+        headers.clone(),
+        Some(batch),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let receipts: SubmissionBatchResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        receipts
+            .receipts
+            .iter()
+            .map(|r| r.workshop_id.0)
+            .collect::<Vec<_>>(),
+        [101, 102]
+    );
+
+    sql.execute_batch(
+        "CREATE TRIGGER fail_admin_audit BEFORE INSERT ON submission_audit_log
+         WHEN NEW.contributor_name = 'admin' BEGIN SELECT RAISE(ABORT, 'test failure'); END;",
+    )
+    .unwrap();
+    let admin = vec![("x-admin-token", "admin-token")];
+    let uri = "/api/v1/admin/items/101/override";
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        uri,
+        admin.clone(),
+        Some(json!({"status": "removed", "dependencies": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let original = state
+        .repo
+        .get_item(WorkshopId(101))
+        .unwrap()
+        .unwrap()
+        .record;
+    assert_eq!(original.status, WorkshopItemStatus::Active);
+    assert_eq!(original.dependencies.len(), 1);
+    assert_eq!(state.repo.list_revisions(WorkshopId(101)).unwrap().len(), 1);
+
+    sql.execute_batch("DROP TRIGGER fail_admin_audit").unwrap();
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        uri,
+        admin.clone(),
+        Some(json!({"status": "removed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        state
+            .repo
+            .get_item(WorkshopId(101))
+            .unwrap()
+            .unwrap()
+            .record
+            .dependencies
+            .len(),
+        1
+    );
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        uri,
+        admin,
+        Some(json!({"status": "removed", "dependencies": []})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(state
+        .repo
+        .get_item(WorkshopId(101))
+        .unwrap()
+        .unwrap()
+        .record
+        .dependencies
+        .is_empty());
+
+    // Hold a competing writer while the request starts, then disable the contributor before releasing it.
+    sql.execute_batch("BEGIN IMMEDIATE; UPDATE contributors SET enabled = 0")
+        .unwrap();
+    let submit = tokio::spawn(async move {
+        json_request(
+            &app,
+            "POST",
+            "/api/v1/submissions",
+            headers,
+            Some(json!({"items": []})),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    sql.execute_batch("COMMIT").unwrap();
+    assert_eq!(submit.await.unwrap().0, StatusCode::FORBIDDEN);
 }

@@ -85,10 +85,12 @@ impl ResilientDownloader {
                 return Err(WorkshopError::Cancelled);
             }
 
-            match self
-                .download_once(req, cancel.clone(), on_progress.as_ref())
-                .await
-            {
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(WorkshopError::Cancelled),
+                result = self.download_once(req, cancel.clone(), on_progress.as_ref()) => result,
+            };
+            match result {
                 Ok(result) => return Ok(result),
                 Err(WorkshopError::Cancelled) => {
                     self.cleanup_partial(req.workshop_id);
@@ -255,7 +257,10 @@ impl ResilientDownloader {
             etag,
             last_modified,
         };
-        fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap_or_default())?;
+        fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+        )?;
 
         let mut file = if resume_from > 0 {
             OpenOptions::new()
