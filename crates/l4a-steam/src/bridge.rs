@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use l4a_protocol::{
-    MetadataSource, WorkshopCollectionRecord, WorkshopDependency, WorkshopFileType,
-    WorkshopFetchOutcome, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    MetadataSource, WorkshopCollectionRecord, WorkshopDependency, WorkshopFetchOutcome,
+    WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use libloading::Library;
 use serde::{Deserialize, Serialize};
@@ -240,13 +240,11 @@ impl DynamicBridgeState {
     }
 
     fn ensure_loaded(&self) -> Result<(Arc<BridgeApi>, SteamCapabilities), BridgeError> {
-        let enabled = self
-            .enabled
-            .lock()
-            .map(|g| *g)
-            .unwrap_or(false);
+        let enabled = self.enabled.lock().map(|g| *g).unwrap_or(false);
         if !enabled {
-            return Err(BridgeError::Unavailable("配置中已禁用 Steamworks SDK".into()));
+            return Err(BridgeError::Unavailable(
+                "配置中已禁用 Steamworks SDK".into(),
+            ));
         }
 
         let mut guard = self
@@ -390,10 +388,8 @@ impl SteamBridge for DynamicSteamBridge {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let items: Vec<WorkshopItemRecord> = raw_items
-            .iter()
-            .filter_map(parse_sdk_item_value)
-            .collect();
+        let items: Vec<WorkshopItemRecord> =
+            raw_items.iter().filter_map(parse_sdk_item_value).collect();
         let child_ids = items.iter().map(|i| i.workshop_id).collect();
 
         Ok(WorkshopCollectionRecord {
@@ -411,11 +407,10 @@ impl SteamBridge for DynamicSteamBridge {
 
     async fn subscribed_items(&self) -> Result<Vec<SubscribedItemInfo>, BridgeError> {
         let state = self.state.clone();
-        let val = tokio::task::spawn_blocking(move || {
-            state.call_sync("get_subscribed_items", json!({}))
-        })
-        .await
-        .map_err(|e| BridgeError::CallFailed(e.to_string()))??;
+        let val =
+            tokio::task::spawn_blocking(move || state.call_sync("get_subscribed_items", json!({})))
+                .await
+                .map_err(|e| BridgeError::CallFailed(e.to_string()))??;
 
         let arr = val
             .get("items")
@@ -463,7 +458,11 @@ impl SteamBridge for DynamicSteamBridge {
         .await
         .map_err(|e| BridgeError::CallFailed(e.to_string()))??;
 
-        if val.get("accepted").and_then(Value::as_bool).unwrap_or(false) {
+        if val
+            .get("accepted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             Ok(())
         } else {
             Err(BridgeError::CallFailed(
@@ -520,10 +519,12 @@ pub fn parse_sdk_item_value(val: &Value) -> Option<WorkshopItemRecord> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string);
-    let file_size = val
-        .get("file_size")
-        .and_then(Value::as_u64)
-        .or_else(|| val.get("file_size").and_then(Value::as_str)?.parse::<u64>().ok());
+    let file_size = val.get("file_size").and_then(Value::as_u64).or_else(|| {
+        val.get("file_size")
+            .and_then(Value::as_str)?
+            .parse::<u64>()
+            .ok()
+    });
     let time_created = val.get("time_created").and_then(Value::as_i64);
     let time_updated = val.get("time_updated").and_then(Value::as_i64);
     let tags = val

@@ -41,7 +41,6 @@ crates/*/target/
 .playwright-mcp
 known_addons.json
 /l4a
-package-lock.json
 *.db
 *.db-wal
 *.db-shm

@@ -139,6 +139,9 @@ mod tests {
         let bridge = NullSteamBridge::new("disabled by user");
         let caps = bridge.capabilities().await;
         assert!(!caps.bridge_available);
-        assert!(bridge.fetch_items(&[WorkshopId::new(1).unwrap()]).await.is_err());
+        assert!(bridge
+            .fetch_items(&[WorkshopId::new(1).unwrap()])
+            .await
+            .is_err());
     }
 }

@@ -1,9 +1,7 @@
 use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
-use l4a_protocol::{
-    MetadataSource, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId,
-};
+use l4a_protocol::{MetadataSource, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId};
 use l4a_steam::SteamBridge;
 use std::sync::Arc;
 

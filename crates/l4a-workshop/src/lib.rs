@@ -4,7 +4,9 @@ pub mod provider;
 pub mod providers;
 pub mod resolver;
 
-pub use downloader::{DownloadProgress, DownloadRequest, DownloadResult, ProgressSink, ResilientDownloader};
+pub use downloader::{
+    DownloadProgress, DownloadRequest, DownloadResult, ProgressSink, ResilientDownloader,
+};
 pub use error::WorkshopError;
 pub use provider::{ProviderCapabilities, WorkshopProvider};
 pub use providers::{

@@ -105,7 +105,11 @@ pub struct WorkshopCollectionRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "outcome",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 #[allow(clippy::large_enum_variant)]
 pub enum WorkshopFetchOutcome {
     Found {

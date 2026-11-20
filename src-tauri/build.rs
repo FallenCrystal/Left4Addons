@@ -18,11 +18,23 @@ fn main() {
 fn stage_steam_bridge() -> Result<(), String> {
     let target = env::var("TARGET").map_err(|e| e.to_string())?;
     let (bridge_source_name, bridge_staged_name, steam_api_name) = if target.contains("windows") {
-        ("l4a_steam_bridge.dll", "l4a-steam-bridge.dll", "steam_api64.dll")
+        (
+            "l4a_steam_bridge.dll",
+            "l4a-steam-bridge.dll",
+            "steam_api64.dll",
+        )
     } else if target.contains("linux") {
-        ("libl4a_steam_bridge.so", "libl4a-steam-bridge.so", "libsteam_api.so")
+        (
+            "libl4a_steam_bridge.so",
+            "libl4a-steam-bridge.so",
+            "libsteam_api.so",
+        )
     } else if target.contains("darwin") {
-        ("libl4a_steam_bridge.dylib", "libl4a-steam-bridge.dylib", "libsteam_api.dylib")
+        (
+            "libl4a_steam_bridge.dylib",
+            "libl4a-steam-bridge.dylib",
+            "libsteam_api.dylib",
+        )
     } else {
         return Ok(());
     };
@@ -93,7 +105,10 @@ fn stage_steam_bridge() -> Result<(), String> {
             "libstdc++-6.dll",
             "libwinpthread-1.dll",
         ] {
-            if let Ok(output) = Command::new(&gxx).arg(format!("-print-file-name={dll}")).output() {
+            if let Ok(output) = Command::new(&gxx)
+                .arg(format!("-print-file-name={dll}"))
+                .output()
+            {
                 if output.status.success() {
                     let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     let src_path = Path::new(&resolved);

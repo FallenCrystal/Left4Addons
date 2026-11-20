@@ -7,18 +7,28 @@ pub fn hash_token(token: &str) -> String {
 }
 
 pub fn generate_token() -> String {
-    format!("l4a_{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+    format!(
+        "l4a_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 pub fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let val = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let val = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     val.strip_prefix("Bearer ")
         .or_else(|| val.strip_prefix("bearer "))
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
 
-pub fn verify_admin(headers: &HeaderMap, expected_admin_token: &str) -> Result<(), (StatusCode, String)> {
+pub fn verify_admin(
+    headers: &HeaderMap,
+    expected_admin_token: &str,
+) -> Result<(), (StatusCode, String)> {
     if expected_admin_token.trim().is_empty() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -45,14 +55,21 @@ pub fn verify_contributor(
     headers: &HeaderMap,
     repo: &ServerRepo,
 ) -> Result<ContributorAuthRecord, (StatusCode, String)> {
-    let token = extract_bearer(headers)
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "缺少贡献者 Bearer Token".to_string()))?;
+    let token = extract_bearer(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "缺少贡献者 Bearer Token".to_string(),
+        )
+    })?;
     let hash = hash_token(token);
     let contributor = repo
         .find_contributor_by_token_hash(&hash)
         .map_err(|err| {
             tracing::error!(error = %err, "查询贡献者令牌失败");
-            (StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误".to_string())
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "服务端内部错误".to_string(),
+            )
         })?
         .ok_or_else(|| (StatusCode::UNAUTHORIZED, "贡献者 Token 无效".to_string()))?;
 

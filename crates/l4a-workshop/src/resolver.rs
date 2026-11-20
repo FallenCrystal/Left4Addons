@@ -143,10 +143,7 @@ impl WorkshopResolver {
             }
         }
 
-        let ordered = ids
-            .iter()
-            .filter_map(|id| results.remove(id))
-            .collect();
+        let ordered = ids.iter().filter_map(|id| results.remove(id)).collect();
         Ok((ordered, warnings))
     }
 

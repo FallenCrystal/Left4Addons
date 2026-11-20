@@ -126,10 +126,13 @@ impl MirrorRouter {
             };
         };
 
-        let Some(host) = parsed_url.host_str().map(|hostname| match parsed_url.port() {
-            Some(port) => format!("{hostname}:{port}"),
-            None => hostname.to_string(),
-        }) else {
+        let Some(host) = parsed_url
+            .host_str()
+            .map(|hostname| match parsed_url.port() {
+                Some(port) => format!("{hostname}:{port}"),
+                None => hostname.to_string(),
+            })
+        else {
             return ResolvedRequest {
                 url: url.to_string(),
                 original_host: None,

@@ -118,7 +118,10 @@ pub fn parse_library_folders_vdf(content: &str) -> Vec<PathBuf> {
         let tokens = extract_vdf_tokens(line_str);
         if tokens.as_slice() == ["550"]
             || (tokens.len() >= 3 && tokens[0].eq_ignore_ascii_case("apps") && tokens[1] == "550")
-            || tokens.iter().any(|t| t == "550") && tokens.first().is_some_and(|t| t.eq_ignore_ascii_case("apps"))
+            || tokens.iter().any(|t| t == "550")
+                && tokens
+                    .first()
+                    .is_some_and(|t| t.eq_ignore_ascii_case("apps"))
         {
             current_has_550 = true;
         }

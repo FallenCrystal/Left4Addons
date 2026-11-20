@@ -435,7 +435,8 @@ pub fn extract_mission_info_from_kv(kv: &Value) -> (Vec<MissionMapInfo>, Option<
                                 .and_then(Value::as_str)
                             {
                                 let code = map_code.trim().to_string();
-                                if !code.is_empty() && seen_codes.insert(code.to_ascii_lowercase()) {
+                                if !code.is_empty() && seen_codes.insert(code.to_ascii_lowercase())
+                                {
                                     let name = map_obj
                                         .get("displayname")
                                         .or_else(|| map_obj.get("name"))

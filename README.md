@@ -55,15 +55,18 @@
 
 ## 快速验证与开发
 
+验证环境使用 Node.js 24、Rust 1.100.0 和随附的 `rustfmt`。
+
 ```bash
-# 1. 运行 Rust 工作区全部单元测试与集成测试（零外部 Steam/网络依赖）
-cargo test
+# 1. 检查 Rust 格式并运行默认工作区成员的测试（零外部 Steam/网络依赖）
+cargo fmt --all -- --check
+cargo test --locked
 
 # 2. 启动独立的创意工坊信息管理/缓存后端（管理页位于 http://127.0.0.1:8787/admin）
 L4A_SERVER_ADMIN_TOKEN=dev-secret cargo run -p l4a-server
 
 # 3. 安装前端依赖并运行前端校验/测试/构建
-npm install
+npm ci
 npm run lint
 npm test
 npm run build

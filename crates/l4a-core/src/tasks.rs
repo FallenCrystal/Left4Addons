@@ -3,7 +3,11 @@ use crate::error::CoreError;
 use chrono::Utc;
 use l4a_protocol::{TaskId, TaskKind, TaskRecord, TaskStatus};
 
-pub fn create_task(db: &LocalDb, kind: TaskKind, target_id: impl Into<String>) -> Result<TaskRecord, CoreError> {
+pub fn create_task(
+    db: &LocalDb,
+    kind: TaskKind,
+    target_id: impl Into<String>,
+) -> Result<TaskRecord, CoreError> {
     let now = Utc::now();
     let task = TaskRecord {
         id: TaskId::generate(),

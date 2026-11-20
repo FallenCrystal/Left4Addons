@@ -150,7 +150,10 @@ mod tests {
 
     #[test]
     fn relevant_event_filters_only_direct_vpk_children() {
-        let watched = vec![PathBuf::from("/tmp/loading"), PathBuf::from("/tmp/workshop")];
+        let watched = vec![
+            PathBuf::from("/tmp/loading"),
+            PathBuf::from("/tmp/workshop"),
+        ];
         let ok_ev = Event {
             kind: EventKind::Modify(ModifyKind::Any),
             paths: vec![PathBuf::from("/tmp/loading/abc.vpk.disabled")],

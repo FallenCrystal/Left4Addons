@@ -8,7 +8,10 @@ use tracing_subscriber::EnvFilter;
 const INSECURE_DEFAULT_TOKEN: &str = "change-me-admin-token";
 
 #[derive(Debug, Parser)]
-#[command(name = "l4a-server", about = "Left4Addons v2 创意工坊信息管理与缓存后端")]
+#[command(
+    name = "l4a-server",
+    about = "Left4Addons v2 创意工坊信息管理与缓存后端"
+)]
 struct Cli {
     #[arg(long, env = "L4A_SERVER_BIND", default_value = "127.0.0.1:8787")]
     bind: String,

@@ -7,7 +7,7 @@ use axum::{
 use chrono::Utc;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
-    MetadataSource, SearchQuery, WorkshopDependency, WorkshopFileType, WorkshopFetchOutcome,
+    MetadataSource, SearchQuery, WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType,
     WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use l4a_steam::MockSteamBridge;
@@ -81,7 +81,10 @@ async fn steam_web_api_maps_active_removed_and_private_statuses() {
     match &outcomes[0] {
         WorkshopFetchOutcome::Found { item } => {
             assert_eq!(item.title, "Active Map");
-            assert_eq!(item.file_url.as_deref(), Some("https://cdn.example/101.vpk"));
+            assert_eq!(
+                item.file_url.as_deref(),
+                Some("https://cdn.example/101.vpk")
+            );
             assert_eq!(item.file_size, Some(2048));
             assert_eq!(item.tags, vec!["Campaign"]);
         }
@@ -174,7 +177,10 @@ async fn resolver_merges_sdk_dependencies_with_web_api_file_url_and_skips_scrape
 
     match &outcomes[0] {
         WorkshopFetchOutcome::Found { item } => {
-            assert_eq!(item.file_url.as_deref(), Some("https://cdn.example/501.vpk"));
+            assert_eq!(
+                item.file_url.as_deref(),
+                Some("https://cdn.example/501.vpk")
+            );
             assert_eq!(item.dependencies.len(), 1);
             assert_eq!(item.dependencies[0].workshop_id, dep_id);
         }
@@ -209,7 +215,11 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
                                 .parse()
                                 .unwrap();
                             if start >= data.len() {
-                                return (StatusCode::RANGE_NOT_SATISFIABLE, out_headers, Vec::new())
+                                return (
+                                    StatusCode::RANGE_NOT_SATISFIABLE,
+                                    out_headers,
+                                    Vec::new(),
+                                )
                                     .into_response();
                             }
                             out_headers.insert(
@@ -221,7 +231,11 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
                                 ))
                                 .unwrap(),
                             );
-                            (StatusCode::PARTIAL_CONTENT, out_headers, data[start..].to_vec())
+                            (
+                                StatusCode::PARTIAL_CONTENT,
+                                out_headers,
+                                data[start..].to_vec(),
+                            )
                                 .into_response()
                         } else {
                             (StatusCode::OK, out_headers, (*data).clone()).into_response()

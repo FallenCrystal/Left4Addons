@@ -1,9 +1,9 @@
+use l4a_protocol::WorkshopId;
 use l4a_vpk::{
     extract_addon_metadata, extract_mission_info_from_kv, generate_dummy_vpk, inspect_dummy_vpk,
     parse_key_values, parse_vpk, read_vpk_entry, write_vpk, DummyInspection, DummySpec,
     VpkFileToWrite,
 };
-use l4a_protocol::WorkshopId;
 use std::fs;
 use tempfile::tempdir;
 
@@ -85,7 +85,10 @@ fn vpk_write_and_read_roundtrip_extracts_metadata_and_maps() {
     let meta = extract_addon_metadata(&vpk_path, &cache_dir);
     assert!(meta.error.is_none());
     assert_eq!(meta.files_count, 4);
-    assert_eq!(meta.addon_info.get("addontitle").map(String::as_str), Some("City 17 Redux"));
+    assert_eq!(
+        meta.addon_info.get("addontitle").map(String::as_str),
+        Some("City 17 Redux")
+    );
     assert!(meta.has_image);
     assert!(cache_dir.join(meta.image_path.as_ref().unwrap()).exists());
 
@@ -146,7 +149,8 @@ fn dummy_v2_roundtrip_and_legacy_v1_detection() {
                 ext: "txt".into(),
                 path: "".into(),
                 filename: "addoninfo".into(),
-                content: br#""AddonInfo" { "addontitle" "Real Mod" "addonversion" "1.2" }"#.to_vec(),
+                content: br#""AddonInfo" { "addontitle" "Real Mod" "addonversion" "1.2" }"#
+                    .to_vec(),
             },
             VpkFileToWrite {
                 ext: "jpg".into(),

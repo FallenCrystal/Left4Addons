@@ -180,9 +180,6 @@ mod tests {
     fn addon_id_helpers_produce_stable_prefixes() {
         let wid = WorkshopId::new(42).unwrap();
         assert_eq!(AddonId::from_workshop_id(wid).as_str(), "ws:42");
-        assert_eq!(
-            AddonId::from_content_hash(" AbCd ").as_str(),
-            "hash:abcd"
-        );
+        assert_eq!(AddonId::from_content_hash(" AbCd ").as_str(), "hash:abcd");
     }
 }

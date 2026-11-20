@@ -145,18 +145,30 @@ impl WorkshopProvider for SteamWebApiProvider {
                             .and_then(Value::as_str)
                             .filter(|s| !s.is_empty())
                             .map(ToString::to_string);
-                        let file_size = entry
-                            .get("file_size")
-                            .and_then(Value::as_u64)
-                            .or_else(|| entry.get("file_size").and_then(Value::as_str)?.parse().ok());
+                        let file_size =
+                            entry.get("file_size").and_then(Value::as_u64).or_else(|| {
+                                entry.get("file_size").and_then(Value::as_str)?.parse().ok()
+                            });
                         let time_created = entry
                             .get("time_created")
                             .and_then(Value::as_i64)
-                            .or_else(|| entry.get("time_created").and_then(Value::as_str)?.parse().ok());
+                            .or_else(|| {
+                                entry
+                                    .get("time_created")
+                                    .and_then(Value::as_str)?
+                                    .parse()
+                                    .ok()
+                            });
                         let time_updated = entry
                             .get("time_updated")
                             .and_then(Value::as_i64)
-                            .or_else(|| entry.get("time_updated").and_then(Value::as_str)?.parse().ok());
+                            .or_else(|| {
+                                entry
+                                    .get("time_updated")
+                                    .and_then(Value::as_str)?
+                                    .parse()
+                                    .ok()
+                            });
                         let tags = entry
                             .get("tags")
                             .and_then(Value::as_array)
@@ -310,10 +322,8 @@ impl WorkshopProvider for SteamWebApiProvider {
             .collect();
 
         let col_meta = by_id.remove(&collection_id);
-        let items: Vec<WorkshopItemRecord> = child_ids
-            .iter()
-            .filter_map(|id| by_id.remove(id))
-            .collect();
+        let items: Vec<WorkshopItemRecord> =
+            child_ids.iter().filter_map(|id| by_id.remove(id)).collect();
 
         Ok(WorkshopCollectionRecord {
             collection_id,
