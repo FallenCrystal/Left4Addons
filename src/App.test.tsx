@@ -11,6 +11,7 @@ let eventHandler: ((ev: { payload: CoreEvent }) => void) | null = null;
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: (...args: unknown[]) => invokeMock(...args),
+  convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}`,
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
@@ -83,6 +84,35 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     await waitFor(() => {
       expect(screen.queryByText('Dummy Overwritten')).toBeNull();
     });
+  });
+
+  it('defaults to HTTPS-only in Sources & SDK and saves the switch value', async () => {
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sources & SDK' }));
+
+    const httpsOnly = screen.getByRole('switch', { name: 'Require Secure HTTPS Connections' });
+    expect(httpsOnly.getAttribute('aria-checked')).toBe('true');
+    fireEvent.click(httpsOnly);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(async () => {
+      expect((await previewEngine.getDashboardSnapshot()).config.httpsOnly).toBe(false);
+    });
+  });
+
+  it('loads desktop remote covers through the app protocol', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    const coverUrl = 'http://catalog.example.com/cover.jpg?size=64&v=2';
+    snapshot.addons[0].coverImage = coverUrl;
+    invokeMock.mockResolvedValue(snapshot);
+    render(<App />);
+
+    const img = await screen.findByAltText(snapshot.addons[0].title);
+    const src = new URL(img.getAttribute('src')!);
+    expect(src.protocol).toBe('l4a-cover:');
+    expect(src.searchParams.get('url')).toBe(coverUrl);
   });
 
   it('excludes hidden filtered-out addons from batch actions', async () => {

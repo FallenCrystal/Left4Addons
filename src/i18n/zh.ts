@@ -314,6 +314,7 @@ export const zh = {
     concurrency: '并发下载数',
     retries: '失败重试次数',
     sourceOrder: '数据源优先级',
+    httpsOnly: '仅允许安全的 HTTPS 连接',
     catalogUrl: 'Catalog Server 地址',
     catalogToken: 'Contributor Token',
     disableSdk: '禁用 Steamworks SDK',

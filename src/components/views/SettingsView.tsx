@@ -376,9 +376,17 @@ export function SettingsView({
               </section>
 
               <section className="l4a-section-card">
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.httpsOnly')}</span>
+                  <Switch
+                    checked={effective.httpsOnly}
+                    label={t('settings.httpsOnly')}
+                    onChange={(v) => updateDraft((d) => ({ ...d, httpsOnly: v }))}
+                  />
+                </div>
                 <TextField
                   label={t('settings.catalogUrl')}
-                  placeholder="http://127.0.0.1:8787"
+                  placeholder={effective.httpsOnly ? 'https://catalog.example.com' : 'http://127.0.0.1:8787'}
                   value={effective.catalogServerUrl ?? ''}
                   onChange={(e) =>
                     updateDraft((d) => ({

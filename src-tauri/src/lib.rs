@@ -4,6 +4,7 @@ use l4a_core::{EventSink, L4aEngine};
 use l4a_protocol::CoreEvent;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::http::{header, Method, Request, Response, StatusCode};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub struct TauriState {
@@ -47,9 +48,53 @@ fn resolve_writable_runtime_dir(app: &tauri::App, preferred: PathBuf) -> PathBuf
     preferred
 }
 
+async fn workshop_cover_response(
+    engine: &L4aEngine,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    let response = Response::builder().header(header::CACHE_CONTROL, "no-store");
+    if request.method() != Method::GET || request.uri().path() != "/image" {
+        return response
+            .status(StatusCode::BAD_REQUEST)
+            .body(Vec::new())
+            .unwrap();
+    }
+    let url = tauri::Url::parse(&request.uri().to_string())
+        .ok()
+        .and_then(|request| {
+            request
+                .query_pairs()
+                .find(|(key, _)| key == "url")
+                .map(|(_, url)| url.into_owned())
+        });
+    if let Some(url) = url {
+        if let Ok((mime, bytes)) = engine.fetch_workshop_cover(&url).await {
+            return response
+                .header(header::CONTENT_TYPE, mime)
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(
+                    header::CONTENT_SECURITY_POLICY,
+                    "default-src 'none'; sandbox",
+                )
+                .body(bytes)
+                .unwrap();
+        }
+    }
+    response
+        .status(StatusCode::NOT_FOUND)
+        .body(Vec::new())
+        .unwrap()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("l4a-cover", |context, request, responder| {
+            let engine = context.app_handle().state::<TauriState>().engine.clone();
+            tauri::async_runtime::spawn(async move {
+                responder.respond(workshop_cover_response(&engine, request).await);
+            });
+        })
         .setup(|app| {
             let mut host_runtime_dir = std::env::current_exe()
                 .ok()

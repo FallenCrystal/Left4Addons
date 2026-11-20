@@ -73,24 +73,24 @@ pub fn sanitize_vpk_filename(raw_name: &str, rules: &RenameRuleConfig) -> String
         .unwrap_or(raw_name);
 
     let no_ctrl: String = base.chars().filter(|c| !c.is_control()).collect();
-    let mut out = win_invalid_re().replace_all(&no_ctrl, "_").into_owned();
-
-    if rules.clean_special_chars {
+    let mut out = if rules.clean_special_chars {
         let rep = match rules.invalid_char_replace {
             InvalidCharReplace::Space => " ",
             InvalidCharReplace::Empty => "",
             InvalidCharReplace::Underscore => "_",
         };
-        let mut cleaned = String::with_capacity(out.len());
-        for c in out.chars() {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '[' | ']' | ' ') {
+        let mut cleaned = String::with_capacity(no_ctrl.len());
+        for c in no_ctrl.chars() {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '(' | ')' | '[' | ']' | ' ') {
                 cleaned.push(c);
             } else {
                 cleaned.push_str(rep);
             }
         }
-        out = cleaned;
-    }
+        cleaned
+    } else {
+        win_invalid_re().replace_all(&no_ctrl, "_").into_owned()
+    };
 
     if rules.enable_trim {
         out = out.trim().to_string();
@@ -694,4 +694,28 @@ pub fn search_by_map_code(db: &LocalDb, query: &str) -> Result<Vec<AddonSummary>
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_keeps_brackets_parentheses_and_underscores() {
+        let mut rules = RenameRuleConfig {
+            clean_special_chars: true,
+            ..Default::default()
+        };
+        for (replacement, expected) in [
+            (InvalidCharReplace::Space, "[Pack]_Map (v2) Part.vpk"),
+            (InvalidCharReplace::Underscore, "[Pack]_Map (v2)_Part_.vpk"),
+            (InvalidCharReplace::Empty, "[Pack]_Map (v2)Part.vpk"),
+        ] {
+            rules.invalid_char_replace = replacement;
+            assert_eq!(
+                sanitize_vpk_filename("[Pack]_Map (v2):Part!.VPK", &rules),
+                expected
+            );
+        }
+    }
 }

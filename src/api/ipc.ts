@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 export type AddonDirType = 'loading' | 'workshop';
@@ -199,6 +199,7 @@ export interface AppConfig {
   gameUpdateDummyPolicy: GameUpdateDummyPolicy;
   disableSteamworksSdk: boolean;
   forceSteamworksSdkDownload: boolean;
+  httpsOnly: boolean;
   catalogServerUrl?: string | null;
   catalogContributorToken?: string | null;
   sourceOrder: string[];
@@ -531,6 +532,12 @@ export async function searchByMapCode(query: string): Promise<AddonSummary[]> {
 
 export async function readCachedImage(cacheKey: string): Promise<number[]> {
   return invokeCommand<number[]>('read_cached_image', { cacheKey });
+}
+
+export function workshopCoverUrl(url: string): string {
+  const resource = new URL(convertFileSrc('image', 'l4a-cover'));
+  resource.searchParams.set('url', url);
+  return resource.toString();
 }
 
 export async function openExternalUrl(url: string): Promise<void> {

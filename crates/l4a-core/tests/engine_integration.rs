@@ -1,17 +1,18 @@
 mod support;
 
-use axum::{routing::get, Router};
+use axum::{routing::get, Json, Router};
 use chrono::Utc;
 use l4a_core::db::LocalDb;
 use l4a_core::{AppPaths, CoreError, EventSink, L4aEngine, NullEventSink};
 use l4a_protocol::{
     AddonDirType, AddonId, AddonOperationOutcome, AppConfig, CoreEvent, DesktopError,
     DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile, MetadataSource,
-    ProfileId, ReconcileAction, ReconcileIssueKind, RenameRuleConfig, UserGroup,
-    WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+    ProfileId, ReconcileAction, ReconcileIssueKind, RenameRuleConfig, SearchQuery, SearchResponse,
+    UserGroup, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
 };
 use l4a_steam::{MockSteamBridge, SubscribedItemInfo};
 use l4a_workshop::WorkshopError;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -524,6 +525,100 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
 }
 
 #[tokio::test]
+async fn existing_settings_default_to_https_for_catalog_and_covers_until_disabled() {
+    let dir = tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/v1/items/search",
+            get({
+                let requests = requests.clone();
+                move || async move {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    Json(SearchResponse {
+                        items: vec![],
+                        total: 0,
+                        page: 1,
+                        page_size: 30,
+                        source: MetadataSource::CatalogServer,
+                    })
+                }
+            }),
+        )
+        .route(
+            "/cover.jpg",
+            get({
+                let requests = requests.clone();
+                move || async move {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                    ([("content-type", "image/jpeg")], vec![0xff, 0xd8, 0xff])
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let paths = AppPaths::from_runtime_dir(dir.path());
+    paths.ensure_dirs().unwrap();
+    std::fs::write(
+        &paths.settings_path,
+        format!(
+            "loadingDir = 'addons'\nworkshopDir = 'addons/workshop'\n\
+             catalogServerUrl = 'http://{addr}'\nsourceOrder = ['catalog-server']\n"
+        ),
+    )
+    .unwrap();
+    let engine = L4aEngine::open_default(dir.path(), Arc::new(NullEventSink)).unwrap();
+    let query = SearchQuery::default();
+    let cover_url = format!("http://{addr}/cover.jpg");
+    assert!(engine.config().https_only);
+    assert!(engine
+        .search_workshop(&query)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS"));
+    assert!(engine
+        .fetch_workshop_cover(&cover_url)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("HTTPS"));
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+
+    let config = engine
+        .save_config(AppConfig {
+            https_only: false,
+            ..engine.config()
+        })
+        .unwrap();
+    assert!(
+        !l4a_core::load_config(&paths.settings_path)
+            .unwrap()
+            .https_only
+    );
+    assert_eq!(
+        engine.search_workshop(&query).await.unwrap().source,
+        MetadataSource::CatalogServer
+    );
+    assert_eq!(
+        engine.fetch_workshop_cover(&cover_url).await.unwrap(),
+        ("image/jpeg".to_string(), vec![0xff, 0xd8, 0xff])
+    );
+
+    engine
+        .save_config(AppConfig {
+            https_only: true,
+            ..config
+        })
+        .unwrap();
+    assert!(engine.search_workshop(&query).await.is_err());
+    assert!(engine.fetch_workshop_cover(&cover_url).await.is_err());
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
 async fn download_workflow_fetches_vpk_and_registers_addon_with_dummy() {
     let dir = tempdir().unwrap();
     let vpk_fixture = dir.path().join("fixture.vpk");
@@ -564,10 +659,23 @@ async fn download_workflow_fetches_vpk_and_registers_addon_with_dummy() {
     let cfg = AppConfig {
         loading_dir: loading_dir.to_string_lossy().into_owned(),
         workshop_dir: workshop_dir.to_string_lossy().into_owned(),
+        max_download_retries: 0,
         enable_dummy_bypass: true,
+        source_order: vec!["steamworks-sdk".into()],
         ..Default::default()
     };
     let engine = make_engine(dir.path(), cfg, bridge);
+
+    let blocked = engine.download_workshop_item(wid).await.unwrap_err();
+    assert!(
+        matches!(blocked, CoreError::Workshop(WorkshopError::Network(message)) if message.contains("HTTPS"))
+    );
+    engine
+        .save_config(AppConfig {
+            https_only: false,
+            ..engine.config()
+        })
+        .unwrap();
 
     let summary = engine.download_workshop_item(wid).await.unwrap();
     assert_eq!(summary.install_state, InstallState::Installed);
@@ -858,6 +966,7 @@ async fn downloads_can_retry_after_invalid_data_and_an_install_transaction_error
         loading_dir: loading.to_str().unwrap().into(),
         workshop_dir: workshop.to_str().unwrap().into(),
         enable_dummy_bypass: true,
+        https_only: false,
         ..Default::default()
     };
     let engine = make_engine(dir.path(), config, bridge);
@@ -979,6 +1088,7 @@ async fn downloads_respect_cancellation_and_files_created_during_transfer() {
         dir.path(),
         AppConfig {
             loading_dir: loading.to_str().unwrap().into(),
+            https_only: false,
             ..Default::default()
         },
         bridge,

@@ -22,7 +22,7 @@ import type {
   WorkshopItemRecord,
 } from './ipc';
 import { IpcError } from './ipc';
-import { previewFilenameByRules } from '../utils/format';
+import { previewFilenameByRules, sanitizeVpkFilename } from '../utils/format';
 
 const PREVIEW_CATALOG: WorkshopItemRecord[] = [
   {
@@ -171,7 +171,8 @@ function createInitialSnapshot(): DashboardSnapshot {
       gameUpdateDummyPolicy: 'ask',
       disableSteamworksSdk: false,
       forceSteamworksSdkDownload: false,
-      catalogServerUrl: 'http://127.0.0.1:8787',
+      httpsOnly: true,
+      catalogServerUrl: null,
       catalogContributorToken: '',
       sourceOrder: ['catalog-server', 'steamworks-sdk', 'steam-web-api'],
       renameRules: {
@@ -999,7 +1000,7 @@ class PreviewEngine {
         });
         continue;
       }
-      const clean = rawName.endsWith('.vpk') ? rawName : `${rawName}.vpk`;
+      const clean = sanitizeVpkFilename(rawName, this.state.config.renameRules);
       if (addon.currentFileName === clean) {
         items.push({ addonId, status: 'unchanged' });
       } else {

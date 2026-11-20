@@ -83,6 +83,7 @@ export function getFileBaseName(path?: string | null): string {
 }
 
 const WIN_INVALID_RE = /[\\/:*?"<>|]/g;
+const WIN_RESERVED_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
 export function previewFilenameByRules(
   rules: RenameRuleConfig,
@@ -96,8 +97,14 @@ export function previewFilenameByRules(
     parts.push(`[${sample.groupName.trim()}]`);
   }
   parts.push(sample.title.trim());
+  return sanitizeVpkFilename(parts.join(' '), rules);
+}
 
-  let out = parts.join(' ').replace(WIN_INVALID_RE, '_');
+export function sanitizeVpkFilename(rawName: string, rules: RenameRuleConfig): string {
+  const lower = rawName.toLowerCase();
+  const suffix = ['.vpk.disabled', '.disabled', '.vpk'].find((suffix) => lower.endsWith(suffix));
+  const base = suffix ? rawName.slice(0, -suffix.length) : rawName;
+  let out = base.replace(/\p{Cc}/gu, '');
 
   if (rules.cleanSpecialChars) {
     const rep =
@@ -106,9 +113,9 @@ export function previewFilenameByRules(
         : rules.invalidCharReplace === 'empty'
           ? ''
           : '_';
-    out = Array.from(out)
-      .map((ch) => (/[0-9a-zA-Z_[\] ]/.test(ch) ? ch : rep))
-      .join('');
+    out = out.replace(/[^0-9a-zA-Z_()[\] ]/gu, rep);
+  } else {
+    out = out.replace(WIN_INVALID_RE, '_');
   }
 
   if (rules.enableTrim) {
@@ -129,7 +136,8 @@ export function previewFilenameByRules(
   }
 
   const cleaned = out.replace(/^[. ]+|[. ]+$/g, '') || 'addon';
-  return `${cleaned}.vpk`;
+  const stem = WIN_RESERVED_RE.test(cleaned.split('.', 1)[0]) ? `_${cleaned}` : cleaned;
+  return `${stem}.vpk`;
 }
 
 export interface BatchSummaryCounts {

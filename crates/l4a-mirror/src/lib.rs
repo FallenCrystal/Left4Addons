@@ -1,9 +1,11 @@
 use regex::Regex;
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, ClientBuilder, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -15,6 +17,8 @@ pub enum MirrorError {
     Json(#[from] serde_json::Error),
     #[error("构建 HTTP 客户端失败: {0}")]
     ClientBuild(#[from] reqwest::Error),
+    #[error("已启用仅 HTTPS 连接，请使用 HTTPS 地址")]
+    HttpsRequired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -58,6 +62,7 @@ pub struct ResolvedRequest {
 #[derive(Debug, Clone, Default)]
 pub struct MirrorRouter {
     rules: Vec<CompiledRule>,
+    https_only: Arc<AtomicBool>,
 }
 
 impl MirrorRouter {
@@ -78,7 +83,10 @@ impl MirrorRouter {
                 }
             }
         }
-        Self { rules: compiled }
+        Self {
+            rules: compiled,
+            ..Self::default()
+        }
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, MirrorError> {
@@ -93,6 +101,10 @@ impl MirrorRouter {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    pub fn set_https_only(&self, enabled: bool) {
+        self.https_only.store(enabled, Ordering::Relaxed);
     }
 
     pub fn resolve(&self, url: &str) -> ResolvedRequest {
@@ -132,9 +144,6 @@ impl MirrorRouter {
             };
             let target = replace_captures(&compiled.raw.target, &captures);
             if set_target_host(&mut parsed_url, &target) {
-                if compiled.raw.insecure_tls {
-                    tracing::warn!(url = %url, target = %target, "镜像规则启用了 insecure-tls 跳过证书校验");
-                }
                 return ResolvedRequest {
                     url: parsed_url.to_string(),
                     original_host: compiled.raw.keep_host.then_some(host),
@@ -158,7 +167,7 @@ impl MirrorRouter {
         timeout: Option<Duration>,
     ) -> Result<(Client, ResolvedRequest), MirrorError> {
         let resolved = self.resolve(url);
-        let mut builder = Client::builder().danger_accept_invalid_certs(resolved.insecure_tls);
+        let mut builder = self.client_builder(&resolved)?;
         if let Some(t) = timeout {
             builder = builder.timeout(t);
         }
@@ -173,12 +182,26 @@ impl MirrorRouter {
         read_timeout: Duration,
     ) -> Result<(Client, ResolvedRequest), MirrorError> {
         let resolved = self.resolve(url);
-        let client = Client::builder()
-            .danger_accept_invalid_certs(resolved.insecure_tls)
+        let client = self
+            .client_builder(&resolved)?
             .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .build()?;
         Ok((client, resolved))
+    }
+
+    fn client_builder(&self, resolved: &ResolvedRequest) -> Result<ClientBuilder, MirrorError> {
+        let https_only = self.https_only.load(Ordering::Relaxed);
+        if https_only && !url::Url::parse(&resolved.url).is_ok_and(|url| url.scheme() == "https") {
+            return Err(MirrorError::HttpsRequired);
+        }
+        let insecure_tls = resolved.insecure_tls && !https_only;
+        if insecure_tls {
+            tracing::warn!("镜像规则启用了 insecure-tls 跳过证书校验");
+        }
+        Ok(Client::builder()
+            .https_only(https_only)
+            .danger_accept_invalid_certs(insecure_tls))
     }
 
     pub fn prepare_get(&self, client: &Client, url: &str) -> (RequestBuilder, ResolvedRequest) {

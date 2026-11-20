@@ -10,25 +10,28 @@ import {
   Skull,
   User,
 } from 'lucide-react';
-import { isTauriRuntime, readCachedImage } from '../../api/ipc';
+import { isTauriRuntime, readCachedImage, workshopCoverUrl } from '../../api/ipc';
 
 const cacheUrlMap = new Map<string, string>();
 const inFlightCacheLoads = new Map<string, Promise<string | null>>();
 
-function isDirectUrl(src?: string): boolean {
-  if (!src) return false;
-  return (
-    src.startsWith('http://') ||
-    src.startsWith('https://') ||
+function resolveDirectUrl(src?: string): string | undefined {
+  if (!src) return;
+  if (/^(?:https?:)?\/\//i.test(src)) {
+    const remoteUrl = src.startsWith('//') ? `https:${src}` : src;
+    return isTauriRuntime() ? workshopCoverUrl(remoteUrl) : remoteUrl;
+  }
+  if (
     src.startsWith('data:') ||
     src.startsWith('blob:') ||
-    src.startsWith('/')
-  );
+    (src.startsWith('/') && !src.includes('\\') && !/\p{Cc}/u.test(src))
+  ) {
+    return src;
+  }
 }
 
 function isLocalCacheKey(src?: string): boolean {
-  if (!src || isDirectUrl(src)) return false;
-  return /^[a-zA-Z0-9._-]+\.(?:jpe?g|png|webp)$/i.test(src) && !src.includes('..');
+  return Boolean(src && /^[a-zA-Z0-9._-]+\.(?:jpe?g|png|webp)$/i.test(src) && !src.includes('..'));
 }
 
 function mimeForCacheKey(key: string): string {
@@ -133,10 +136,10 @@ export function AddonCover({
     };
   }, [shouldLoadCache, src, cachedImmediate]);
 
-  const resolvedUrl = isDirectUrl(src)
-    ? src
-    : cachedImmediate ??
-      (loadedCache && loadedCache.key === src ? (loadedCache.url ?? undefined) : undefined);
+  const resolvedUrl =
+    resolveDirectUrl(src) ??
+    cachedImmediate ??
+    (loadedCache?.key === src ? loadedCache?.url : undefined);
 
   const canLoadImg = Boolean(resolvedUrl && failedSrc !== resolvedUrl);
 

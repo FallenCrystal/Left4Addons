@@ -211,6 +211,7 @@ describe('v2 IPC client wrapper', () => {
       gameUpdateDummyPolicy: 'ask' as const,
       disableSteamworksSdk: false,
       forceSteamworksSdkDownload: false,
+      httpsOnly: true,
       sourceOrder: ['catalog-server'],
       renameRules: rules,
     };

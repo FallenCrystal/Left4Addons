@@ -314,6 +314,7 @@ export const en = {
     concurrency: 'Concurrency',
     retries: 'Max Retries',
     sourceOrder: 'Provider Order',
+    httpsOnly: 'Require Secure HTTPS Connections',
     catalogUrl: 'Catalog Server URL',
     catalogToken: 'Contributor Token',
     disableSdk: 'Disable Steamworks SDK',

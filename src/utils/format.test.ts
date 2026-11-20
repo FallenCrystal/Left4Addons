@@ -32,13 +32,17 @@ describe('format utilities', () => {
     expect(getFileBaseName('/steam/addons/workshop/12345.vpk')).toBe('12345.vpk');
   });
 
-  it('previews renamed filenames matching Rust rename rules', () => {
+  it.each([
+    ['underscore', '[2814104912] [Campaigns] Chernobyl_Chapter One (v2)_.vpk'],
+    ['space', '[2814104912] [Campaigns] Chernobyl Chapter One (v2).vpk'],
+    ['empty', '[2814104912] [Campaigns] ChernobylChapter One (v2).vpk'],
+  ] as const)('previews permitted punctuation with %s replacement', (replacement, expected) => {
     const out = previewFilenameByRules(
       {
         enableWorkshopIdPrefix: true,
         enableGroupPrefix: true,
         cleanSpecialChars: true,
-        invalidCharReplace: 'underscore',
+        invalidCharReplace: replacement,
         maxFilenameLength: 0,
         enableTrim: true,
         enableRemoveDoubleSpaces: true,
@@ -46,10 +50,10 @@ describe('format utilities', () => {
       {
         workshopId: '2814104912',
         groupName: 'Campaigns',
-        title: '  Chernobyl:  Chapter One! ',
+        title: '  Chernobyl:Chapter  One (v2)! ',
       },
     );
-    expect(out).toBe('[2814104912] [Campaigns] Chernobyl_ Chapter One_.vpk');
+    expect(out).toBe(expected);
   });
 
   it('summarizes batch reports accurately', () => {

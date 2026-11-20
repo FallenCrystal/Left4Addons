@@ -38,6 +38,7 @@ use std::future::Future;
 use std::io::{self, Read};
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -104,6 +105,7 @@ impl L4aEngine {
         let mirror = Arc::new(
             MirrorRouter::from_file(&paths.mirrors_path).unwrap_or_else(|_| MirrorRouter::empty()),
         );
+        mirror.set_https_only(config.https_only);
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(Path::to_path_buf))
@@ -149,6 +151,7 @@ impl L4aEngine {
     ) -> Result<Self, CoreError> {
         paths.ensure_dirs()?;
         config.download_concurrency = config.download_concurrency.clamp(1, 8);
+        mirror.set_https_only(config.https_only);
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
             download_gate: DownloadGate::new(config.download_concurrency),
@@ -191,6 +194,7 @@ impl L4aEngine {
         save_config(&self.paths.settings_path, &next)?;
         let dirs_changed = {
             let mut guard = self.config.write().unwrap();
+            self.mirror.set_https_only(next.https_only);
             let changed =
                 guard.loading_dir != next.loading_dir || guard.workshop_dir != next.workshop_dir;
             *guard = next.clone();
@@ -293,6 +297,56 @@ impl L4aEngine {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
+    }
+
+    pub async fn fetch_workshop_cover(&self, url: &str) -> Result<(String, Vec<u8>), CoreError> {
+        const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
+
+        let url = url::Url::parse(url)
+            .ok()
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none()
+            })
+            .ok_or_else(|| CoreError::InvalidInput("无效的封面图片地址".into()))?;
+        let (client, _) = self
+            .mirror
+            .build_client_for(url.as_str(), Some(Duration::from_secs(15)))
+            .map_err(|err| WorkshopError::Network(err.to_string()))?;
+        let (request, _) = self.mirror.prepare_get(&client, url.as_str());
+        let mut response = request
+            .send()
+            .await
+            .and_then(|response| response.error_for_status())
+            .map_err(|err| WorkshopError::Network(err.to_string()))?;
+        let mime = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(|mime| mime.trim().to_ascii_lowercase())
+            .filter(|mime| mime.starts_with("image/"));
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|err| WorkshopError::Network(err.to_string()))?
+        {
+            if bytes.len() + chunk.len() > MAX_COVER_BYTES {
+                return Err(CoreError::InvalidInput("封面图片过大".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let mime = mime
+            .or_else(|| {
+                image::guess_format(&bytes)
+                    .ok()
+                    .map(|format| format.to_mime_type().into())
+            })
+            .ok_or_else(|| CoreError::InvalidInput("无法识别封面图片格式".into()))?;
+        Ok((mime, bytes))
     }
 
     fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {

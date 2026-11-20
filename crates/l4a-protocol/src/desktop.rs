@@ -434,6 +434,8 @@ pub struct AppConfig {
     pub disable_steamworks_sdk: bool,
     #[serde(default)]
     pub force_steamworks_sdk_download: bool,
+    #[serde(default = "default_true_flag")]
+    pub https_only: bool,
     #[serde(default)]
     pub catalog_server_url: Option<String>,
     #[serde(default)]
@@ -472,6 +474,7 @@ impl Default for AppConfig {
             game_update_dummy_policy: GameUpdateDummyPolicy::default(),
             disable_steamworks_sdk: false,
             force_steamworks_sdk_download: false,
+            https_only: true,
             catalog_server_url: None,
             catalog_contributor_token: None,
             source_order: default_provider_order(),
