@@ -233,6 +233,7 @@ pub(crate) fn scan_and_commit<T>(
                 enabled,
                 file_size,
                 meta,
+                known_addon,
                 &existing_addons,
             )
         } else if let Some(cached) = prev
@@ -262,6 +263,7 @@ pub(crate) fn scan_and_commit<T>(
                 enabled,
                 file_size,
                 meta,
+                known_addon,
                 &existing_addons,
             )
         };
@@ -460,12 +462,19 @@ fn build_addon_summary(
     enabled: bool,
     file_size: u64,
     meta: l4a_vpk::AddonMetadata,
+    known_addon: Option<&AddonSummary>,
     existing_addons: &HashMap<AddonId, AddonSummary>,
 ) -> AddonSummary {
-    let id = match workshop_id {
-        Some(wid) => AddonId::from_workshop_id(wid),
-        None => AddonId::from_content_hash(&meta.content_hash),
-    };
+    let id = known_addon
+        .filter(|addon| {
+            addon.workshop_id == workshop_id
+                && addon.content_hash.as_deref() == Some(meta.content_hash.as_str())
+        })
+        .map(|addon| addon.id.clone())
+        .unwrap_or_else(|| match workshop_id {
+            Some(wid) => AddonId::from_workshop_id(wid),
+            None => AddonId::from_content_hash(&meta.content_hash),
+        });
     let prev = existing_addons.get(&id);
     let title = meta
         .addon_info

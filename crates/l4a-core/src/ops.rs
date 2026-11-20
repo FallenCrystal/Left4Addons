@@ -561,7 +561,10 @@ fn find_addon<'a>(
         .ok_or_else(|| CoreError::NotFound(format!("未找到模组: {id}")))
 }
 
-fn addon_path<'a>(config: &AppConfig, addon: &'a AddonSummary) -> Result<&'a Path, CoreError> {
+pub(crate) fn addon_path<'a>(
+    config: &AppConfig,
+    addon: &'a AddonSummary,
+) -> Result<&'a Path, CoreError> {
     let path = addon
         .current_path
         .as_deref()
@@ -578,7 +581,7 @@ fn addon_path<'a>(config: &AppConfig, addon: &'a AddonSummary) -> Result<&'a Pat
     Ok(path)
 }
 
-fn take_addon_file(
+pub(crate) fn take_addon_file(
     changes: &mut FileChanges,
     addon: &AddonSummary,
     source: &Path,

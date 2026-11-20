@@ -1,0 +1,656 @@
+import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  Check,
+  Cpu,
+  Download,
+  Eye,
+  EyeOff,
+  FolderSearch,
+  Palette,
+  RefreshCw,
+  Shield,
+  TextCursorInput,
+} from 'lucide-react';
+import type {
+  AppConfig,
+  GameUpdateDummyPolicy,
+  InvalidCharReplace,
+  SteamCapabilities,
+} from '../../api/ipc';
+import { previewFilenameByRules } from '../../utils/format';
+import { THEME_SEEDS, type ThemeMode, type ThemePreference } from '../../utils/theme';
+import {
+  Button,
+  IconButton,
+  SegmentedButton,
+  Switch,
+  TextField,
+} from '../m3/primitives';
+
+export type SettingsSection =
+  | 'paths'
+  | 'bypass'
+  | 'downloads'
+  | 'sources'
+  | 'rename'
+  | 'appearance';
+
+export interface SettingsViewProps {
+  config: AppConfig;
+  section: SettingsSection;
+  onSectionChange: (section: SettingsSection) => void;
+  steamCaps: SteamCapabilities | null;
+  checkingSteamCaps: boolean;
+  busy: boolean;
+  themePref: ThemePreference;
+  language: 'zh' | 'en';
+  onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<boolean>;
+  onDetectPath: () => Promise<string | null>;
+  onRefreshSteamCaps: () => void;
+  onChangeTheme: (pref: ThemePreference) => void;
+  onChangeLanguage: (lang: 'zh' | 'en') => void;
+  onNotify: (msg: string, tone?: 'default' | 'error') => void;
+}
+
+export function SettingsView({
+  config,
+  section,
+  onSectionChange,
+  steamCaps,
+  checkingSteamCaps,
+  busy,
+  themePref,
+  language,
+  onSaveConfig,
+  onDetectPath,
+  onRefreshSteamCaps,
+  onChangeTheme,
+  onChangeLanguage,
+  onNotify,
+}: SettingsViewProps) {
+  const { t } = useTranslation();
+  const [draft, setDraft] = useState<AppConfig | null>(null);
+  const [showToken, setShowToken] = useState(false);
+  const [detecting, setDetecting] = useState(false);
+
+  const effective = draft ?? config;
+
+  useEffect(() => {
+    if (section === 'sources' && !steamCaps && !checkingSteamCaps) {
+      onRefreshSteamCaps();
+    }
+  }, [section, steamCaps, checkingSteamCaps, onRefreshSteamCaps]);
+
+  const sections: { id: SettingsSection; label: string; icon: typeof FolderSearch }[] = [
+    { id: 'paths', label: t('settings.sections.paths'), icon: FolderSearch },
+    { id: 'bypass', label: t('settings.sections.bypass'), icon: Shield },
+    { id: 'downloads', label: t('settings.sections.downloads'), icon: Download },
+    { id: 'sources', label: t('settings.sections.sources'), icon: Cpu },
+    { id: 'rename', label: t('settings.sections.rename'), icon: TextCursorInput },
+    { id: 'appearance', label: t('settings.sections.appearance'), icon: Palette },
+  ];
+
+  const updateDraft = (updater: (curr: AppConfig) => AppConfig) => {
+    setDraft((prev) => updater(prev ?? config));
+  };
+
+  const dirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(config);
+  const pathsChanged =
+    effective.loadingDir !== config.loadingDir || effective.workshopDir !== config.workshopDir;
+
+  const handleSave = async () => {
+    if (!dirty) return;
+    const ok = await onSaveConfig(effective, pathsChanged);
+    if (ok) setDraft(null);
+  };
+
+  const handleDetect = async () => {
+    setDetecting(true);
+    try {
+      const detected = await onDetectPath();
+      if (detected) {
+        const sep = detected.includes('\\') ? '\\' : '/';
+        const normalized = detected.replace(/[\\/]+$/, '');
+        updateDraft((prev) => ({
+          ...prev,
+          loadingDir: normalized,
+          workshopDir: `${normalized}${sep}workshop`,
+        }));
+        onNotify(t('settings.detected'));
+      } else {
+        onNotify(t('settings.notDetected'), 'error');
+      }
+    } finally {
+      setDetecting(false);
+    }
+  };
+
+  const moveProvider = (idx: number, delta: -1 | 1) => {
+    const nextIdx = idx + delta;
+    if (nextIdx < 0 || nextIdx >= effective.sourceOrder.length) return;
+    updateDraft((prev) => {
+      const list = [...prev.sourceOrder];
+      const [item] = list.splice(idx, 1);
+      list.splice(nextIdx, 0, item);
+      return { ...prev, sourceOrder: list };
+    });
+  };
+
+  const renameSample = previewFilenameByRules(effective.renameRules, {
+    workshopId: '2814104912',
+    groupName: 'Campaigns',
+    title: '  Chernobyl:  Chapter One (v2.4)  ',
+  });
+
+  return (
+    <div className="l4a-view">
+      <header className="l4a-view-header">
+        <h1 className="md-headline-small">{t('nav.settings')}</h1>
+        <div className="l4a-spacer" />
+        {dirty && (
+          <>
+            <Button variant="text" onClick={() => setDraft(null)}>
+              {t('common.cancel')}
+            </Button>
+            <Button variant="filled" disabled={busy} onClick={() => void handleSave()}>
+              {pathsChanged ? t('settings.saveAndScan') : t('common.save')}
+            </Button>
+          </>
+        )}
+      </header>
+
+      <div className="l4a-settings-layout">
+        <nav className="l4a-settings-nav" aria-label={t('settings.navLabel')}>
+          {sections.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className="l4a-settings-nav-item"
+                data-active={section === item.id ? 'true' : 'false'}
+                onClick={() => onSectionChange(item.id)}
+              >
+                <Icon size={18} />
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="l4a-settings-pane">
+          {section === 'paths' && (
+            <section className="l4a-section-card">
+              <TextField
+                label={t('settings.loadingDir')}
+                value={effective.loadingDir}
+                onChange={(e) => updateDraft((d) => ({ ...d, loadingDir: e.target.value }))}
+                trailing={
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    disabled={detecting}
+                    onClick={() => void handleDetect()}
+                  >
+                    {t('settings.autoDetect')}
+                  </Button>
+                }
+              />
+              <TextField
+                label={t('settings.workshopDir')}
+                value={effective.workshopDir}
+                onChange={(e) => updateDraft((d) => ({ ...d, workshopDir: e.target.value }))}
+              />
+            </section>
+          )}
+
+          {section === 'bypass' && (
+            <section className="l4a-section-card">
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.enableDummyBypass')}</span>
+                <Switch
+                  checked={effective.enableDummyBypass}
+                  label={t('settings.enableDummyBypass')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      enableDummyBypass: v,
+                      gameUpdateDummyPolicy: !v ? 'ask' : d.gameUpdateDummyPolicy,
+                    }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.autoAdoptNew')}</span>
+                <Switch
+                  checked={effective.autoAdoptNewWorkshopDownloads}
+                  disabled={!effective.enableDummyBypass}
+                  label={t('settings.autoAdoptNew')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({ ...d, autoAdoptNewWorkshopDownloads: v }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+                <span className="md-title-small">{t('settings.updatePolicy')}</span>
+                <SegmentedButton<GameUpdateDummyPolicy>
+                  ariaLabel={t('settings.updatePolicy')}
+                  value={effective.gameUpdateDummyPolicy}
+                  onChange={(v) => updateDraft((d) => ({ ...d, gameUpdateDummyPolicy: v }))}
+                  options={[
+                    { value: 'ask', label: t('settings.policy.ask') },
+                    {
+                      value: 'auto_adopt_keep_customizations',
+                      label: t('settings.policy.auto_adopt_keep_customizations'),
+                      disabled: !effective.enableDummyBypass,
+                    },
+                    {
+                      value: 'auto_keep_local_regenerate_dummy',
+                      label: t('settings.policy.auto_keep_local_regenerate_dummy'),
+                      disabled: !effective.enableDummyBypass,
+                    },
+                  ]}
+                />
+              </div>
+            </section>
+          )}
+
+          {section === 'downloads' && (
+            <section className="l4a-section-card">
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.concurrency')}</span>
+                <div className="l4a-row-wrap">
+                  <Button
+                    variant="outlined"
+                    size="sm"
+                    disabled={effective.downloadConcurrency <= 1}
+                    onClick={() =>
+                      updateDraft((d) => ({
+                        ...d,
+                        downloadConcurrency: Math.max(1, d.downloadConcurrency - 1),
+                      }))
+                    }
+                  >
+                    −
+                  </Button>
+                  <span className="md-title-medium md-mono" style={{ minWidth: 28, textAlign: 'center' }}>
+                    {effective.downloadConcurrency}
+                  </span>
+                  <Button
+                    variant="outlined"
+                    size="sm"
+                    disabled={effective.downloadConcurrency >= 8}
+                    onClick={() =>
+                      updateDraft((d) => ({
+                        ...d,
+                        downloadConcurrency: Math.min(8, d.downloadConcurrency + 1),
+                      }))
+                    }
+                  >
+                    +
+                  </Button>
+                </div>
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.retries')}</span>
+                <div className="l4a-row-wrap">
+                  <Button
+                    variant="outlined"
+                    size="sm"
+                    disabled={effective.maxDownloadRetries <= 0}
+                    onClick={() =>
+                      updateDraft((d) => ({
+                        ...d,
+                        maxDownloadRetries: Math.max(0, d.maxDownloadRetries - 1),
+                      }))
+                    }
+                  >
+                    −
+                  </Button>
+                  <span className="md-title-medium md-mono" style={{ minWidth: 28, textAlign: 'center' }}>
+                    {effective.maxDownloadRetries}
+                  </span>
+                  <Button
+                    variant="outlined"
+                    size="sm"
+                    disabled={effective.maxDownloadRetries >= 10}
+                    onClick={() =>
+                      updateDraft((d) => ({
+                        ...d,
+                        maxDownloadRetries: Math.min(10, d.maxDownloadRetries + 1),
+                      }))
+                    }
+                  >
+                    +
+                  </Button>
+                </div>
+              </div>
+            </section>
+          )}
+
+          {section === 'sources' && (
+            <>
+              <section className="l4a-section-card">
+                <span className="md-label-medium" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                  {t('settings.sourceOrder')}
+                </span>
+                <div className="l4a-list">
+                  {effective.sourceOrder.map((src, idx) => (
+                    <div
+                      key={src}
+                      className="l4a-list-row"
+                      style={{ minHeight: 50, cursor: 'default' }}
+                    >
+                      <span className="md-pill md-mono" data-tone="secondary">
+                        {idx + 1}
+                      </span>
+                      <span className="md-title-small" style={{ flex: 1 }}>
+                        {t(`settings.provider.${src}`, { defaultValue: src })}
+                      </span>
+                      <IconButton
+                        size="sm"
+                        label={t('common.moveUp')}
+                        disabled={idx === 0}
+                        onClick={() => moveProvider(idx, -1)}
+                      >
+                        <ArrowUp size={15} />
+                      </IconButton>
+                      <IconButton
+                        size="sm"
+                        label={t('common.moveDown')}
+                        disabled={idx === effective.sourceOrder.length - 1}
+                        onClick={() => moveProvider(idx, 1)}
+                      >
+                        <ArrowDown size={15} />
+                      </IconButton>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section className="l4a-section-card">
+                <TextField
+                  label={t('settings.catalogUrl')}
+                  placeholder="http://127.0.0.1:8787"
+                  value={effective.catalogServerUrl ?? ''}
+                  onChange={(e) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      catalogServerUrl: e.target.value || null,
+                    }))
+                  }
+                />
+                <TextField
+                  label={t('settings.catalogToken')}
+                  type={showToken ? 'text' : 'password'}
+                  value={effective.catalogContributorToken ?? ''}
+                  onChange={(e) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      catalogContributorToken: e.target.value || null,
+                    }))
+                  }
+                  trailing={
+                    <IconButton
+                      size="sm"
+                      label={t('common.toggleVisibility')}
+                      onClick={() => setShowToken((v) => !v)}
+                    >
+                      {showToken ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </IconButton>
+                  }
+                />
+              </section>
+
+              <section className="l4a-section-card">
+                <div className="l4a-setting-row">
+                  <div className="l4a-row-wrap">
+                    <span className="md-title-small">{t('settings.sdkStatus')}</span>
+                    <span
+                      className="md-pill"
+                      data-tone={
+                        checkingSteamCaps
+                          ? 'tertiary'
+                          : steamCaps?.bridgeInitialized
+                            ? 'primary'
+                            : 'surface'
+                      }
+                    >
+                      {checkingSteamCaps
+                        ? t('settings.sdkChecking')
+                        : steamCaps?.bridgeInitialized
+                          ? t('settings.sdkReady')
+                          : t('settings.sdkUnavailable')}
+                    </span>
+                    {steamCaps?.bridgeVersion && (
+                      <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                        v{steamCaps.bridgeVersion}
+                      </span>
+                    )}
+                    {steamCaps?.currentUserSteamId && (
+                      <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                        {steamCaps.currentUserSteamId}
+                      </span>
+                    )}
+                  </div>
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    disabled={checkingSteamCaps}
+                    icon={<RefreshCw size={13} className={checkingSteamCaps ? 'md-spin' : undefined} />}
+                    onClick={onRefreshSteamCaps}
+                  >
+                    {t('settings.refreshSdk')}
+                  </Button>
+                </div>
+                {steamCaps?.lastError && !steamCaps.bridgeInitialized && (
+                  <div className="l4a-path-chip">
+                    <AlertCircle size={14} style={{ color: 'var(--md-sys-color-error)', flexShrink: 0 }} />
+                    <span className="md-body-small selectable">{steamCaps.lastError}</span>
+                  </div>
+                )}
+                <div className="l4a-divider" />
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.disableSdk')}</span>
+                  <Switch
+                    checked={effective.disableSteamworksSdk}
+                    label={t('settings.disableSdk')}
+                    onChange={(v) => updateDraft((d) => ({ ...d, disableSteamworksSdk: v }))}
+                  />
+                </div>
+                <div className="l4a-divider" />
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.forceSdkDownload')}</span>
+                  <Switch
+                    checked={effective.forceSteamworksSdkDownload}
+                    disabled={effective.disableSteamworksSdk}
+                    label={t('settings.forceSdkDownload')}
+                    onChange={(v) =>
+                      updateDraft((d) => ({ ...d, forceSteamworksSdkDownload: v }))
+                    }
+                  />
+                </div>
+              </section>
+            </>
+          )}
+
+          {section === 'rename' && (
+            <section className="l4a-section-card">
+              <div className="md-field">
+                <span className="md-field-label">{t('settings.previewLabel')}</span>
+                <div className="l4a-preview-box">{renameSample}</div>
+              </div>
+
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.workshopIdPrefix')}</span>
+                <Switch
+                  checked={effective.renameRules.enableWorkshopIdPrefix}
+                  label={t('settings.workshopIdPrefix')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      renameRules: { ...d.renameRules, enableWorkshopIdPrefix: v },
+                    }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.groupPrefix')}</span>
+                <Switch
+                  checked={effective.renameRules.enableGroupPrefix}
+                  label={t('settings.groupPrefix')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      renameRules: { ...d.renameRules, enableGroupPrefix: v },
+                    }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.cleanSpecialChars')}</span>
+                <Switch
+                  checked={effective.renameRules.cleanSpecialChars}
+                  label={t('settings.cleanSpecialChars')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      renameRules: { ...d.renameRules, cleanSpecialChars: v },
+                    }))
+                  }
+                />
+              </div>
+              {effective.renameRules.cleanSpecialChars && (
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.invalidCharReplace')}</span>
+                  <SegmentedButton<InvalidCharReplace>
+                    ariaLabel={t('settings.invalidCharReplace')}
+                    value={effective.renameRules.invalidCharReplace}
+                    onChange={(v) =>
+                      updateDraft((d) => ({
+                        ...d,
+                        renameRules: { ...d.renameRules, invalidCharReplace: v },
+                      }))
+                    }
+                    options={[
+                      { value: 'underscore', label: t('settings.replace.underscore') },
+                      { value: 'space', label: t('settings.replace.space') },
+                      { value: 'empty', label: t('settings.replace.empty') },
+                    ]}
+                  />
+                </div>
+              )}
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.enableTrim')}</span>
+                <Switch
+                  checked={effective.renameRules.enableTrim}
+                  label={t('settings.enableTrim')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      renameRules: { ...d.renameRules, enableTrim: v },
+                    }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.removeDoubleSpaces')}</span>
+                <Switch
+                  checked={effective.renameRules.enableRemoveDoubleSpaces}
+                  label={t('settings.removeDoubleSpaces')}
+                  onChange={(v) =>
+                    updateDraft((d) => ({
+                      ...d,
+                      renameRules: { ...d.renameRules, enableRemoveDoubleSpaces: v },
+                    }))
+                  }
+                />
+              </div>
+              <div className="l4a-divider" />
+              <TextField
+                label={t('settings.maxFilenameLength')}
+                type="number"
+                min={0}
+                max={240}
+                value={effective.renameRules.maxFilenameLength}
+                onChange={(e) =>
+                  updateDraft((d) => ({
+                    ...d,
+                    renameRules: {
+                      ...d.renameRules,
+                      maxFilenameLength: Math.max(
+                        0,
+                        Number.parseInt(e.target.value || '0', 10) || 0,
+                      ),
+                    },
+                  }))
+                }
+              />
+            </section>
+          )}
+
+          {section === 'appearance' && (
+            <section className="l4a-section-card">
+              <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+                <span className="md-title-small">{t('settings.themeMode')}</span>
+                <SegmentedButton<ThemeMode>
+                  ariaLabel={t('settings.themeMode')}
+                  value={themePref.mode}
+                  onChange={(mode) => onChangeTheme({ ...themePref, mode })}
+                  options={[
+                    { value: 'system', label: t('settings.theme.system') },
+                    { value: 'light', label: t('settings.theme.light') },
+                    { value: 'dark', label: t('settings.theme.dark') },
+                  ]}
+                />
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.seedColor')}</span>
+                <div className="l4a-color-swatches">
+                  {THEME_SEEDS.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      className="l4a-swatch"
+                      style={{ backgroundColor: s.swatch }}
+                      data-selected={themePref.seed === s.id ? 'true' : 'false'}
+                      aria-label={s.id}
+                      onClick={() => onChangeTheme({ ...themePref, seed: s.id })}
+                    >
+                      {themePref.seed === s.id && <Check size={15} strokeWidth={2.8} />}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="l4a-divider" />
+              <div className="l4a-setting-row">
+                <span className="md-title-small">{t('settings.language')}</span>
+                <SegmentedButton<'zh' | 'en'>
+                  ariaLabel={t('settings.language')}
+                  value={language}
+                  onChange={onChangeLanguage}
+                  options={[
+                    { value: 'zh', label: '中文' },
+                    { value: 'en', label: 'English' },
+                  ]}
+                />
+              </div>
+            </section>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

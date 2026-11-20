@@ -32,10 +32,8 @@ pub fn rebuild_auto_bundles(db: &LocalDb) -> Result<Vec<BundleRecord>, CoreError
     db.delete_unlocked_auto_bundles()?;
 
     let addons = db.list_addons()?;
-    let addon_map: HashMap<AddonId, AddonSummary> = addons
-        .iter()
-        .map(|a| (a.id.clone(), a.clone()))
-        .collect();
+    let addon_map: HashMap<AddonId, AddonSummary> =
+        addons.iter().map(|a| (a.id.clone(), a.clone())).collect();
     let wid_to_addon: HashMap<WorkshopId, AddonSummary> = addons
         .iter()
         .filter_map(|a| a.workshop_id.map(|w| (w, a.clone())))
@@ -196,6 +194,10 @@ pub fn set_bundle_locked(db: &LocalDb, id: &BundleId, locked: bool) -> Result<()
     db.set_bundle_locked(id, locked)
 }
 
+pub fn delete_bundle(db: &LocalDb, id: &BundleId) -> Result<(), CoreError> {
+    db.delete_bundle(id)
+}
+
 fn assemble_bundle(
     id: BundleId,
     name: String,
@@ -267,9 +269,14 @@ pub async fn track_workshop_collection(
     auto_sync: bool,
 ) -> Result<TrackedCollectionRecord, CoreError> {
     let (remote, _warnings) = resolver.fetch_collection(collection_id).await?;
-    for item in &remote.items {
-        db.upsert_workshop_snapshot(item, false)?;
-    }
+    let _workspace = db.lock_workspace()?;
+    let mut removed_upstream_ids = db
+        .list_tracked_collections()?
+        .into_iter()
+        .find(|col| col.collection_id == collection_id)
+        .map(|col| col.removed_upstream_ids)
+        .unwrap_or_default();
+    removed_upstream_ids.retain(|id| !remote.child_ids.contains(id));
     let record = TrackedCollectionRecord {
         collection_id,
         title: remote
@@ -279,14 +286,23 @@ pub async fn track_workshop_collection(
         description: remote.description,
         auto_sync,
         member_workshop_ids: remote.child_ids,
-        removed_upstream_ids: Vec::new(),
+        removed_upstream_ids,
         last_synced_at: Some(Utc::now()),
     };
-    db.save_tracked_collection(&record)?;
+    db.write(|tx| {
+        for item in &remote.items {
+            LocalDb::upsert_workshop_snapshot_tx(tx, item, false)?;
+        }
+        LocalDb::save_tracked_collection_tx(tx, &record)
+    })?;
     Ok(record)
 }
 
-pub fn untrack_workshop_collection(db: &LocalDb, collection_id: WorkshopId) -> Result<(), CoreError> {
+pub fn untrack_workshop_collection(
+    db: &LocalDb,
+    collection_id: WorkshopId,
+) -> Result<(), CoreError> {
+    let _workspace = db.lock_workspace()?;
     db.delete_tracked_collection(collection_id)
 }
 
@@ -324,10 +340,8 @@ pub fn apply_profile(
 
     let desired: HashSet<AddonId> = profile.enabled_addon_ids.iter().cloned().collect();
     let addons = db.list_addons()?;
-    let by_id: HashMap<AddonId, AddonSummary> = addons
-        .iter()
-        .map(|a| (a.id.clone(), a.clone()))
-        .collect();
+    let by_id: HashMap<AddonId, AddonSummary> =
+        addons.iter().map(|a| (a.id.clone(), a.clone())).collect();
 
     let mut missing_addons = Vec::new();
     let mut skipped_workshop_only = Vec::new();
@@ -337,7 +351,9 @@ pub fn apply_profile(
     for aid in &desired {
         match by_id.get(aid) {
             None => missing_addons.push(aid.clone()),
-            Some(a) if a.install_state != InstallState::Installed => missing_addons.push(aid.clone()),
+            Some(a) if a.install_state != InstallState::Installed => {
+                missing_addons.push(aid.clone())
+            }
             Some(a) if a.primary_dir == Some(AddonDirType::Workshop) && !a.enabled => {
                 skipped_workshop_only.push(aid.clone());
             }

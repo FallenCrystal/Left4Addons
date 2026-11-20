@@ -315,7 +315,7 @@ pub fn auto_resolve_by_policy(
     let mut resolved = 0usize;
     for issue in issues {
         let action = match issue.kind {
-            ReconcileIssueKind::DummyOverwrittenByGameUpdate => {
+            ReconcileIssueKind::DummyOverwrittenByGameUpdate if config.enable_dummy_bypass => {
                 match config.game_update_dummy_policy {
                     GameUpdateDummyPolicy::AutoAdoptKeepCustomizations => {
                         Some(ReconcileAction::AdoptWorkshopUpdate)

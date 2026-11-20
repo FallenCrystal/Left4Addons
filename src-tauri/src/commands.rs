@@ -1,12 +1,15 @@
 use crate::TauriState;
+use l4a_core::{validate_external_url, CoreError};
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
-    DashboardSnapshot, DesktopError, GroupId, IssueId, LoadoutProfile, ProfileApplyReport,
-    ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse,
-    SyncReport, TrackedCollectionRecord, UserGroup, WorkshopId,
+    DashboardSnapshot, DesktopError, DesktopErrorCode, GroupId, IssueId, LoadoutProfile,
+    ProfileApplyReport, ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig,
+    SearchQuery, SearchResponse, SyncReport, TrackedCollectionRecord, UserGroup, WorkshopId,
+    WorkshopItemRecord,
 };
 use l4a_steam::SteamCapabilities;
 use tauri::State;
+use tokio::process::Command;
 
 #[tauri::command]
 pub async fn get_dashboard_snapshot(
@@ -20,6 +23,39 @@ pub async fn scan_workspace(
     state: State<'_, TauriState>,
 ) -> Result<DashboardSnapshot, DesktopError> {
     state.engine.scan().map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn read_cached_image(
+    cache_key: String,
+    state: State<'_, TauriState>,
+) -> Result<Vec<u8>, DesktopError> {
+    state
+        .engine
+        .read_cached_image(&cache_key)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), DesktopError> {
+    let validated = validate_external_url(&url)?;
+    let program = match std::env::consts::OS {
+        "linux" => "xdg-open",
+        "macos" => "open",
+        "windows" => "rundll32.exe",
+        _ => {
+            return Err(DesktopError {
+                code: DesktopErrorCode::Unsupported,
+                message: "当前平台不支持打开外部链接".into(),
+            });
+        }
+    };
+    let mut command = Command::new(program);
+    if cfg!(windows) {
+        command.arg("url.dll,FileProtocolHandler");
+    }
+    command.arg(&validated).spawn().map_err(CoreError::from)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -43,6 +79,17 @@ pub async fn get_steam_capabilities(
 }
 
 #[tauri::command]
+pub async fn get_subscribed_workshop_ids(
+    state: State<'_, TauriState>,
+) -> Result<Vec<WorkshopId>, DesktopError> {
+    state
+        .engine
+        .subscribed_workshop_ids()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn sync_workshop(state: State<'_, TauriState>) -> Result<SyncReport, DesktopError> {
     state.engine.sync_workshop().await.map_err(Into::into)
 }
@@ -60,6 +107,18 @@ pub async fn search_workshop(
 }
 
 #[tauri::command]
+pub async fn fetch_workshop_item(
+    workshop_id: WorkshopId,
+    state: State<'_, TauriState>,
+) -> Result<WorkshopItemRecord, DesktopError> {
+    state
+        .engine
+        .fetch_workshop_item(workshop_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn download_workshop_item(
     workshop_id: WorkshopId,
     state: State<'_, TauriState>,
@@ -67,6 +126,18 @@ pub async fn download_workshop_item(
     state
         .engine
         .download_workshop_item(workshop_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn update_workshop_item(
+    workshop_id: WorkshopId,
+    state: State<'_, TauriState>,
+) -> Result<AddonSummary, DesktopError> {
+    state
+        .engine
+        .update_workshop_item(workshop_id)
         .await
         .map_err(Into::into)
 }
@@ -150,6 +221,19 @@ pub async fn delete_addons(
 }
 
 #[tauri::command]
+pub async fn safe_delete_obsolete_dependency(
+    workshop_id: WorkshopId,
+    delete_disk_file: bool,
+    purge_known_record: bool,
+    state: State<'_, TauriState>,
+) -> Result<AddonBatchReport, DesktopError> {
+    state
+        .engine
+        .safe_delete_obsolete_dependency(workshop_id, delete_disk_file, purge_known_record)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 pub async fn rebuild_bundles(
     state: State<'_, TauriState>,
 ) -> Result<Vec<BundleRecord>, DesktopError> {
@@ -178,6 +262,14 @@ pub async fn set_bundle_locked(
         .engine
         .set_bundle_locked(&bundle_id, locked)
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn delete_bundle(
+    bundle_id: BundleId,
+    state: State<'_, TauriState>,
+) -> Result<(), DesktopError> {
+    state.engine.delete_bundle(&bundle_id).map_err(Into::into)
 }
 
 #[tauri::command]

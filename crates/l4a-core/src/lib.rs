@@ -1,7 +1,9 @@
 pub mod config;
 pub mod db;
+mod download_gate;
 pub mod engine;
 pub mod error;
+mod external_url;
 mod file_changes;
 pub mod grouping;
 pub mod lifecycle;
@@ -14,3 +16,4 @@ pub mod watcher;
 pub use config::{load_config, save_config, AppPaths};
 pub use engine::{EventSink, L4aEngine, NullEventSink};
 pub use error::CoreError;
+pub use external_url::validate_external_url;

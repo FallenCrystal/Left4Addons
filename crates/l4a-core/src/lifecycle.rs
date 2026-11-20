@@ -4,7 +4,7 @@ use chrono::Utc;
 use l4a_protocol::{
     AppConfig, CollectionSyncDiff, DependencyDiff, InstallState, ItemSubmission, MetadataSource,
     ObsoleteDependencyHint, RemovedUpstreamItem, SubmissionBatchRequest, SyncReport,
-    UpdateAvailableItem, WorkshopFileType, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+    UpdateAvailableItem, WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemStatus,
 };
 use l4a_workshop::{CatalogBackendProvider, WorkshopResolver};
 use std::collections::{HashMap, HashSet};
@@ -19,12 +19,13 @@ pub async fn sync_lifecycle(
     catalog_reporter: Option<Arc<CatalogBackendProvider>>,
 ) -> Result<SyncReport, CoreError> {
     let addons = db.list_addons()?;
-    let collections = db.list_tracked_collections()?;
-
-    let mut query_ids: Vec<WorkshopId> = addons
-        .iter()
-        .filter_map(|a| a.workshop_id)
+    let collections: Vec<_> = db
+        .list_tracked_collections()?
+        .into_iter()
+        .filter(|col| col.auto_sync)
         .collect();
+
+    let mut query_ids: Vec<WorkshopId> = addons.iter().filter_map(|a| a.workshop_id).collect();
     for col in &collections {
         for mid in &col.member_workshop_ids {
             query_ids.push(*mid);
@@ -62,6 +63,7 @@ pub async fn sync_lifecycle(
             Vec::new();
 
         for outcome in outcomes {
+            let _workspace = db.lock_workspace()?;
             match outcome {
                 WorkshopFetchOutcome::Found { item } => {
                     let wid = item.workshop_id;
@@ -72,14 +74,10 @@ pub async fn sync_lifecycle(
                     if can_diff_deps {
                         let new_dep_set: HashSet<WorkshopId> =
                             item.dependencies.iter().map(|d| d.workshop_id).collect();
-                        let added: Vec<WorkshopId> = new_dep_set
-                            .difference(&old_dep_set)
-                            .copied()
-                            .collect();
-                        let removed: Vec<WorkshopId> = old_dep_set
-                            .difference(&new_dep_set)
-                            .copied()
-                            .collect();
+                        let added: Vec<WorkshopId> =
+                            new_dep_set.difference(&old_dep_set).copied().collect();
+                        let removed: Vec<WorkshopId> =
+                            old_dep_set.difference(&new_dep_set).copied().collect();
 
                         if !added.is_empty() || !removed.is_empty() {
                             let mut added_sorted = added;
@@ -255,7 +253,10 @@ pub async fn sync_lifecycle(
         let mut removed_parents_map: HashMap<WorkshopId, Vec<WorkshopId>> = HashMap::new();
         for (parent_wid, parent_title, added, removed) in diff_candidates {
             for dep in &removed {
-                removed_parents_map.entry(*dep).or_default().push(parent_wid);
+                removed_parents_map
+                    .entry(*dep)
+                    .or_default()
+                    .push(parent_wid);
             }
             report.dependency_diffs.push(DependencyDiff {
                 parent_workshop_id: parent_wid,
@@ -281,7 +282,8 @@ pub async fn sync_lifecycle(
             let dep_title = dep_addon
                 .map(|a| a.title.clone())
                 .or_else(|| snap.map(|s| s.title));
-            let is_installed = dep_addon.is_some_and(|a| a.install_state == InstallState::Installed);
+            let is_installed =
+                dep_addon.is_some_and(|a| a.install_state == InstallState::Installed);
 
             obsolete_list.push(ObsoleteDependencyHint {
                 dependency_workshop_id: dep_wid,
@@ -296,9 +298,10 @@ pub async fn sync_lifecycle(
         report.obsolete_dependencies = obsolete_list;
 
         // 可选地将核验结果提交到自托管 l4a-server
-        if let (Some(reporter), Some(token)) =
-            (catalog_reporter, config.catalog_contributor_token.as_deref())
-        {
+        if let (Some(reporter), Some(token)) = (
+            catalog_reporter,
+            config.catalog_contributor_token.as_deref(),
+        ) {
             if !submissions.is_empty() && !token.trim().is_empty() {
                 if let Err(err) = reporter
                     .submit_observations(token, &SubmissionBatchRequest { items: submissions })
@@ -313,9 +316,17 @@ pub async fn sync_lifecycle(
     }
 
     // 同步已追踪合集的成员变更 Diff
-    for mut col in collections {
-        match resolver.fetch_collection(col.collection_id).await {
+    for tracked in collections {
+        match resolver.fetch_collection(tracked.collection_id).await {
             Ok((remote, warnings)) => {
+                let _workspace = db.lock_workspace()?;
+                let Some(mut col) = db.list_tracked_collections()?.into_iter().find(|col| {
+                    col.collection_id == tracked.collection_id
+                        && col.auto_sync
+                        && col.last_synced_at == tracked.last_synced_at
+                }) else {
+                    continue;
+                };
                 report.warnings.extend(warnings);
                 if matches!(
                     remote.status,
@@ -330,7 +341,8 @@ pub async fn sync_lifecycle(
                     continue;
                 }
 
-                let old_set: HashSet<WorkshopId> = col.member_workshop_ids.iter().copied().collect();
+                let old_set: HashSet<WorkshopId> =
+                    col.member_workshop_ids.iter().copied().collect();
                 let new_set: HashSet<WorkshopId> = remote.child_ids.iter().copied().collect();
 
                 let mut added: Vec<WorkshopId> = new_set.difference(&old_set).copied().collect();
@@ -347,10 +359,6 @@ pub async fn sync_lifecycle(
                     });
                 }
 
-                for item in &remote.items {
-                    db.upsert_workshop_snapshot(item, false)?;
-                }
-
                 if let Some(t) = remote.title {
                     if !t.trim().is_empty() {
                         col.title = t;
@@ -365,12 +373,17 @@ pub async fn sync_lifecycle(
                 col.removed_upstream_ids.sort_unstable();
                 col.removed_upstream_ids.dedup();
                 col.last_synced_at = Some(Utc::now());
-                db.save_tracked_collection(&col)?;
+                db.write(|tx| {
+                    for item in &remote.items {
+                        LocalDb::upsert_workshop_snapshot_tx(tx, item, false)?;
+                    }
+                    LocalDb::save_tracked_collection_tx(tx, &col)
+                })?;
             }
             Err(err) => {
                 report
                     .warnings
-                    .push(format!("同步合集 {} 失败: {err}", col.collection_id));
+                    .push(format!("同步合集 {} 失败: {err}", tracked.collection_id));
             }
         }
     }
@@ -378,7 +391,7 @@ pub async fn sync_lifecycle(
     Ok(report)
 }
 
-fn source_provides_dependencies(source: MetadataSource) -> bool {
+pub(crate) fn source_provides_dependencies(source: MetadataSource) -> bool {
     matches!(
         source,
         MetadataSource::SteamworksSdk

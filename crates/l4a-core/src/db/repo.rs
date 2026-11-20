@@ -21,6 +21,8 @@ pub struct PhysicalFileRow {
 
 pub struct LocalDb {
     conn: Mutex<Connection>,
+    // Serializes workspace operations with lifecycle writes to the dependency graph.
+    workspace: Mutex<()>,
 }
 
 impl LocalDb {
@@ -37,6 +39,7 @@ impl LocalDb {
         run_migrations(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            workspace: Mutex::new(()),
         })
     }
 
@@ -47,6 +50,7 @@ impl LocalDb {
         run_migrations(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            workspace: Mutex::new(()),
         })
     }
 
@@ -54,6 +58,12 @@ impl LocalDb {
         self.conn
             .lock()
             .map_err(|_| CoreError::InvalidInput("本地数据库互斥锁异常".into()))
+    }
+
+    pub(crate) fn lock_workspace(&self) -> Result<MutexGuard<'_, ()>, CoreError> {
+        self.workspace
+            .lock()
+            .map_err(|_| CoreError::Conflict("工作区锁状态异常".into()))
     }
 
     pub(crate) fn write<T>(
@@ -342,6 +352,25 @@ impl LocalDb {
         replace_deps: bool,
     ) -> Result<(), CoreError> {
         self.write(|tx| Self::upsert_workshop_snapshot_tx(tx, item, replace_deps))
+    }
+
+    pub(crate) fn save_workshop_update_tx(
+        tx: &Connection,
+        addon: &AddonSummary,
+        item: &WorkshopItemRecord,
+        replace_deps: bool,
+    ) -> Result<(), CoreError> {
+        Self::upsert_workshop_snapshot_tx(tx, item, replace_deps)?;
+        // Ordinary upserts retain missing fields. A replacement's metadata belongs to the new VPK.
+        tx.execute(
+            "UPDATE addons SET cover_image = ?2, local_time_updated = ?3 WHERE id = ?1",
+            params![addon.id.as_str(), addon.cover_image, item.time_updated],
+        )?;
+        tx.execute(
+            "UPDATE workshop_snapshots SET preview_url = ?2, time_updated = ?3 WHERE workshop_id = ?1",
+            params![item.workshop_id.as_u64() as i64, item.preview_url, item.time_updated],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn upsert_workshop_snapshot_tx(
@@ -810,6 +839,15 @@ impl LocalDb {
         Ok(())
     }
 
+    pub fn delete_bundle(&self, id: &BundleId) -> Result<(), CoreError> {
+        let conn = self.lock_conn()?;
+        let affected = conn.execute("DELETE FROM bundles WHERE id = ?1", params![id.as_str()])?;
+        if affected == 0 {
+            return Err(CoreError::NotFound(format!("Bundle {id}")));
+        }
+        Ok(())
+    }
+
     pub fn set_bundle_locked(&self, id: &BundleId, locked: bool) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
         let affected = conn.execute(
@@ -867,8 +905,13 @@ impl LocalDb {
     }
 
     pub fn save_tracked_collection(&self, col: &TrackedCollectionRecord) -> Result<(), CoreError> {
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction()?;
+        self.write(|tx| Self::save_tracked_collection_tx(tx, col))
+    }
+
+    pub(crate) fn save_tracked_collection_tx(
+        tx: &Connection,
+        col: &TrackedCollectionRecord,
+    ) -> Result<(), CoreError> {
         let cid = col.collection_id.as_u64() as i64;
         tx.execute(
             r#"
@@ -906,7 +949,6 @@ impl LocalDb {
             )?;
             pos += 1;
         }
-        tx.commit()?;
         Ok(())
     }
 

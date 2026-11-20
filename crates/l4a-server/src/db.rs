@@ -419,12 +419,15 @@ impl ServerRepo {
         let offset_u64 = u64::from(page - 1) * u64::from(page_size);
         let offset = i64::try_from(offset_u64).unwrap_or(i64::MAX);
 
-        let q_filter = query
+        let q_text = query
             .query
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| format!("%{}%", escape_like(&s.to_ascii_lowercase())));
+            .map(str::to_ascii_lowercase);
+        let q_filter = q_text
+            .as_deref()
+            .map(|text| format!("%{}%", escape_like(text)));
         let tag_filter = query
             .tag
             .as_deref()
@@ -446,11 +449,23 @@ impl ServerRepo {
         )?;
         let total = u64::try_from(total_i64).unwrap_or(0);
 
+        let limit = i64::from(page_size);
+        let mut page_params: Vec<&dyn rusqlite::ToSql> =
+            vec![&q_filter, &tag_filter, &status_filter, &limit, &offset];
         let order_by = match query.sort.as_deref() {
             Some("updated_asc") => "ORDER BY COALESCE(time_updated, 0) ASC, workshop_id ASC",
             Some("title") => "ORDER BY title COLLATE NOCASE ASC, workshop_id ASC",
             Some("subscriptions") => "ORDER BY COALESCE(subscriptions, 0) DESC, workshop_id ASC",
-            _ => "ORDER BY COALESCE(time_updated, 0) DESC, workshop_id ASC",
+            Some("newest") => "ORDER BY COALESCE(time_created, 0) DESC, workshop_id DESC",
+            Some("updated") => "ORDER BY COALESCE(time_updated, 0) DESC, workshop_id DESC",
+            _ if q_text.is_some() => {
+                page_params.push(&q_text);
+                "ORDER BY CASE WHEN LOWER(title) = ?6 THEN 0
+                               WHEN SUBSTR(LOWER(title), 1, LENGTH(?6)) = ?6 THEN 1
+                               ELSE 2 END,
+                          COALESCE(subscriptions, 0) DESC, COALESCE(time_updated, 0) DESC, workshop_id ASC"
+            }
+            _ => "ORDER BY COALESCE(subscriptions, 0) DESC, COALESCE(time_updated, 0) DESC, workshop_id ASC",
         };
         let page_sql = format!(
             r#"
@@ -466,19 +481,10 @@ impl ServerRepo {
 
         let mut stmt = conn.prepare(&page_sql)?;
         let page_ids: Vec<WorkshopId> = stmt
-            .query_map(
-                params![
-                    q_filter,
-                    tag_filter,
-                    status_filter,
-                    i64::from(page_size),
-                    offset
-                ],
-                |r| {
-                    let raw: i64 = r.get(0)?;
-                    parse_workshop_id_col(0, raw)
-                },
-            )?
+            .query_map(page_params.as_slice(), |r| {
+                let raw: i64 = r.get(0)?;
+                parse_workshop_id_col(0, raw)
+            })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut items = Vec::with_capacity(page_ids.len());

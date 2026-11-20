@@ -1,194 +1,567 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { AlertCircle, RefreshCw } from 'lucide-react';
+import type { AddonDirType, AddonSummary, LoadoutProfile, UserGroup } from './api/ipc';
+import { NavigationRail, type NavDestination } from './components/layout/NavigationRail';
+import { Button, EmptyState, LinearProgress, Snackbar } from './components/m3/primitives';
+import { AddonDetailSheet } from './components/overlays/AddonDetailSheet';
+import { BatchReportDialog } from './components/overlays/BatchReportDialog';
+import { DeleteDialog } from './components/overlays/DeleteDialog';
 import {
-  getDashboardSnapshot,
-  isTauriRuntime,
-  resolveReconcileIssue,
-  scanWorkspace,
-  subscribeCoreEvents,
-  syncWorkshop,
-  type DashboardSnapshot,
-  type ReconcileAction,
-  type SyncReport,
-} from './api/ipc';
+  AddToGroupDialog,
+  ExternalLinkDialog,
+  ManualBundleDialog,
+  ProfileDialog,
+  TrackCollectionDialog,
+  UserGroupDialog,
+  WorkshopToggleDialog,
+} from './components/overlays/OrganizeDialogs';
+import { BatchRenameDialog, SingleRenameDialog } from './components/overlays/RenameDialog';
+import { TaskCenterSheet } from './components/overlays/TaskCenterSheet';
+import { LibraryView, type ExternalAddonFilter } from './components/views/LibraryView';
+import { OrganizeView } from './components/views/OrganizeView';
+import { ReconcileView } from './components/views/ReconcileView';
+import { SettingsView, type SettingsSection } from './components/views/SettingsView';
+import { WorkshopView } from './components/views/WorkshopView';
+import { setAppLanguage } from './i18n';
+import { useAppController } from './state/useAppController';
+import { summarizeBatchReport } from './utils/format';
+import {
+  applyThemePreference,
+  loadThemePreference,
+  resolveColorScheme,
+  type ThemePreference,
+} from './utils/theme';
 
 export function App() {
-  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
-  const [syncReport, setSyncReport] = useState<SyncReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const { t, i18n } = useTranslation();
+  const [destination, setDestination] = useState<NavDestination>('library');
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>('paths');
+  const [themePref, setThemePref] = useState<ThemePreference>(() => loadThemePreference());
+  const [systemScheme, setSystemScheme] = useState<'light' | 'dark'>(() =>
+    resolveColorScheme('system'),
+  );
+  const resolvedTheme: 'light' | 'dark' =
+    themePref.mode === 'system' ? systemScheme : themePref.mode;
 
-  const refresh = useCallback(async () => {
-    if (!isTauriRuntime()) return;
-    try {
-      const next = await getDashboardSnapshot();
-      setSnapshot(next);
-      setError(null);
-    } catch (err) {
-      setError(String(err));
+  const [externalFilter, setExternalFilter] = useState<ExternalAddonFilter | null>(null);
+  const [detailAddonId, setDetailAddonId] = useState<string | null>(null);
+  const [tasksOpen, setTasksOpen] = useState(false);
+  const [tasksTab, setTasksTab] = useState<'queue' | 'sync'>('queue');
+
+  const [singleRenameAddon, setSingleRenameAddon] = useState<AddonSummary | null>(null);
+  const [batchRenameIds, setBatchRenameIds] = useState<string[] | null>(null);
+  const [deleteTargets, setDeleteTargets] = useState<AddonSummary[]>([]);
+  const [addToGroupIds, setAddToGroupIds] = useState<string[]>([]);
+  const [bundleDialogIds, setBundleDialogIds] = useState<string[] | null>(null);
+  const [groupDialogState, setGroupDialogState] = useState<{
+    open: boolean;
+    initial: UserGroup | null;
+    preselectedIds?: string[];
+  }>({ open: false, initial: null });
+  const [profileDialogState, setProfileDialogState] = useState<{
+    open: boolean;
+    initial: LoadoutProfile | null;
+  }>({ open: false, initial: null });
+  const [trackDialogOpen, setTrackDialogOpen] = useState(false);
+  const [workshopToggleTarget, setWorkshopToggleTarget] = useState<{
+    addon: AddonSummary;
+    enabled: boolean;
+  } | null>(null);
+  const [externalUrl, setExternalUrl] = useState<string | null>(null);
+
+  const openReconcile = useCallback(() => setDestination('reconcile'), []);
+  const ctrl = useAppController(openReconcile);
+
+  const handleChangeTheme = useCallback((next: ThemePreference) => {
+    setThemePref(next);
+    if (next.mode === 'system') {
+      setSystemScheme(resolveColorScheme('system'));
     }
   }, []);
 
   useEffect(() => {
-    if (!isTauriRuntime()) return;
-    let active = true;
-    let unlisten: (() => void) | undefined;
+    applyThemePreference(themePref);
+    if (themePref.mode !== 'system' || typeof window.matchMedia !== 'function') {
+      return;
+    }
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const listener = () => {
+      const next = applyThemePreference(themePref);
+      setSystemScheme(next);
+    };
+    mq.addEventListener('change', listener);
+    return () => mq.removeEventListener('change', listener);
+  }, [themePref]);
 
-    void getDashboardSnapshot()
-      .then((next) => {
-        if (!active) return;
-        setSnapshot(next);
-        setError(null);
-      })
-      .catch((err) => {
-        if (!active) return;
-        setError(String(err));
-      });
+  const addons = useMemo(() => ctrl.snapshot?.addons ?? [], [ctrl.snapshot]);
+  const addonsById = useMemo(() => {
+    const map = new Map<string, AddonSummary>();
+    for (const a of addons) map.set(a.id, a);
+    return map;
+  }, [addons]);
 
-    void subscribeCoreEvents((ev) => {
-      if (!active) return;
-      if (ev.type === 'snapshot_updated') {
-        void refresh();
-      } else if (ev.type === 'watch_error') {
-        setError(ev.message);
-      }
-    }).then((fn) => {
-      if (!active) {
-        fn();
+  const activeDetailAddon = detailAddonId ? (addonsById.get(detailAddonId) ?? null) : null;
+  const language: 'zh' | 'en' = i18n.language?.startsWith('en') ? 'en' : 'zh';
+
+  const handleCopy = useCallback(
+    async (text: string) => {
+      if (!navigator.clipboard?.writeText) {
+        ctrl.notify(t('common.copyFailed'), { tone: 'error' });
         return;
       }
-      unlisten = fn;
+      try {
+        await navigator.clipboard.writeText(text);
+        ctrl.notify(t('common.copied'));
+      } catch {
+        ctrl.notify(t('common.copyFailed'), { tone: 'error' });
+      }
+    },
+    [ctrl, t],
+  );
+
+  const handleToggleSingle = useCallback(
+    (addon: AddonSummary, enabled: boolean) => {
+      if (addon.primaryDir === 'workshop') {
+        setWorkshopToggleTarget({ addon, enabled });
+        return;
+      }
+      void ctrl.toggleAddons([addon.id], enabled, false);
+    },
+    [ctrl],
+  );
+
+  const handleMoveSingle = useCallback(
+    (addon: AddonSummary) => {
+      const target: AddonDirType = addon.primaryDir === 'loading' ? 'workshop' : 'loading';
+      void ctrl.moveAddons([addon.id], target);
+    },
+    [ctrl],
+  );
+
+  const handleBatchToggle = useCallback(
+    (addonIds: string[], enabled: boolean) => {
+      void ctrl.toggleAddons(addonIds, enabled, false);
+    },
+    [ctrl],
+  );
+
+  const handleSyncAndNotify = useCallback(async () => {
+    const report = await ctrl.sync();
+    if (!report) return;
+    const hasFindings =
+      report.updatesAvailable.length > 0 ||
+      report.removedUpstream.length > 0 ||
+      report.dependencyDiffs.length > 0 ||
+      report.obsoleteDependencies.length > 0 ||
+      report.collectionDiffs.length > 0 ||
+      report.warnings.length > 0;
+
+    ctrl.notify(t('toast.syncDone', { count: report.checkedItems }), {
+      actionLabel: hasFindings ? t('common.view') : undefined,
+      onAction: hasFindings
+        ? () => {
+            setTasksTab('sync');
+            setTasksOpen(true);
+          }
+        : undefined,
     });
+  }, [ctrl, t]);
 
-    return () => {
-      active = false;
-      unlisten?.();
-    };
-  }, [refresh]);
-
-  async function handleScan() {
-    setBusy(true);
-    try {
-      setSnapshot(await scanWorkspace());
-      setError(null);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleSync() {
-    setBusy(true);
-    try {
-      setSyncReport(await syncWorkshop());
-      await refresh();
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function handleResolve(issueId: string, action: ReconcileAction) {
-    setBusy(true);
-    try {
-      setSnapshot(await resolveReconcileIssue(issueId, action));
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
+  const runningTasksCount = useMemo(() => {
+    const liveEntries = Object.values(ctrl.liveDownloads);
+    const liveTaskIds = new Set(liveEntries.map((d) => d.taskId));
+    const liveWids = new Set(liveEntries.map((d) => d.workshopId));
+    const persistedActive = (ctrl.snapshot?.tasks ?? []).filter(
+      (task) =>
+        (task.status === 'running' || task.status === 'queued') &&
+        !liveTaskIds.has(task.id) &&
+        !(task.kind === 'download' && liveWids.has(task.targetId)),
+    ).length;
+    return liveEntries.length + persistedActive;
+  }, [ctrl.liveDownloads, ctrl.snapshot]);
 
   return (
-    <main className="shell">
-      <header className="panel header">
-        <div>
-          <h1>Left4Addons v2 Core Workbench</h1>
-          <p className="muted">
-            多 Crate Rust 底座 + SQLite 引擎 + Dummy Bypass v2 对账状态机 · 前端交互壳占位
-          </p>
-        </div>
-        <div className="actions">
-          <button disabled={busy || !isTauriRuntime()} onClick={() => void handleScan()}>
-            扫描与对账
-          </button>
-          <button disabled={busy || !isTauriRuntime()} onClick={() => void handleSync()}>
-            工坊生命周期同步
-          </button>
-        </div>
-      </header>
+    <div className="l4a-shell">
+      <NavigationRail
+        active={destination}
+        onSelect={setDestination}
+        onScan={() => void ctrl.scan()}
+        scanning={ctrl.scanning}
+        openIssuesCount={ctrl.snapshot?.openIssues.length ?? 0}
+        activeTasksCount={runningTasksCount}
+        onOpenTasks={() => {
+          setTasksTab('queue');
+          setTasksOpen(true);
+        }}
+        resolvedTheme={resolvedTheme}
+        onToggleTheme={() =>
+          handleChangeTheme({
+            ...themePref,
+            mode: resolvedTheme === 'dark' ? 'light' : 'dark',
+          })
+        }
+        language={language}
+        onToggleLanguage={() => setAppLanguage(language === 'zh' ? 'en' : 'zh')}
+        isPreview={!ctrl.isTauri}
+      />
 
-      {!isTauriRuntime() && (
-        <section className="panel notice">
-          当前运行于纯浏览器预览模式。桌面核心引擎命令需通过 <code>npm run tauri:dev</code> 启动 Tauri
-          窗口 (独立后端控制台可运行 <code>npm run server:run</code> 后访问 <code>/admin</code>)。
-        </section>
+      <main className="l4a-workspace">
+        {(ctrl.loading || ctrl.scanning || ctrl.syncing) && (
+          <div style={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20 }}>
+            <LinearProgress indeterminate label={t('nav.scan')} />
+          </div>
+        )}
+
+        {!ctrl.snapshot && ctrl.initError && (
+          <EmptyState
+            icon={<AlertCircle size={28} style={{ color: 'var(--md-sys-color-error)' }} />}
+            title={t('common.loadFailed')}
+            action={
+              <Button
+                variant="filled"
+                icon={<RefreshCw size={15} />}
+                onClick={() => void ctrl.bootstrap()}
+              >
+                {t('common.retry')}
+              </Button>
+            }
+          />
+        )}
+
+        {ctrl.snapshot && destination === 'library' && (
+          <LibraryView
+            addons={ctrl.snapshot.addons}
+            snapshotVersion={ctrl.snapshotVersion}
+            liveDownloads={ctrl.liveDownloads}
+            externalFilter={externalFilter}
+            onClearExternalFilter={() => setExternalFilter(null)}
+            busy={ctrl.busy}
+            syncing={ctrl.syncing}
+            onSync={() => void handleSyncAndNotify()}
+            onScan={() => void ctrl.scan()}
+            onSearchMapCode={ctrl.searchByMapCode}
+            onSelectAddon={(addon) => setDetailAddonId(addon.id)}
+            onToggleSingle={handleToggleSingle}
+            onBatchToggle={handleBatchToggle}
+            onBatchMove={(ids, dir) => void ctrl.moveAddons(ids, dir)}
+            onBatchRename={(ids) => setBatchRenameIds(ids)}
+            onBatchAddToGroup={(ids) => setAddToGroupIds(ids)}
+            onBatchCreateBundle={(ids) => setBundleDialogIds(ids)}
+            onBatchDelete={(items) => setDeleteTargets(items)}
+            onDownloadItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
+            onUpdateItem={(wid) => void ctrl.updateWorkshopItem(wid)}
+          />
+        )}
+
+        {ctrl.snapshot && destination === 'organize' && (
+          <OrganizeView
+            addons={ctrl.snapshot.addons}
+            bundles={ctrl.snapshot.bundles}
+            collections={ctrl.snapshot.collections}
+            userGroups={ctrl.snapshot.userGroups}
+            profiles={ctrl.snapshot.profiles}
+            busy={ctrl.busy}
+            onRebuildBundles={() => void ctrl.rebuildBundles()}
+            onCreateBundle={() => setBundleDialogIds([])}
+            onDeleteBundle={(id) => void ctrl.deleteBundle(id)}
+            onToggleBundleLock={(id, locked) => void ctrl.setBundleLocked(id, locked)}
+            onTrackCollection={() => setTrackDialogOpen(true)}
+            onUntrackCollection={(id) => void ctrl.untrackCollection(id)}
+            onDownloadWorkshopItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
+            onCreateGroup={() => setGroupDialogState({ open: true, initial: null })}
+            onEditGroup={(group) => setGroupDialogState({ open: true, initial: group })}
+            onDeleteGroup={(id) => void ctrl.deleteUserGroup(id)}
+            onCreateProfile={() => setProfileDialogState({ open: true, initial: null })}
+            onEditProfile={(profile) => setProfileDialogState({ open: true, initial: profile })}
+            onDeleteProfile={(id) => void ctrl.deleteProfile(id)}
+            onApplyProfile={(id) => void ctrl.applyProfile(id)}
+            onBulkToggle={handleBatchToggle}
+            onOpenFilterInLibrary={(filter) => {
+              setExternalFilter(filter);
+              setDestination('library');
+            }}
+          />
+        )}
+
+        {ctrl.snapshot && destination === 'reconcile' && (
+          <ReconcileView
+            issues={ctrl.snapshot.openIssues}
+            addons={ctrl.snapshot.addons}
+            config={ctrl.snapshot.config}
+            busy={ctrl.busy}
+            scanning={ctrl.scanning}
+            onScan={() => void ctrl.scan()}
+            onResolve={(id, action) => ctrl.resolveIssue(id, action)}
+            onOpenBypassSettings={() => {
+              setSettingsSection('bypass');
+              setDestination('settings');
+            }}
+          />
+        )}
+
+        {ctrl.snapshot && destination === 'workshop' && (
+          <WorkshopView
+            addons={ctrl.snapshot.addons}
+            collections={ctrl.snapshot.collections}
+            liveDownloads={ctrl.liveDownloads}
+            onSearch={ctrl.searchWorkshop}
+            onFetchItem={ctrl.fetchWorkshopItem}
+            onImportSubscribed={ctrl.getSubscribedWorkshopIds}
+            onDownload={ctrl.downloadWorkshopItem}
+            onUpdate={ctrl.updateWorkshopItem}
+            onCancelDownload={(wid) => void ctrl.cancelDownload(wid)}
+            onTrackCollection={ctrl.trackCollection}
+            onOpenSourcesSettings={() => {
+              setSettingsSection('sources');
+              setDestination('settings');
+            }}
+            onOpenExternal={(url) => setExternalUrl(url)}
+            onInvalidId={() => ctrl.notify(t('toast.invalidWorkshopId'), { tone: 'error' })}
+            onNotify={(msg) => ctrl.notify(msg)}
+          />
+        )}
+
+        {ctrl.snapshot && destination === 'settings' && (
+          <SettingsView
+            config={ctrl.snapshot.config}
+            section={settingsSection}
+            onSectionChange={setSettingsSection}
+            steamCaps={ctrl.steamCaps}
+            checkingSteamCaps={ctrl.checkingSteamCaps}
+            busy={ctrl.busy}
+            themePref={themePref}
+            language={language}
+            onSaveConfig={ctrl.saveConfig}
+            onDetectPath={ctrl.detectGamePath}
+            onRefreshSteamCaps={() => void ctrl.refreshSteamCapabilities()}
+            onChangeTheme={handleChangeTheme}
+            onChangeLanguage={setAppLanguage}
+            onNotify={(msg, tone) => ctrl.notify(msg, { tone })}
+          />
+        )}
+      </main>
+
+      <AddonDetailSheet
+        addon={activeDetailAddon}
+        bundles={ctrl.snapshot?.bundles ?? []}
+        userGroups={ctrl.snapshot?.userGroups ?? []}
+        busy={ctrl.busy}
+        onClose={() => setDetailAddonId(null)}
+        onToggle={handleToggleSingle}
+        onMove={handleMoveSingle}
+        onRename={(addon) => setSingleRenameAddon(addon)}
+        onDelete={(addon) => setDeleteTargets([addon])}
+        onDownload={(wid) => void ctrl.downloadWorkshopItem(wid)}
+        onUpdate={(wid) => void ctrl.updateWorkshopItem(wid)}
+        onAddToGroup={(addon) => setAddToGroupIds([addon.id])}
+        onRemoveFromGroup={(group, addonId) => {
+          void ctrl.saveUserGroup({
+            ...group,
+            addonIds: group.addonIds.filter((id) => id !== addonId),
+          });
+        }}
+        onOpenExternal={(url) => setExternalUrl(url)}
+        onCopy={(text) => void handleCopy(text)}
+      />
+
+      <TaskCenterSheet
+        open={tasksOpen}
+        tab={tasksTab}
+        onTabChange={setTasksTab}
+        onClose={() => setTasksOpen(false)}
+        addons={addons}
+        tasks={ctrl.snapshot?.tasks ?? []}
+        liveDownloads={ctrl.liveDownloads}
+        syncReport={ctrl.syncReport}
+        syncing={ctrl.syncing}
+        busy={ctrl.busy}
+        onSync={() => void handleSyncAndNotify()}
+        onCancelDownload={(wid) => void ctrl.cancelDownload(wid)}
+        onDownloadItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
+        onUpdateItem={(wid) => void ctrl.updateWorkshopItem(wid)}
+        onSafeDeleteObsolete={(wid) => void ctrl.safeDeleteObsoleteDependency(wid, true, false)}
+      />
+
+      <SingleRenameDialog
+        key={`single-rename:${singleRenameAddon?.id ?? 'closed'}`}
+        addon={singleRenameAddon}
+        busy={ctrl.busy}
+        onClose={() => setSingleRenameAddon(null)}
+        onConfirm={async (addonId, fileName) => {
+          const report = await ctrl.applyRenames([[addonId, fileName]]);
+          if (report && !summarizeBatchReport(report).hasIssue) {
+            setSingleRenameAddon(null);
+          }
+        }}
+      />
+
+      {ctrl.snapshot && (
+        <BatchRenameDialog
+          key={`batch-rename:${batchRenameIds ? batchRenameIds.join(',') : 'closed'}`}
+          open={batchRenameIds !== null}
+          addonIds={batchRenameIds ?? []}
+          initialRules={ctrl.snapshot.config.renameRules}
+          busy={ctrl.busy}
+          onPreview={ctrl.previewRename}
+          onClose={() => setBatchRenameIds(null)}
+          onConfirm={async (rules, renames) => {
+            if (
+              ctrl.snapshot &&
+              JSON.stringify(rules) !== JSON.stringify(ctrl.snapshot.config.renameRules)
+            ) {
+              const saved = await ctrl.saveConfig(
+                { ...ctrl.snapshot.config, renameRules: rules },
+                false,
+              );
+              if (!saved) return;
+            }
+            const report = await ctrl.applyRenames(renames);
+            if (report && !summarizeBatchReport(report).hasIssue) {
+              setBatchRenameIds(null);
+            }
+          }}
+        />
       )}
 
-      {error && <section className="panel error">{error}</section>}
+      <DeleteDialog
+        key={`delete:${deleteTargets.map((item) => item.id).join(',') || 'closed'}`}
+        addons={deleteTargets}
+        busy={ctrl.busy}
+        onClose={() => setDeleteTargets([])}
+        onConfirm={async (ids, deleteDiskFile, purgeKnownRecord) => {
+          const report = await ctrl.deleteAddons(ids, deleteDiskFile, purgeKnownRecord);
+          if (report) {
+            const failedIds = new Set(
+              report.items
+                .filter((i) => i.status === 'failed' || i.status === 'not_attempted')
+                .map((i) => i.addonId),
+            );
+            if (
+              detailAddonId &&
+              ids.includes(detailAddonId) &&
+              purgeKnownRecord &&
+              !failedIds.has(detailAddonId)
+            ) {
+              setDetailAddonId(null);
+            }
+            if (!summarizeBatchReport(report).hasIssue) {
+              setDeleteTargets([]);
+            } else {
+              setDeleteTargets((prev) => prev.filter((item) => failedIds.has(item.id)));
+            }
+          }
+        }}
+      />
 
-      {snapshot && (
-        <>
-          <section className="grid">
-            <div className="panel stat">
-              <span className="muted">已知 Addons</span>
-              <strong>{snapshot.addons.length}</strong>
-            </div>
-            <div className="panel stat">
-              <span className="muted">对账待处理告警</span>
-              <strong>{snapshot.openIssues.length}</strong>
-            </div>
-            <div className="panel stat">
-              <span className="muted">Bundle / 预设 / 自定义组</span>
-              <strong>
-                {snapshot.bundles.length} / {snapshot.profiles.length} / {snapshot.userGroups.length}
-              </strong>
-            </div>
-            <div className="panel stat">
-              <span className="muted">追踪合集</span>
-              <strong>{snapshot.collections.length}</strong>
-            </div>
-          </section>
+      <BatchReportDialog
+        payload={ctrl.batchReport}
+        addonsById={addonsById}
+        onClose={() => ctrl.setBatchReport(null)}
+        onRescan={ctrl.scan}
+      />
 
-          <section className="panel">
-            <h2>Dummy Bypass v2 与目录对账告警</h2>
-            {snapshot.openIssues.length === 0 ? (
-              <p className="muted">暂无目录漂移或游戏覆写告警。</p>
-            ) : (
-              <ul className="list">
-                {snapshot.openIssues.map((issue) => (
-                  <li key={issue.id} className="list-item">
-                    <div>
-                      <strong>{issue.kind}</strong>
-                      <p className="muted">{issue.summary}</p>
-                    </div>
-                    <div className="actions">
-                      {issue.availableActions.map((act) => (
-                        <button
-                          key={act}
-                          disabled={busy}
-                          onClick={() => void handleResolve(issue.id, act)}
-                        >
-                          {act}
-                        </button>
-                      ))}
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        </>
+      <UserGroupDialog
+        key={`user-group:${groupDialogState.open ? (groupDialogState.initial?.id ?? `new-${groupDialogState.preselectedIds?.join(',') ?? ''}`) : 'closed'}`}
+        open={groupDialogState.open}
+        initial={groupDialogState.initial}
+        preselectedIds={groupDialogState.preselectedIds}
+        addons={addons}
+        busy={ctrl.busy}
+        onClose={() => setGroupDialogState({ open: false, initial: null })}
+        onSave={async (group) => {
+          const ok = await ctrl.saveUserGroup(group);
+          if (ok) setGroupDialogState({ open: false, initial: null });
+        }}
+      />
+
+      <ManualBundleDialog
+        key={`manual-bundle:${bundleDialogIds ? bundleDialogIds.join(',') || 'new' : 'closed'}`}
+        open={bundleDialogIds !== null}
+        preselectedIds={bundleDialogIds ?? undefined}
+        addons={addons}
+        busy={ctrl.busy}
+        onClose={() => setBundleDialogIds(null)}
+        onCreate={async (name, memberIds) => {
+          const ok = await ctrl.createManualBundle(name, memberIds);
+          if (ok) setBundleDialogIds(null);
+        }}
+      />
+
+      <TrackCollectionDialog
+        key={`track-collection:${trackDialogOpen ? 'open' : 'closed'}`}
+        open={trackDialogOpen}
+        busy={ctrl.busy}
+        onClose={() => setTrackDialogOpen(false)}
+        onTrack={async (collectionId, autoSync) => {
+          const record = await ctrl.trackCollection(collectionId, autoSync);
+          if (record) setTrackDialogOpen(false);
+        }}
+      />
+
+      <ProfileDialog
+        key={`profile:${profileDialogState.open ? (profileDialogState.initial?.id ?? 'new') : 'closed'}`}
+        open={profileDialogState.open}
+        initial={profileDialogState.initial}
+        addons={addons}
+        busy={ctrl.busy}
+        onClose={() => setProfileDialogState({ open: false, initial: null })}
+        onSave={async (profile) => {
+          const ok = await ctrl.saveProfile(profile);
+          if (ok) setProfileDialogState({ open: false, initial: null });
+        }}
+      />
+
+      <AddToGroupDialog
+        addonIds={addToGroupIds}
+        groups={ctrl.snapshot?.userGroups ?? []}
+        busy={ctrl.busy}
+        onClose={() => setAddToGroupIds([])}
+        onCreateNew={(ids) => {
+          setAddToGroupIds([]);
+          setGroupDialogState({ open: true, initial: null, preselectedIds: ids });
+        }}
+        onAssign={async (group, ids) => {
+          const merged = Array.from(new Set([...group.addonIds, ...ids]));
+          const ok = await ctrl.saveUserGroup({ ...group, addonIds: merged });
+          if (ok) setAddToGroupIds([]);
+        }}
+      />
+
+      <WorkshopToggleDialog
+        target={workshopToggleTarget}
+        busy={ctrl.busy}
+        onClose={() => setWorkshopToggleTarget(null)}
+        onMoveThenToggle={async (addon, enabled) => {
+          setWorkshopToggleTarget(null);
+          const moved = await ctrl.moveAddons([addon.id], 'loading');
+          const moveEntry = moved?.items.find((i) => i.addonId === addon.id);
+          if (moveEntry && (moveEntry.status === 'applied' || moveEntry.status === 'unchanged')) {
+            await ctrl.toggleAddons([addon.id], enabled, false);
+          }
+        }}
+        onToggleDirectly={async (addon, enabled) => {
+          setWorkshopToggleTarget(null);
+          await ctrl.toggleAddons([addon.id], enabled, true);
+        }}
+      />
+
+      <ExternalLinkDialog
+        url={externalUrl}
+        onOpen={ctrl.openExternalUrl}
+        onClose={() => setExternalUrl(null)}
+      />
+
+      {ctrl.snackbar && (
+        <Snackbar
+          message={ctrl.snackbar.message}
+          tone={ctrl.snackbar.tone}
+          actionLabel={ctrl.snackbar.actionLabel}
+          onAction={ctrl.snackbar.onAction}
+          onClose={ctrl.dismissSnackbar}
+        />
       )}
-
-      {syncReport && (
-        <section className="panel">
-          <h2>最近生命周期同步报告</h2>
-          <pre>{JSON.stringify(syncReport, null, 2)}</pre>
-        </section>
-      )}
-    </main>
+    </div>
   );
 }
 

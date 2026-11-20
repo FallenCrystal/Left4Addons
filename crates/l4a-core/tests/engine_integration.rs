@@ -1,116 +1,22 @@
+mod support;
+
 use axum::{routing::get, Router};
 use chrono::Utc;
 use l4a_core::db::LocalDb;
-use l4a_core::{AppPaths, L4aEngine, NullEventSink};
-use l4a_mirror::MirrorRouter;
+use l4a_core::{AppPaths, CoreError, EventSink, L4aEngine, NullEventSink};
 use l4a_protocol::{
-    AddonDirType, AddonId, AddonOperationOutcome, AppConfig, DesktopError, DesktopErrorCode,
-    GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile, MetadataSource, ProfileId,
-    ReconcileAction, ReconcileIssueKind, RenameRuleConfig, UserGroup, WorkshopCollectionRecord,
-    WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemRecord,
-    WorkshopItemStatus,
+    AddonDirType, AddonId, AddonOperationOutcome, AppConfig, CoreEvent, DesktopError,
+    DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile, MetadataSource,
+    ProfileId, ReconcileAction, ReconcileIssueKind, RenameRuleConfig, UserGroup,
+    WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
 };
-use l4a_steam::MockSteamBridge;
-use l4a_vpk::{write_vpk, VpkFileToWrite};
-use l4a_workshop::{
-    SourceRoutingPolicy, SteamBridgeProvider, WebScraperPlaceholderProvider, WorkshopResolver,
-};
-use std::path::Path;
+use l4a_steam::{MockSteamBridge, SubscribedItemInfo};
+use l4a_workshop::WorkshopError;
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
-fn create_test_vpk(
-    path: &Path,
-    title: &str,
-    author: &str,
-    campaign: bool,
-    map_code: Option<&str>,
-    extra_bytes: &[u8],
-) {
-    let addoninfo = format!(
-        "\"AddonInfo\"\n{{\n    \"addonSteamAppID\" \"550\"\n    \"addonversion\" \"1.0\"\n    \"addontitle\" \"{title}\"\n    \"addonauthor\" \"{author}\"\n    \"addonContent_Campaign\" \"{}\"\n}}\n",
-        if campaign { "1" } else { "0" }
-    );
-    let mut entries = vec![
-        VpkFileToWrite {
-            ext: "txt".into(),
-            path: "".into(),
-            filename: "addoninfo".into(),
-            content: addoninfo.into_bytes(),
-        },
-        VpkFileToWrite {
-            ext: "bin".into(),
-            path: "data".into(),
-            filename: "payload".into(),
-            content: extra_bytes.to_vec(),
-        },
-    ];
-    if let Some(code) = map_code {
-        entries.push(VpkFileToWrite {
-            ext: "bsp".into(),
-            path: "maps".into(),
-            filename: code.into(),
-            content: format!("BSP_{code}").into_bytes(),
-        });
-    }
-    write_vpk(path, &entries).unwrap();
-}
-
-fn make_engine(root: &Path, config: AppConfig, bridge: Arc<MockSteamBridge>) -> L4aEngine {
-    let paths = AppPaths::from_runtime_dir(root.join("runtime"));
-    let db = Arc::new(LocalDb::open(&paths.db_path).unwrap());
-    let mirror = Arc::new(MirrorRouter::empty());
-    let resolver = Arc::new(WorkshopResolver::new(
-        vec![
-            Arc::new(WebScraperPlaceholderProvider::placeholder()),
-            Arc::new(SteamBridgeProvider::new(bridge.clone())),
-        ],
-        SourceRoutingPolicy::default(),
-    ));
-    L4aEngine::with_dependencies(
-        paths,
-        db,
-        config,
-        mirror,
-        bridge,
-        resolver,
-        None,
-        Arc::new(NullEventSink),
-    )
-    .unwrap()
-}
-
-fn item_record(id: u64, title: &str, ts: i64, deps: Vec<u64>) -> WorkshopItemRecord {
-    WorkshopItemRecord {
-        workshop_id: WorkshopId::new(id).unwrap(),
-        file_type: WorkshopFileType::Item,
-        status: WorkshopItemStatus::Active,
-        title: title.to_string(),
-        description: Some("desc".into()),
-        creator_steam_id: Some("76561198000000001".into()),
-        creator_name: Some("Mapper".into()),
-        preview_url: None,
-        file_url: None,
-        file_size: Some(1024),
-        time_created: Some(1_700_000_000),
-        time_updated: Some(ts),
-        tags: vec!["Campaign".into()],
-        dependencies: deps
-            .into_iter()
-            .map(|d| WorkshopDependency {
-                workshop_id: WorkshopId::new(d).unwrap(),
-                title: None,
-                required: true,
-            })
-            .collect(),
-        collection_children: Vec::new(),
-        subscriptions: None,
-        favorites: None,
-        source: MetadataSource::SteamworksSdk,
-        fetched_at: Utc::now(),
-    }
-}
+use support::{create_test_vpk, item_record, make_engine, make_engine_with_events, RecordedEvents};
 
 #[tokio::test]
 async fn scan_rename_preserves_workshop_identity_and_map_search_works() {
@@ -568,7 +474,7 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
     assert_eq!(engine.snapshot().unwrap().user_groups.len(), 2);
 
     // Tracked collection detects upstream removal diff on sync
-    engine.track_collection(col_id, false).await.unwrap();
+    engine.track_collection(col_id, true).await.unwrap();
     bridge.insert_collection(WorkshopCollectionRecord {
         collection_id: col_id,
         status: WorkshopItemStatus::Active,
@@ -1407,4 +1313,358 @@ fn delete_reports_restore_files_if_the_record_cannot_be_removed() {
         engine.delete_addons(ids, false, true).unwrap().items[0].outcome,
         AddonOperationOutcome::Unchanged
     );
+}
+
+#[test]
+fn cached_images_require_a_regular_file_and_a_valid_cache_key() {
+    let dir = tempdir().unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig::default(),
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    let cache = AppPaths::from_runtime_dir(dir.path().join("runtime")).image_cache_dir;
+    for key in ["cover.jpg", "cover.jpeg", "cover.png", "cover.webp"] {
+        std::fs::write(cache.join(key), b"cached image bytes").unwrap();
+        assert_eq!(
+            engine.read_cached_image(key).unwrap(),
+            b"cached image bytes"
+        );
+    }
+    std::fs::create_dir(cache.join("directory.png")).unwrap();
+    for invalid in [
+        "",
+        ".",
+        "..",
+        "../cover.jpg",
+        "sub/cover.jpg",
+        "sub\\cover.jpg",
+        "a..b.jpg",
+        "cover\0.png",
+        "cover.JPG",
+        "cover.png.exe",
+        "cover",
+        "directory.png",
+    ] {
+        assert!(
+            matches!(
+                engine.read_cached_image(invalid),
+                Err(CoreError::InvalidInput(_))
+            ),
+            "accepted {invalid:?}"
+        );
+    }
+    let outside = dir.path().join("outside.png");
+    std::fs::write(&outside, b"outside cache").unwrap();
+    assert!(matches!(
+        engine.read_cached_image(outside.to_str().unwrap()),
+        Err(CoreError::InvalidInput(_))
+    ));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside, cache.join("alias.png")).unwrap();
+        assert!(matches!(
+            engine.read_cached_image("alias.png"),
+            Err(CoreError::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        engine.read_cached_image("missing.webp"),
+        Err(CoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn obsolete_dependency_deletion_checks_all_installed_parents() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir(&loading).unwrap();
+    let (parent, disabled_parent, dependency) =
+        (WorkshopId(830001), WorkshopId(830002), WorkshopId(830003));
+    for (wid, suffix) in [
+        (parent, ""),
+        (disabled_parent, ".disabled"),
+        (dependency, ""),
+    ] {
+        create_test_vpk(
+            &loading.join(format!("{wid}.vpk{suffix}")),
+            &format!("Addon {wid}"),
+            "Author",
+            false,
+            None,
+            b"payload",
+        );
+    }
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_str().unwrap().into(),
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.scan().unwrap();
+    for id in [parent, disabled_parent] {
+        engine
+            .db()
+            .upsert_workshop_snapshot(
+                &item_record(id.0, "Parent", 1700000000, vec![dependency.0]),
+                true,
+            )
+            .unwrap();
+    }
+    let error = engine
+        .safe_delete_obsolete_dependency(dependency, true, true)
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Conflict(message) if message.contains("830001, 830002")));
+    let dependency_path = loading.join(format!("{dependency}.vpk"));
+    assert!(dependency_path.is_file());
+    assert!(engine
+        .db()
+        .get_addon_by_workshop_id(dependency)
+        .unwrap()
+        .is_some());
+
+    engine
+        .db()
+        .upsert_workshop_snapshot(&item_record(parent.0, "Parent", 1700000001, vec![]), true)
+        .unwrap();
+    assert!(matches!(
+        engine.safe_delete_obsolete_dependency(dependency, true, true),
+        Err(CoreError::Conflict(message)) if message.contains("830002") && !message.contains("830001")
+    ));
+    let removed_parent = engine
+        .delete_addons(&[AddonId::from_workshop_id(disabled_parent)], true, false)
+        .unwrap();
+    assert_eq!(
+        removed_parent.items[0].outcome,
+        AddonOperationOutcome::Applied
+    );
+    assert_eq!(
+        engine.db().list_all_active_dependency_edges().unwrap(),
+        vec![(disabled_parent, dependency)]
+    );
+
+    let report = engine
+        .safe_delete_obsolete_dependency(dependency, true, true)
+        .unwrap();
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::Applied);
+    assert_eq!(report.refresh_error, None);
+    assert!(!dependency_path.exists());
+    assert!(engine
+        .db()
+        .get_addon_by_workshop_id(dependency)
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        engine.safe_delete_obsolete_dependency(dependency, true, true),
+        Err(CoreError::NotFound(_))
+    ));
+}
+
+#[test]
+fn overwritten_dummy_issues_stay_open_with_bypass_disabled() {
+    for policy in [
+        GameUpdateDummyPolicy::AutoKeepLocalRegenerateDummy,
+        GameUpdateDummyPolicy::AutoAdoptKeepCustomizations,
+    ] {
+        let dir = tempdir().unwrap();
+        let loading = dir.path().join("addons");
+        let workshop = loading.join("workshop");
+        std::fs::create_dir_all(&workshop).unwrap();
+        let local = loading.join("830004.vpk");
+        let upstream = workshop.join("830004.vpk");
+        create_test_vpk(&local, "Local", "Author", false, None, b"local");
+        create_test_vpk(&upstream, "Upstream", "Author", false, None, b"new update");
+        let local_bytes = std::fs::read(&local).unwrap();
+        let upstream_bytes = std::fs::read(&upstream).unwrap();
+        let engine = make_engine(
+            dir.path(),
+            AppConfig {
+                loading_dir: loading.to_str().unwrap().into(),
+                workshop_dir: workshop.to_str().unwrap().into(),
+                game_update_dummy_policy: policy,
+                enable_dummy_bypass: false,
+                auto_adopt_new_workshop_downloads: true,
+                ..Default::default()
+            },
+            Arc::new(MockSteamBridge::new(false)),
+        );
+        let snapshot = engine.scan().unwrap();
+        assert_eq!(snapshot.open_issues.len(), 1);
+        assert_eq!(
+            snapshot.open_issues[0].kind,
+            ReconcileIssueKind::DummyOverwrittenByGameUpdate
+        );
+        assert_eq!(std::fs::read(local).unwrap(), local_bytes);
+        assert_eq!(std::fs::read(upstream).unwrap(), upstream_bytes);
+    }
+}
+
+#[tokio::test]
+async fn retracking_keeps_removed_members_and_sync_skips_manual_collections() {
+    let dir = tempdir().unwrap();
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let engine = make_engine(dir.path(), AppConfig::default(), bridge.clone());
+    let (collection, absent, returns, kept) = (
+        WorkshopId(840000),
+        WorkshopId(840001),
+        WorkshopId(840002),
+        WorkshopId(840003),
+    );
+    let set_children = |child_ids| {
+        bridge.insert_collection(WorkshopCollectionRecord {
+            collection_id: collection,
+            status: WorkshopItemStatus::Active,
+            title: Some("Campaign collection".into()),
+            description: None,
+            preview_url: None,
+            child_ids,
+            items: vec![],
+            source: MetadataSource::SteamworksSdk,
+            fetched_at: Utc::now(),
+        });
+    };
+    set_children(vec![absent, returns, kept]);
+    engine.track_collection(collection, true).await.unwrap();
+    set_children(vec![kept]);
+    assert_eq!(
+        engine.sync_workshop().await.unwrap().collection_diffs[0].removed_items,
+        vec![absent, returns]
+    );
+
+    set_children(vec![kept, returns]);
+    let tracked = engine.track_collection(collection, false).await.unwrap();
+    assert_eq!(tracked.member_workshop_ids, vec![kept, returns]);
+    assert_eq!(tracked.removed_upstream_ids, vec![absent]);
+    assert!(!tracked.auto_sync);
+    let retracked = engine.track_collection(collection, false).await.unwrap();
+    assert_eq!(retracked.removed_upstream_ids, tracked.removed_upstream_ids);
+
+    set_children(vec![absent]);
+    let report = engine.sync_workshop().await.unwrap();
+    assert_eq!(report.checked_items, 0);
+    assert!(report.collection_diffs.is_empty());
+    assert_eq!(engine.snapshot().unwrap().collections, vec![retracked]);
+}
+
+#[test]
+fn deleting_a_bundle_cascades_its_members_and_emits_a_snapshot_update() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir(&loading).unwrap();
+    create_test_vpk(
+        &loading.join("850001.vpk"),
+        "Addon",
+        "Author",
+        false,
+        None,
+        b"payload",
+    );
+    let events = Arc::new(RecordedEvents::default());
+    let engine = make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_str().unwrap().into(),
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+        events.clone(),
+    );
+    let aid = engine.scan().unwrap().addons[0].id.clone();
+    let bundle = engine
+        .create_manual_bundle("Delete me".into(), vec![aid.clone()])
+        .unwrap();
+    let kept = engine
+        .create_manual_bundle("Keep me".into(), vec![aid.clone()])
+        .unwrap();
+    events.drain();
+    engine.delete_bundle(&bundle.id).unwrap();
+    assert_eq!(
+        events.drain(),
+        vec![CoreEvent::SnapshotUpdated {
+            external_change: false
+        }]
+    );
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(snapshot.bundles, vec![kept]);
+    assert_eq!(snapshot.addons[0].id, aid);
+    let sql = rusqlite::Connection::open(dir.path().join("runtime/l4a_v2.db")).unwrap();
+    let members: i64 = sql
+        .query_row(
+            "SELECT COUNT(*) FROM bundle_members WHERE bundle_id = ?1",
+            [bundle.id.as_str()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(members, 0);
+    assert!(matches!(
+        engine.delete_bundle(&bundle.id),
+        Err(CoreError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn workshop_item_inspection_reports_removed_private_and_missing_items() {
+    let dir = tempdir().unwrap();
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let engine = make_engine(dir.path(), AppConfig::default(), bridge.clone());
+    let active = item_record(860001, "Available", 1700000000, vec![860002]);
+    bridge.insert_item(active.clone());
+    bridge.insert_outcome(WorkshopFetchOutcome::Removed {
+        workshop_id: WorkshopId(860002),
+        source: MetadataSource::SteamworksSdk,
+        observed_at: Utc::now(),
+        reason: None,
+    });
+    bridge.insert_outcome(WorkshopFetchOutcome::PrivateOrUnavailable {
+        workshop_id: WorkshopId(860003),
+        source: MetadataSource::SteamworksSdk,
+        observed_at: Utc::now(),
+        reason: None,
+    });
+    assert_eq!(
+        engine
+            .fetch_workshop_item(active.workshop_id)
+            .await
+            .unwrap(),
+        active
+    );
+    for id in [860002, 860003, 860004] {
+        assert!(matches!(
+            engine.fetch_workshop_item(WorkshopId(id)).await,
+            Err(CoreError::NotFound(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn subscribed_workshop_ids_come_from_the_steam_bridge() {
+    let dir = tempdir().unwrap();
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let ids = [WorkshopId(870002), WorkshopId(870001)];
+    let engine = make_engine(dir.path(), AppConfig::default(), bridge.clone());
+    assert!(engine.subscribed_workshop_ids().await.unwrap().is_empty());
+    bridge.set_subscribed(
+        ids.iter()
+            .map(|id| SubscribedItemInfo {
+                workshop_id: *id,
+                item_state: vec!["subscribed".into()],
+                install_folder: None,
+                size_on_disk: None,
+            })
+            .collect(),
+    );
+    assert_eq!(engine.subscribed_workshop_ids().await.unwrap(), ids);
+
+    let disabled = tempdir().unwrap();
+    let engine = make_engine(
+        disabled.path(),
+        AppConfig::default(),
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    assert!(matches!(
+        engine.subscribed_workshop_ids().await,
+        Err(CoreError::Workshop(WorkshopError::Unsupported(_)))
+    ));
 }

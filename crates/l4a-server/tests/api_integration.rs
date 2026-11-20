@@ -8,7 +8,7 @@ use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     AuditLogEntry, BatchItemsResponse, CatalogStats, ConflictDecision, CreateContributorRequest,
     CreateContributorResponse, ItemSubmission, MetadataSource, ScraperPlaceholderStatus,
-    SubmissionBatchRequest, SubmissionBatchResponse, TrustTier, WorkshopDependency,
+    SearchResponse, SubmissionBatchRequest, SubmissionBatchResponse, TrustTier, WorkshopDependency,
     WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use l4a_server::{build_router, ServerState};
@@ -48,6 +48,120 @@ async fn json_request(
         .to_bytes()
         .to_vec();
     (status, bytes)
+}
+
+#[tokio::test]
+async fn search_items_supports_catalog_sorts_and_title_relevance() {
+    let state = ServerState::in_memory("test-admin").unwrap();
+    for (id, title, description, created, updated, subscriptions) in [
+        (9001, "MISSION_", None, Some(6), Some(20), None),
+        (9002, "mission_ Zulu", None, Some(60), Some(50), Some(8)),
+        (9003, "Mission_ alpha", None, Some(60), Some(10), Some(8)),
+        (
+            9004,
+            "An earlier Mission_ text",
+            None,
+            Some(30),
+            Some(50),
+            Some(100),
+        ),
+        (
+            9005,
+            "Beta",
+            Some("A mission_ in the description"),
+            None,
+            Some(100),
+            Some(100),
+        ),
+        (
+            9006,
+            "beta",
+            Some("A mission_ in the description"),
+            Some(30),
+            None,
+            Some(100),
+        ),
+        (9007, "MissionX", None, Some(99), Some(75), Some(1)),
+    ] {
+        state
+            .repo
+            .upsert_item(
+                &WorkshopItemRecord {
+                    workshop_id: WorkshopId(id),
+                    file_type: WorkshopFileType::Item,
+                    status: WorkshopItemStatus::Active,
+                    title: title.into(),
+                    description: description.map(str::to_owned),
+                    creator_steam_id: None,
+                    creator_name: None,
+                    preview_url: None,
+                    file_url: None,
+                    file_size: None,
+                    time_created: created,
+                    time_updated: updated,
+                    tags: vec![],
+                    dependencies: vec![],
+                    collection_children: vec![],
+                    subscriptions,
+                    favorites: None,
+                    source: MetadataSource::AdminOverride,
+                    fetched_at: Utc::now(),
+                },
+                100,
+                false,
+            )
+            .unwrap();
+    }
+    let app = build_router(state);
+    let search = async |params: &str| {
+        let (status, bytes) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/items/search{params}"),
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{params}");
+        let response: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<_> = response
+            .items
+            .iter()
+            .map(|item| item.workshop_id.0)
+            .collect();
+        (response.total, ids)
+    };
+
+    for (params, expected) in [
+        (
+            "?sort=updated_asc",
+            [9006, 9003, 9001, 9002, 9004, 9007, 9005],
+        ),
+        ("?sort=title", [9004, 9005, 9006, 9001, 9003, 9002, 9007]),
+        (
+            "?sort=subscriptions",
+            [9004, 9005, 9006, 9002, 9003, 9007, 9001],
+        ),
+        ("?sort=newest", [9007, 9003, 9002, 9006, 9004, 9001, 9005]),
+        ("?sort=updated", [9005, 9007, 9004, 9002, 9001, 9003, 9006]),
+        ("", [9005, 9004, 9006, 9002, 9003, 9007, 9001]),
+    ] {
+        assert_eq!(search(params).await, (7, expected.to_vec()), "{params}");
+    }
+    for params in ["?q=%20MiSSIon_%20", "?q=mission_&sort=relevance"] {
+        assert_eq!(
+            search(params).await,
+            (6, vec![9001, 9002, 9003, 9005, 9004, 9006])
+        );
+    }
+    assert_eq!(
+        search("?q=mission_&sort=updated").await,
+        (6, vec![9005, 9004, 9002, 9001, 9003, 9006])
+    );
+    assert_eq!(
+        search("?q=mission_&page=2&pageSize=2").await,
+        (6, vec![9003, 9005])
+    );
 }
 
 #[tokio::test]
