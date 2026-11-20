@@ -13,6 +13,7 @@
     "test": "vitest run",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:build:win-msvc": "tauri build --target x86_64-pc-windows-msvc",
     "tauri:build:win-gnu": "npm run build && cargo build --release --target x86_64-pc-windows-gnu -p l4a-tauri --features tauri/custom-protocol",
     "rust:test": "cargo test",
     "server:run": "cargo run -p l4a-server --"

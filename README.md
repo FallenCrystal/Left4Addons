@@ -75,6 +75,19 @@ npm run build
 cargo check --target x86_64-pc-windows-gnu -p l4a-tauri
 ```
 
+### Windows x64 MSVC 构建
+
+在 Windows 上使用 Rust MSVC 工具链和 Visual Studio 的「使用 C++ 的桌面开发」工作负载（含 Windows SDK）。运行桌面程序需要 WebView2。参见 [Tauri 的 Windows 环境要求](https://v2.tauri.app/start/prerequisites/#windows)。
+
+在仓库根目录运行：
+
+```powershell
+npm ci
+npm run tauri:build:win-msvc
+```
+
+构建会先编译前端，再生成 `target/x86_64-pc-windows-msvc/release/l4a-tauri.exe`。项目当前关闭了安装包打包。
+
 ## 许可证
 
 基于 [MIT License](LICENSE) 开源。
