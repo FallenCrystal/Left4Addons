@@ -5,7 +5,7 @@ pub type KvValue = Value;
 
 /// 解析 Valve KeyValues (`.txt` / `.vdf` / `addoninfo.txt` / `missions/*.txt`)。
 ///
-/// 所有 Key 均规范化为小写以消除不同作者的大小写差异；同时跳过非 URL 内的 `//` 行注释。
+/// 所有 Key 均规范化为小写 (消除不同作者的大小写差异)。解析时跳过 URL 之外的 `//` 行注释。
 pub fn parse_key_values(text: &str) -> KvValue {
     let mut clean_text = String::new();
     for line in text.lines() {

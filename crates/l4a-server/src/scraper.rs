@@ -17,7 +17,7 @@ impl CatalogScraper for PlaceholderCatalogScraper {
             implemented: false,
             provider_name: "placeholder-server-scraper".to_string(),
             queued_jobs,
-            message: "服务端主动创意工坊爬虫当前为占位符实现；请通过可信玩家提交或后续接入独立 Scraper Adapter".to_string(),
+            message: "服务端主动创意工坊爬虫当前为占位实现 (数据可通过可信玩家提交或后续接入独立 Scraper Adapter)".to_string(),
         }
     }
 }

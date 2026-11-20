@@ -4,10 +4,11 @@ use l4a_core::db::LocalDb;
 use l4a_core::{AppPaths, L4aEngine, NullEventSink};
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
-    AddonDirType, AddonId, AppConfig, GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile,
-    MetadataSource, ProfileId, ReconcileAction, ReconcileIssueKind, RenameRuleConfig, UserGroup,
-    WorkshopCollectionRecord, WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType,
-    WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    AddonDirType, AddonId, AddonOperationOutcome, AppConfig, DesktopError, DesktopErrorCode,
+    GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile, MetadataSource, ProfileId,
+    ReconcileAction, ReconcileIssueKind, RenameRuleConfig, UserGroup, WorkshopCollectionRecord,
+    WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemRecord,
+    WorkshopItemStatus,
 };
 use l4a_steam::MockSteamBridge;
 use l4a_vpk::{write_vpk, VpkFileToWrite};
@@ -144,21 +145,31 @@ async fn scan_rename_preserves_workshop_identity_and_map_search_works() {
     );
 
     // Direct rename inside workshop/ is refused to avoid Steam redownload
-    let ws_err = engine
+    let denied = engine
         .apply_renames(&[(aid.clone(), "Illegal Workshop Rename.vpk".into())])
-        .unwrap_err();
-    assert!(matches!(ws_err, l4a_core::CoreError::Conflict(_)));
+        .unwrap();
+    assert!(matches!(
+        denied.items[0].outcome,
+        AddonOperationOutcome::Failed {
+            error: DesktopError {
+                code: DesktopErrorCode::Conflict,
+                ..
+            },
+        }
+    ));
 
     // Move to loading/ then rename without workshop ID prefix -> rescan keeps workshop_id!
     engine
         .move_addons(std::slice::from_ref(&aid), AddonDirType::Loading)
         .unwrap();
-    let snap = engine
-        .apply_renames(&[(aid.clone(), "Custom Urban Name.vpk".into())])
+    let rename = engine
+        .apply_renames(&[(aid.clone(), "本地模组.vpk".into())])
         .unwrap();
+    assert_eq!(rename.items[0].outcome, AddonOperationOutcome::Applied);
+    let snap = engine.snapshot().unwrap();
     assert_eq!(
         snap.addons[0].current_file_name.as_deref(),
-        Some("Custom Urban Name.vpk")
+        Some("本地模组.vpk")
     );
 
     let rescanned = engine.scan().unwrap();
@@ -596,6 +607,12 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
         .apply_profile(&ProfileId("prof_clean".into()))
         .unwrap();
     assert_eq!(apply_report.disabled_count, 1);
+    assert_eq!(apply_report.batch.items[0].addon_id, w1_id);
+    assert_eq!(
+        apply_report.batch.items[0].outcome,
+        AddonOperationOutcome::Applied
+    );
+    assert_eq!(apply_report.batch.refresh_error, None);
     assert!(loading_dir.join("w1.vpk.disabled").exists());
     assert!(loading_dir.join("p1.vpk").exists());
 }
@@ -695,13 +712,22 @@ async fn preview_rename_and_apply_reject_conflicts_without_clobbering_files() {
     assert_eq!(preview.len(), 2);
     assert!(preview.iter().any(|p| p.conflict.is_some()));
 
-    let err = engine
+    let report = engine
         .apply_renames(&[
             (snap.addons[0].id.clone(), "Shared.vpk".into()),
             (snap.addons[1].id.clone(), "Shared.vpk".into()),
         ])
-        .unwrap_err();
-    assert!(matches!(err, l4a_core::CoreError::Conflict(_)));
+        .unwrap();
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::NotAttempted);
+    assert!(matches!(
+        report.items[1].outcome,
+        AddonOperationOutcome::Failed {
+            error: DesktopError {
+                code: DesktopErrorCode::Conflict,
+                ..
+            },
+        }
+    ));
     assert!(loading_dir.join("a.vpk").exists());
     assert!(loading_dir.join("b.vpk").exists());
 }
@@ -878,9 +904,11 @@ async fn reconcile_ignore_and_leave_persist_corrupted_skipped_and_move_back_clea
         .toggle_addons(std::slice::from_ref(&aid_500001), false, false)
         .unwrap();
 
-    let back_snap = engine
+    let returned = engine
         .move_addons(std::slice::from_ref(&aid_500001), AddonDirType::Workshop)
         .unwrap();
+    assert_eq!(returned.items[0].outcome, AddonOperationOutcome::Applied);
+    let back_snap = engine.snapshot().unwrap();
     let moved_back = back_snap
         .addons
         .iter()
@@ -1125,9 +1153,28 @@ fn batches_keep_successful_moves_and_reconcile_rejects_stale_issues() {
     .unwrap();
     let a = AddonId::from_workshop_id(WorkshopId(791001));
     let b = AddonId::from_workshop_id(WorkshopId(791002));
-    assert!(engine
-        .move_addons(&[a.clone(), b.clone()], AddonDirType::Loading)
-        .is_err());
+    let c = AddonId::from_workshop_id(WorkshopId(791003));
+    let report = engine
+        .move_addons(
+            &[a.clone(), a.clone(), b.clone(), c.clone()],
+            AddonDirType::Loading,
+        )
+        .unwrap();
+    assert_eq!(report.refresh_error, None);
+    let wire = serde_json::to_value(&report).unwrap();
+    assert_eq!(wire["items"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        wire["items"][0],
+        serde_json::json!({ "addonId": a, "status": "applied" })
+    );
+    assert_eq!(wire["items"][1]["addonId"], serde_json::json!(b));
+    assert_eq!(wire["items"][1]["status"], "failed");
+    assert_eq!(wire["items"][1]["error"]["code"], "conflict");
+    assert_eq!(
+        wire["items"][2],
+        serde_json::json!({ "addonId": c, "status": "not_attempted" })
+    );
+    assert!(wire.get("refreshError").is_none());
     assert_eq!(
         std::fs::read(loading.join("791001.vpk")).unwrap(),
         first_bytes
@@ -1188,5 +1235,176 @@ fn batches_keep_successful_moves_and_reconcile_rejects_stale_issues() {
     assert_eq!(
         std::fs::read(loading.join("791001.vpk")).unwrap(),
         new_bytes
+    );
+}
+
+#[test]
+fn batch_toggle_reports_a_rolled_back_item_and_an_inventory_refresh_error() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    for id in 810001..=810003 {
+        create_test_vpk(
+            &loading.join(format!("{id}.vpk")),
+            &id.to_string(),
+            "Author",
+            false,
+            None,
+            b"mod",
+        );
+    }
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.scan().unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("runtime/l4a_v2.db")).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_toggle BEFORE UPDATE OF enabled ON addons
+         WHEN OLD.workshop_id = 810002 AND NEW.enabled != OLD.enabled BEGIN
+             SELECT RAISE(ABORT, 'toggle failed');
+         END;",
+    )
+    .unwrap();
+
+    let first = AddonId::from_workshop_id(WorkshopId(810001));
+    let second = AddonId::from_workshop_id(WorkshopId(810002));
+    let third = AddonId::from_workshop_id(WorkshopId(810003));
+    let report = engine
+        .toggle_addons(&[first.clone(), second.clone(), third], false, false)
+        .unwrap();
+    assert_eq!(report.refresh_error, None);
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::Applied);
+    assert!(matches!(
+        report.items[1].outcome,
+        AddonOperationOutcome::Failed {
+            error: DesktopError {
+                code: DesktopErrorCode::Database,
+                ..
+            },
+        }
+    ));
+    assert_eq!(report.items[2].outcome, AddonOperationOutcome::NotAttempted);
+    assert!(loading.join("810001.vpk.disabled").is_file());
+    assert!(loading.join("810002.vpk").is_file());
+    assert!(!loading.join("810002.vpk.disabled").exists());
+    assert!(loading.join("810003.vpk").is_file());
+
+    sql.execute_batch(
+        "DROP TRIGGER fail_toggle;
+         CREATE TRIGGER fail_refresh BEFORE DELETE ON physical_files BEGIN
+             SELECT RAISE(ABORT, 'refresh failed');
+         END;",
+    )
+    .unwrap();
+    let report = engine
+        .toggle_addons(&[first, second.clone()], false, false)
+        .unwrap();
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::Unchanged);
+    assert_eq!(report.items[1].outcome, AddonOperationOutcome::Applied);
+    assert_eq!(
+        serde_json::to_value(&report).unwrap()["refreshError"]["code"],
+        "database"
+    );
+    assert!(loading.join("810002.vpk.disabled").is_file());
+    assert!(!engine.db().get_addon(&second).unwrap().unwrap().enabled);
+
+    let new_name = "[810009] 本地模组.vpk";
+    let renamed = engine
+        .apply_renames(&[(second.clone(), new_name.into())])
+        .unwrap();
+    assert_eq!(renamed.items[0].outcome, AddonOperationOutcome::Applied);
+    assert!(renamed.refresh_error.is_some());
+
+    sql.execute_batch("DROP TRIGGER fail_refresh;").unwrap();
+    let scanned = engine.scan().unwrap();
+    let renamed_addon = scanned
+        .addons
+        .iter()
+        .find(|addon| addon.id == second)
+        .unwrap();
+    assert_eq!(renamed_addon.current_file_name.as_deref(), Some(new_name));
+    assert_eq!(renamed_addon.workshop_id, Some(WorkshopId(810002)));
+    let retried = engine.toggle_addons(&[second], false, false).unwrap();
+    assert_eq!(retried.refresh_error, None);
+    assert_eq!(retried.items[0].outcome, AddonOperationOutcome::Unchanged);
+}
+
+#[test]
+fn delete_reports_restore_files_if_the_record_cannot_be_removed() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+    let workshop_file = workshop.join("820001.vpk");
+    create_test_vpk(&workshop_file, "Delete", "Author", false, None, b"original");
+    let original_bytes = std::fs::read(&workshop_file).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            workshop_dir: workshop.to_string_lossy().into_owned(),
+            enable_dummy_bypass: true,
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.scan().unwrap();
+    let id = AddonId::from_workshop_id(WorkshopId(820001));
+    let ids = std::slice::from_ref(&id);
+    engine.move_addons(ids, AddonDirType::Loading).unwrap();
+    let local_file = loading.join("820001.vpk");
+    let dummy_bytes = std::fs::read(&workshop_file).unwrap();
+
+    let report = engine.delete_addons(ids, false, true).unwrap();
+    assert!(matches!(
+        report.items[0].outcome,
+        AddonOperationOutcome::Failed {
+            error: DesktopError {
+                code: DesktopErrorCode::Conflict,
+                ..
+            },
+        }
+    ));
+    let sql = rusqlite::Connection::open(dir.path().join("runtime/l4a_v2.db")).unwrap();
+    sql.execute_batch(
+        "CREATE TRIGGER fail_delete BEFORE DELETE ON addons BEGIN
+             SELECT RAISE(ABORT, 'delete failed');
+         END;",
+    )
+    .unwrap();
+    let report = engine.delete_addons(ids, true, true).unwrap();
+    assert!(matches!(
+        report.items[0].outcome,
+        AddonOperationOutcome::Failed {
+            error: DesktopError {
+                code: DesktopErrorCode::Database,
+                ..
+            },
+        }
+    ));
+    assert_eq!(report.refresh_error, None);
+    assert_eq!(std::fs::read(&local_file).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&workshop_file).unwrap(), dummy_bytes);
+
+    sql.execute_batch("DROP TRIGGER fail_delete;").unwrap();
+    let report = engine.delete_addons(ids, true, false).unwrap();
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::Applied);
+    assert!(!local_file.exists());
+    assert!(!workshop_file.exists());
+    assert_eq!(
+        engine.db().get_addon(&id).unwrap().unwrap().install_state,
+        InstallState::UninstalledKnown
+    );
+    let report = engine.delete_addons(ids, false, true).unwrap();
+    assert_eq!(report.items[0].outcome, AddonOperationOutcome::Applied);
+    assert!(engine.db().get_addon(&id).unwrap().is_none());
+    assert_eq!(
+        engine.delete_addons(ids, false, true).unwrap().items[0].outcome,
+        AddonOperationOutcome::Unchanged
     );
 }

@@ -18,11 +18,11 @@ use crate::tasks::{create_task, update_task};
 use crate::watcher::AddonWatcher;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
-    AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord, CoreEvent,
-    DashboardSnapshot, GroupId, InstallState, IssueId, LoadoutProfile, ProfileApplyReport,
-    ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse,
-    SyncReport, TaskKind, TaskStatus, TrackedCollectionRecord, UserGroup, WorkshopFetchOutcome,
-    WorkshopId,
+    AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
+    CoreEvent, DashboardSnapshot, GroupId, InstallState, IssueId, LoadoutProfile,
+    ProfileApplyReport, ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig,
+    SearchQuery, SearchResponse, SyncReport, TaskKind, TaskStatus, TrackedCollectionRecord,
+    UserGroup, WorkshopFetchOutcome, WorkshopId,
 };
 use l4a_steam::{DynamicSteamBridge, SteamBridge, SteamCapabilities};
 use l4a_vpk::{extract_addon_metadata, inspect_dummy_vpk, DummyInspection, DummySpec};
@@ -551,21 +551,20 @@ impl L4aEngine {
         &self,
         addon_ids: &[AddonId],
         target_dir_type: AddonDirType,
-    ) -> Result<DashboardSnapshot, CoreError> {
+    ) -> Result<AddonBatchReport, CoreError> {
         let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
-        let result = move_addons(
+        let report = move_addons(
             &self.db,
             &cfg,
             &self.paths.image_cache_dir,
             addon_ids,
             target_dir_type,
-        );
-        let snapshot = result.and_then(|_| self.snapshot_locked());
+        )?;
         drop(workspace);
         self.emit_workspace_update();
-        snapshot
+        Ok(report)
     }
 
     pub fn toggle_addons(
@@ -573,23 +572,20 @@ impl L4aEngine {
         addon_ids: &[AddonId],
         enabled: bool,
         allow_workshop_dir: bool,
-    ) -> Result<DashboardSnapshot, CoreError> {
+    ) -> Result<AddonBatchReport, CoreError> {
         let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
-        toggle_addons(
+        let report = toggle_addons(
             &self.db,
             &cfg,
             &self.paths.image_cache_dir,
-            addon_ids,
-            enabled,
+            addon_ids.iter().map(|id| (id, enabled)),
             allow_workshop_dir,
         )?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        let snapshot = self.snapshot_locked();
         drop(workspace);
         self.emit_workspace_update();
-        snapshot
+        Ok(report)
     }
 
     pub fn preview_rename(
@@ -597,22 +593,21 @@ impl L4aEngine {
         rules: &RenameRuleConfig,
         addon_ids: &[AddonId],
     ) -> Result<Vec<RenamePreviewItem>, CoreError> {
-        preview_batch_rename(&self.db, rules, addon_ids)
+        let _workspace = self.lock_workspace()?;
+        preview_batch_rename(&self.db, &self.config(), rules, addon_ids)
     }
 
     pub fn apply_renames(
         &self,
         renames: &[(AddonId, String)],
-    ) -> Result<DashboardSnapshot, CoreError> {
+    ) -> Result<AddonBatchReport, CoreError> {
         let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
-        apply_renames(&self.db, renames, &cfg.rename_rules)?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        let snapshot = self.snapshot_locked();
+        let report = apply_renames(&self.db, &cfg, &self.paths.image_cache_dir, renames)?;
         drop(workspace);
         self.emit_workspace_update();
-        snapshot
+        Ok(report)
     }
 
     pub fn delete_addons(
@@ -620,22 +615,21 @@ impl L4aEngine {
         addon_ids: &[AddonId],
         delete_disk_file: bool,
         purge_known_record: bool,
-    ) -> Result<DashboardSnapshot, CoreError> {
+    ) -> Result<AddonBatchReport, CoreError> {
         let workspace = self.lock_workspace()?;
         let cfg = self.config();
         self.suppress_watcher();
-        delete_addons(
+        let report = delete_addons(
             &self.db,
             &cfg,
+            &self.paths.image_cache_dir,
             addon_ids,
             delete_disk_file,
             purge_known_record,
         )?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
-        let snapshot = self.snapshot_locked();
         drop(workspace);
         self.emit_workspace_update();
-        snapshot
+        Ok(report)
     }
 
     pub fn rebuild_bundles(&self) -> Result<Vec<BundleRecord>, CoreError> {
@@ -692,7 +686,6 @@ impl L4aEngine {
         let cfg = self.config();
         self.suppress_watcher();
         let report = apply_profile(&self.db, id, &self.paths.image_cache_dir, &cfg)?;
-        scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
         drop(workspace);
         self.emit_workspace_update();
         Ok(report)

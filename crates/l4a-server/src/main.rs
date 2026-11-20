@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
                 other.unwrap_or_else(|| INSECURE_DEFAULT_TOKEN.to_string())
             } else {
                 anyhow::bail!(
-                    "拒绝启动：必须通过 --admin-token 或环境变量 L4A_SERVER_ADMIN_TOKEN 提供非空的强管理员令牌（且不可为 change-me-admin-token）；本地调试可显式添加 --allow-insecure-dev-token 并绑定回环地址"
+                    "拒绝启动：必须通过 --admin-token 或环境变量 L4A_SERVER_ADMIN_TOKEN 提供非空的强管理员令牌 (且不可为 change-me-admin-token)。本地调试可显式添加 --allow-insecure-dev-token 并绑定回环地址"
                 );
             }
         }

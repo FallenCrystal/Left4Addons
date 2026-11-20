@@ -122,7 +122,7 @@ export function App() {
       {!isTauriRuntime() && (
         <section className="panel notice">
           当前运行于纯浏览器预览模式。桌面核心引擎命令需通过 <code>npm run tauri:dev</code> 启动 Tauri
-          窗口；独立后端控制台请运行 <code>npm run server:run</code> 并访问 <code>/admin</code>。
+          窗口 (独立后端控制台可运行 <code>npm run server:run</code> 后访问 <code>/admin</code>)。
         </section>
       )}
 

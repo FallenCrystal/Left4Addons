@@ -1,6 +1,7 @@
 use crate::db::repo::{derive_categories_from_info, PhysicalFileRow};
 use crate::db::LocalDb;
 use crate::error::CoreError;
+use crate::ops::strip_suffix_ascii_case;
 use l4a_protocol::{
     AddonDirType, AddonId, AddonSummary, AppConfig, FileRole, InstallState, PhysicalFileRecord,
     WorkshopId,
@@ -67,6 +68,10 @@ pub(crate) fn scan_and_commit<T>(
         }
         existing_addons.insert(addon.id.clone(), addon);
     }
+    let addons_by_path: HashMap<_, _> = existing_addons
+        .values()
+        .filter_map(|addon| addon.current_path.as_deref().map(|path| (path, addon)))
+        .collect();
 
     let mut disk_entries: Vec<(PathBuf, AddonDirType, String, bool, u64, i64)> = Vec::new();
     for (dir, dir_type) in [
@@ -120,6 +125,8 @@ pub(crate) fn scan_and_commit<T>(
         let path_str = path.to_string_lossy().into_owned();
         let prev = existing_files.get(&path_str);
         let seed = seeds_by_path.get(&path_str);
+        // A file operation can commit the new path even when the inventory refresh fails.
+        let known_addon = seed.or_else(|| addons_by_path.get(path_str.as_str()).copied());
         let unchanged = seed.is_none()
             && prev.is_some_and(|p| {
                 p.record.file_size == file_size
@@ -156,7 +163,7 @@ pub(crate) fn scan_and_commit<T>(
                         db,
                         &existing_addons,
                         &existing_files,
-                        seed,
+                        known_addon,
                     )?
                 }
             } else {
@@ -167,7 +174,7 @@ pub(crate) fn scan_and_commit<T>(
                     db,
                     &existing_addons,
                     &existing_files,
-                    seed,
+                    known_addon,
                 )?
             };
 
@@ -330,19 +337,11 @@ pub(crate) fn modified_at(metadata: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn strip_suffix_ascii_case<'a>(input: &'a str, suffix: &str) -> &'a str {
-    if input.len() >= suffix.len()
-        && input[input.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-    {
-        &input[..input.len() - suffix.len()]
-    } else {
-        input
-    }
-}
-
 fn raw_name_fallback(path: &Path) -> String {
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    strip_suffix_ascii_case(name, ".disabled").to_string()
+    strip_suffix_ascii_case(name, ".disabled")
+        .unwrap_or(name)
+        .to_string()
 }
 
 #[allow(clippy::type_complexity)]
@@ -353,7 +352,7 @@ fn inspect_disk_vpk(
     db: &LocalDb,
     existing_addons: &HashMap<AddonId, AddonSummary>,
     existing_files: &HashMap<String, PhysicalFileRow>,
-    seed: Option<&AddonSummary>,
+    known_addon: Option<&AddonSummary>,
 ) -> Result<
     (
         FileRole,
@@ -391,7 +390,7 @@ fn inspect_disk_vpk(
                 .get(&path.to_string_lossy().into_owned())
                 .and_then(|p| p.record.workshop_id);
             let real_id = if let Some(addon) =
-                seed.filter(|addon| addon.content_hash.as_ref() == Some(&content_hash))
+                known_addon.filter(|addon| addon.content_hash.as_ref() == Some(&content_hash))
             {
                 addon.workshop_id
             } else {
@@ -474,7 +473,11 @@ fn build_addon_summary(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(|| prev.map(|p| p.title.clone()))
-        .unwrap_or_else(|| strip_suffix_ascii_case(vpk_name, ".vpk").to_string());
+        .unwrap_or_else(|| {
+            strip_suffix_ascii_case(vpk_name, ".vpk")
+                .unwrap_or(vpk_name)
+                .to_string()
+        });
     let author = meta
         .addon_info
         .get("addonauthor")
@@ -520,8 +523,8 @@ fn build_addon_summary(
 }
 
 pub fn extract_workshop_id_from_filename(vpk_name: &str) -> Option<WorkshopId> {
-    let base = strip_suffix_ascii_case(vpk_name, ".disabled");
-    let base = strip_suffix_ascii_case(base, ".vpk");
+    let base = strip_suffix_ascii_case(vpk_name, ".disabled").unwrap_or(vpk_name);
+    let base = strip_suffix_ascii_case(base, ".vpk").unwrap_or(base);
 
     if base.chars().all(|c| c.is_ascii_digit()) && !base.is_empty() {
         return WorkshopId::from_str(base).ok();

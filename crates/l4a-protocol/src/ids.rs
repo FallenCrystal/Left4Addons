@@ -40,8 +40,8 @@ impl fmt::Display for AddonId {
 
 /// Steam Workshop PublishedFileId (u64)。
 ///
-/// 序列化为十进制字符串以避免 JavaScript `Number.MAX_SAFE_INTEGER` 精度问题；
-/// 反序列化同时兼容字符串（`"123456"`）与整数（`123456`）。
+/// 序列化为十进制字符串 (避免 JavaScript `Number.MAX_SAFE_INTEGER` 精度问题)。
+/// 反序列化接受字符串 (`"123456"`) 和整数 (`123456`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkshopId(pub u64);
 

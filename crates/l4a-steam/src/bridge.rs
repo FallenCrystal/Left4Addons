@@ -198,7 +198,7 @@ struct DynamicBridgeState {
     last_error: Mutex<Option<String>>,
 }
 
-/// 按需懒加载 `l4a-steam-bridge` 动态库并隔离 FFI 调用；支持显式 `shutdown` 以规避 VAC 信任冲突。
+/// 按需加载 `l4a-steam-bridge` 动态库并隔离 FFI 调用 (支持显式 `shutdown` 以规避 VAC 信任冲突)。
 pub struct DynamicSteamBridge {
     state: Arc<DynamicBridgeState>,
 }

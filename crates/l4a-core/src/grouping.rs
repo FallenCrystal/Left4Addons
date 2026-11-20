@@ -3,8 +3,8 @@ use crate::error::CoreError;
 use crate::ops::toggle_addons;
 use chrono::Utc;
 use l4a_protocol::{
-    AddonDirType, AddonId, AddonSummary, BundleId, BundleKind, BundleRecord, GroupId,
-    InstallState, LoadoutProfile, MapEntry, ProfileApplyReport, ProfileId,
+    AddonDirType, AddonId, AddonOperationOutcome, AddonSummary, BundleId, BundleKind, BundleRecord,
+    GroupId, InstallState, LoadoutProfile, MapEntry, ProfileApplyReport, ProfileId,
     TrackedCollectionRecord, UserGroup, WorkshopId,
 };
 use l4a_workshop::WorkshopResolver;
@@ -308,8 +308,8 @@ pub fn delete_profile(db: &LocalDb, id: &ProfileId) -> Result<(), CoreError> {
     db.delete_profile(id)
 }
 
-/// 一键应用预设方案：只修改托管在 `loading/` 目录下的模组启用状态；
-/// 仅在 `workshop/` 目录的模组不会被直接重命名为 `.disabled` 以防触发 Steam 重新下载。
+/// 一键应用预设方案 (仅切换 `loading/` 目录中的模组)。
+/// 跳过 `workshop/` 目录中的模组，以免触发 Steam 重新下载。
 pub fn apply_profile(
     db: &LocalDb,
     profile_id: &ProfileId,
@@ -364,14 +364,21 @@ pub fn apply_profile(
         }
     }
 
-    let enabled_count = to_enable.len();
-    let disabled_count = to_disable.len();
-
-    if !to_enable.is_empty() {
-        toggle_addons(db, config, image_cache_dir, &to_enable, true, false)?;
-    }
-    if !to_disable.is_empty() {
-        toggle_addons(db, config, image_cache_dir, &to_disable, false, false)?;
+    let toggles = to_enable
+        .iter()
+        .map(|id| (id, true))
+        .chain(to_disable.iter().map(|id| (id, false)));
+    let batch = toggle_addons(db, config, image_cache_dir, toggles, false)?;
+    let mut enabled_count = 0;
+    let mut disabled_count = 0;
+    for item in &batch.items {
+        if item.outcome == AddonOperationOutcome::Applied {
+            if desired.contains(&item.addon_id) {
+                enabled_count += 1;
+            } else {
+                disabled_count += 1;
+            }
+        }
     }
 
     skipped_workshop_only.sort();
@@ -383,5 +390,6 @@ pub fn apply_profile(
         disabled_count,
         skipped_workshop_only,
         missing_addons,
+        batch,
     })
 }

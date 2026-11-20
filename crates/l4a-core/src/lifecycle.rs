@@ -95,7 +95,7 @@ pub async fn sync_lifecycle(
                         }
                     }
 
-                    // 只有支持依赖信息的来源（或非空依赖列表）才替换现有依赖边；
+                    // 只有支持依赖信息的来源 (或非空依赖列表) 才替换现有依赖边。
                     // 仅用 Steam Web API（不暴露依赖字段）同步时绝不擦除历史依赖。
                     db.upsert_workshop_snapshot(&item, can_diff_deps)?;
 

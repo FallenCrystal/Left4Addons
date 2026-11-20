@@ -106,6 +106,15 @@ export interface LoadoutProfile {
   enabledAddonIds: string[];
 }
 
+export interface ProfileApplyReport {
+  profileId: string;
+  enabledCount: number;
+  disabledCount: number;
+  skippedWorkshopOnly: string[];
+  missingAddons: string[];
+  batch: AddonBatchReport;
+}
+
 export interface TaskRecord {
   id: string;
   kind: 'download' | 'sync' | 'scan';
@@ -128,6 +137,42 @@ export interface RenameRuleConfig {
   maxFilenameLength: number;
   enableTrim: boolean;
   enableRemoveDoubleSpaces: boolean;
+}
+
+export interface RenamePreviewItem {
+  addonId: string;
+  currentFileName: string;
+  targetFileName: string;
+  conflict?: string;
+}
+
+export type DesktopErrorCode =
+  | 'invalid_input'
+  | 'not_found'
+  | 'conflict'
+  | 'io'
+  | 'database'
+  | 'config'
+  | 'vpk'
+  | 'network'
+  | 'unsupported'
+  | 'cancelled'
+  | 'workshop'
+  | 'recovery_required';
+
+export interface DesktopError {
+  code: DesktopErrorCode;
+  message: string;
+}
+
+export type AddonOperationResult = { addonId: string } & (
+  | { status: 'applied' | 'unchanged' | 'not_attempted' }
+  | { status: 'failed'; error: DesktopError }
+);
+
+export interface AddonBatchReport {
+  items: AddonOperationResult[];
+  refreshError?: DesktopError;
 }
 
 export interface AppConfig {
@@ -221,27 +266,102 @@ export type CoreEvent =
   | { type: 'reconcile_issues_detected'; count: number }
   | { type: 'watch_error'; message: string };
 
+export class IpcError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+  }
+}
+
+async function invokeCommand<T>(...args: Parameters<typeof invoke>): Promise<T> {
+  try {
+    return await invoke<T>(...args);
+  } catch (error) {
+    if (
+      typeof error === 'object' && error !== null &&
+      'code' in error && typeof error.code === 'string' &&
+      'message' in error && typeof error.message === 'string'
+    ) {
+      throw new IpcError(error.code, error.message);
+    }
+    throw new IpcError('ipc', error instanceof Error ? error.message : String(error));
+  }
+}
+
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
-  return invoke<DashboardSnapshot>('get_dashboard_snapshot');
+  return invokeCommand<DashboardSnapshot>('get_dashboard_snapshot');
 }
 
 export async function scanWorkspace(): Promise<DashboardSnapshot> {
-  return invoke<DashboardSnapshot>('scan_workspace');
+  return invokeCommand<DashboardSnapshot>('scan_workspace');
+}
+
+export async function saveConfig(config: AppConfig): Promise<AppConfig> {
+  return invokeCommand<AppConfig>('save_config', { config });
+}
+
+export async function detectGameAddonsPath(): Promise<string | null> {
+  return invokeCommand<string | null>('detect_game_addons_path');
 }
 
 export async function syncWorkshop(): Promise<SyncReport> {
-  return invoke<SyncReport>('sync_workshop');
+  return invokeCommand<SyncReport>('sync_workshop');
 }
 
 export async function resolveReconcileIssue(
   issueId: string,
   action: ReconcileAction,
 ): Promise<DashboardSnapshot> {
-  return invoke<DashboardSnapshot>('resolve_reconcile_issue', { issueId, action });
+  return invokeCommand<DashboardSnapshot>('resolve_reconcile_issue', { issueId, action });
+}
+
+export async function moveAddons(
+  addonIds: string[],
+  targetDirType: AddonDirType,
+): Promise<AddonBatchReport> {
+  return invokeCommand<AddonBatchReport>('move_addons', { addonIds, targetDirType });
+}
+
+export async function toggleAddons(
+  addonIds: string[],
+  enabled: boolean,
+  allowWorkshopDir = false,
+): Promise<AddonBatchReport> {
+  return invokeCommand<AddonBatchReport>('toggle_addons', { addonIds, enabled, allowWorkshopDir });
+}
+
+export async function previewRename(
+  rules: RenameRuleConfig,
+  addonIds: string[] = [],
+): Promise<RenamePreviewItem[]> {
+  return invokeCommand<RenamePreviewItem[]>('preview_rename', { rules, addonIds });
+}
+
+export async function applyRenames(
+  renames: [addonId: string, fileName: string][],
+): Promise<AddonBatchReport> {
+  return invokeCommand<AddonBatchReport>('apply_renames', { renames });
+}
+
+export async function deleteAddons(
+  addonIds: string[],
+  deleteDiskFile: boolean,
+  purgeKnownRecord: boolean,
+): Promise<AddonBatchReport> {
+  return invokeCommand<AddonBatchReport>('delete_addons', {
+    addonIds, deleteDiskFile, purgeKnownRecord,
+  });
+}
+
+export async function applyProfile(profileId: string): Promise<ProfileApplyReport> {
+  return invokeCommand<ProfileApplyReport>('apply_profile', { profileId });
+}
+
+export async function searchByMapCode(query: string): Promise<AddonSummary[]> {
+  return invokeCommand<AddonSummary[]>('search_by_map_code', { query });
 }
 
 export async function subscribeCoreEvents(

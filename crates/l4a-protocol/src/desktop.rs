@@ -299,6 +299,7 @@ pub struct ProfileApplyReport {
     pub disabled_count: usize,
     pub skipped_workshop_only: Vec<AddonId>,
     pub missing_addons: Vec<AddonId>,
+    pub batch: AddonBatchReport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -355,6 +356,54 @@ pub struct RenamePreviewItem {
     pub target_file_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopErrorCode {
+    InvalidInput,
+    NotFound,
+    Conflict,
+    Io,
+    Database,
+    Config,
+    Vpk,
+    Network,
+    Unsupported,
+    Cancelled,
+    Workshop,
+    RecoveryRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopError {
+    pub code: DesktopErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AddonOperationOutcome {
+    Applied,
+    Unchanged,
+    Failed { error: DesktopError },
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonOperationResult {
+    pub addon_id: AddonId,
+    #[serde(flatten)]
+    pub outcome: AddonOperationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddonBatchReport {
+    pub items: Vec<AddonOperationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_error: Option<DesktopError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

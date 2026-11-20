@@ -170,7 +170,7 @@ impl FileChanges {
         if failures.is_empty() {
             original_error
         } else {
-            CoreError::Conflict(format!("{original_error}；{}", failures.join("；")))
+            CoreError::RecoveryRequired(format!("{original_error} ({})", failures.join(", ")))
         }
     }
 }
@@ -281,8 +281,9 @@ mod tests {
             fs::write(&original, b"external update")?;
             Err::<(), _>(CoreError::Conflict("test failure".into()))
         });
-        let message = result.unwrap_err().to_string();
-        assert!(message.contains(recovery.to_str().unwrap()));
+        let error = result.unwrap_err();
+        assert!(matches!(error, CoreError::RecoveryRequired(_)));
+        assert!(error.to_string().contains(recovery.to_str().unwrap()));
         assert_eq!(fs::read(original).unwrap(), b"external update");
         assert_eq!(fs::read(recovery).unwrap(), b"original");
     }

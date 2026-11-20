@@ -17,8 +17,7 @@ pub struct TagCategory {
 
 /// 未来接入 Steam Community 网页端抓取的显式扩展契约。
 ///
-/// 当前阶段按架构约束故意保留为占位接口；后续可在独立 crate 或本 trait 实现类中接入 HTML SSR 解析，
-/// 而不影响 `l4a-core` 与 `WorkshopResolver` 的任何调用代码。
+/// 当前为占位接口 (可通过独立 crate 或本 trait 的实现接入 HTML SSR 解析)。
 #[async_trait]
 pub trait WorkshopWebScraper: Send + Sync {
     async fn scrape_item_page(
