@@ -49,6 +49,7 @@
 - [06. 新分组模型](docs/architecture/06-grouping-model.md)
 - [07. `l4a-server` 后端设计与管理控制台](docs/architecture/07-catalog-backend.md)
 - [08. 测试策略与校验命令](docs/architecture/08-testing-strategy.md)
+- [Catalog Server 介绍与部署指南](docs/guides/catalog-server-guide.md)
 - [Catalog Server REST API 规范](docs/api/catalog-server-api.md)
 
 ---

@@ -22,6 +22,7 @@
 - [ADR-005](./adr/ADR-005-grouping-and-loadout-model.md): 四层正交分组与预设模型
 
 ### 3. 接口与实用指南 (`docs/api/` & `docs/guides/`)
+- [Catalog Server 介绍与部署指南 (`l4a-server`)](./guides/catalog-server-guide.md)
 - [Catalog Server REST API 规范](./api/catalog-server-api.md)
 - [镜像代理配置指南 (`mirrors.json`)](./guides/mirrors-configuration.md)
 - [Steamworks SDK 实测细节与限制](./guides/steamworks-sdk-details.md)

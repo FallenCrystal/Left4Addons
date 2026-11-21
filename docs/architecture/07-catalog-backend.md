@@ -15,6 +15,8 @@
   - `SteamWebApi` 等无依赖来源更新时默认不擦除现有依赖边；
   - 非 `Maintainer` 尝试将 `Active` 标为下架/私密时强制进入 `FlaggedForReview`，且低权重仅可补全无害展示字段（`description` / `creator_name` / `tags` / `preview_url`），绝不以低信任 `file_url` 或伪造依赖污染高信任主记录。
 
+## 2. 冲突裁决与防投毒状态机
+
 ```mermaid
 flowchart TD
     Sub["贡献者提交 ItemSubmission"] --> CheckUrl{"URL 是否通过 HTTPS Steam CDN 白名单校验?"}
@@ -40,3 +42,10 @@ flowchart TD
 - 生成可信玩家 Token（明文只展示一次，数据库只存 SHA-256 哈希）或一键禁用滥用 Token；
 - 审查最近 200 条提交审计日志（高亮 `flagged_for_review`）；
 - 查看服务端爬虫占位模块 (`PlaceholderCatalogScraper`) 队列与接入状态。
+
+## 4. 详细部署与 API 规范
+
+关于生产环境安装（Systemd、Docker、Nginx/Caddy 反向代理）、环境变量配置、Token 签发与客户端连接配置的完整步骤，请参见：
+- [Catalog Server 介绍与部署指南 (`docs/guides/catalog-server-guide.md`)](../guides/catalog-server-guide.md)
+- [Catalog Server REST API 规范 (`docs/api/catalog-server-api.md`)](../api/catalog-server-api.md)
+- [ADR-003: 创意工坊多源管道与自托管缓存后端](../adr/ADR-003-workshop-provider-pipeline-and-catalog-backend.md)

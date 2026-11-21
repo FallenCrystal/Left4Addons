@@ -2,6 +2,8 @@
 
 默认监听：`127.0.0.1:8787`；管理控制台：`GET /admin`。
 
+> 部署与配置说明请参见 [Catalog Server 介绍与部署指南](../guides/catalog-server-guide.md)，后端架构与冲突裁决逻辑参见 [07. 后端设计](../architecture/07-catalog-backend.md)。
+
 ## 1. 公开查询接口
 
 ### `GET /api/v1/health`
