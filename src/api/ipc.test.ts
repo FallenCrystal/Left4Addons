@@ -18,10 +18,12 @@ import {
   isTauriRuntime,
   moveAddons,
   openExternalUrl,
+  openInFileManager,
   previewRename,
   readCachedImage,
   rebuildBundles,
   resolveReconcileIssue,
+  resolveReconcileIssuesBatch,
   safeDeleteObsoleteDependency,
   saveConfig,
   saveProfile,
@@ -92,6 +94,13 @@ describe('v2 IPC client wrapper', () => {
       action: 'adopt_workshop_update',
     });
 
+    await resolveReconcileIssuesBatch([
+      { issueId: 'overwritten_888', action: 'adopt_workshop_update' },
+    ]);
+    expect(invokeMock).toHaveBeenCalledWith('resolve_reconcile_issues_batch', {
+      items: [{ issueId: 'overwritten_888', action: 'adopt_workshop_update' }],
+    });
+
     await searchWorkshop({ query: 'yama', tag: 'Campaigns', page: 2, pageSize: 24 });
     expect(invokeMock).toHaveBeenCalledWith('search_workshop', {
       query: { query: 'yama', tag: 'Campaigns', page: 2, pageSize: 24 },
@@ -131,6 +140,11 @@ describe('v2 IPC client wrapper', () => {
     await openExternalUrl('https://steamcommunity.com/sharedfiles/filedetails/?id=42');
     expect(invokeMock).toHaveBeenCalledWith('open_external_url', {
       url: 'https://steamcommunity.com/sharedfiles/filedetails/?id=42',
+    });
+
+    await openInFileManager('/addons/test.vpk');
+    expect(invokeMock).toHaveBeenCalledWith('open_in_file_manager', {
+      path: '/addons/test.vpk',
     });
   });
 

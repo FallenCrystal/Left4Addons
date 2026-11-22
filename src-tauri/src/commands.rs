@@ -3,11 +3,13 @@ use l4a_core::{validate_external_url, CoreError};
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
     DashboardSnapshot, DesktopError, DesktopErrorCode, GroupId, IssueId, LoadoutProfile,
-    ProfileApplyReport, ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig,
-    SearchQuery, SearchResponse, SyncReport, TrackedCollectionRecord, UserGroup, WorkshopId,
-    WorkshopItemRecord,
+    ProfileApplyReport, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileBatchReport,
+    RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse, SyncReport,
+    TrackedCollectionRecord, UserGroup, WorkshopId, WorkshopItemRecord,
 };
 use l4a_steam::SteamCapabilities;
+use std::io;
+use std::path::{Path, PathBuf};
 use tauri::State;
 use tokio::process::Command;
 
@@ -56,6 +58,156 @@ pub async fn open_external_url(url: String) -> Result<(), DesktopError> {
     }
     command.arg(&validated).spawn().map_err(CoreError::from)?;
     Ok(())
+}
+
+#[tauri::command]
+pub async fn open_in_file_manager(
+    path: String,
+    state: State<'_, TauriState>,
+) -> Result<(), DesktopError> {
+    let target = state.engine.resolve_managed_path(&path)?;
+    tokio::task::spawn_blocking(move || show_in_folder(&target))
+        .await
+        .map_err(|err| CoreError::Io(io::Error::other(err)))??;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn clean_canonical_path(path: &Path) -> PathBuf {
+    let path = path.to_string_lossy();
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else {
+        PathBuf::from(path.strip_prefix(r"\\?\").unwrap_or(&path))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn clean_canonical_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+fn show_in_folder(path: &Path) -> Result<(), CoreError> {
+    let is_file = path.is_file();
+    let canonical = clean_canonical_path(path);
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let path = canonical.to_string_lossy().replace('"', "");
+        let argument = if is_file {
+            format!("/select,\"{path}\"")
+        } else {
+            format!("\"{path}\"")
+        };
+        std::process::Command::new("explorer")
+            .raw_arg(argument)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut open = Command::new("open");
+        if is_file {
+            open.arg("-R");
+        }
+        open.arg(&canonical).spawn()?;
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let mut directory = canonical.as_path();
+        if is_file {
+            if reveal_with_dbus(&canonical) {
+                return Ok(());
+            }
+            for manager in [
+                "nautilus",
+                "dolphin",
+                "thunar",
+                "nemo",
+                "pcmanfm-qt",
+                "dde-file-manager",
+            ] {
+                if Command::new(manager)
+                    .arg("--select")
+                    .arg(&canonical)
+                    .spawn()
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+            if let Some(parent) = canonical.parent() {
+                directory = parent;
+            }
+        }
+        Command::new("xdg-open").arg(directory).spawn()?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn path_to_file_url(path: &Path) -> String {
+    use std::fmt::Write;
+
+    let mut url = String::from("file://");
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            url.push(char::from(byte));
+        } else {
+            write!(url, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    url
+}
+
+#[cfg(all(test, not(any(target_os = "windows", target_os = "macos"))))]
+#[test]
+fn encodes_file_manager_url() {
+    assert_eq!(
+        path_to_file_url(Path::new("/addons/Café 100% #1_~.vpk")),
+        "file:///addons/Caf%C3%A9%20100%25%20%231_~.vpk"
+    );
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn reveal_with_dbus(path: &Path) -> bool {
+    use std::process::{Command, Stdio};
+
+    let url = path_to_file_url(path);
+    let success = |command: &mut Command| {
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    success(Command::new("dbus-send").args([
+        "--session",
+        "--dest=org.freedesktop.FileManager1",
+        "--type=method_call",
+        "--print-reply",
+        "--reply-timeout=3000",
+        "/org/freedesktop/FileManager1",
+        "org.freedesktop.FileManager1.ShowItems",
+        &format!("array:string:{url}"),
+        "string:",
+    ])) || success(Command::new("busctl").args([
+        "--user",
+        "--timeout=3s",
+        "call",
+        "org.freedesktop.FileManager1",
+        "/org/freedesktop/FileManager1",
+        "org.freedesktop.FileManager1",
+        "ShowItems",
+        "ass",
+        "1",
+        &url,
+        "",
+    ]))
 }
 
 #[tauri::command]
@@ -159,6 +311,17 @@ pub async fn resolve_reconcile_issue(
     state
         .engine
         .resolve_issue(&issue_id, action)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn resolve_reconcile_issues_batch(
+    items: Vec<ReconcileBatchItem>,
+    state: State<'_, TauriState>,
+) -> Result<ReconcileBatchReport, DesktopError> {
+    state
+        .engine
+        .resolve_issues_batch(&items)
         .map_err(Into::into)
 }
 

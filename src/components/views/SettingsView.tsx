@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -9,6 +9,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  FolderOpen,
   FolderSearch,
   Palette,
   RefreshCw,
@@ -50,6 +51,7 @@ export interface SettingsViewProps {
   language: 'zh' | 'en';
   onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<boolean>;
   onDetectPath: () => Promise<string | null>;
+  onOpenInFileManager: (path: string) => void;
   onRefreshSteamCaps: () => void;
   onChangeTheme: (pref: ThemePreference) => void;
   onChangeLanguage: (lang: 'zh' | 'en') => void;
@@ -67,6 +69,7 @@ export function SettingsView({
   language,
   onSaveConfig,
   onDetectPath,
+  onOpenInFileManager,
   onRefreshSteamCaps,
   onChangeTheme,
   onChangeLanguage,
@@ -102,11 +105,41 @@ export function SettingsView({
   const pathsChanged =
     effective.loadingDir !== config.loadingDir || effective.workshopDir !== config.workshopDir;
 
-  const handleSave = async () => {
-    if (!dirty) return;
+  const [saveBarMounted, setSaveBarMounted] = useState(dirty);
+  const [lastPathsChanged, setLastPathsChanged] = useState(pathsChanged);
+
+  if (dirty && !saveBarMounted) {
+    setSaveBarMounted(true);
+  }
+  if (dirty && pathsChanged !== lastPathsChanged) {
+    setLastPathsChanged(pathsChanged);
+  }
+
+  useEffect(() => {
+    if (dirty || !saveBarMounted) return;
+    const timer = window.setTimeout(() => {
+      setSaveBarMounted(false);
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [dirty, saveBarMounted]);
+
+  const handleSave = useCallback(async () => {
+    if (!dirty || busy) return;
     const ok = await onSaveConfig(effective, pathsChanged);
     if (ok) setDraft(null);
-  };
+  }, [busy, dirty, effective, onSaveConfig, pathsChanged]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        void handleSave();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [dirty, handleSave]);
 
   const handleDetect = async () => {
     setDetecting(true);
@@ -147,20 +180,9 @@ export function SettingsView({
   });
 
   return (
-    <div className="l4a-view">
+    <div className="l4a-view l4a-settings-view">
       <header className="l4a-view-header">
         <h1 className="md-headline-small">{t('nav.settings')}</h1>
-        <div className="l4a-spacer" />
-        {dirty && (
-          <>
-            <Button variant="text" onClick={() => setDraft(null)}>
-              {t('common.cancel')}
-            </Button>
-            <Button variant="filled" disabled={busy} onClick={() => void handleSave()}>
-              {pathsChanged ? t('settings.saveAndScan') : t('common.save')}
-            </Button>
-          </>
-        )}
       </header>
 
       <div className="l4a-settings-layout">
@@ -190,20 +212,42 @@ export function SettingsView({
                 value={effective.loadingDir}
                 onChange={(e) => updateDraft((d) => ({ ...d, loadingDir: e.target.value }))}
                 trailing={
-                  <Button
-                    variant="tonal"
-                    size="sm"
-                    disabled={detecting}
-                    onClick={() => void handleDetect()}
-                  >
-                    {t('settings.autoDetect')}
-                  </Button>
+                  <div className="l4a-row-wrap" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                    {config.loadingDir && (
+                      <IconButton
+                        size="sm"
+                        label={t('common.openFolder')}
+                        onClick={() => onOpenInFileManager(config.loadingDir)}
+                      >
+                        <FolderOpen size={15} />
+                      </IconButton>
+                    )}
+                    <Button
+                      variant="tonal"
+                      size="sm"
+                      disabled={detecting}
+                      onClick={() => void handleDetect()}
+                    >
+                      {t('settings.autoDetect')}
+                    </Button>
+                  </div>
                 }
               />
               <TextField
                 label={t('settings.workshopDir')}
                 value={effective.workshopDir}
                 onChange={(e) => updateDraft((d) => ({ ...d, workshopDir: e.target.value }))}
+                trailing={
+                  config.workshopDir ? (
+                    <IconButton
+                      size="sm"
+                      label={t('common.openFolder')}
+                      onClick={() => onOpenInFileManager(config.workshopDir)}
+                    >
+                      <FolderOpen size={15} />
+                    </IconButton>
+                  ) : undefined
+                }
               />
             </section>
           )}
@@ -659,6 +703,32 @@ export function SettingsView({
           )}
         </div>
       </div>
+
+      {saveBarMounted && (
+        <div
+          className="l4a-settings-save-bar"
+          role="region"
+          aria-label={t('settings.unsavedChanges')}
+          data-state={dirty ? 'open' : 'closing'}
+        >
+          <span className="l4a-settings-save-dot" aria-hidden="true" />
+          <span className="md-label-large">{t('settings.unsavedChanges')}</span>
+          <div className="l4a-spacer" />
+          <Button variant="text" size="sm" disabled={busy || !dirty} onClick={() => setDraft(null)}>
+            {t('common.cancel')}
+          </Button>
+          <Button
+            variant="filled"
+            size="sm"
+            disabled={busy || !dirty}
+            onClick={() => void handleSave()}
+          >
+            {(dirty ? pathsChanged : lastPathsChanged)
+              ? t('settings.saveAndScan')
+              : t('common.save')}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

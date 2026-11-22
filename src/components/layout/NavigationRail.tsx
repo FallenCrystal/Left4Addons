@@ -29,17 +29,6 @@ export interface NavigationRailProps {
   isPreview: boolean;
 }
 
-function BrandMark() {
-  return (
-    <svg width="28" height="28" viewBox="0 0 28 28" fill="none" aria-hidden="true">
-      <rect x="2" y="2" width="10.5" height="10.5" rx="3" fill="currentColor" />
-      <rect x="15.5" y="2" width="10.5" height="10.5" rx="5.25" fill="currentColor" opacity="0.45" />
-      <rect x="2" y="15.5" width="10.5" height="10.5" rx="3" fill="currentColor" opacity="0.72" />
-      <rect x="15.5" y="15.5" width="10.5" height="10.5" rx="3" fill="currentColor" />
-    </svg>
-  );
-}
-
 export function NavigationRail({
   active,
   onSelect,
@@ -52,7 +41,6 @@ export function NavigationRail({
   onToggleTheme,
   language,
   onToggleLanguage,
-  isPreview,
 }: NavigationRailProps) {
   const { t } = useTranslation();
 
@@ -76,14 +64,11 @@ export function NavigationRail({
 
   return (
     <nav className="l4a-rail" aria-label={t('nav.primary')}>
-      <div className="l4a-brand">
-        <BrandMark />
-      </div>
-
       <button
         type="button"
         className="md-fab"
         aria-label={t('nav.scan')}
+        title={t('nav.scan')}
         disabled={scanning}
         onClick={onScan}
       >
@@ -116,8 +101,6 @@ export function NavigationRail({
       </div>
 
       <div className="l4a-rail-footer">
-        {isPreview && <span className="l4a-preview-dot">{t('nav.preview')}</span>}
-
         <IconButton
           label={t('nav.tasks')}
           variant={activeTasksCount > 0 ? 'tonal' : 'standard'}

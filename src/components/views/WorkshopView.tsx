@@ -42,6 +42,7 @@ import {
   FilterChip,
   IconButton,
   LinearProgress,
+  LoadingIndicator,
   SideSheet,
 } from '../m3/primitives';
 
@@ -434,6 +435,7 @@ export function WorkshopView({
           ))}
         </div>
         <div className="l4a-spacer" />
+        {loading && response && <LoadingIndicator size="sm" label={t('common.search')} />}
         {response && (
           <span className="md-pill" data-tone="surface">
             {response.source}
@@ -441,10 +443,12 @@ export function WorkshopView({
         )}
       </div>
 
-      {loading && <LinearProgress indeterminate label={t('common.search')} />}
-
       <div className="l4a-view-scroll">
-        {searchError ? (
+        {loading && !response ? (
+          <div className="l4a-loading-center">
+            <LoadingIndicator size="lg" contained label={t('common.search')} />
+          </div>
+        ) : searchError ? (
           <EmptyState
             icon={<Store size={26} />}
             title={
@@ -715,15 +719,7 @@ export function WorkshopView({
             )}
 
             {activeItem.description && (
-              <div
-                className="md-body-small selectable"
-                style={{
-                  whiteSpace: 'pre-wrap',
-                  padding: '10px 12px',
-                  borderRadius: 'var(--md-sys-shape-corner-small)',
-                  backgroundColor: 'var(--md-sys-color-surface-container)',
-                }}
-              >
+              <div className="md-body-small selectable l4a-description-box">
                 {activeItem.description}
               </div>
             )}

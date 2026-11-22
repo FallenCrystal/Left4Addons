@@ -14,6 +14,17 @@ vi.mock('@tauri-apps/api/core', () => ({
   convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}`,
 }));
 
+vi.mock('@tauri-apps/api/window', () => ({
+  getCurrentWindow: () => ({
+    minimize: vi.fn(async () => {}),
+    toggleMaximize: vi.fn(async () => {}),
+    isMaximized: vi.fn(async () => false),
+    close: vi.fn(async () => {}),
+    startDragging: vi.fn(async () => {}),
+    onResized: vi.fn(async () => () => {}),
+  }),
+}));
+
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn(async (_name: string, cb: (ev: { payload: CoreEvent }) => void) => {
     eventHandler = cb;
@@ -58,13 +69,57 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(screen.getByRole('tab', { name: /Profiles/ })).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: /Reconcile/ }));
-    expect(await screen.findByText('Dummy Overwritten')).toBeTruthy();
+    expect((await screen.findAllByText('Dummy Overwritten')).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
     expect(await screen.findByPlaceholderText('Search Workshop')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-    expect(await screen.findByText('Loading Directory')).toBeTruthy();
+    expect(await screen.findByText('Manual Addons Directory (addons)')).toBeTruthy();
+  });
+
+  it('shows explorer action and clickable AddonInfo URL in detail sheet', async () => {
+    render(<App />);
+    const trigger = await screen.findByRole('button', { name: 'Chernobyl: Chapter One' });
+    fireEvent.click(trigger);
+
+    const sheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
+    expect(within(sheet).getByRole('button', { name: 'Show in Explorer' })).toBeTruthy();
+    expect(
+      within(sheet).getByRole('button', {
+        name: 'https://steamcommunity.com/sharedfiles/filedetails/?id=2814104912',
+      }),
+    ).toBeTruthy();
+  });
+
+  it('supports batch reconcile, help guide dialog, and inline organize inspector', async () => {
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+
+    // Manual scope label replaces misleading Loading tag
+    expect(screen.getByRole('button', { name: /Manual/ })).toBeTruthy();
+
+    // Organize inline inspector opens when clicking a group card
+    fireEvent.click(screen.getByRole('button', { name: 'Organize' }));
+    fireEvent.click(await screen.findByRole('tab', { name: /Groups/ }));
+    fireEvent.click(await screen.findByText('Campaigns'));
+    const groupSheet = await screen.findByRole('dialog', { name: 'Campaigns' });
+    expect(within(groupSheet).getByText('Chernobyl: Chapter One')).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Reconcile help dialog and batch recommended action
+    fireEvent.click(screen.getByRole('button', { name: /Reconcile/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Reconcile & Action Effects Guide' }));
+    expect(await screen.findByRole('dialog', { name: 'Reconcile & Action Effects Guide' })).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    fireEvent.click(screen.getByRole('button', { name: /Apply Recommended/ }));
+    const batchDialog = await screen.findByRole('dialog', { name: 'Confirm Batch Reconcile' });
+    fireEvent.click(within(batchDialog).getByRole('button', { name: /Confirm/ }));
+
+    await waitFor(() => {
+      expect(screen.getByText('All synced')).toBeTruthy();
+    });
   });
 
   it('requires confirmation before executing destructive reconcile actions', async () => {

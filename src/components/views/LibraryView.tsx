@@ -8,6 +8,7 @@ import {
   CloudOff,
   Download,
   Folder,
+  FolderOpen,
   FolderPlus,
   LayoutGrid,
   Layers,
@@ -77,6 +78,7 @@ export interface LibraryViewProps {
   onBatchDelete: (addons: AddonSummary[]) => void;
   onDownloadItem: (workshopId: string) => void;
   onUpdateItem: (workshopId: string) => void;
+  onOpenInFileManager: (path: string) => void;
 }
 
 export function LibraryView({
@@ -100,6 +102,7 @@ export function LibraryView({
   onBatchDelete,
   onDownloadItem,
   onUpdateItem,
+  onOpenInFileManager,
 }: LibraryViewProps) {
   const { t } = useTranslation();
   const [query, setQuery] = useState('');
@@ -758,13 +761,27 @@ export function LibraryView({
                       </div>
 
                       {installed ? (
-                        <Switch
-                          compact
-                          checked={addon.enabled}
-                          disabled={busy}
-                          label={addon.title}
-                          onChange={(next) => onToggleSingle(addon, next)}
-                        />
+                        <div className="l4a-row-wrap" style={{ gap: 6, flexWrap: 'nowrap' }}>
+                          {addon.currentPath && (
+                            <IconButton
+                              size="sm"
+                              label={t('common.openInExplorer')}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onOpenInFileManager(addon.currentPath!);
+                              }}
+                            >
+                              <FolderOpen size={15} />
+                            </IconButton>
+                          )}
+                          <Switch
+                            compact
+                            checked={addon.enabled}
+                            disabled={busy}
+                            label={addon.title}
+                            onChange={(next) => onToggleSingle(addon, next)}
+                          />
+                        </div>
                       ) : addon.workshopId && !remoteUnavailable ? (
                         <Button
                           variant="tonal"
@@ -868,13 +885,27 @@ export function LibraryView({
                       </span>
                     )}
                     {installed ? (
-                      <Switch
-                        compact
-                        checked={addon.enabled}
-                        disabled={busy}
-                        label={addon.title}
-                        onChange={(next) => onToggleSingle(addon, next)}
-                      />
+                      <>
+                        {addon.currentPath && (
+                          <IconButton
+                            size="sm"
+                            label={t('common.openInExplorer')}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onOpenInFileManager(addon.currentPath!);
+                            }}
+                          >
+                            <FolderOpen size={15} />
+                          </IconButton>
+                        )}
+                        <Switch
+                          compact
+                          checked={addon.enabled}
+                          disabled={busy}
+                          label={addon.title}
+                          onChange={(next) => onToggleSingle(addon, next)}
+                        />
+                      </>
                     ) : addon.workshopId && !remoteUnavailable ? (
                       <Button
                         variant="tonal"

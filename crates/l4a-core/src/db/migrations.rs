@@ -1,5 +1,5 @@
 use crate::error::CoreError;
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 
 pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
     conn.execute_batch(
@@ -177,6 +177,20 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
         "state_fingerprint",
         "ALTER TABLE reconcile_issues ADD COLUMN state_fingerprint TEXT NOT NULL DEFAULT ''",
     )?;
+
+    // Force the next scan to re-extract metadata with the corrected VPK parser.
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let applied = tx
+        .prepare("SELECT 1 FROM schema_migrations WHERE version = 2")?
+        .exists([])?;
+    if !applied {
+        tx.execute("DELETE FROM physical_files", [])?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (2, datetime('now'))",
+            [],
+        )?;
+    }
+    tx.commit()?;
 
     Ok(())
 }

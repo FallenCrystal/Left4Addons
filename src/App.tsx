@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next';
 import { AlertCircle, RefreshCw } from 'lucide-react';
 import type { AddonDirType, AddonSummary, LoadoutProfile, UserGroup } from './api/ipc';
 import { NavigationRail, type NavDestination } from './components/layout/NavigationRail';
-import { Button, EmptyState, LinearProgress, Snackbar } from './components/m3/primitives';
+import { TitleBar } from './components/layout/TitleBar';
+import { Button, EmptyState, LoadingIndicator, Snackbar } from './components/m3/primitives';
 import { AddonDetailSheet } from './components/overlays/AddonDetailSheet';
 import { BatchReportDialog } from './components/overlays/BatchReportDialog';
 import { DeleteDialog } from './components/overlays/DeleteDialog';
@@ -146,6 +147,13 @@ export function App() {
     [ctrl],
   );
 
+  const handleOpenInFileManager = useCallback(
+    (path: string) => {
+      void ctrl.openInFileManager(path);
+    },
+    [ctrl],
+  );
+
   const handleSyncAndNotify = useCallback(async () => {
     const report = await ctrl.sync();
     if (!report) return;
@@ -181,8 +189,18 @@ export function App() {
     return liveEntries.length + persistedActive;
   }, [ctrl.liveDownloads, ctrl.snapshot]);
 
+  const activityLabel = ctrl.syncing
+    ? t('window.syncing')
+    : ctrl.scanning
+      ? t('window.scanning')
+      : ctrl.loading && ctrl.snapshot
+        ? t('window.loading')
+        : null;
+
   return (
     <div className="l4a-shell">
+      <TitleBar activityLabel={activityLabel} isPreview={!ctrl.isTauri} />
+
       <NavigationRail
         active={destination}
         onSelect={setDestination}
@@ -207,9 +225,9 @@ export function App() {
       />
 
       <main className="l4a-workspace">
-        {(ctrl.loading || ctrl.scanning || ctrl.syncing) && (
-          <div style={{ position: 'absolute', top: 0, left: 0, right: 0, zIndex: 20 }}>
-            <LinearProgress indeterminate label={t('nav.scan')} />
+        {!ctrl.snapshot && ctrl.loading && !ctrl.initError && (
+          <div className="l4a-loading-center">
+            <LoadingIndicator size="lg" contained label={t('window.loading')} />
           </div>
         )}
 
@@ -251,6 +269,7 @@ export function App() {
             onBatchDelete={(items) => setDeleteTargets(items)}
             onDownloadItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
             onUpdateItem={(wid) => void ctrl.updateWorkshopItem(wid)}
+            onOpenInFileManager={handleOpenInFileManager}
           />
         )}
 
@@ -271,12 +290,16 @@ export function App() {
             onDownloadWorkshopItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
             onCreateGroup={() => setGroupDialogState({ open: true, initial: null })}
             onEditGroup={(group) => setGroupDialogState({ open: true, initial: group })}
+            onSaveUserGroup={ctrl.saveUserGroup}
             onDeleteGroup={(id) => void ctrl.deleteUserGroup(id)}
             onCreateProfile={() => setProfileDialogState({ open: true, initial: null })}
             onEditProfile={(profile) => setProfileDialogState({ open: true, initial: profile })}
             onDeleteProfile={(id) => void ctrl.deleteProfile(id)}
             onApplyProfile={(id) => void ctrl.applyProfile(id)}
             onBulkToggle={handleBatchToggle}
+            onToggleSingle={handleToggleSingle}
+            onSelectAddon={(addon) => setDetailAddonId(addon.id)}
+            onOpenInFileManager={handleOpenInFileManager}
             onOpenFilterInLibrary={(filter) => {
               setExternalFilter(filter);
               setDestination('library');
@@ -293,6 +316,8 @@ export function App() {
             scanning={ctrl.scanning}
             onScan={() => void ctrl.scan()}
             onResolve={(id, action) => ctrl.resolveIssue(id, action)}
+            onResolveBatch={ctrl.resolveIssuesBatch}
+            onOpenInFileManager={handleOpenInFileManager}
             onOpenBypassSettings={() => {
               setSettingsSection('bypass');
               setDestination('settings');
@@ -334,6 +359,7 @@ export function App() {
             language={language}
             onSaveConfig={ctrl.saveConfig}
             onDetectPath={ctrl.detectGamePath}
+            onOpenInFileManager={handleOpenInFileManager}
             onRefreshSteamCaps={() => void ctrl.refreshSteamCapabilities()}
             onChangeTheme={handleChangeTheme}
             onChangeLanguage={setAppLanguage}
@@ -362,6 +388,7 @@ export function App() {
           });
         }}
         onOpenExternal={(url) => setExternalUrl(url)}
+        onOpenInFileManager={handleOpenInFileManager}
         onCopy={(text) => void handleCopy(text)}
       />
 
@@ -552,15 +579,7 @@ export function App() {
         onClose={() => setExternalUrl(null)}
       />
 
-      {ctrl.snackbar && (
-        <Snackbar
-          message={ctrl.snackbar.message}
-          tone={ctrl.snackbar.tone}
-          actionLabel={ctrl.snackbar.actionLabel}
-          onAction={ctrl.snackbar.onAction}
-          onClose={ctrl.dismissSnackbar}
-        />
-      )}
+      <Snackbar item={ctrl.snackbar} onClose={ctrl.dismissSnackbar} />
     </div>
   );
 }

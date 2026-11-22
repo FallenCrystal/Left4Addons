@@ -21,9 +21,10 @@ use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
     CoreEvent, DashboardSnapshot, GroupId, InstallState, IssueId, LoadoutProfile,
-    ProfileApplyReport, ProfileId, ReconcileAction, RenamePreviewItem, RenameRuleConfig,
-    SearchQuery, SearchResponse, SyncReport, TaskKind, TaskStatus, TrackedCollectionRecord,
-    UserGroup, WorkshopFetchOutcome, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    ProfileApplyReport, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileBatchReport,
+    ReconcileItemResult, RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse,
+    SyncReport, TaskKind, TaskStatus, TrackedCollectionRecord, UserGroup, WorkshopFetchOutcome,
+    WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use l4a_steam::{BridgeError, DynamicSteamBridge, SteamBridge, SteamCapabilities};
 use l4a_vpk::{extract_addon_metadata, inspect_dummy_vpk, DummyInspection, DummySpec};
@@ -36,7 +37,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::io::{self, Read};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -176,6 +177,43 @@ impl L4aEngine {
 
     pub fn config(&self) -> AppConfig {
         self.config.read().unwrap().clone()
+    }
+
+    pub fn resolve_managed_path(&self, raw_path: &str) -> Result<PathBuf, CoreError> {
+        if raw_path.trim().is_empty() || raw_path.contains('\0') {
+            return Err(CoreError::InvalidInput("文件路径无效".into()));
+        }
+
+        let cfg = self.config();
+        let mut roots = Vec::new();
+        for dir in [&cfg.loading_dir, &cfg.workshop_dir] {
+            if dir.trim().is_empty() {
+                continue;
+            }
+            if let Ok(root) = fs::canonicalize(dir) {
+                if root.is_dir() {
+                    roots.push(root);
+                }
+            }
+        }
+        if roots.is_empty() {
+            return Err(CoreError::NotFound("未找到受管理的目录".into()));
+        }
+
+        let target = fs::canonicalize(raw_path).map_err(|err| {
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) {
+                CoreError::NotFound(raw_path.into())
+            } else {
+                CoreError::Io(err)
+            }
+        })?;
+        if !roots.iter().any(|root| target.starts_with(root)) {
+            return Err(CoreError::InvalidInput("路径位于受管理的目录之外".into()));
+        }
+        Ok(target)
     }
 
     fn lock_workspace(&self) -> Result<std::sync::MutexGuard<'_, ()>, CoreError> {
@@ -384,6 +422,45 @@ impl L4aEngine {
         drop(workspace);
         self.emit_workspace_update();
         snapshot
+    }
+
+    pub fn resolve_issues_batch(
+        &self,
+        items: &[ReconcileBatchItem],
+    ) -> Result<ReconcileBatchReport, CoreError> {
+        let workspace = self.lock_workspace()?;
+        let cfg = self.config();
+        self.suppress_watcher();
+
+        let mut results = Vec::with_capacity(items.len());
+        for item in items {
+            let error = resolve_reconcile_issue(
+                &self.db,
+                &cfg,
+                &self.paths.image_cache_dir,
+                &item.issue_id,
+                item.action,
+            )
+            .err()
+            .map(|err| {
+                self.refresh_after_error(&cfg);
+                err.into()
+            });
+            results.push(ReconcileItemResult {
+                issue_id: item.issue_id.clone(),
+                action: item.action,
+                ok: error.is_none(),
+                error,
+            });
+        }
+
+        let snapshot = self.snapshot_locked();
+        drop(workspace);
+        self.emit_workspace_update();
+        Ok(ReconcileBatchReport {
+            items: results,
+            snapshot: snapshot?,
+        })
     }
 
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
@@ -1247,4 +1324,83 @@ fn build_resolver_from_config(
         )),
         reporter,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn resolves_existing_paths_only_inside_managed_directories() {
+        let dir = tempdir().unwrap();
+        let loading = dir.path().join("addons");
+        let workshop = dir.path().join("workshop");
+        let outside = dir.path().join("addons-other");
+        for path in [&loading, &workshop, &outside] {
+            fs::create_dir(path).unwrap();
+        }
+        let loading_file = loading.join("local.vpk");
+        let workshop_file = workshop.join("123456.vpk");
+        let outside_file = outside.join("outside.vpk");
+        for path in [&loading_file, &workshop_file, &outside_file] {
+            fs::write(path, b"test").unwrap();
+        }
+        let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
+        paths.ensure_dirs().unwrap();
+        save_config(
+            &paths.settings_path,
+            &AppConfig {
+                loading_dir: loading.to_str().unwrap().into(),
+                workshop_dir: workshop.to_str().unwrap().into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let engine = L4aEngine::open_default(&paths.runtime_dir, Arc::new(NullEventSink)).unwrap();
+        for path in [&loading, &workshop, &loading_file, &workshop_file] {
+            assert_eq!(
+                engine.resolve_managed_path(path.to_str().unwrap()).unwrap(),
+                path.canonicalize().unwrap()
+            );
+        }
+        for bad in ["", " \t", "nul\0path"] {
+            assert!(matches!(
+                engine.resolve_managed_path(bad),
+                Err(CoreError::InvalidInput(_))
+            ));
+        }
+        assert!(matches!(
+            engine.resolve_managed_path(loading.join("missing.vpk").to_str().unwrap()),
+            Err(CoreError::NotFound(_))
+        ));
+        for path in [
+            outside_file.clone(),
+            loading.join("../addons-other/outside.vpk"),
+        ] {
+            assert!(matches!(
+                engine.resolve_managed_path(path.to_str().unwrap()),
+                Err(CoreError::InvalidInput(_))
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let link = loading.join("outside-link.vpk");
+            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+            assert!(matches!(
+                engine.resolve_managed_path(link.to_str().unwrap()),
+                Err(CoreError::InvalidInput(_))
+            ));
+        }
+
+        fs::remove_dir_all(workshop).unwrap();
+        assert!(engine
+            .resolve_managed_path(loading.to_str().unwrap())
+            .is_ok());
+        fs::remove_dir_all(loading).unwrap();
+        assert!(matches!(
+            engine.resolve_managed_path(outside_file.to_str().unwrap()),
+            Err(CoreError::NotFound(_))
+        ));
+    }
 }

@@ -6,9 +6,10 @@ use l4a_core::db::LocalDb;
 use l4a_core::{AppPaths, CoreError, EventSink, L4aEngine, NullEventSink};
 use l4a_protocol::{
     AddonDirType, AddonId, AddonOperationOutcome, AppConfig, CoreEvent, DesktopError,
-    DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState, LoadoutProfile, MetadataSource,
-    ProfileId, ReconcileAction, ReconcileIssueKind, RenameRuleConfig, SearchQuery, SearchResponse,
-    UserGroup, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+    DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState, IssueId, LoadoutProfile,
+    MetadataSource, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileIssueKind,
+    RenameRuleConfig, SearchQuery, SearchResponse, UserGroup, WorkshopCollectionRecord,
+    WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
 };
 use l4a_steam::{MockSteamBridge, SubscribedItemInfo};
 use l4a_workshop::WorkshopError;
@@ -18,6 +19,129 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 
 use support::{create_test_vpk, item_record, make_engine, make_engine_with_events, RecordedEvents};
+
+#[test]
+fn metadata_cache_migration_reparses_an_unchanged_vpk_once() {
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir(&loading_dir).unwrap();
+    create_test_vpk(
+        &loading_dir.join("local.vpk"),
+        "Correct title",
+        "Author",
+        false,
+        None,
+        b"v1",
+    );
+    let cfg = AppConfig {
+        loading_dir: loading_dir.to_str().unwrap().into(),
+        ..Default::default()
+    };
+    let open = || {
+        make_engine(
+            dir.path(),
+            cfg.clone(),
+            Arc::new(MockSteamBridge::new(false)),
+        )
+    };
+    let engine = open();
+    let id = engine.scan().unwrap().addons[0].id.clone();
+    let group = engine
+        .save_user_group(UserGroup {
+            id: GroupId::new("migration-test").unwrap(),
+            name: "My group".into(),
+            tags: vec![],
+            color: None,
+            addon_ids: vec![id.clone()],
+        })
+        .unwrap();
+    drop(engine);
+
+    let db_path = AppPaths::from_runtime_dir(dir.path().join("runtime")).db_path;
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        r#"DELETE FROM schema_migrations WHERE version = 2;
+           UPDATE addons SET title = 'Cached title', addon_info_json = '{"vltava":"bad field"}';"#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let engine = open();
+    assert!(engine.db().list_physical_files().unwrap().is_empty());
+    let before_scan = engine.snapshot().unwrap();
+    assert_eq!(before_scan.addons[0].title, "Cached title");
+    assert_eq!(before_scan.user_groups, vec![group.clone()]);
+    let after_scan = engine.scan().unwrap();
+    assert_eq!(after_scan.addons[0].id, id);
+    assert_eq!(after_scan.addons[0].title, "Correct title");
+    assert_eq!(after_scan.user_groups, vec![group]);
+    drop(engine);
+
+    assert_eq!(open().db().list_physical_files().unwrap().len(), 1);
+}
+
+#[test]
+fn reconcile_batch_reports_partial_failure_and_emits_one_update() {
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    let workshop_dir = loading_dir.join("workshop");
+    std::fs::create_dir_all(&workshop_dir).unwrap();
+    for file in ["123456.vpk", "234567.vpk"] {
+        create_test_vpk(&workshop_dir.join(file), file, "Author", false, None, b"v1");
+    }
+    let events = Arc::new(RecordedEvents::default());
+    let engine = make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            workshop_dir: workshop_dir.to_str().unwrap().into(),
+            enable_dummy_bypass: true,
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+        events.clone(),
+    );
+    let snapshot = engine.scan().unwrap();
+    assert_eq!(snapshot.open_issues.len(), 2);
+    events.drain();
+    let items = [
+        ReconcileBatchItem {
+            issue_id: snapshot.open_issues[0].id.clone(),
+            action: ReconcileAction::Ignore,
+        },
+        ReconcileBatchItem {
+            issue_id: IssueId("stale".into()),
+            action: ReconcileAction::Ignore,
+        },
+        ReconcileBatchItem {
+            issue_id: snapshot.open_issues[1].id.clone(),
+            action: ReconcileAction::LeaveInWorkshop,
+        },
+    ];
+    let report = engine.resolve_issues_batch(&items).unwrap();
+    assert_eq!(report.items.len(), items.len());
+    for (result, item) in report.items.iter().zip(&items) {
+        assert_eq!(result.issue_id, item.issue_id);
+        assert_eq!(result.action, item.action);
+    }
+    for i in [0, 2] {
+        assert!(report.items[i].ok);
+        assert!(report.items[i].error.is_none());
+    }
+    assert!(!report.items[1].ok);
+    assert_eq!(
+        report.items[1].error.as_ref().unwrap().code,
+        DesktopErrorCode::Conflict
+    );
+    assert!(report.snapshot.open_issues.is_empty());
+    assert_eq!(
+        events.drain(),
+        vec![CoreEvent::SnapshotUpdated {
+            external_change: false
+        }]
+    );
+    assert!(engine.scan().unwrap().open_issues.is_empty());
+}
 
 #[tokio::test]
 async fn scan_rename_preserves_workshop_identity_and_map_search_works() {

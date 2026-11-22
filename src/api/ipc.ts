@@ -80,6 +80,23 @@ export interface ReconcileIssue {
   detectedAt: string;
 }
 
+export interface ReconcileBatchItem {
+  issueId: string;
+  action: ReconcileAction;
+}
+
+export interface ReconcileItemResult {
+  issueId: string;
+  action: ReconcileAction;
+  ok: boolean;
+  error?: DesktopError;
+}
+
+export interface ReconcileBatchReport {
+  items: ReconcileItemResult[];
+  snapshot: DashboardSnapshot;
+}
+
 export interface BundleRecord {
   id: string;
   name: string;
@@ -417,6 +434,12 @@ export async function resolveReconcileIssue(
   return invokeCommand<DashboardSnapshot>('resolve_reconcile_issue', { issueId, action });
 }
 
+export async function resolveReconcileIssuesBatch(
+  items: ReconcileBatchItem[],
+): Promise<ReconcileBatchReport> {
+  return invokeCommand<ReconcileBatchReport>('resolve_reconcile_issues_batch', { items });
+}
+
 export async function moveAddons(
   addonIds: string[],
   targetDirType: AddonDirType,
@@ -542,6 +565,10 @@ export function workshopCoverUrl(url: string): string {
 
 export async function openExternalUrl(url: string): Promise<void> {
   return invokeCommand<void>('open_external_url', { url });
+}
+
+export async function openInFileManager(path: string): Promise<void> {
+  return invokeCommand<void>('open_in_file_manager', { path });
 }
 
 export async function subscribeCoreEvents(

@@ -1,4 +1,4 @@
-import { useId, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -9,6 +9,7 @@ import {
   Download,
   ExternalLink,
   Folder,
+  FolderOpen,
   Layers,
   Map as MapIcon,
   Pencil,
@@ -42,7 +43,16 @@ export interface AddonDetailSheetProps {
   onAddToGroup: (addon: AddonSummary) => void;
   onRemoveFromGroup: (group: UserGroup, addonId: string) => void;
   onOpenExternal: (url: string) => void;
+  onOpenInFileManager: (path: string) => void;
   onCopy: (text: string) => void;
+}
+
+function isHttpUrl(value: string): boolean {
+  return /^https?:\/\/\S+$/i.test(value.trim());
+}
+
+function isZeroContentFlag(key: string, value: string): boolean {
+  return key.startsWith('addoncontent_') && value.trim() === '0';
 }
 
 export function AddonDetailSheet({
@@ -60,20 +70,40 @@ export function AddonDetailSheet({
   onAddToGroup,
   onRemoveFromGroup,
   onOpenExternal,
+  onOpenInFileManager,
   onCopy,
 }: AddonDetailSheetProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<'info' | 'maps'>('info');
+  const [showZeroFlags, setShowZeroFlags] = useState(false);
   const tabsId = useId();
+
+  const { primaryInfoEntries, zeroFlagEntries } = useMemo(() => {
+    if (!addon) {
+      return { primaryInfoEntries: [] as [string, string][], zeroFlagEntries: [] as [string, string][] };
+    }
+    const primary: [string, string][] = [];
+    const zeros: [string, string][] = [];
+    for (const [k, v] of Object.entries(addon.addonInfo)) {
+      const trimmed = v.trim();
+      if (!trimmed || k === 'addondescription' || k === 'description') continue;
+      if (isZeroContentFlag(k, trimmed)) {
+        zeros.push([k, trimmed]);
+      } else {
+        primary.push([k, trimmed]);
+      }
+    }
+    return { primaryInfoEntries: primary, zeroFlagEntries: zeros };
+  }, [addon]);
 
   if (!addon) return null;
 
   const memberBundles = bundles.filter((b) => b.memberAddonIds.includes(addon.id));
   const memberGroups = userGroups.filter((g) => g.addonIds.includes(addon.id));
   const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
-  const infoEntries = Object.entries(addon.addonInfo).filter(
-    ([k, v]) => v.trim() !== '' && k !== 'addondescription' && k !== 'description',
-  );
+  const visibleInfoEntries = showZeroFlags
+    ? [...primaryInfoEntries, ...zeroFlagEntries]
+    : primaryInfoEntries;
   const installed = addon.installState === 'installed';
   const remoteUnavailable =
     addon.remoteStatus === 'removed' || addon.remoteStatus === 'private_or_unavailable';
@@ -235,32 +265,46 @@ export function AddonDetailSheet({
               </div>
             </div>
 
-            {addon.workshopId && (
+            {(addon.currentPath || addon.workshopId) && (
               <div className="l4a-row-wrap">
-                <Button
-                  variant="outlined"
-                  size="sm"
-                  icon={<ExternalLink size={14} />}
-                  onClick={() => onOpenExternal(buildSteamProtocolUrl(addon.workshopId!))}
-                >
-                  {t('detail.openSteam')}
-                </Button>
-                <Button
-                  variant="outlined"
-                  size="sm"
-                  icon={<ExternalLink size={14} />}
-                  onClick={() => onOpenExternal(buildWorkshopUrl(addon.workshopId!))}
-                >
-                  {t('detail.openWeb')}
-                </Button>
-                <Button
-                  variant="text"
-                  size="sm"
-                  icon={<Copy size={14} />}
-                  onClick={() => onCopy(addon.workshopId!)}
-                >
-                  {addon.workshopId}
-                </Button>
+                {addon.currentPath && installed && (
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    icon={<FolderOpen size={14} />}
+                    onClick={() => onOpenInFileManager(addon.currentPath!)}
+                  >
+                    {t('common.openInExplorer')}
+                  </Button>
+                )}
+                {addon.workshopId && (
+                  <>
+                    <Button
+                      variant="outlined"
+                      size="sm"
+                      icon={<ExternalLink size={14} />}
+                      onClick={() => onOpenExternal(buildSteamProtocolUrl(addon.workshopId!))}
+                    >
+                      {t('detail.openSteam')}
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      size="sm"
+                      icon={<ExternalLink size={14} />}
+                      onClick={() => onOpenExternal(buildWorkshopUrl(addon.workshopId!))}
+                    >
+                      {t('detail.openWeb')}
+                    </Button>
+                    <Button
+                      variant="text"
+                      size="sm"
+                      icon={<Copy size={14} />}
+                      onClick={() => onCopy(addon.workshopId!)}
+                    >
+                      {addon.workshopId}
+                    </Button>
+                  </>
+                )}
               </div>
             )}
 
@@ -332,7 +376,10 @@ export function AddonDetailSheet({
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
-                <span className="md-label-medium" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                <span
+                  className="md-label-medium"
+                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                >
                   {t('detail.groups')}
                 </span>
                 <IconButton
@@ -345,7 +392,10 @@ export function AddonDetailSheet({
               </div>
               <div className="md-chip-row">
                 {memberGroups.length === 0 ? (
-                  <span className="md-body-small" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                  <span
+                    className="md-body-small"
+                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                  >
                     {t('detail.noGroups')}
                   </span>
                 ) : (
@@ -375,7 +425,10 @@ export function AddonDetailSheet({
 
             {memberBundles.length > 0 && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                <span className="md-label-medium" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                <span
+                  className="md-label-medium"
+                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                >
                   {t('detail.bundles')}
                 </span>
                 <div className="md-chip-row">
@@ -391,49 +444,74 @@ export function AddonDetailSheet({
 
             {description && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <span className="md-label-medium" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                <span
+                  className="md-label-medium"
+                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                >
                   {t('detail.description')}
                 </span>
-                <div
-                  className="md-body-small selectable"
-                  style={{
-                    color: 'var(--md-sys-color-on-surface)',
-                    whiteSpace: 'pre-wrap',
-                    backgroundColor: 'var(--md-sys-color-surface-container)',
-                    padding: '10px 12px',
-                    borderRadius: 'var(--md-sys-shape-corner-small)',
-                  }}
-                >
-                  {description}
-                </div>
+                <div className="md-body-small selectable l4a-description-box">{description}</div>
               </div>
             )}
 
-            {infoEntries.length > 0 && (
+            {(visibleInfoEntries.length > 0 || zeroFlagEntries.length > 0) && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <span className="md-label-medium" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                  {t('detail.metadata')}
-                </span>
-                <div className="l4a-list">
-                  {infoEntries.map(([k, v]) => (
-                    <div
-                      key={k}
-                      style={{
-                        display: 'flex',
-                        justifyContent: 'space-between',
-                        gap: 12,
-                        padding: '8px 12px',
-                        borderBottom: '1px solid color-mix(in srgb, var(--md-sys-color-outline-variant) 45%, transparent)',
-                      }}
+                <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                  <span
+                    className="md-label-medium"
+                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                  >
+                    {t('detail.metadata')}
+                  </span>
+                  {zeroFlagEntries.length > 0 && (
+                    <Button
+                      variant="text"
+                      size="sm"
+                      onClick={() => setShowZeroFlags((v) => !v)}
                     >
-                      <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                        {k}
-                      </span>
-                      <span className="md-body-small selectable" style={{ textAlign: 'right' }}>
-                        {v}
-                      </span>
-                    </div>
-                  ))}
+                      {showZeroFlags
+                        ? t('detail.hideZeroFlags')
+                        : t('detail.showAllFields', {
+                            count: primaryInfoEntries.length + zeroFlagEntries.length,
+                          })}
+                    </Button>
+                  )}
+                </div>
+                <div className="l4a-list">
+                  {visibleInfoEntries.map(([k, v]) => {
+                    const urlValue = isHttpUrl(v);
+                    const stacked = urlValue || v.length > 28 || v.includes('\n');
+                    return (
+                      <div
+                        key={k}
+                        className="l4a-info-row"
+                        data-stacked={stacked ? 'true' : 'false'}
+                      >
+                        <span className="l4a-info-key md-body-small md-mono">{k}</span>
+                        {urlValue ? (
+                          <div className="l4a-info-url-wrap">
+                            <button
+                              type="button"
+                              className="l4a-info-link md-body-small selectable"
+                              onClick={() => onOpenExternal(v.trim())}
+                            >
+                              <span>{v.trim()}</span>
+                              <ExternalLink size={12} style={{ flexShrink: 0 }} />
+                            </button>
+                            <IconButton
+                              size="sm"
+                              label={t('common.copy')}
+                              onClick={() => onCopy(v.trim())}
+                            >
+                              <Copy size={13} />
+                            </IconButton>
+                          </div>
+                        ) : (
+                          <span className="l4a-info-value md-body-small selectable">{v}</span>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -460,7 +538,10 @@ export function AddonDetailSheet({
                 )}
                 <div className="l4a-list-main">
                   <span className="md-title-small">{m.name}</span>
-                  <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                  <span
+                    className="md-body-small md-mono"
+                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                  >
                     {m.code}
                   </span>
                 </div>

@@ -13,8 +13,12 @@
     "windows": [
       {
         "title": "Left 4 Dead 2 Addons Manager",
-        "width": 800,
-        "height": 600,
+        "decorations": false,
+        "shadow": true,
+        "width": 1120,
+        "height": 740,
+        "minWidth": 760,
+        "minHeight": 520,
         "resizable": true,
         "fullscreen": false
       }

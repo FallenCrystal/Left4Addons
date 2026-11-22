@@ -1,50 +1,121 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, ExternalLink, Sparkles } from 'lucide-react';
+import { Check, ExternalLink, Search, Sparkles, X } from 'lucide-react';
 import type { AddonSummary, LoadoutProfile, UserGroup } from '../../api/ipc';
-import { extractWorkshopIdInput } from '../../utils/format';
-import { Button, Checkbox, Dialog, Switch, TextField } from '../m3/primitives';
+import { extractWorkshopIdInput, formatBytes } from '../../utils/format';
+import { AddonCover } from '../m3/AddonCover';
+import { Button, Checkbox, Dialog, FilterChip, IconButton, Switch, TextField } from '../m3/primitives';
 
 const GROUP_COLORS = ['#246A4D', '#006399', '#964422', '#6750A4', '#8B5E00', '#AD2E56', '#3D6373'];
+
+type PickerFilterMode = 'all' | 'selected' | 'manual';
 
 function AddonPicker({
   addons,
   missingIds,
   selected,
   onToggle,
+  onSelectMany,
+  onClearAll,
 }: {
   addons: AddonSummary[];
   missingIds?: string[];
   selected: Set<string>;
   onToggle: (id: string) => void;
+  onSelectMany?: (ids: string[]) => void;
+  onClearAll?: () => void;
 }) {
   const { t } = useTranslation();
   const [filter, setFilter] = useState('');
+  const [mode, setMode] = useState<PickerFilterMode>('all');
 
   const visible = useMemo(() => {
     const q = filter.trim().toLowerCase();
-    if (!q) return addons;
-    return addons.filter(
-      (a) =>
+    return addons.filter((a) => {
+      if (mode === 'selected' && !selected.has(a.id)) return false;
+      if (mode === 'manual' && a.primaryDir !== 'loading') return false;
+      if (!q) return true;
+      return (
         a.title.toLowerCase().includes(q) ||
+        (a.author ?? '').toLowerCase().includes(q) ||
         a.workshopId?.includes(q) ||
-        a.currentFileName?.toLowerCase().includes(q),
-    );
-  }, [addons, filter]);
+        a.currentFileName?.toLowerCase().includes(q)
+      );
+    });
+  }, [addons, filter, mode, selected]);
+
+  const hasMixedDirs = useMemo(
+    () => addons.some((a) => a.primaryDir === 'loading') && addons.some((a) => a.primaryDir === 'workshop'),
+    [addons],
+  );
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <TextField
-        label={`${t('organize.pickAddons')} (${selected.size})`}
-        placeholder={t('common.search')}
-        value={filter}
-        onChange={(e) => setFilter(e.target.value)}
-      />
-      <div className="l4a-picker-list">
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+        <span className="md-field-label">
+          {t('organize.pickAddons')} ({selected.size})
+        </span>
+        <div className="l4a-row-wrap" style={{ gap: 4 }}>
+          {onSelectMany && visible.length > 0 && (
+            <Button
+              variant="text"
+              size="sm"
+              onClick={() => onSelectMany(visible.map((a) => a.id))}
+            >
+              {t('organize.pickerSelectVisible')}
+            </Button>
+          )}
+          {onClearAll && selected.size > 0 && (
+            <Button variant="text" size="sm" onClick={onClearAll}>
+              {t('organize.pickerClear')}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div className="md-search-bar" style={{ height: 40, minWidth: 0 }}>
+        <Search size={16} style={{ color: 'var(--md-sys-color-on-surface-variant)', flexShrink: 0 }} />
+        <input
+          className="md-search-input"
+          style={{ fontSize: 13 }}
+          placeholder={t('library.searchPlaceholder')}
+          aria-label={t('common.search')}
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        {filter && (
+          <IconButton size="sm" label={t('common.clear')} onClick={() => setFilter('')}>
+            <X size={14} />
+          </IconButton>
+        )}
+      </div>
+
+      <div className="md-chip-row">
+        <FilterChip
+          label={t('organize.pickerAll')}
+          count={addons.length}
+          selected={mode === 'all'}
+          onClick={() => setMode('all')}
+        />
+        <FilterChip
+          label={t('organize.pickerSelected', { count: selected.size })}
+          selected={mode === 'selected'}
+          onClick={() => setMode((m) => (m === 'selected' ? 'all' : 'selected'))}
+        />
+        {hasMixedDirs && (
+          <FilterChip
+            label={t('organize.pickerManual')}
+            selected={mode === 'manual'}
+            onClick={() => setMode((m) => (m === 'manual' ? 'all' : 'manual'))}
+          />
+        )}
+      </div>
+
+      <div className="l4a-picker-list l4a-picker-list-tall">
         {missingIds?.map((id) => {
           const checked = selected.has(id);
           return (
-            <div key={id} className="l4a-picker-row">
+            <div key={id} className="l4a-picker-row" onClick={() => onToggle(id)}>
               <Checkbox checked={checked} label={id} onChange={() => onToggle(id)} />
               <span className="md-body-medium md-mono l4a-truncate" style={{ flex: 1 }}>
                 {id}
@@ -55,30 +126,52 @@ function AddonPicker({
             </div>
           );
         })}
-        {visible.map((addon) => {
-          const checked = selected.has(addon.id);
-          return (
-            <div key={addon.id} className="l4a-picker-row">
-              <Checkbox
-                checked={checked}
-                label={addon.title}
-                onChange={() => onToggle(addon.id)}
-              />
-              <span
-                className="md-body-medium l4a-truncate"
-                style={{ flex: 1 }}
+        {visible.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--md-sys-color-on-surface-variant)' }}>
+            {t('common.noResults')}
+          </div>
+        ) : (
+          visible.map((addon) => {
+            const checked = selected.has(addon.id);
+            return (
+              <div
+                key={addon.id}
+                className="l4a-picker-row"
+                data-selected={checked ? 'true' : 'false'}
                 onClick={() => onToggle(addon.id)}
               >
-                {addon.title}
-              </span>
-              {addon.primaryDir && (
-                <span className="md-pill" data-tone="surface">
-                  {addon.primaryDir}
-                </span>
-              )}
-            </div>
-          );
-        })}
+                <Checkbox
+                  checked={checked}
+                  label={addon.title}
+                  onChange={() => onToggle(addon.id)}
+                />
+                <div className="l4a-picker-thumb">
+                  <AddonCover
+                    compact
+                    src={addon.coverImage}
+                    title={addon.title}
+                    category={addon.categories[0]}
+                  />
+                </div>
+                <div className="l4a-list-main">
+                  <span className="md-title-small l4a-truncate">{addon.title}</span>
+                  <div className="l4a-addon-meta">
+                    <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+                    <span>·</span>
+                    <span>{formatBytes(addon.fileSize)}</span>
+                  </div>
+                </div>
+                {addon.primaryDir && (
+                  <span className="md-pill" data-tone="surface">
+                    {addon.primaryDir === 'loading'
+                      ? t('library.loadingDir')
+                      : t('library.workshopDir')}
+                  </span>
+                )}
+              </div>
+            );
+          })
+        )}
       </div>
     </div>
   );
@@ -118,9 +211,27 @@ export function UserGroupDialog({
     });
   };
 
+  const handleAutoTags = () => {
+    const counts = new Map<string, number>();
+    for (const addon of addons) {
+      if (!selectedIds.has(addon.id)) continue;
+      for (const cat of addon.categories) {
+        counts.set(cat, (counts.get(cat) ?? 0) + 1);
+      }
+    }
+    const derived = Array.from(counts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([cat]) => t(`categories.${cat}`, { defaultValue: cat }));
+    if (derived.length > 0) {
+      setTagsRaw(derived.join(', '));
+    }
+  };
+
   return (
     <Dialog
       open={open}
+      wide
       title={initial ? t('common.edit') : t('organize.newGroup')}
       onClose={onClose}
       actions={
@@ -150,17 +261,30 @@ export function UserGroupDialog({
         </>
       }
     >
-      <TextField
-        label={t('organize.groupName')}
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        autoFocus
-      />
-      <TextField
-        label={t('organize.groupTags')}
-        value={tagsRaw}
-        onChange={(e) => setTagsRaw(e.target.value)}
-      />
+      <div className="l4a-dialog-two-col">
+        <TextField
+          label={t('organize.groupName')}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          autoFocus
+        />
+        <TextField
+          label={t('organize.groupTags')}
+          value={tagsRaw}
+          onChange={(e) => setTagsRaw(e.target.value)}
+          trailing={
+            <Button
+              variant="text"
+              size="sm"
+              disabled={selectedIds.size === 0}
+              icon={<Sparkles size={13} />}
+              onClick={handleAutoTags}
+            >
+              {t('organize.autoTags')}
+            </Button>
+          }
+        />
+      </div>
       <div className="md-field">
         <span className="md-field-label">{t('organize.groupColor')}</span>
         <div className="l4a-color-swatches">
@@ -179,7 +303,13 @@ export function UserGroupDialog({
           ))}
         </div>
       </div>
-      <AddonPicker addons={addons} selected={selectedIds} onToggle={toggleId} />
+      <AddonPicker
+        addons={addons}
+        selected={selectedIds}
+        onToggle={toggleId}
+        onSelectMany={(ids) => setSelectedIds((prev) => new Set([...prev, ...ids]))}
+        onClearAll={() => setSelectedIds(new Set())}
+      />
     </Dialog>
   );
 }
@@ -217,6 +347,7 @@ export function ManualBundleDialog({
   return (
     <Dialog
       open={open}
+      wide
       title={t('organize.newBundle')}
       onClose={onClose}
       actions={
@@ -240,7 +371,13 @@ export function ManualBundleDialog({
         onChange={(e) => setName(e.target.value)}
         autoFocus
       />
-      <AddonPicker addons={addons} selected={selectedIds} onToggle={toggleId} />
+      <AddonPicker
+        addons={addons}
+        selected={selectedIds}
+        onToggle={toggleId}
+        onSelectMany={(ids) => setSelectedIds((prev) => new Set([...prev, ...ids]))}
+        onClearAll={() => setSelectedIds(new Set())}
+      />
     </Dialog>
   );
 }
@@ -343,6 +480,7 @@ export function ProfileDialog({
   return (
     <Dialog
       open={open}
+      wide
       title={initial ? t('common.edit') : t('organize.newProfile')}
       onClose={onClose}
       actions={
@@ -367,17 +505,19 @@ export function ProfileDialog({
         </>
       }
     >
-      <TextField
-        label={t('organize.profileName')}
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        autoFocus
-      />
-      <TextField
-        label={t('organize.profileNote')}
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-      />
+      <div className="l4a-dialog-two-col">
+        <TextField
+          label={t('organize.profileName')}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          autoFocus
+        />
+        <TextField
+          label={t('organize.profileNote')}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      </div>
       <div className="l4a-row-wrap">
         <Button
           variant="tonal"
@@ -395,6 +535,8 @@ export function ProfileDialog({
         missingIds={missingIds}
         selected={selectedIds}
         onToggle={toggleId}
+        onSelectMany={(ids) => setSelectedIds((prev) => new Set([...prev, ...ids]))}
+        onClearAll={() => setSelectedIds(new Set())}
       />
     </Dialog>
   );

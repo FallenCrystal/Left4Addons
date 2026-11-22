@@ -8,6 +8,56 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn extracts_non_utf8_metadata_and_nested_missions() {
+    let dir = tempdir().unwrap();
+    let vpk_path = dir.path().join("encoded.vpk");
+    let cache_dir = dir.path().join("cache");
+    let addoninfo = r#""AddonInfo" { "addonTitle" "Café" }"#;
+    let mission =
+        r#""mission" { "modes" { "coop" { "1" { "map" "c1" "displayname" "Entrée" } } } }"#;
+
+    let le = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+    let be = |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_be_bytes).collect() };
+    let latin1 = addoninfo.chars().map(|c| c as u8).chain([0]).collect();
+    for encoded in [
+        [vec![0xef, 0xbb, 0xbf], addoninfo.as_bytes().to_vec()].concat(),
+        [vec![0xff, 0xfe], le(addoninfo)].concat(),
+        [vec![0xfe, 0xff], be(addoninfo)].concat(),
+        le(addoninfo),
+        be(addoninfo),
+        latin1,
+    ] {
+        write_vpk(
+            &vpk_path,
+            &[
+                VpkFileToWrite {
+                    ext: "txt".into(),
+                    path: "".into(),
+                    filename: "addoninfo".into(),
+                    content: encoded,
+                },
+                VpkFileToWrite {
+                    ext: "txt".into(),
+                    path: "missions".into(),
+                    filename: "encoded".into(),
+                    content: [vec![0xfe, 0xff], be(mission)].concat(),
+                },
+            ],
+        )
+        .unwrap();
+        let metadata = extract_addon_metadata(&vpk_path, &cache_dir);
+        assert_eq!(metadata.addon_info["addontitle"], "Café");
+        assert_eq!(metadata.maps.len(), 1);
+        assert_eq!(metadata.maps[0].code, "c1");
+        assert_eq!(metadata.maps[0].name, "Entrée");
+        let DummyInspection::RealVpk { content_hash, .. } = inspect_dummy_vpk(&vpk_path) else {
+            panic!("expected a real VPK");
+        };
+        assert_eq!(metadata.content_hash, content_hash);
+    }
+}
+
+#[test]
 fn vpk_write_and_read_roundtrip_extracts_metadata_and_maps() {
     let dir = tempdir().unwrap();
     let vpk_path = dir.path().join("campaign_part1.vpk");

@@ -144,6 +144,30 @@ pub enum ReconcileAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReconcileBatchItem {
+    pub issue_id: IssueId,
+    pub action: ReconcileAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileItemResult {
+    pub issue_id: IssueId,
+    pub action: ReconcileAction,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<DesktopError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileBatchReport {
+    pub items: Vec<ReconcileItemResult>,
+    pub snapshot: DashboardSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReconcileIssue {
     pub id: IssueId,
     pub kind: ReconcileIssueKind,

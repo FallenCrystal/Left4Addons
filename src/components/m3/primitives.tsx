@@ -1,5 +1,5 @@
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, RefObject } from 'react';
-import { useEffect, useId, useRef } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, X } from 'lucide-react';
 
@@ -131,6 +131,7 @@ export function IconButton({
   size = 'md',
   active = false,
   label,
+  title,
   className = '',
   type = 'button',
   children,
@@ -140,6 +141,7 @@ export function IconButton({
     <button
       type={type}
       aria-label={label}
+      title={title ?? label}
       className={`md-icon-btn ${className}`.trim()}
       data-variant={variant}
       data-size={size}
@@ -413,6 +415,53 @@ export function Tabs<T extends string>({
   );
 }
 
+export function LoadingIndicator({
+  size = 'md',
+  contained = false,
+  label,
+}: {
+  size?: 'sm' | 'md' | 'lg';
+  contained?: boolean;
+  label?: string;
+}) {
+  return (
+    <span
+      className="md-loading-indicator"
+      role="progressbar"
+      aria-label={label}
+      data-size={size}
+      data-contained={contained ? 'true' : 'false'}
+    >
+      <span className="md-loading-rotor" aria-hidden="true">
+        <svg
+          className="md-loading-shape md-loading-shape-1"
+          viewBox="0 0 48 48"
+          fill="currentColor"
+          shapeRendering="geometricPrecision"
+        >
+          <path d="M 24.00 5.80 C 26.05 5.80 27.23 9.53 29.59 10.51 C 31.95 11.49 35.42 9.68 36.87 11.13 C 38.32 12.58 36.51 16.05 37.49 18.41 C 38.47 20.77 42.20 21.95 42.20 24.00 C 42.20 26.05 38.47 27.23 37.49 29.59 C 36.51 31.95 38.32 35.42 36.87 36.87 C 35.42 38.32 31.95 36.51 29.59 37.49 C 27.23 38.47 26.05 42.20 24.00 42.20 C 21.95 42.20 20.77 38.47 18.41 37.49 C 16.05 36.51 12.58 38.32 11.13 36.87 C 9.68 35.42 11.49 31.95 10.51 29.59 C 9.53 27.23 5.80 26.05 5.80 24.00 C 5.80 21.95 9.53 20.77 10.51 18.41 C 11.49 16.05 9.68 12.58 11.13 11.13 C 12.58 9.68 16.05 11.49 18.41 10.51 C 20.77 9.53 21.95 5.80 24.00 5.80 Z" />
+        </svg>
+        <svg
+          className="md-loading-shape md-loading-shape-2"
+          viewBox="0 0 48 48"
+          fill="currentColor"
+          shapeRendering="geometricPrecision"
+        >
+          <path d="M 24.00 5.50 C 27.06 5.50 28.95 12.26 32.34 15.66 C 35.74 19.05 42.50 20.94 42.50 24.00 C 42.50 27.06 35.74 28.95 32.34 32.34 C 28.95 35.74 27.06 42.50 24.00 42.50 C 20.94 42.50 19.05 35.74 15.66 32.34 C 12.26 28.95 5.50 27.06 5.50 24.00 C 5.50 20.94 12.26 19.05 15.66 15.66 C 19.05 12.26 20.94 5.50 24.00 5.50 Z" />
+        </svg>
+        <svg
+          className="md-loading-shape md-loading-shape-3"
+          viewBox="0 0 48 48"
+          fill="currentColor"
+          shapeRendering="geometricPrecision"
+        >
+          <path d="M 24.00 5.60 C 26.49 5.60 27.88 10.54 30.80 12.22 C 33.72 13.91 38.69 12.64 39.93 14.80 C 41.18 16.96 37.60 20.63 37.60 24.00 C 37.60 27.37 41.18 31.04 39.93 33.20 C 38.69 35.36 33.72 34.09 30.80 35.78 C 27.88 37.46 26.49 42.40 24.00 42.40 C 21.51 42.40 20.12 37.46 17.20 35.78 C 14.28 34.09 9.31 35.36 8.07 33.20 C 6.82 31.04 10.40 27.37 10.40 24.00 C 10.40 20.63 6.82 16.96 8.07 14.80 C 9.31 12.64 14.28 13.91 17.20 12.22 C 20.12 10.54 21.51 5.60 24.00 5.60 Z" />
+        </svg>
+      </span>
+    </span>
+  );
+}
+
 export function LinearProgress({
   value,
   indeterminate = false,
@@ -554,33 +603,62 @@ export function SideSheet({
   );
 }
 
-export function Snackbar({
-  message,
-  tone = 'default',
-  actionLabel,
-  onAction,
-  onClose,
-}: {
+export interface SnackbarData {
+  id: number;
   message: string;
   tone?: 'default' | 'error';
   actionLabel?: string;
   onAction?: () => void;
+}
+
+export function Snackbar({
+  item,
+  onClose,
+}: {
+  item: SnackbarData | null;
   onClose: () => void;
 }) {
   const { t } = useTranslation();
+  const [displayed, setDisplayed] = useState<SnackbarData | null>(item);
+
+  if (item && item.id !== displayed?.id) {
+    setDisplayed(item);
+  }
+
+  useEffect(() => {
+    if (item || !displayed) return;
+    const timer = window.setTimeout(() => {
+      setDisplayed(null);
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [item, displayed]);
+
+  const active = item ?? displayed;
+  if (!active) return null;
+
+  const tone = active.tone ?? 'default';
+  const state = item ? 'open' : 'closing';
+
   return (
-    <div className="md-snackbar" role="status" data-tone={tone}>
-      <span style={{ flex: 1 }}>{message}</span>
-      {actionLabel && onAction && (
+    <div
+      key={active.id}
+      className="md-snackbar"
+      role="status"
+      aria-live={tone === 'error' ? 'assertive' : 'polite'}
+      data-tone={tone}
+      data-state={state}
+    >
+      <span className="md-snackbar-text">{active.message}</span>
+      {active.actionLabel && active.onAction && (
         <button
           type="button"
           className="md-snackbar-action"
           onClick={() => {
-            onAction();
+            active.onAction?.();
             onClose();
           }}
         >
-          {actionLabel}
+          {active.actionLabel}
         </button>
       )}
       <IconButton

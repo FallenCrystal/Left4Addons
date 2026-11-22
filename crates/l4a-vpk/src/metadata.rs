@@ -29,6 +29,47 @@ pub struct AddonMetadata {
     pub error: Option<String>,
 }
 
+pub fn decode_vpk_text(bytes: &[u8]) -> String {
+    fn decode_utf16(bytes: &[u8], read_unit: fn([u8; 2]) -> u16) -> String {
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        let mut units: Vec<_> = pairs.iter().copied().map(read_unit).collect();
+        if !remainder.is_empty() {
+            units.push(0xfffd);
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    let mut text = match bytes {
+        [0xef, 0xbb, 0xbf, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        [0xff, 0xfe, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
+        [0xfe, 0xff, rest @ ..] => decode_utf16(rest, u16::from_be_bytes),
+        _ => {
+            let mut even_nuls = 0;
+            let mut odd_nuls = 0;
+            if bytes.len() >= 4 && bytes.len().is_multiple_of(2) {
+                for pair in bytes.as_chunks::<2>().0 {
+                    even_nuls += usize::from(pair[0] == 0);
+                    odd_nuls += usize::from(pair[1] == 0);
+                }
+            }
+            let threshold = bytes.len().div_ceil(4);
+            if odd_nuls >= threshold && odd_nuls > even_nuls.saturating_mul(3) {
+                decode_utf16(bytes, u16::from_le_bytes)
+            } else if even_nuls >= threshold && even_nuls > odd_nuls.saturating_mul(3) {
+                decode_utf16(bytes, u16::from_be_bytes)
+            } else {
+                std::str::from_utf8(bytes)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|_| bytes.iter().copied().map(char::from).collect())
+            }
+        }
+    };
+    let without_bom = text.trim_start_matches('\u{feff}');
+    text.drain(..text.len() - without_bom.len());
+    text.retain(|c| c != '\0');
+    text
+}
+
 pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     vpk_path: P,
     cache_dir: Q,
@@ -59,11 +100,12 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     if let Some(key) = addoninfo_key {
         if let Some(entry) = archive.entries.get(&key) {
             if let Ok(bytes) = read_vpk_entry(&mut archive.file, entry) {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let text = decode_vpk_text(&bytes);
                 let kv = parse_key_values(&text);
                 result.addon_info = flatten_kv_strings(&kv);
                 result.raw_addon_info = kv;
-                addoninfo_content = text;
+                // Keep fingerprints stable for existing addon IDs and dummy VPKs.
+                addoninfo_content = String::from_utf8_lossy(&bytes).into_owned();
             }
         }
     }
@@ -159,7 +201,7 @@ pub fn extract_addon_metadata<P: AsRef<Path>, Q: AsRef<Path>>(
     for key in &mission_keys {
         if let Some(entry) = archive.entries.get(key) {
             if let Ok(bytes) = read_vpk_entry(&mut archive.file, entry) {
-                let text = String::from_utf8_lossy(&bytes);
+                let text = decode_vpk_text(&bytes);
                 let kv = parse_key_values(&text);
                 extract_map_names_from_kv(&kv, &mut map_names);
                 let (parsed_maps, hint) = extract_mission_info_from_kv(&kv);

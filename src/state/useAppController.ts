@@ -12,6 +12,8 @@ import type {
   LoadoutProfile,
   ProfileApplyReport,
   ReconcileAction,
+  ReconcileBatchItem,
+  ReconcileBatchReport,
   RenamePreviewItem,
   RenameRuleConfig,
   SearchQuery,
@@ -73,6 +75,9 @@ export interface DesktopClient {
     issueId: string,
     action: ReconcileAction,
   ) => Promise<DashboardSnapshot>;
+  resolveReconcileIssuesBatch: (
+    items: ReconcileBatchItem[],
+  ) => Promise<ReconcileBatchReport>;
   moveAddons: (addonIds: string[], targetDirType: AddonDirType) => Promise<AddonBatchReport>;
   toggleAddons: (
     addonIds: string[],
@@ -104,6 +109,7 @@ export interface DesktopClient {
   applyProfile: (profileId: string) => Promise<ProfileApplyReport>;
   searchByMapCode: (query: string) => Promise<AddonSummary[]>;
   openExternalUrl: (url: string) => Promise<void>;
+  openInFileManager: (path: string) => Promise<void>;
   subscribeCoreEvents: (handler: (ev: CoreEvent) => void) => Promise<() => void>;
 }
 
@@ -123,6 +129,7 @@ function getClient(tauri: boolean): DesktopClient {
       updateWorkshopItem: ipc.updateWorkshopItem,
       cancelDownload: ipc.cancelDownload,
       resolveReconcileIssue: ipc.resolveReconcileIssue,
+      resolveReconcileIssuesBatch: ipc.resolveReconcileIssuesBatch,
       moveAddons: ipc.moveAddons,
       toggleAddons: ipc.toggleAddons,
       previewRename: ipc.previewRename,
@@ -142,6 +149,7 @@ function getClient(tauri: boolean): DesktopClient {
       applyProfile: ipc.applyProfile,
       searchByMapCode: ipc.searchByMapCode,
       openExternalUrl: ipc.openExternalUrl,
+      openInFileManager: ipc.openInFileManager,
       subscribeCoreEvents: ipc.subscribeCoreEvents,
     };
   }
@@ -159,6 +167,7 @@ function getClient(tauri: boolean): DesktopClient {
     updateWorkshopItem: (id) => previewEngine.updateWorkshopItem(id),
     cancelDownload: (id) => previewEngine.cancelDownload(id),
     resolveReconcileIssue: (id, act) => previewEngine.resolveReconcileIssue(id, act),
+    resolveReconcileIssuesBatch: (items) => previewEngine.resolveReconcileIssuesBatch(items),
     moveAddons: (ids, dir) => previewEngine.moveAddons(ids, dir),
     toggleAddons: (ids, en, allow) => previewEngine.toggleAddons(ids, en, allow),
     previewRename: (rules, ids) => previewEngine.previewRename(rules, ids),
@@ -179,6 +188,7 @@ function getClient(tauri: boolean): DesktopClient {
     applyProfile: (id) => previewEngine.applyProfile(id),
     searchByMapCode: (q) => previewEngine.searchByMapCode(q),
     openExternalUrl: (u) => previewEngine.openExternalUrl(u),
+    openInFileManager: (p) => previewEngine.openInFileManager(p),
     subscribeCoreEvents: async (h) => previewEngine.subscribe(h),
   };
 }
@@ -671,6 +681,37 @@ export function useAppController(onOpenReconcile?: () => void) {
     [client, commitSnapshot, nextSnapshotSeq, notify],
   );
 
+  const resolveIssuesBatch = useCallback(
+    async (items: ReconcileBatchItem[]) => {
+      if (items.length === 0) return null;
+      setBusy(true);
+      const seq = nextSnapshotSeq();
+      try {
+        const report = await client.resolveReconcileIssuesBatch(items);
+        commitSnapshot(seq, report.snapshot);
+        const okCount = report.items.filter((item) => item.ok).length;
+        const failedCount = report.items.length - okCount;
+        if (failedCount > 0) {
+          const firstErr = report.items.find((item) => !item.ok)?.error?.message;
+          const summary = tRef.current('reconcile.batchPartial', {
+            ok: okCount,
+            failed: failedCount,
+          });
+          notify(firstErr ? `${summary} · ${firstErr}` : summary, { tone: 'error' });
+        } else {
+          notify(tRef.current('reconcile.batchDone', { ok: okCount }));
+        }
+        return report;
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, commitSnapshot, nextSnapshotSeq, notify],
+  );
+
   const runTransfer = useCallback(
     async (workshopId: string, kind: 'download' | 'update') => {
       if (liveDownloadsRef.current[workshopId]) {
@@ -1042,6 +1083,22 @@ export function useAppController(onOpenReconcile?: () => void) {
     [client, notify],
   );
 
+  const openInFileManager = useCallback(
+    async (path: string): Promise<boolean> => {
+      try {
+        await client.openInFileManager(path);
+        if (!isTauri) {
+          notify(tRef.current('toast.previewFileManager'));
+        }
+        return true;
+      } catch (err) {
+        notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
+        return false;
+      }
+    },
+    [client, isTauri, notify],
+  );
+
   return {
     isTauri,
     snapshot,
@@ -1074,6 +1131,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     deleteAddons,
     safeDeleteObsoleteDependency,
     resolveIssue,
+    resolveIssuesBatch,
     downloadWorkshopItem,
     updateWorkshopItem,
     cancelDownload,
@@ -1093,6 +1151,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     getSubscribedWorkshopIds,
     searchByMapCode,
     openExternalUrl,
+    openInFileManager,
   };
 }
 

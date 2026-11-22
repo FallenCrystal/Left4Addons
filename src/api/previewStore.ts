@@ -10,6 +10,9 @@ import type {
   LoadoutProfile,
   ProfileApplyReport,
   ReconcileAction,
+  ReconcileBatchItem,
+  ReconcileBatchReport,
+  ReconcileItemResult,
   RenamePreviewItem,
   RenameRuleConfig,
   SearchQuery,
@@ -219,6 +222,7 @@ function createInitialSnapshot(): DashboardSnapshot {
           addonauthor: 'PripyatTeam',
           addonversion: '2.4',
           addondescription: 'Five-chapter custom campaign set across the Chernobyl Exclusion Zone.',
+          addonurl0: 'https://steamcommunity.com/sharedfiles/filedetails/?id=2814104912',
           addoncontent_campaign: '1',
         },
       },
@@ -873,6 +877,27 @@ class PreviewEngine {
     return this.cloneSnapshot();
   }
 
+  async resolveReconcileIssuesBatch(items: ReconcileBatchItem[]): Promise<ReconcileBatchReport> {
+    const results: ReconcileItemResult[] = [];
+    for (const item of items) {
+      try {
+        await this.resolveReconcileIssue(item.issueId, item.action);
+        results.push({ issueId: item.issueId, action: item.action, ok: true });
+      } catch (err) {
+        results.push({
+          issueId: item.issueId,
+          action: item.action,
+          ok: false,
+          error: {
+            code: err instanceof IpcError ? (err.code as ReconcileItemResult['error'] extends { code: infer C } ? C : 'conflict') : 'conflict',
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    }
+    return { items: results, snapshot: this.cloneSnapshot() };
+  }
+
   async moveAddons(
     addonIds: string[],
     targetDirType: AddonDirType,
@@ -1225,6 +1250,10 @@ class PreviewEngine {
     if (typeof window !== 'undefined') {
       window.open(url, '_blank', 'noopener,noreferrer');
     }
+  }
+
+  async openInFileManager(_path: string): Promise<void> {
+    // Preview mode has no local file manager.
   }
 }
 
