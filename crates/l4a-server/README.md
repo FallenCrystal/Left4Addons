@@ -1,33 +1,27 @@
 # l4a-server
 
-`l4a-server` 是 Left4Addons v2 的创意工坊信息管理与缓存后端服务。
+`l4a-server` 是 Left4Addons v2 的创意工坊缓存与同步后端服务。它基于纯协议层 **SteamKit CM (`steam-vent`)** 直接向 Steam Connection Manager 拉取《求生之路 2》(AppID `550`) 的模组元数据、前置依赖有向图、合集成员、画廊预览以及 `.vpk` 下载直链 (`file_url`)，使桌面客户端无需加载受 VAC 限制的 Steamworks SDK 即可完成高速查询与直链下载。
 
 ## 核心特性
 
-- **高性能轻量架构**：基于 Axum 0.8 与 SQLite WAL 模式，内存开销极低。
-- **创意工坊防 429 缓存**：缓存模组元数据、封面、直链与合集层级，减少直连 Steam 带来的限流。
-- **模组版本与依赖存档**：记录模组历史修订（revisions）与依赖有向图，避免模组下架后变成“死链黑盒”。
-- **可信贡献者与冲突裁决**：支持客户端上报元数据，通过分级信任权重（Trust Tiers）、Steam CDN 白名单校验与防恶意下架裁决机制确保数据安全。
-- **自包含暗色管理后台 (`GET /admin`)**：开箱即用，支持条目检索、数据覆写、Token 签发与禁用、审计日志审阅。
+- **纯协议层 SteamKit CM 上游**：无需在服务器上安装 Steam 客户端或 Steamworks SDK，也无需申请 Steam Web API Key；默认匿名 CM 会话即可拉取 `file_url`、依赖树与合集，同时支持登录普通 Steam 账号解锁创作者昵称解析与更高配额。
+- **`file_url` 实时保鲜与穿透缓存**：通过 `PublishedFile.QueryFiles` (`RankedByLastUpdatedDate`) 定时增量同步 + 按需 Read-Through 穿透与 TTL 过期重刷，及时更新模组发版后的新版 CDN 直链。
+- **下架墓碑与版本归档**：当上游条目变为 `Removed` (`result=9`) 或 `PrivateOrUnavailable` 时，自动清空失效下载直链并完整保留历史标题、简介、封面、画廊与依赖拓扑。
+- **零环境变量 TOML 配置 (`catalog.toml`)**：首次启动自动生成带随机强管理员密码的 `catalog.toml`，控制台中的所有策略调整、密码修改与 Steam Refresh Token 均原子持久化回配置文件。
+- **现代化 React 运维控制台 (`GET /admin/`)**：内置登录鉴权、Steam 手机扫码 / 账号密码 + Steam Guard / Refresh Token 登录、缓存检索与强刷、管理员覆写锁定及安全审计日志。
 
-## 快速运行 (本地调试)
-
-```bash
-# 启动本地开发服务 (默认监听 127.0.0.1:8787，开发模式弱口令)
-cargo run -p l4a-server -- --allow-insecure-dev-token
-```
-
-访问 `http://127.0.0.1:8787/admin` 即可查看管理后台，默认测试令牌为 `change-me-admin-token`。
-
-## 生产运行
+## 快速运行
 
 ```bash
-# 生产环境必须提供非空强管理员令牌，且不可为默认弱口令
-L4A_SERVER_ADMIN_TOKEN="$(openssl rand -hex 32)" cargo run --release -p l4a-server -- --bind 0.0.0.0:8787 --db-path /var/lib/l4a-server/catalog.db
+# 构建前端控制台静态资源并启动服务（首次启动将在当前目录自动生成 ./catalog.toml 并打印初始密码）
+npm run catalog:build
+cargo run -p l4a-server -- --config ./catalog.toml
 ```
+
+访问 `http://127.0.0.1:8787/admin/` 并使用启动日志（或 `catalog.toml` 中 `[admin].password`）的初始密码即可登录控制台。
 
 ## 完整文档
 
-- [Catalog Server 介绍与部署指南 (Systemd / Docker / Nginx / 运维)](../../docs/guides/catalog-server-guide.md)
+- [Catalog Server 介绍与部署指南 (TOML 配置 / Systemd / Docker / Nginx)](../../docs/guides/catalog-server-guide.md)
 - [Catalog Server REST API 接口规范](../../docs/api/catalog-server-api.md)
-- [架构设计与冲突裁决状态机](../../docs/architecture/07-catalog-backend.md)
+- [07. SteamKit CM 缓存后端架构设计](../../docs/architecture/07-catalog-backend.md)

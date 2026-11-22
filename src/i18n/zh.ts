@@ -402,7 +402,6 @@ export const zh = {
     sourceOrder: '数据源优先级',
     httpsOnly: '仅允许安全的 HTTPS 连接',
     catalogUrl: 'Catalog Server 地址',
-    catalogToken: 'Contributor Token',
     disableSdk: '禁用 Steamworks SDK',
     forceSdkDownload: '强制 SDK 下载',
     sdkStatus: 'Steamworks SDK',

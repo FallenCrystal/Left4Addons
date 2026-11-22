@@ -7,11 +7,11 @@ export type WorkshopItemStatus = 'active' | 'removed' | 'private_or_unavailable'
 export type WorkshopFileType = 'item' | 'collection';
 export type MetadataSource =
   | 'catalog_server'
+  | 'steam_kit'
   | 'steamworks_sdk'
   | 'steam_web_api'
   | 'web_scraper'
   | 'local_vpk'
-  | 'user_contribution'
   | 'admin_override';
 export type BundleKind = 'dependency_graph' | 'campaign_parts' | 'manual';
 
@@ -218,7 +218,6 @@ export interface AppConfig {
   forceSteamworksSdkDownload: boolean;
   httpsOnly: boolean;
   catalogServerUrl?: string | null;
-  catalogContributorToken?: string | null;
   sourceOrder: string[];
   renameRules: RenameRuleConfig;
 }
@@ -248,6 +247,13 @@ export interface WorkshopDependency {
   required: boolean;
 }
 
+export interface WorkshopPreview {
+  previewId?: string;
+  url?: string;
+  youtubeVideoId?: string;
+  previewType: number;
+}
+
 export interface WorkshopItemRecord {
   workshopId: string;
   fileType: WorkshopFileType;
@@ -257,6 +263,7 @@ export interface WorkshopItemRecord {
   creatorSteamId?: string;
   creatorName?: string;
   previewUrl?: string;
+  previews?: WorkshopPreview[];
   fileUrl?: string;
   fileSize?: number;
   timeCreated?: number;

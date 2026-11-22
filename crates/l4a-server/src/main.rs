@@ -1,37 +1,26 @@
 use clap::Parser;
-use l4a_server::{build_router, ServerConfig, ServerState};
-use std::net::SocketAddr;
+use l4a_server::{build_router, ServerState};
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-const INSECURE_DEFAULT_TOKEN: &str = "change-me-admin-token";
-
 #[derive(Debug, Parser)]
 #[command(
     name = "l4a-server",
-    about = "Left4Addons v2 创意工坊信息管理与缓存后端"
+    about = "Left4Addons v2 SteamKit CM 创意工坊缓存后端"
 )]
 struct Cli {
-    #[arg(long, env = "L4A_SERVER_BIND", default_value = "127.0.0.1:8787")]
-    bind: String,
-    #[arg(long, env = "L4A_SERVER_DB", default_value = "./l4a-catalog.db")]
-    db_path: PathBuf,
-    #[arg(long, env = "L4A_SERVER_ADMIN_TOKEN")]
-    admin_token: Option<String>,
-    #[arg(long, default_value_t = false)]
-    allow_insecure_dev_token: bool,
-}
+    /// TOML 配置文件路径（不存在时首次运行将自动生成默认配置与随机管理员密码）
+    #[arg(short, long, default_value = "./catalog.toml")]
+    config: PathBuf,
 
-fn is_loopback_bind(bind: &str) -> bool {
-    if let Ok(addr) = bind.parse::<SocketAddr>() {
-        return addr.ip().is_loopback();
-    }
-    let lower = bind.trim().to_ascii_lowercase();
-    lower == "localhost"
-        || lower.starts_with("localhost:")
-        || lower.starts_with("127.0.0.1:")
-        || lower.starts_with("[::1]:")
+    /// 可选：覆盖配置文件中的监听地址
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// 可选：覆盖配置文件中的 SQLite 数据库路径
+    #[arg(long)]
+    db_path: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -43,42 +32,42 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let trimmed_token = cli
-        .admin_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+    let (mut cfg, created_new) = l4a_server::config::CatalogConfig::load_or_init(&cli.config)?;
+    if let Some(bind) = cli.bind {
+        cfg.server.bind = bind;
+    }
+    if let Some(db_path) = cli.db_path {
+        cfg.server.db_path = db_path;
+    }
 
-    let admin_token = match trimmed_token {
-        Some(t) if t != INSECURE_DEFAULT_TOKEN => t,
-        other => {
-            if cli.allow_insecure_dev_token && is_loopback_bind(&cli.bind) {
-                tracing::warn!(
-                    bind = %cli.bind,
-                    "当前正在使用开发模式弱/默认管理员令牌，仅限本地回环调试，请勿用于生产环境"
-                );
-                other.unwrap_or_else(|| INSECURE_DEFAULT_TOKEN.to_string())
-            } else {
-                anyhow::bail!(
-                    "拒绝启动：必须通过 --admin-token 或环境变量 L4A_SERVER_ADMIN_TOKEN 提供非空的强管理员令牌 (且不可为 change-me-admin-token)。本地调试可显式添加 --allow-insecure-dev-token 并绑定回环地址"
-                );
-            }
-        }
-    };
+    let initial_user = cfg.admin.username.clone();
+    let initial_pass = cfg.admin.password.clone();
+    let bind_addr = cfg.server.bind.clone();
+    let db_display = cfg.server.db_path.display().to_string();
 
-    let state = ServerState::open(&ServerConfig {
-        bind_addr: cli.bind.clone(),
-        db_path: cli.db_path.clone(),
-        admin_token,
-    })?;
+    let store = std::sync::Arc::new(l4a_server::config::CatalogConfigStore::new(
+        Some(cli.config.clone()),
+        cfg,
+    ));
+    let state = ServerState::from_config_store(store)?;
+    let _worker_token = state.sync.spawn_background_workers();
 
-    let listener = TcpListener::bind(&cli.bind).await?;
+    if created_new {
+        tracing::info!(
+            config = %cli.config.display(),
+            username = %initial_user,
+            password = %initial_pass,
+            "已自动初始化 catalog.toml，请使用上述初始管理员账号密码登录控制台（登录后可在界面修改）"
+        );
+    }
+
+    let listener = TcpListener::bind(&bind_addr).await?;
     tracing::info!(
-        bind = %cli.bind,
-        db = %cli.db_path.display(),
-        admin_ui = %format!("http://{}/admin", cli.bind),
-        "l4a-server 已启动"
+        bind = %bind_addr,
+        config = %cli.config.display(),
+        db = %db_display,
+        console = %format!("http://{bind_addr}/admin/"),
+        "l4a-server (SteamKit CM Catalog) 已启动"
     );
 
     axum::serve(listener, build_router(state)).await?;

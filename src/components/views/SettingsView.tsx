@@ -7,8 +7,6 @@ import {
   Check,
   Cpu,
   Download,
-  Eye,
-  EyeOff,
   FolderOpen,
   FolderSearch,
   Palette,
@@ -77,7 +75,6 @@ export function SettingsView({
 }: SettingsViewProps) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<AppConfig | null>(null);
-  const [showToken, setShowToken] = useState(false);
   const [detecting, setDetecting] = useState(false);
 
   const effective = draft ?? config;
@@ -437,26 +434,6 @@ export function SettingsView({
                       ...d,
                       catalogServerUrl: e.target.value || null,
                     }))
-                  }
-                />
-                <TextField
-                  label={t('settings.catalogToken')}
-                  type={showToken ? 'text' : 'password'}
-                  value={effective.catalogContributorToken ?? ''}
-                  onChange={(e) =>
-                    updateDraft((d) => ({
-                      ...d,
-                      catalogContributorToken: e.target.value || null,
-                    }))
-                  }
-                  trailing={
-                    <IconButton
-                      size="sm"
-                      label={t('common.toggleVisibility')}
-                      onClick={() => setShowToken((v) => !v)}
-                    >
-                      {showToken ? <EyeOff size={16} /> : <Eye size={16} />}
-                    </IconButton>
                   }
                 />
               </section>

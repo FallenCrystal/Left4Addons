@@ -154,7 +154,6 @@ string_id_type!(GroupId);
 string_id_type!(ProfileId);
 string_id_type!(IssueId);
 string_id_type!(TaskId);
-string_id_type!(ContributorId);
 
 #[cfg(test)]
 mod tests {

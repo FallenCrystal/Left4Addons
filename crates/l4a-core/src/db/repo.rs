@@ -575,6 +575,7 @@ impl LocalDb {
                 creator_steam_id: r.get(5)?,
                 creator_name: r.get(6)?,
                 preview_url: r.get(7)?,
+                previews: Vec::new(),
                 file_url: r.get(8)?,
                 file_size: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
                 time_created: r.get(10)?,

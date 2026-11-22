@@ -585,6 +585,7 @@ pub fn parse_sdk_item_value(val: &Value) -> Option<WorkshopItemRecord> {
         creator_steam_id,
         creator_name,
         preview_url,
+        previews: Vec::new(),
         file_url: None,
         file_size,
         time_created,

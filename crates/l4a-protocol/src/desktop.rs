@@ -462,8 +462,6 @@ pub struct AppConfig {
     pub https_only: bool,
     #[serde(default)]
     pub catalog_server_url: Option<String>,
-    #[serde(default)]
-    pub catalog_contributor_token: Option<String>,
     #[serde(default = "default_provider_order")]
     pub source_order: Vec<String>,
     #[serde(default)]
@@ -500,7 +498,6 @@ impl Default for AppConfig {
             force_steamworks_sdk_download: false,
             https_only: true,
             catalog_server_url: None,
-            catalog_contributor_token: None,
             source_order: default_provider_order(),
             rename_rules: RenameRuleConfig::default(),
         }

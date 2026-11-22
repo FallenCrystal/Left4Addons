@@ -20,16 +20,16 @@ pub trait WorkshopProvider: Send + Sync {
 
 | 数据源 | 实现类 | `dependencies` | `file_url` | 下架检测 | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| 自托管后端 | `CatalogBackendProvider` | 是 | 是 | 是 | 默认优先（低延迟、聚合多玩家核验） |
+| 自托管后端 | `CatalogBackendProvider` | 是 | 是 | 是 | 默认优先（服务端基于 SteamKit CM 直连缓存，免除客户端 SDK/VAC 限制） |
 | Steamworks SDK | `SteamBridgeProvider` | 是 | **否** | 部分 | 无 HTTP 限流，能准确给出依赖树，但会占用游戏进程身份触发 VAC 提示 |
 | Steam Web API | `SteamWebApiProvider` | **否** | 是 | 是 (`result=9/15`) | 免鉴权公开接口，能拿到 CDN 直链与下架状态 |
-| 网页爬虫 (占位) | `WebScraperPlaceholderProvider` | 预留 | 预留 | 预留 | **当前严格占位**，调用返回 `WorkshopError::ScraperNotImplemented` |
+| 网页爬虫 (占位) | `WebScraperPlaceholderProvider` | 预留 | 预留 | 预留 | **当前严格占位**，调用返回 `WorkshopError::ScraperNotImplemented`（客户端侧富信息补全预留） |
 
 ## 3. 智能合并路由 (`WorkshopResolver`)
 
 v1 中 Steamworks SDK 查到模组但缺少 `file_url` 时不得不额外写散落的回落代码。v2 中 `WorkshopResolver` 按配置顺序依次查询：
 1. 未命中的 ID 自动向下游 Provider 回落；
-2. 已命中但缺少 `file_url` 或 `dependencies` 的记录，会向具备对应能力 (`provides_file_url` / `provides_dependencies`) 的后续 Provider 请求并**原地合并缺失字段**；
+2. 已命中但缺少 `file_url` 或尚未经权威依赖源 (`provides_dependencies`) 核验的记录，才会向具备对应能力的后续 Provider 请求并**原地合并缺失字段**（若 `CatalogBackendProvider` 已确认某条目无前置依赖，则直接标记权威完成，绝不无谓唤醒 `SteamBridgeProvider`）；
 3. 遇 `WorkshopError::ScraperNotImplemented` 静默跳过，确保占位符接入路由器后不影响生产路径。
 
 ## 4. 未来接入 Web 抓取的规范接口
