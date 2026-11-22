@@ -23,6 +23,7 @@ pub enum WorkshopFileType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataSource {
+    #[serde(alias = "user_contribution")]
     CatalogServer,
     SteamKit,
     SteamworksSdk,

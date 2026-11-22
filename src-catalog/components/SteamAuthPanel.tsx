@@ -58,9 +58,9 @@ export function SteamAuthPanel({ steam, onSteamUpdated, onNotify }: SteamAuthPan
   const handleStartQr = async () => {
     setBusy(true);
     try {
-      const started = await startQrAuth();
+      await startQrAuth();
       const next = await getSteamStatus();
-      onSteamUpdated({ ...next, activeAuthFlow: started });
+      onSteamUpdated(next);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
@@ -73,10 +73,10 @@ export function SteamAuthPanel({ steam, onSteamUpdated, onNotify }: SteamAuthPan
     if (!accountName.trim() || !password) return;
     setBusy(true);
     try {
-      const started = await startCredentialsAuth(accountName.trim(), password);
+      await startCredentialsAuth(accountName.trim(), password);
       setPassword('');
       const next = await getSteamStatus();
-      onSteamUpdated({ ...next, activeAuthFlow: started });
+      onSteamUpdated(next);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
@@ -89,10 +89,10 @@ export function SteamAuthPanel({ steam, onSteamUpdated, onNotify }: SteamAuthPan
     if (!flow || !guardCode.trim()) return;
     setBusy(true);
     try {
-      const updated = await submitSteamGuardCode(flow.flowId, guardCode.trim());
+      await submitSteamGuardCode(flow.flowId, guardCode.trim());
       setGuardCode('');
       const next = await getSteamStatus();
-      onSteamUpdated({ ...next, activeAuthFlow: updated });
+      onSteamUpdated(next);
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
@@ -330,8 +330,10 @@ export function SteamAuthPanel({ steam, onSteamUpdated, onNotify }: SteamAuthPan
               </button>
             </form>
 
-            {flow?.kind === 'credentials' &&
-              (flow.state === 'waiting_for_code' || flow.state === 'authenticating') && (
+            {flow?.kind === 'credentials' && flow.state === 'authenticating' && (
+              <div className="cat-banner">正在验证 Steam 登录。如手机 Steam App 收到确认请求，请在手机上批准。</div>
+            )}
+            {flow?.kind === 'credentials' && flow.state === 'waiting_for_code' && (
                 <form
                   onSubmit={(e) => void handleSubmitGuard(e)}
                   className="cat-banner"

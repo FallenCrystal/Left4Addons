@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Copy, ExternalLink, Lock, RefreshCw, Unlock, X } from 'lucide-react';
 import {
   clearItemOverride,
@@ -38,19 +38,23 @@ export function ItemInspectorDrawer({
   const [ovDepsText, setOvDepsText] = useState('');
   const [ovReason, setOvReason] = useState('');
 
+  const loadDraft = useCallback((res: AdminItemDetailResponse) => {
+    setDetail(res);
+    setOvStatus(res.item.status);
+    setOvTitle(res.item.title);
+    setOvFileUrl(res.item.fileUrl ?? '');
+    setOvPreviewUrl(res.item.previewUrl ?? '');
+    setOvDepsText(res.item.dependencies.map((d) => d.workshopId).join(', '));
+    setOvReason('');
+  }, []);
+
   useEffect(() => {
     if (!workshopId) return;
     let cancelled = false;
     void getAdminItemDetail(workshopId)
       .then((res) => {
         if (cancelled) return;
-        setDetail(res);
-        setOvStatus(res.item.status);
-        setOvTitle(res.item.title);
-        setOvFileUrl(res.item.fileUrl ?? '');
-        setOvPreviewUrl(res.item.previewUrl ?? '');
-        setOvDepsText(res.item.dependencies.map((d) => d.workshopId).join(', '));
-        setOvReason('');
+        loadDraft(res);
       })
       .catch((err) => {
         if (!cancelled) {
@@ -62,7 +66,7 @@ export function ItemInspectorDrawer({
     return () => {
       cancelled = true;
     };
-  }, [onClose, onNotify, workshopId]);
+  }, [loadDraft, onClose, onNotify, workshopId]);
 
   if (!workshopId) return null;
   const activeDetail = detail?.item.workshopId === workshopId ? detail : null;
@@ -72,7 +76,7 @@ export function ItemInspectorDrawer({
     setBusy(true);
     try {
       const next = await refreshAdminItem(workshopId);
-      setDetail(next);
+      loadDraft(next);
       onUpdated();
       onNotify(`已从 Steam CM 刷新 #${workshopId}`);
     } catch (err) {
@@ -87,10 +91,11 @@ export function ItemInspectorDrawer({
     setBusy(true);
     try {
       const depIds = parseWorkshopIdsInput(ovDepsText);
+      const fileUrl = ovFileUrl.trim();
       await overrideCatalogItem(workshopId, {
         status: ovStatus,
         title: ovTitle.trim() || undefined,
-        fileUrl: ovFileUrl.trim() || undefined,
+        fileUrl: fileUrl === (activeDetail?.item.fileUrl ?? '') ? undefined : fileUrl,
         previewUrl: ovPreviewUrl.trim() || undefined,
         dependencies: depIds.map((id) => ({ workshopId: id, required: true })),
         reason: ovReason.trim() || '控制台管理员手动覆写',
@@ -110,7 +115,7 @@ export function ItemInspectorDrawer({
     setBusy(true);
     try {
       const next = await clearItemOverride(workshopId);
-      setDetail(next);
+      loadDraft(next);
       onUpdated();
       onNotify(`已解除 #${workshopId} 的覆写锁定并恢复自动同步`);
     } catch (err) {

@@ -15,14 +15,14 @@ flowchart LR
 
 1. **彻底规避客户端 VAC 冲突**：客户端只需将 `Catalog Server` 置于数据源首位，即可关闭本地 Steamworks SDK，直接从 Catalog 获取依赖拓扑与下载直链。
 2. **无需环境变量与 API Key**：默认通过匿名 Steam CM 会话即可拉取 `file_url`；首次运行自动生成 `catalog.toml` 与随机强管理员密码。
-3. **`file_url` 自动保鲜**：结合定时增量轮询 (`RankedByLastUpdatedDate`) 与按需 Read-Through TTL 过期重刷，确保模组作者更新后客户端始终拿到有效的新版直链。
-4. **下架墓碑保护**：上游模组被删除或设为私密时，自动保留本地已归档的历史标题、简介、封面与前置依赖图，避免死链变成未知黑盒。
+3. **`file_url` 自动保鲜**：增量轮询处理工坊更新，后台按 ID 分批复核已缓存条目，按 ID 查询也可触发过期重刷。公开搜索暂时隐藏超过 `item_ttl_secs` 的活跃条目，核验后可恢复展示。控制台可检索完整缓存。
+4. **下架墓碑保护**：上游模组下架时保留已归档的历史元数据并清除下载直链。私密或不可用条目的公开缓存仅保留墓碑信息。
 
 ---
 
 ## 二、`catalog.toml` 配置文件详解
 
-`l4a-server` 通过 `--config <PATH>`（默认 `./catalog.toml`）加载配置。若文件不存在，首次启动时会自动创建并打印初始管理员密码。
+`l4a-server` 通过 `--config <PATH>`（默认 `./catalog.toml`）加载配置。文件不存在或缺少 `[admin].password` 时，服务会生成、保存并在启动日志中打印初始管理员密码。Unix 上新写入的配置与 Steam Guard 数据使用 `0600` 权限。
 
 完整配置模板参见 [`crates/l4a-server/catalog.example.toml`](../../crates/l4a-server/catalog.example.toml)：
 
@@ -35,6 +35,7 @@ db_path = "./l4a-catalog.db"
 username = "admin"
 password = "cat_auto_generated_strong_password"
 session_ttl_hours = 168
+allow_insecure_http = false # 仅本地 HTTP 开发时设为 true
 
 [steam]
 app_id = 550
@@ -114,7 +115,9 @@ catalog.example.com {
 
 ## 四、Web 管理控制台 (`GET /admin/`)
 
-浏览器访问 `http://127.0.0.1:8787/admin/`（或反代域名 `/admin/`）登录控制台后可执行：
+通过 HTTPS 反向代理访问 `/admin/` 时，管理员会话 Cookie 默认带 `Secure`。本地通过 `http://127.0.0.1:8787/admin/` 开发时，可在 `[admin]` 中显式设置 `allow_insecure_http = true`，使浏览器在 HTTP 上保留会话。
+
+登录控制台后可执行：
 
 1. **总览与同步引擎**：查看缓存命中/下架统计、按 Workshop ID 或链接手动预热抓取、立即触发增量同步、开启或重置全量工坊游标回填、在线调整 TTL 与轮询间隔（自动写回 `catalog.toml`）。
 2. **SteamKit 账号会话**：支持通过 **Steam 手机令牌扫码**、**账号密码 + Steam Guard** 或 **Refresh Token** 登录普通 Steam 账号，登录态自动持久化为 `refresh_token`，也可随时一键切回匿名会话。

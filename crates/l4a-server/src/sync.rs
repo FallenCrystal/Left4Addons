@@ -1,31 +1,50 @@
 use crate::config::CatalogConfigStore;
 use crate::db::{ServerRepo, StoredItemMeta};
 use crate::upstream::{
-    WorkshopUpstream, MATCHING_FILE_TYPE_COLLECTIONS, MATCHING_FILE_TYPE_ITEMS,
-    QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE, QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+    WorkshopObservation, WorkshopUpstream, DETAILS_BATCH_SIZE, MATCHING_FILE_TYPE_COLLECTIONS,
+    MATCHING_FILE_TYPE_ITEMS, QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
+    QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
 };
 use chrono::{DateTime, Utc};
 use l4a_protocol::{
     AdminFetchUpstreamResponse, BatchItemsResponse, CatalogSyncStatus, MetadataSource,
     WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopFileType, WorkshopId,
-    WorkshopItemRecord, WorkshopItemStatus,
+    WorkshopItemRecord,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-const STATE_HIGH_WATER_UPDATED: &str = "high_water_time_updated";
+// The old checkpoint also included timestamps from outside the incremental feed.
+const STATE_INCREMENTAL_SCAN: &str = "incremental_scan";
 const STATE_BACKFILL_CURSOR: &str = "backfill_cursor";
 const STATE_BACKFILL_SYNCED_TOTAL: &str = "backfill_synced_total";
 const STATE_REMOTE_WORKSHOP_TOTAL: &str = "remote_workshop_total";
-const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
+// The desktop HTTP client gives the Catalog 15 seconds, including transfer.
+const PUBLIC_REFRESH_BUDGET: Duration = Duration::from_secs(10);
+const LISTING_RECHECK_INTERVAL: Duration = Duration::from_secs(15);
 
-#[derive(Clone)]
-struct NegativeCacheEntry {
-    status: WorkshopItemStatus,
-    verified_at: DateTime<Utc>,
+#[derive(Default, Deserialize, Serialize)]
+struct IncrementalScan {
+    checkpoint: Option<i64>,
+    pending: Option<IncrementalPage>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct IncrementalPage {
+    cursor: String,
+    newest: Option<i64>,
+}
+
+fn load_incremental_scan(repo: &ServerRepo) -> anyhow::Result<IncrementalScan> {
+    match repo.get_sync_state(STATE_INCREMENTAL_SCAN)? {
+        Some(value) => Ok(serde_json::from_str(&value)?),
+        None => Ok(IncrementalScan::default()),
+    }
 }
 
 #[derive(Default)]
@@ -41,11 +60,10 @@ pub struct CatalogSyncCoordinator {
     config_store: Arc<CatalogConfigStore>,
     repo: Arc<ServerRepo>,
     upstream: Arc<dyn WorkshopUpstream>,
-    inflight: Mutex<HashMap<WorkshopId, broadcast::Sender<Result<(), String>>>>,
-    negative_cache: StdMutex<HashMap<WorkshopId, NegativeCacheEntry>>,
+    inflight: Mutex<HashMap<WorkshopId, broadcast::Receiver<Result<(), String>>>>,
     metrics: StdMutex<SyncRuntimeMetrics>,
     incremental_lock: Mutex<()>,
-    backfill_lock: Mutex<()>,
+    backfill_lock: Arc<Mutex<()>>,
     wake_notify: Notify,
 }
 
@@ -60,45 +78,15 @@ impl CatalogSyncCoordinator {
             repo,
             upstream,
             inflight: Mutex::new(HashMap::new()),
-            negative_cache: StdMutex::new(HashMap::new()),
             metrics: StdMutex::new(SyncRuntimeMetrics::default()),
             incremental_lock: Mutex::new(()),
-            backfill_lock: Mutex::new(()),
+            backfill_lock: Arc::new(Mutex::new(())),
             wake_notify: Notify::new(),
         })
     }
 
     pub fn notify_config_changed(&self) {
         self.wake_notify.notify_waiters();
-    }
-
-    fn check_negative_cache(&self, wid: WorkshopId, ttl_secs: u64) -> Option<WorkshopItemStatus> {
-        let now = Utc::now();
-        let guard = self.negative_cache.lock().unwrap();
-        let entry = guard.get(&wid)?;
-        if (now - entry.verified_at).num_seconds() < ttl_secs as i64 {
-            Some(entry.status)
-        } else {
-            None
-        }
-    }
-
-    fn put_negative_cache(&self, wid: WorkshopId, status: WorkshopItemStatus) {
-        let mut guard = self.negative_cache.lock().unwrap();
-        if guard.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
-            guard.clear();
-        }
-        guard.insert(
-            wid,
-            NegativeCacheEntry {
-                status,
-                verified_at: Utc::now(),
-            },
-        );
-    }
-
-    fn clear_negative_cache(&self, wid: WorkshopId) {
-        self.negative_cache.lock().unwrap().remove(&wid);
     }
 
     async fn db_call<T: Send + 'static>(
@@ -111,9 +99,19 @@ impl CatalogSyncCoordinator {
 
     /// 供 `GET /api/v1/items/{id}` 使用：解析单条工坊详情（支持 Read-Through、TTL 过期重刷与 `?refresh=true`）。
     pub async fn resolve_single_item(
-        &self,
+        self: &Arc<Self>,
         wid: WorkshopId,
         force_refresh: bool,
+    ) -> anyhow::Result<Option<WorkshopItemRecord>> {
+        self.resolve_single_until(wid, force_refresh, Instant::now() + PUBLIC_REFRESH_BUDGET)
+            .await
+    }
+
+    async fn resolve_single_until(
+        self: &Arc<Self>,
+        wid: WorkshopId,
+        force_refresh: bool,
+        deadline: Instant,
     ) -> anyhow::Result<Option<WorkshopItemRecord>> {
         let sync_cfg = self.config_store.get().sync;
         let cached = self.db_call(move |r| r.get_item(wid)).await?;
@@ -127,26 +125,21 @@ impl CatalogSyncCoordinator {
         } else if let Some(ref meta) = cached {
             is_stale(meta.last_verified_at, sync_cfg.item_ttl_secs)
         } else {
-            self.check_negative_cache(wid, sync_cfg.item_ttl_secs)
+            self.repo
+                .negative_status(wid, sync_cfg.item_ttl_secs)
                 .is_none()
         };
 
         if should_fetch {
-            if let Err(err) = self.singleflight_refresh(&[wid]).await {
-                if let Some(meta) = cached {
-                    tracing::warn!(
-                        workshop_id = %wid,
-                        error = %err,
-                        "Steam CM 上游刷新失败，回退返回本地已有缓存快照"
-                    );
-                    return Ok(Some(with_catalog_source(meta.record)));
-                }
-                if force_refresh {
+            let refresh = self.singleflight_refresh(&[wid], deadline).await;
+            let current = self.db_call(move |r| r.get_item(wid)).await?;
+            if let Err(err) = refresh {
+                tracing::warn!(workshop_id = %wid, error = %err, "Steam CM 上游刷新失败");
+                if force_refresh && current.is_none() {
                     return Err(err);
                 }
             }
-            let refreshed = self.db_call(move |r| r.get_item(wid)).await?;
-            return Ok(refreshed.map(|m| with_catalog_source(m.record)));
+            return Ok(current.map(|m| with_catalog_source(m.record)));
         }
 
         Ok(cached.map(|m| with_catalog_source(m.record)))
@@ -154,9 +147,19 @@ impl CatalogSyncCoordinator {
 
     /// 供 `POST /api/v1/items/batch` 使用：批量返回缓存条目，对过期或缺失条目自动合并 Singleflight 上游拉取。
     pub async fn resolve_batch(
-        &self,
+        self: &Arc<Self>,
         ids: &[WorkshopId],
         force_refresh: bool,
+    ) -> anyhow::Result<BatchItemsResponse> {
+        self.resolve_batch_until(ids, force_refresh, Instant::now() + PUBLIC_REFRESH_BUDGET)
+            .await
+    }
+
+    async fn resolve_batch_until(
+        self: &Arc<Self>,
+        ids: &[WorkshopId],
+        force_refresh: bool,
+        deadline: Instant,
     ) -> anyhow::Result<BatchItemsResponse> {
         if ids.is_empty() {
             return Ok(BatchItemsResponse {
@@ -185,7 +188,8 @@ impl CatalogSyncCoordinator {
                     }
                 } else if force_refresh
                     || self
-                        .check_negative_cache(*wid, sync_cfg.item_ttl_secs)
+                        .repo
+                        .negative_status(*wid, sync_cfg.item_ttl_secs)
                         .is_none()
                 {
                     to_refresh.push(*wid);
@@ -194,7 +198,7 @@ impl CatalogSyncCoordinator {
         }
 
         if !to_refresh.is_empty() {
-            if let Err(err) = self.singleflight_refresh(&to_refresh).await {
+            if let Err(err) = self.singleflight_refresh(&to_refresh, deadline).await {
                 tracing::warn!(error = %err, count = to_refresh.len(), "批量穿透刷新部分失败，回退使用本地缓存");
             }
         }
@@ -209,7 +213,7 @@ impl CatalogSyncCoordinator {
         let mut truly_missing = Vec::new();
         let now = Utc::now();
         for wid in still_missing {
-            if let Some(neg_status) = self.check_negative_cache(wid, sync_cfg.item_ttl_secs) {
+            if let Some(neg_status) = self.repo.negative_status(wid, sync_cfg.item_ttl_secs) {
                 items.push(WorkshopItemRecord {
                     workshop_id: wid,
                     file_type: WorkshopFileType::Item,
@@ -245,12 +249,12 @@ impl CatalogSyncCoordinator {
 
     /// 供 `GET /api/v1/collections/{id}` 使用：拉取合集并自动补全子条目详情。
     pub async fn resolve_collection(
-        &self,
+        self: &Arc<Self>,
         collection_id: WorkshopId,
         force_refresh: bool,
     ) -> anyhow::Result<Option<WorkshopCollectionRecord>> {
-        let _ = self
-            .resolve_single_item(collection_id, force_refresh)
+        let deadline = Instant::now() + PUBLIC_REFRESH_BUDGET;
+        self.resolve_single_until(collection_id, force_refresh, deadline)
             .await?;
         let col_opt = self
             .db_call(move |r| r.get_collection(collection_id))
@@ -260,7 +264,8 @@ impl CatalogSyncCoordinator {
         };
 
         if !col.child_ids.is_empty() {
-            let _ = self.resolve_batch(&col.child_ids, force_refresh).await?;
+            self.resolve_batch_until(&col.child_ids, force_refresh, deadline)
+                .await?;
             return self.db_call(move |r| r.get_collection(collection_id)).await;
         }
 
@@ -283,13 +288,12 @@ impl CatalogSyncCoordinator {
         }
 
         let outcomes = self.upstream.fetch_details(&deduped).await?;
-        self.apply_and_index_outcomes(&outcomes).await?;
 
         let mut child_ids = Vec::new();
         let mut removed_ids = Vec::new();
         let mut unavailable_ids = Vec::new();
-        for o in &outcomes {
-            match o {
+        for observation in &outcomes {
+            match &observation.outcome {
                 WorkshopFetchOutcome::Found { item } => {
                     if item.file_type == WorkshopFileType::Collection {
                         for cid in &item.collection_children {
@@ -308,9 +312,10 @@ impl CatalogSyncCoordinator {
             }
         }
 
+        self.apply_outcomes(outcomes).await?;
         if !child_ids.is_empty() {
             if let Ok(child_outcomes) = self.upstream.fetch_details(&child_ids).await {
-                let _ = self.apply_and_index_outcomes(&child_outcomes).await;
+                let _ = self.apply_outcomes(child_outcomes).await;
             }
         }
 
@@ -325,110 +330,105 @@ impl CatalogSyncCoordinator {
         })
     }
 
-    async fn singleflight_refresh(&self, ids: &[WorkshopId]) -> anyhow::Result<()> {
-        let mut leader_ids = Vec::new();
-        let mut leader_senders = Vec::new();
-        let mut follower_receivers = Vec::new();
-
+    async fn singleflight_refresh(
+        self: &Arc<Self>,
+        ids: &[WorkshopId],
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        let mut receivers = Vec::new();
+        let mut leaders = Vec::new();
         {
             let mut map = self.inflight.lock().await;
-            for wid in ids {
-                if let Some(tx) = map.get(wid) {
-                    follower_receivers.push(tx.subscribe());
+            for &wid in ids {
+                if let Some(rx) = map.get(&wid).filter(|rx| !rx.is_closed()) {
+                    receivers.push(rx.resubscribe());
                 } else {
-                    let (tx, _) = broadcast::channel(1);
-                    map.insert(*wid, tx.clone());
-                    leader_ids.push(*wid);
-                    leader_senders.push((*wid, tx));
+                    let (tx, rx) = broadcast::channel(1);
+                    receivers.push(rx.resubscribe());
+                    map.insert(wid, rx);
+                    leaders.push((wid, tx));
                 }
             }
         }
 
-        let mut leader_err: Option<anyhow::Error> = None;
-        if !leader_ids.is_empty() {
-            let res = async {
-                let outcomes = self.upstream.fetch_details(&leader_ids).await?;
-                self.apply_and_index_outcomes(&outcomes).await?;
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
+        for group in leaders.chunks(DETAILS_BATCH_SIZE) {
+            let coordinator = Arc::clone(self);
+            let group = group.to_vec();
+            // Apply successful chunks independently of other chunks and of the HTTP deadline.
+            tokio::spawn(async move {
+                let ids: Vec<_> = group.iter().map(|(wid, _)| *wid).collect();
+                let result = async {
+                    let outcomes = coordinator.upstream.fetch_details(&ids).await?;
+                    let verified: HashSet<_> =
+                        outcomes.iter().map(|o| o.outcome.workshop_id()).collect();
+                    coordinator.apply_outcomes(outcomes).await?;
+                    Ok::<_, anyhow::Error>(verified)
+                }
+                .await
+                .map_err(|err| err.to_string());
 
-            let broadcast_msg = match &res {
-                Ok(()) => Ok(()),
-                Err(e) => Err(e.to_string()),
-            };
-
-            {
-                let mut map = self.inflight.lock().await;
-                for (wid, tx) in leader_senders {
+                let mut map = coordinator.inflight.lock().await;
+                for (wid, sender) in group {
                     map.remove(&wid);
-                    let _ = tx.send(broadcast_msg.clone());
+                    let signal = match &result {
+                        Ok(verified) if verified.contains(&wid) => Ok(()),
+                        Ok(_) => Err(format!("Steam CM 未核验条目 {wid}")),
+                        Err(err) => Err(err.clone()),
+                    };
+                    let _ = sender.send(signal);
+                }
+            });
+        }
+        drop(leaders);
+
+        tokio::time::timeout_at(deadline, async {
+            let mut first_error = None;
+            for mut rx in receivers {
+                if let Err(message) = rx.recv().await? {
+                    first_error.get_or_insert_with(|| anyhow::Error::msg(message));
                 }
             }
-
-            if let Err(err) = res {
-                leader_err = Some(err);
-            }
-        }
-
-        for mut rx in follower_receivers {
-            if let Ok(Err(msg)) = rx.recv().await {
-                if leader_err.is_none() {
-                    leader_err = Some(anyhow::anyhow!(msg));
-                }
-            }
-        }
-
-        if let Some(err) = leader_err {
-            return Err(err);
-        }
-        Ok(())
+            first_error.map_or(Ok(()), Err)
+        })
+        .await?
     }
 
-    async fn apply_and_index_outcomes(
-        &self,
-        outcomes: &[WorkshopFetchOutcome],
-    ) -> anyhow::Result<u64> {
-        for o in outcomes {
-            match o {
-                WorkshopFetchOutcome::Found { item } => {
-                    self.clear_negative_cache(item.workshop_id);
-                }
-                WorkshopFetchOutcome::Removed { workshop_id, .. } => {
-                    self.put_negative_cache(*workshop_id, WorkshopItemStatus::Removed);
-                }
-                WorkshopFetchOutcome::PrivateOrUnavailable { workshop_id, .. } => {
-                    self.put_negative_cache(*workshop_id, WorkshopItemStatus::PrivateOrUnavailable);
-                }
-            }
-        }
-
-        let owned = outcomes.to_vec();
+    async fn apply_outcomes(&self, outcomes: Vec<WorkshopObservation>) -> anyhow::Result<u64> {
         let summary = self
-            .db_call(move |r| r.apply_upstream_outcomes(&owned))
+            .db_call(move |repo| repo.apply_upstream_outcomes(&outcomes))
             .await?;
-
-        if let Some(max_ts) = summary.max_time_updated {
-            let _ = self.advance_high_water_updated(max_ts).await;
-        }
         Ok(summary.active_upserted)
     }
 
-    async fn advance_high_water_updated(&self, candidate: i64) -> anyhow::Result<()> {
-        self.db_call(move |r| {
-            let prev = r
-                .get_sync_state(STATE_HIGH_WATER_UPDATED)?
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
-            if candidate > prev {
-                r.set_sync_state(STATE_HIGH_WATER_UPDATED, &candidate.to_string())?;
-            }
-            Ok(())
-        })
-        .await
+    async fn recheck_listings(
+        self: &Arc<Self>,
+        cursor: &mut Option<WorkshopId>,
+        ttl_secs: u64,
+    ) -> anyhow::Result<()> {
+        let after = *cursor;
+        let recheck_age = i64::try_from(ttl_secs - ttl_secs / 3).unwrap_or(i64::MAX);
+        let verified_before = Utc::now().timestamp().saturating_sub(recheck_age);
+        let ids = self
+            .db_call(move |repo| {
+                repo.listing_recheck_ids(after, verified_before, DETAILS_BATCH_SIZE)
+            })
+            .await?;
+        // Continue past failures so one inaccessible item never starves the rest of the cache.
+        *cursor = if ids.len() == DETAILS_BATCH_SIZE {
+            ids.last().copied()
+        } else {
+            None
+        };
+        self.singleflight_refresh(&ids, Instant::now() + PUBLIC_REFRESH_BUDGET)
+            .await
     }
 
-    pub async fn run_incremental_once(&self) -> anyhow::Result<u64> {
+    pub async fn run_incremental_once(self: &Arc<Self>) -> anyhow::Result<u64> {
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move { coordinator.run_incremental_job().await }).await?
+    }
+
+    async fn run_incremental_job(&self) -> anyhow::Result<u64> {
         let Ok(_guard) = self.incremental_lock.try_lock() else {
             return Ok(0);
         };
@@ -459,58 +459,73 @@ impl CatalogSyncCoordinator {
 
     async fn run_incremental_inner(&self) -> anyhow::Result<u64> {
         let sync_cfg = self.config_store.get().sync;
-        let prev_high_water = self
-            .db_call(|r| {
-                Ok(r.get_sync_state(STATE_HIGH_WATER_UPDATED)?
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(0))
-            })
-            .await?;
+        let mut scan = self.db_call(load_incremental_scan).await?;
+        let mut pending = scan.pending.take().unwrap_or(IncrementalPage {
+            cursor: "*".into(),
+            newest: None,
+        });
+        let mut total_upserted = 0;
 
-        let mut total_upserted = 0u64;
-        let mut cursor = "*".to_string();
-
-        for _ in 0..sync_cfg.incremental_pages_per_tick.clamp(1, 20) {
+        for _ in 0..sync_cfg.incremental_pages_per_tick {
             let page = self
                 .upstream
                 .query_files(
                     QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
                     MATCHING_FILE_TYPE_ITEMS,
-                    &cursor,
+                    &pending.cursor,
                     50,
                 )
                 .await?;
 
-            if page.total > 0 {
-                let total_str = page.total.to_string();
-                let _ = self
-                    .db_call(move |r| r.set_sync_state(STATE_REMOTE_WORKSHOP_TOTAL, &total_str))
-                    .await;
+            let page_newest = page
+                .outcomes
+                .iter()
+                .filter_map(|observation| match &observation.outcome {
+                    WorkshopFetchOutcome::Found { item } => item.time_updated,
+                    _ => None,
+                })
+                .max();
+            // Keep the scan's upper bound once observed so newer arrivals are revisited.
+            pending.newest = pending.newest.or(page_newest);
+            // Scan timestamp ties too, since an item's update timestamp has second precision.
+            let past_boundary = page_newest
+                .zip(scan.checkpoint)
+                .is_some_and(|(newest, checkpoint)| newest < checkpoint);
+
+            total_upserted += self.apply_outcomes(page.outcomes).await?;
+
+            let next = page.next_cursor.filter(|_| !past_boundary);
+            let stalled = next.as_ref() == Some(&pending.cursor);
+            let complete = next.is_none();
+            if complete {
+                scan.checkpoint = scan.checkpoint.max(pending.newest);
+            }
+            if let Some(next) = next.filter(|_| !stalled) {
+                scan.pending = Some(IncrementalPage {
+                    cursor: next,
+                    newest: pending.newest,
+                });
             }
 
-            if page.items.is_empty() {
-                break;
+            let value = serde_json::to_string(&scan)?;
+            self.db_call(move |r| {
+                if page.total > 0 {
+                    r.set_sync_states(&[
+                        (STATE_INCREMENTAL_SCAN, &value),
+                        (STATE_REMOTE_WORKSHOP_TOTAL, &page.total.to_string()),
+                    ])
+                } else {
+                    r.set_sync_state(STATE_INCREMENTAL_SCAN, &value)
+                }
+            })
+            .await?;
+            if stalled {
+                // Retry from the committed checkpoint on the next tick.
+                anyhow::bail!("Steam CM 增量同步游标未前进");
             }
-
-            let reached_known_waterline = prev_high_water > 0
-                && page
-                    .items
-                    .iter()
-                    .all(|i| i.time_updated.unwrap_or(0) <= prev_high_water);
-
-            let outcomes: Vec<WorkshopFetchOutcome> = page
-                .items
-                .into_iter()
-                .map(|item| WorkshopFetchOutcome::Found { item })
-                .collect();
-            total_upserted += self.apply_and_index_outcomes(&outcomes).await?;
-
-            if reached_known_waterline {
-                break;
-            }
-            match page.next_cursor {
-                Some(next) if next != cursor => cursor = next,
-                _ => break,
+            match scan.pending.take() {
+                Some(next) => pending = next,
+                None => break,
             }
         }
 
@@ -525,20 +540,18 @@ impl CatalogSyncCoordinator {
             )
             .await
         {
-            if !col_page.items.is_empty() {
-                let outcomes: Vec<WorkshopFetchOutcome> = col_page
-                    .items
-                    .into_iter()
-                    .map(|item| WorkshopFetchOutcome::Found { item })
-                    .collect();
-                total_upserted += self.apply_and_index_outcomes(&outcomes).await?;
-            }
+            total_upserted += self.apply_outcomes(col_page.outcomes).await?;
         }
 
         Ok(total_upserted)
     }
 
-    pub async fn run_backfill_step_once(&self) -> anyhow::Result<u64> {
+    pub async fn run_backfill_step_once(self: &Arc<Self>) -> anyhow::Result<u64> {
+        let coordinator = Arc::clone(self);
+        tokio::spawn(async move { coordinator.run_backfill_job().await }).await?
+    }
+
+    async fn run_backfill_job(&self) -> anyhow::Result<u64> {
         let Ok(_guard) = self.backfill_lock.try_lock() else {
             return Ok(0);
         };
@@ -600,18 +613,7 @@ impl CatalogSyncCoordinator {
                 .await;
         }
 
-        if page.items.is_empty() {
-            self.db_call(|r| r.set_sync_state(STATE_BACKFILL_CURSOR, "DONE"))
-                .await?;
-            return Ok(0);
-        }
-
-        let outcomes: Vec<WorkshopFetchOutcome> = page
-            .items
-            .into_iter()
-            .map(|item| WorkshopFetchOutcome::Found { item })
-            .collect();
-        let count = self.apply_and_index_outcomes(&outcomes).await?;
+        let count = self.apply_outcomes(page.outcomes).await?;
         let next_cursor = page
             .next_cursor
             .filter(|c| c != &cursor)
@@ -619,9 +621,10 @@ impl CatalogSyncCoordinator {
         let next_total = prev_total + count;
 
         self.db_call(move |r| {
-            r.set_sync_state(STATE_BACKFILL_CURSOR, &next_cursor)?;
-            r.set_sync_state(STATE_BACKFILL_SYNCED_TOTAL, &next_total.to_string())?;
-            Ok(())
+            r.set_sync_states(&[
+                (STATE_BACKFILL_CURSOR, &next_cursor),
+                (STATE_BACKFILL_SYNCED_TOTAL, &next_total.to_string()),
+            ])
         })
         .await?;
 
@@ -629,10 +632,13 @@ impl CatalogSyncCoordinator {
     }
 
     pub async fn reset_backfill_cursor(&self) -> anyhow::Result<()> {
-        self.db_call(|r| {
-            r.set_sync_state(STATE_BACKFILL_CURSOR, "*")?;
-            r.set_sync_state(STATE_BACKFILL_SYNCED_TOTAL, "0")?;
-            Ok(())
+        let guard = self.backfill_lock.clone().lock_owned().await;
+        self.db_call(move |r| {
+            let _guard = guard;
+            r.set_sync_states(&[
+                (STATE_BACKFILL_CURSOR, "*"),
+                (STATE_BACKFILL_SYNCED_TOTAL, "0"),
+            ])
         })
         .await
     }
@@ -641,9 +647,7 @@ impl CatalogSyncCoordinator {
         let cfg_dto = self.config_store.get().sync.to_dto();
         let (high_water, cursor, synced_total, remote_total) = self
             .db_call(|r| {
-                let hw = r
-                    .get_sync_state(STATE_HIGH_WATER_UPDATED)?
-                    .and_then(|v| v.parse::<i64>().ok());
+                let hw = load_incremental_scan(r)?.checkpoint;
                 let cur = r.get_sync_state(STATE_BACKFILL_CURSOR)?;
                 let synced = r
                     .get_sync_state(STATE_BACKFILL_SYNCED_TOTAL)?
@@ -681,6 +685,8 @@ impl CatalogSyncCoordinator {
                 .checked_sub(Duration::from_secs(3600))
                 .unwrap_or_else(tokio::time::Instant::now);
             let mut last_bf = last_inc;
+            let mut last_recheck = last_inc;
+            let mut recheck_cursor = None;
 
             loop {
                 let sync_cfg = coordinator.config_store.get().sync;
@@ -706,6 +712,18 @@ impl CatalogSyncCoordinator {
                     last_bf = tokio::time::Instant::now();
                 }
 
+                if sync_cfg.enable_incremental_sync
+                    && now.duration_since(last_recheck) >= LISTING_RECHECK_INTERVAL
+                {
+                    if let Err(err) = coordinator
+                        .recheck_listings(&mut recheck_cursor, sync_cfg.item_ttl_secs)
+                        .await
+                    {
+                        tracing::warn!(error = %err, "后台公开条目核验未完成");
+                    }
+                    last_recheck = tokio::time::Instant::now();
+                }
+
                 tokio::select! {
                     _ = child_token.cancelled() => break,
                     _ = coordinator.wake_notify.notified() => {},
@@ -719,12 +737,66 @@ impl CatalogSyncCoordinator {
 }
 
 fn is_stale(last_verified_at: DateTime<Utc>, ttl_secs: u64) -> bool {
-    (Utc::now() - last_verified_at).num_seconds() >= ttl_secs as i64
+    (Utc::now() - last_verified_at).num_seconds().max(0) as u64 >= ttl_secs
 }
 
-fn with_catalog_source(mut record: WorkshopItemRecord) -> WorkshopItemRecord {
+pub(crate) fn with_catalog_source(mut record: WorkshopItemRecord) -> WorkshopItemRecord {
     if record.source != MetadataSource::AdminOverride {
         record.source = MetadataSource::CatalogServer;
     }
     record
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CatalogConfig;
+    use crate::upstream::MockWorkshopUpstream;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn public_deadline_returns_cache_while_the_refresh_is_waiting_to_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(ServerRepo::open(&dir.path().join("catalog.db")).unwrap());
+        repo.with_transaction(|tx| {
+            tx.execute(
+                "INSERT INTO workshop_items
+                    (workshop_id, file_type, status, title, file_url, source, fetched_at, last_verified_at)
+                 VALUES (1, 'item', 'active', 'Map', 'cached-link', 'steam_kit', ?1, ?1)",
+                [Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        }).unwrap();
+        let coordinator = CatalogSyncCoordinator::new(
+            Arc::new(CatalogConfigStore::new(None, CatalogConfig::default())),
+            Arc::clone(&repo),
+            Arc::new(MockWorkshopUpstream::new()),
+        );
+
+        let (locked_tx, locked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let hold_writer = tokio::task::spawn_blocking(move || {
+            repo.with_transaction(|_| {
+                let _ = locked_tx.send(());
+                let _ = release_rx.blocking_recv();
+                Ok(())
+            })
+        });
+        locked_rx.await.unwrap();
+        let item = tokio::time::timeout(
+            Duration::from_secs(2),
+            coordinator.resolve_single_until(
+                WorkshopId(1),
+                true,
+                Instant::now() + Duration::from_millis(50),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(item.file_url.as_deref(), Some("cached-link"));
+        release_tx.send(()).unwrap();
+        hold_writer.await.unwrap().unwrap();
+    }
 }

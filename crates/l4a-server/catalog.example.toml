@@ -9,6 +9,8 @@ db_path = "./l4a-catalog.db"
 username = "admin"
 password = "replace-with-strong-admin-password"
 session_ttl_hours = 168
+# 仅在浏览器直接通过本地 HTTP 调试时设为 true。HTTPS 反代部署保持 false。
+allow_insecure_http = false
 
 [steam]
 # Left 4 Dead 2 AppID
@@ -21,10 +23,10 @@ guard_data_path = "./steam-guard.json"
 request_concurrency = 4
 
 [sync]
-# 客户端请求未命中或超过 TTL 时自动穿透向 Steam CM 拉取最新详情与直链
+# 客户端请求未命中或过期时按 ID 核验。过期活跃条目会暂时退出公开搜索。
 enable_read_through = true
 item_ttl_secs = 900
-# 定时按 RankedByLastUpdatedDate 增量拉取工坊更新，及时刷新组件更新后变化的 file_url
+# 定时拉取工坊增量更新，并按 ID 分批核验接近过期的公开缓存
 enable_incremental_sync = true
 incremental_interval_secs = 180
 incremental_pages_per_tick = 2

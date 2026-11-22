@@ -192,7 +192,7 @@ async fn resolver_merges_sdk_dependencies_with_web_api_file_url_and_skips_scrape
 }
 
 #[tokio::test]
-async fn catalog_backend_provider_resolves_zero_dep_item_without_falling_back_to_sdk() {
+async fn catalog_backend_accepts_legacy_sources_without_falling_back_to_sdk() {
     let catalog_app = Router::new().route(
         "/api/v1/items/batch",
         post(|| async {
@@ -204,6 +204,16 @@ async fn catalog_backend_provider_resolves_zero_dep_item_without_falling_back_to
                         "status": "active",
                         "title": "Standalone Skin",
                         "fileUrl": "https://cdn.steamusercontent.com/ugc/901/skin.vpk",
+                        "dependencies": [],
+                        "source": "user_contribution",
+                        "fetchedAt": "2026-11-21T00:00:00Z"
+                    },
+                    {
+                        "workshopId": "902",
+                        "fileType": "item",
+                        "status": "active",
+                        "title": "Current Catalog Item",
+                        "fileUrl": "https://cdn.steamusercontent.com/ugc/902/item.vpk",
                         "dependencies": [],
                         "source": "catalog_server",
                         "fetchedAt": "2026-11-21T00:00:00Z"
@@ -228,15 +238,19 @@ async fn catalog_backend_provider_resolves_zero_dep_item_without_falling_back_to
         SourceRoutingPolicy::default(),
     );
 
-    let (outcomes, warnings) = resolver
-        .fetch_items(&[WorkshopId::new(901).unwrap()])
-        .await
-        .unwrap();
+    let ids = [WorkshopId::new(901).unwrap(), WorkshopId::new(902).unwrap()];
+    let (outcomes, warnings) = resolver.fetch_items(&ids).await.unwrap();
     assert!(
         warnings.is_empty(),
         "Catalog hit with file_url and authoritative empty dependencies should not invoke SDK: {warnings:?}"
     );
-    assert_eq!(outcomes.len(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(WorkshopFetchOutcome::workshop_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
 }
 
 #[tokio::test]

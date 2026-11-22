@@ -6,7 +6,7 @@
 
 ## 1. 公开查询接口
 
-公开接口默认支持 Read-Through 穿透缓存：当本地未命中或超过 `sync.item_ttl_secs` 时，服务端会自动通过 SteamKit CM 拉取最新元数据与 `.vpk` 下载直链 (`fileUrl`)。
+按 ID 查询默认支持 Read-Through 穿透缓存。本地未命中或超过 `sync.item_ttl_secs` 时，服务端会通过 SteamKit CM 核验。一次公开请求最多等待刷新 10 秒，合集和子条目共享该预算。刷新失败或超时后会尽量返回已有缓存。
 
 ### `GET /api/v1/health`
 返回服务健康状态、缓存总条目数 (`items`) 与当前 Steam CM 连接状态 (`steamState`)。
@@ -27,6 +27,8 @@
 ### `GET /api/v1/items/search?q=&tag=&status=&sort=&page=1&pageSize=30`
 在本地 SQLite 缓存库中按标题/描述/ID、标签（大小写不敏感匹配）与状态 (`active` / `removed` / `private_or_unavailable`) 分页检索。`sort` 支持 `relevance`、`updated`、`updated_asc`、`newest`、`subscriptions`、`title`。
 
+搜索会排除未列出、尚未核验可见性和已过期的活跃条目。未列出的 Steam 条目仍可按 ID 查询。此前已确认公开的墓碑和管理员锁定的公开覆写可以继续显示。
+
 ### `GET /api/v1/collections/{collection_id}?refresh=false`
 查询合集元数据及其子条目明细（若目标或子条目缺失会自动穿透拉取并补全 `items`；若目标 ID 非合集类型返回 `404`）。
 
@@ -36,9 +38,11 @@
 
 管理接口支持 `HttpOnly` 会话 Cookie (`l4a_admin_session`)、`Authorization: Bearer <token>` 或 `X-Admin-Token: <admin_password>`。
 
+使用 Cookie 认证时，写请求须通过 `X-L4A-CSRF` 携带 `GET /api/v1/admin/auth/me` 返回的 `csrfToken`。CLI 可以继续使用显式凭证。
+
 - `POST /api/v1/admin/auth/login` — 验证 `{ "username", "password" }`，签发会话 Token 并写入 `HttpOnly; SameSite=Strict` Cookie
 - `POST /api/v1/admin/auth/logout` — 吊销当前会话并清除 Cookie
-- `GET /api/v1/admin/auth/me` — 查询当前登录态 (`{ "authenticated", "username", "expiresAt" }`)
+- `GET /api/v1/admin/auth/me` — 查询当前登录态。使用有效会话 Cookie 时返回该会话的 `csrfToken`
 - `POST /api/v1/admin/auth/password` — 修改管理员密码并自动写回 `catalog.toml`
 
 ---
@@ -65,6 +69,7 @@
 - `POST /api/v1/admin/steam/auth/anonymous` — 清除已绑定账号并切回匿名 CM 会话
 
 ### 单条目检视与人工覆写
+- `GET /api/v1/admin/items/search` — 使用公开搜索的参数查询完整管理缓存
 - `GET /api/v1/admin/items/{workshop_id}` — 查看条目完整缓存详情、覆写锁状态、墓碑时间与历史 `revisions`
 - `POST /api/v1/admin/items/{workshop_id}/refresh` — 强制从 Steam CM 重刷单条记录（若处于覆写锁定则返回 `409 Conflict`）
 - `POST /api/v1/admin/items/{workshop_id}/override` — 强制覆写并锁定条目状态、标题、备用 `fileUrl` 或前置依赖

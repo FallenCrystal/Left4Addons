@@ -17,7 +17,7 @@ use l4a_server::{
     config::{CatalogConfig, CatalogConfigStore},
     db::ServerRepo,
     upstream::{
-        MockWorkshopUpstream, WorkshopQueryPage, MATCHING_FILE_TYPE_ITEMS,
+        MockWorkshopUpstream, WorkshopObservation, WorkshopQueryPage, MATCHING_FILE_TYPE_ITEMS,
         QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE, QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
     },
     ServerState,
@@ -462,6 +462,10 @@ async fn collection_auto_hydration_and_catalog_backend_provider_roundtrip() {
         vec![WorkshopId(5001), WorkshopId(5002)]
     );
     assert_eq!(fetched_col.items.len(), 2);
+    assert!(fetched_col
+        .items
+        .iter()
+        .all(|item| item.source == MetadataSource::CatalogServer));
     assert_eq!(
         fetched_col.items[0].file_url.as_deref(),
         Some("https://cdn.steamusercontent.com/ugc/5001.vpk")
@@ -497,19 +501,25 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         WorkshopQueryPage {
             total: 2,
             next_cursor: None,
-            items: vec![
-                sample_item(
-                    7001,
-                    "Updated Map A",
-                    5500,
-                    Some("https://cdn.steamusercontent.com/ugc/7001.vpk"),
-                ),
-                sample_item(
-                    7002,
-                    "Updated Map B",
-                    5400,
-                    Some("https://cdn.steamusercontent.com/ugc/7002.vpk"),
-                ),
+            outcomes: vec![
+                WorkshopFetchOutcome::Found {
+                    item: sample_item(
+                        7001,
+                        "Updated Map A",
+                        5500,
+                        Some("https://cdn.steamusercontent.com/ugc/7001.vpk"),
+                    ),
+                }
+                .into(),
+                WorkshopFetchOutcome::Found {
+                    item: sample_item(
+                        7002,
+                        "Updated Map B",
+                        5400,
+                        Some("https://cdn.steamusercontent.com/ugc/7002.vpk"),
+                    ),
+                }
+                .into(),
             ],
         },
     );
@@ -520,12 +530,15 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         WorkshopQueryPage {
             total: 2,
             next_cursor: Some("cursor_page_2".into()),
-            items: vec![sample_item(
-                7003,
-                "Backfill Item",
-                4000,
-                Some("https://cdn.steamusercontent.com/ugc/7003.vpk"),
-            )],
+            outcomes: vec![WorkshopFetchOutcome::Found {
+                item: sample_item(
+                    7003,
+                    "Backfill Item",
+                    4000,
+                    Some("https://cdn.steamusercontent.com/ugc/7003.vpk"),
+                ),
+            }
+            .into()],
         },
     );
 
@@ -560,6 +573,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         .to_str()
         .unwrap();
     assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("; Secure"));
     let cookie_pair = set_cookie.split(';').next().unwrap();
 
     let (status, me_bytes) = json_request(
@@ -574,6 +588,17 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
     let me: AdminSessionInfo = serde_json::from_slice(&me_bytes).unwrap();
     assert!(me.authenticated);
     assert_eq!(me.username.as_deref(), Some("admin"));
+
+    let csrf_token = me.csrf_token.as_deref().unwrap();
+    let cookie_write = vec![("Cookie", cookie_pair), ("X-L4A-CSRF", csrf_token)];
+    for headers in [
+        vec![("Cookie", cookie_pair)],
+        vec![("Cookie", cookie_pair), ("X-L4A-CSRF", "wrong-token")],
+    ] {
+        let (status, _) =
+            json_request(&app, "POST", "/api/v1/admin/sync/trigger", headers, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
 
     // 4. Update sync config & trigger incremental + backfill sync
     let bearer = format!("Bearer {}", login_resp.token);
@@ -603,7 +628,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         &app,
         "POST",
         "/api/v1/admin/sync/trigger",
-        vec![("Cookie", cookie_pair)],
+        cookie_write.clone(),
         None,
     )
     .await;
@@ -637,7 +662,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         &app,
         "POST",
         "/api/v1/admin/steam/auth/qr/start",
-        vec![("Cookie", cookie_pair)],
+        cookie_write.clone(),
         None,
     )
     .await;
@@ -650,7 +675,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         &app,
         "POST",
         "/api/v1/admin/steam/auth/credentials",
-        vec![("Cookie", cookie_pair)],
+        cookie_write.clone(),
         Some(json!({ "accountName": "valve_bot", "password": "secret" })),
     )
     .await;
@@ -662,7 +687,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         &app,
         "POST",
         "/api/v1/admin/steam/auth/guard",
-        vec![("Cookie", cookie_pair)],
+        cookie_write.clone(),
         Some(json!({ "flowId": cred_flow.flow_id, "code": "A1B2C" })),
     )
     .await;
@@ -676,7 +701,7 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
         &app,
         "POST",
         "/api/v1/admin/auth/password",
-        vec![("Cookie", cookie_pair)],
+        cookie_write.clone(),
         Some(json!({
             "currentPassword": initial_password,
             "newPassword": "updated-super-strong-pass"
@@ -701,4 +726,589 @@ async fn admin_session_toml_config_incremental_backfill_and_steam_auth_flows_wor
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[test]
+fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    {
+        let repo = ServerRepo::open(&path).unwrap();
+        let mut override_item = sample_item(8001, "Legacy override", 100, None);
+        override_item.source = MetadataSource::AdminOverride;
+        repo.upsert_item(&override_item, true, true).unwrap();
+        let mut private = sample_item(
+            8003,
+            "Account only",
+            100,
+            Some("https://example.test/private"),
+        );
+        private.status = WorkshopItemStatus::PrivateOrUnavailable;
+        repo.upsert_item(&private, false, true).unwrap();
+    }
+
+    // Reproduce the previous release's constrained revision column and missing lock column.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_revisions_wid;
+         ALTER TABLE workshop_item_revisions RENAME TO revision_fixture;
+         CREATE TABLE workshop_item_revisions (
+             id INTEGER PRIMARY KEY AUTOINCREMENT, workshop_id INTEGER NOT NULL,
+             status TEXT NOT NULL, title TEXT NOT NULL, time_updated INTEGER,
+             dependencies_json TEXT NOT NULL, source TEXT NOT NULL,
+             trust_score INTEGER NOT NULL, recorded_at TEXT NOT NULL
+         );
+         INSERT INTO workshop_item_revisions
+             SELECT id, workshop_id, status, title, time_updated, dependencies_json,
+                    source, 60, recorded_at
+             FROM revision_fixture;
+         DROP TABLE revision_fixture;
+         CREATE INDEX idx_revisions_wid ON workshop_item_revisions(workshop_id, id DESC);
+         ALTER TABLE workshop_items DROP COLUMN is_admin_override;
+         ALTER TABLE workshop_items DROP COLUMN previews_json;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let repo = ServerRepo::open(&path).unwrap();
+    let outcome = |id| {
+        WorkshopObservation::from(WorkshopFetchOutcome::Found {
+            item: sample_item(id, "Steam update", 200, None),
+        })
+    };
+    let summary = repo
+        .apply_upstream_outcomes(&[outcome(8001), outcome(8002)])
+        .unwrap();
+    assert_eq!(summary.skipped_overrides, 1);
+    assert_eq!(summary.active_upserted, 1);
+
+    let stored = repo.get_item(WorkshopId(8001)).unwrap().unwrap();
+    assert!(stored.is_admin_override);
+    assert_eq!(stored.record.title, "Legacy override");
+    let historical = repo.list_revisions(WorkshopId(8001)).unwrap();
+    assert_eq!(historical.len(), 1);
+    assert_eq!(historical[0].title, "Legacy override");
+    let private = repo.get_item(WorkshopId(8003)).unwrap().unwrap().record;
+    assert_eq!(private.status, WorkshopItemStatus::PrivateOrUnavailable);
+    assert_eq!(private.title, "Workshop #8003");
+    assert!(private.file_url.is_none());
+    let written = repo.list_revisions(WorkshopId(8002)).unwrap();
+    assert_eq!(written.len(), 1);
+    assert!(written[0].id > historical[0].id);
+}
+
+#[tokio::test]
+async fn incremental_checkpoint_resumes_after_restart_and_ignores_read_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.db");
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let mut config = CatalogConfig::default();
+    config.sync.incremental_pages_per_tick = 1;
+    let store = Arc::new(CatalogConfigStore::new(None, config));
+    let open = || {
+        ServerState::with_components(
+            store.clone(),
+            Arc::new(ServerRepo::open(&path).unwrap()),
+            upstream.clone(),
+        )
+    };
+    let page = |id, updated, next: Option<&str>| WorkshopQueryPage {
+        total: 4,
+        next_cursor: next.map(str::to_owned),
+        outcomes: vec![WorkshopFetchOutcome::Found {
+            item: sample_item(id, "Incremental item", updated, None),
+        }
+        .into()],
+    };
+    let install = |cursor, page| {
+        upstream.insert_query_page(
+            QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
+            MATCHING_FILE_TYPE_ITEMS,
+            cursor,
+            page,
+        );
+    };
+
+    let state = open();
+    install("*", page(8101, 100, None));
+    state.sync.run_incremental_once().await.unwrap();
+    assert_eq!(
+        state.sync.status().await.unwrap().high_water_time_updated,
+        Some(100)
+    );
+
+    upstream.insert_item(sample_item(8102, "Read through", 999, None));
+    state
+        .sync
+        .resolve_single_item(WorkshopId(8102), false)
+        .await
+        .unwrap();
+    install("*", page(8103, 300, Some("next")));
+    install("next", page(8104, 200, Some("boundary")));
+    install("boundary", page(8105, 50, Some("older")));
+
+    state.sync.run_incremental_once().await.unwrap();
+    assert_eq!(
+        state.sync.status().await.unwrap().high_water_time_updated,
+        Some(100)
+    );
+    drop(state);
+
+    let state = open();
+    state.sync.run_incremental_once().await.unwrap();
+    assert!(state.repo.get_item(WorkshopId(8104)).unwrap().is_some());
+    assert_eq!(
+        state.sync.status().await.unwrap().high_water_time_updated,
+        Some(100)
+    );
+    state.sync.run_incremental_once().await.unwrap();
+    assert_eq!(
+        state.sync.status().await.unwrap().high_water_time_updated,
+        Some(300)
+    );
+}
+
+#[tokio::test]
+async fn config_write_failure_preserves_password_settings_and_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog.toml");
+    std::fs::create_dir(&path).unwrap();
+    let mut config = CatalogConfig::default();
+    config.admin.password = "old-password".into();
+    let store = Arc::new(CatalogConfigStore::new(Some(path.clone()), config));
+    let state = ServerState::with_components(
+        store.clone(),
+        Arc::new(ServerRepo::open_in_memory().unwrap()),
+        Arc::new(MockWorkshopUpstream::new()),
+    );
+    let app = build_router(state.clone());
+
+    let old_interval = store.get().sync.incremental_interval_secs;
+    assert!(store
+        .update(|cfg| cfg.sync.incremental_interval_secs = 321)
+        .is_err());
+    assert_eq!(store.get().sync.incremental_interval_secs, old_interval);
+    let other_session = state.auth.login("admin", "old-password").unwrap();
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/auth/password",
+        vec![("X-Admin-Token", "old-password")],
+        Some(json!({"currentPassword": "old-password", "newPassword": "new-password"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(store.get().admin.password, "old-password");
+    assert!(state.auth.login("admin", "old-password").is_ok());
+    assert!(state.auth.login("admin", "new-password").is_err());
+    let (status, _) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/stats",
+        vec![("X-Admin-Token", &other_session.token)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn restricted_details_stay_out_of_public_item_and_search_responses() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state = ServerState::in_memory_with_upstream("admin-password", upstream.clone()).unwrap();
+    let app = build_router(state.clone());
+    let public = sample_item(8201, "Public title", 100, None);
+    state.repo.upsert_item(&public, false, true).unwrap();
+
+    let mut private = sample_item(
+        8201,
+        "Account only",
+        200,
+        Some("https://example.test/private"),
+    );
+    private.status = WorkshopItemStatus::PrivateOrUnavailable;
+    upstream.insert_item(private);
+    let (status, bytes) =
+        json_request(&app, "GET", "/api/v1/items/8201?refresh=true", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item: WorkshopItemRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(item.status, WorkshopItemStatus::PrivateOrUnavailable);
+    assert_eq!(item.source, MetadataSource::CatalogServer);
+    assert_eq!(item.title, "Workshop #8201");
+    assert!(item.file_url.is_none());
+    assert!(item.preview_url.is_none());
+
+    let (status, bytes) =
+        json_request(&app, "GET", "/api/v1/items/search?q=8201", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let results: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(results.items.len(), 1);
+    assert_eq!(results.items[0].source, MetadataSource::CatalogServer);
+    assert_eq!(results.items[0].title, "Workshop #8201");
+}
+
+#[tokio::test]
+async fn cancelling_refresh_request_does_not_strand_singleflight() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Arc::new(ServerRepo::open(&dir.path().join("catalog.db")).unwrap());
+    let store = Arc::new(CatalogConfigStore::new(None, CatalogConfig::default()));
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let wid = WorkshopId(8301);
+    upstream.insert_item(sample_item(wid.as_u64(), "Refresh item", 100, None));
+    let state = ServerState::with_components(store, repo.clone(), upstream.clone());
+
+    // Hold the writer so the refresh is in flight when its originating request is aborted.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let hold_writer = tokio::task::spawn_blocking(move || {
+        repo.with_transaction(|_| {
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.blocking_recv();
+            Ok(())
+        })
+    });
+    locked_rx.await.unwrap();
+    let sync = state.sync.clone();
+    let leader = tokio::spawn(async move { sync.resolve_single_item(wid, false).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while upstream.fetch_count(wid) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    leader.abort();
+    assert!(leader.await.unwrap_err().is_cancelled());
+    release_tx.send(()).unwrap();
+    hold_writer.await.unwrap().unwrap();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.sync.resolve_single_item(wid, true),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.workshop_id, wid);
+}
+
+#[test]
+fn rejects_old_steam_versions_and_observations_after_a_tombstone() {
+    let repo = ServerRepo::open(std::path::Path::new(":memory:")).unwrap();
+    let now = Utc::now();
+    let wid = WorkshopId(8401);
+    let found = |wid: WorkshopId, ver, offset| {
+        let mut item = sample_item(
+            wid.as_u64(),
+            "Public map",
+            ver,
+            Some(if ver == 200 {
+                "https://example.test/v2.vpk"
+            } else {
+                "https://example.test/v1.vpk"
+            }),
+        );
+        item.fetched_at = now + chrono::Duration::seconds(offset);
+        WorkshopObservation::from(WorkshopFetchOutcome::Found { item })
+    };
+    let private = |wid, offset| {
+        WorkshopObservation::from(WorkshopFetchOutcome::PrivateOrUnavailable {
+            workshop_id: wid,
+            source: MetadataSource::SteamKit,
+            observed_at: now + chrono::Duration::seconds(offset),
+            reason: None,
+        })
+    };
+
+    let initial = found(wid, 200, 0);
+    repo.apply_upstream_outcomes(&[initial]).unwrap();
+    let summary = repo
+        .apply_upstream_outcomes(&[found(wid, 100, 1), private(wid, -1)])
+        .unwrap();
+    assert_eq!(summary.skipped_stale, 2);
+    let current = repo.get_item(wid).unwrap().unwrap();
+    assert_eq!(current.last_verified_at, now);
+    assert_eq!(
+        current.record.file_url.as_deref(),
+        Some("https://example.test/v2.vpk")
+    );
+    assert_eq!(current.record.time_updated, Some(200));
+
+    repo.apply_upstream_outcomes(&[private(wid, 2)]).unwrap();
+    let summary = repo
+        .apply_upstream_outcomes(&[found(wid, 200, 1), found(wid, 100, 3)])
+        .unwrap();
+    assert_eq!(summary.skipped_stale, 2);
+    let current = repo.get_item(wid).unwrap().unwrap().record;
+    assert_eq!(current.status, WorkshopItemStatus::PrivateOrUnavailable);
+    assert!(current.file_url.is_none());
+
+    let unknown = WorkshopId(8402);
+    repo.apply_upstream_outcomes(&[private(unknown, 2)])
+        .unwrap();
+    repo.apply_upstream_outcomes(&[found(unknown, 200, 1)])
+        .unwrap();
+    assert!(repo.get_item(unknown).unwrap().is_none());
+
+    repo.apply_upstream_outcomes(&[found(wid, 200, 4)]).unwrap();
+    assert_eq!(
+        repo.get_item(wid).unwrap().unwrap().record.status,
+        WorkshopItemStatus::Active
+    );
+}
+
+#[test]
+fn empty_steam_gallery_replaces_cached_previews_and_dependency_order_is_ignored() {
+    let repo = ServerRepo::open_in_memory().unwrap();
+    let mut item = sample_item(8451, "Map", 200, None);
+    item.dependencies = [8481, 8471]
+        .into_iter()
+        .map(|id| WorkshopDependency {
+            workshop_id: WorkshopId(id),
+            title: None,
+            required: true,
+        })
+        .collect();
+    let wid = item.workshop_id;
+    let observation = |item| WorkshopObservation::from(WorkshopFetchOutcome::Found { item });
+    repo.apply_upstream_outcomes(&[observation(item.clone())])
+        .unwrap();
+    assert_eq!(
+        repo.get_item(wid).unwrap().unwrap().record.previews.len(),
+        1
+    );
+
+    item.fetched_at += chrono::Duration::milliseconds(1);
+    repo.apply_upstream_outcomes(&[observation(item.clone())])
+        .unwrap();
+    assert_eq!(repo.list_revisions(wid).unwrap().len(), 1);
+
+    item.fetched_at += chrono::Duration::milliseconds(1);
+    item.time_updated = Some(300);
+    item.previews.clear();
+    repo.apply_upstream_outcomes(&[observation(item)]).unwrap();
+    assert!(repo
+        .get_item(wid)
+        .unwrap()
+        .unwrap()
+        .record
+        .previews
+        .is_empty());
+    assert_eq!(repo.list_revisions(wid).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn search_excludes_expired_and_unlisted_rows_but_direct_lookups_still_work() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.sync.enable_read_through = false)
+        .unwrap();
+    let app = build_router(state.clone());
+
+    let expired = WorkshopItemRecord {
+        fetched_at: Utc::now() - chrono::Duration::hours(2),
+        ..sample_item(
+            8501,
+            "Map expired",
+            100,
+            Some("https://example.test/old.vpk"),
+        )
+    };
+    state.repo.upsert_item(&expired, false, true).unwrap();
+    state
+        .repo
+        .upsert_item(&sample_item(8502, "Map listed", 200, None), false, true)
+        .unwrap();
+    upstream.insert_outcome(
+        WorkshopId(8503),
+        WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found {
+                item: sample_item(
+                    8503,
+                    "Map unlisted",
+                    300,
+                    Some("https://example.test/unlisted.vpk"),
+                ),
+            },
+            listed: false,
+        },
+    );
+
+    for id in [8501, 8503] {
+        let suffix = if id == 8503 { "?refresh=true" } else { "" };
+        let (status, data) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/items/{id}{suffix}"),
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let item: WorkshopItemRecord = serde_json::from_slice(&data).unwrap();
+        assert!(item.file_url.is_some());
+    }
+
+    let (status, data) = json_request(
+        &app,
+        "GET",
+        "/api/v1/items/search?q=map&pageSize=1",
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items: SearchResponse = serde_json::from_slice(&data).unwrap();
+    assert_eq!(items.total, 1);
+    assert_eq!(items.items[0].workshop_id, WorkshopId(8502));
+
+    let (status, data) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/items/search?q=map",
+        vec![("X-Admin-Token", "test-admin-password")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items: SearchResponse = serde_json::from_slice(&data).unwrap();
+    assert_eq!(items.total, 3);
+
+    upstream.insert_outcome(
+        WorkshopId(8501),
+        WorkshopFetchOutcome::PrivateOrUnavailable {
+            workshop_id: WorkshopId(8501),
+            source: MetadataSource::SteamKit,
+            observed_at: Utc::now(),
+            reason: None,
+        },
+    );
+    let workers = state.sync.spawn_background_workers();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let item = state
+                .repo
+                .get_item(WorkshopId(8501))
+                .unwrap()
+                .unwrap()
+                .record;
+            if item.status == WorkshopItemStatus::PrivateOrUnavailable {
+                assert!(item.file_url.is_none());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    workers.cancel();
+}
+
+#[tokio::test]
+async fn private_dependency_titles_are_removed_from_public_parents() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    let app = build_router(state.clone());
+    state
+        .repo
+        .upsert_item(
+            &sample_item(8601, "Dependency title", 100, None),
+            false,
+            true,
+        )
+        .unwrap();
+    let mut parent = sample_item(8602, "Parent", 200, None);
+    parent.dependencies = vec![WorkshopDependency {
+        workshop_id: WorkshopId(8601),
+        title: None,
+        required: true,
+    }];
+    state.repo.upsert_item(&parent, false, true).unwrap();
+    assert_eq!(
+        state
+            .repo
+            .get_item(WorkshopId(8602))
+            .unwrap()
+            .unwrap()
+            .record
+            .dependencies[0]
+            .title
+            .as_deref(),
+        Some("Dependency title")
+    );
+
+    upstream.insert_outcome(
+        WorkshopId(8601),
+        WorkshopFetchOutcome::PrivateOrUnavailable {
+            workshop_id: WorkshopId(8601),
+            source: MetadataSource::SteamKit,
+            observed_at: Utc::now(),
+            reason: None,
+        },
+    );
+    state
+        .sync
+        .resolve_single_item(WorkshopId(8601), true)
+        .await
+        .unwrap();
+    let title: Option<String> = state.repo.with_transaction(|tx| Ok(tx.query_row(
+        "SELECT dep_title FROM workshop_item_dependencies WHERE parent_workshop_id = 8602 AND dep_workshop_id = 8601",
+        [], |row| row.get(0),
+    )?)).unwrap();
+    assert!(title.is_none());
+
+    upstream.insert_item(parent);
+    let (status, data) =
+        json_request(&app, "GET", "/api/v1/items/8602?refresh=true", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let item: WorkshopItemRecord = serde_json::from_slice(&data).unwrap();
+    assert_eq!(item.dependencies[0].workshop_id, WorkshopId(8601));
+    assert!(item.dependencies[0].title.is_none());
+}
+
+#[tokio::test]
+async fn batch_keeps_successful_chunks_and_falls_back_only_for_failed_ids() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    let app = build_router(state.clone());
+    for id in 1..=100 {
+        upstream.insert_item(sample_item(id, "Fetched map", 200, None));
+    }
+    state
+        .repo
+        .upsert_item(
+            &sample_item(
+                101,
+                "Cached map",
+                100,
+                Some("https://example.test/cached.vpk"),
+            ),
+            false,
+            true,
+        )
+        .unwrap();
+    upstream.fail_details_containing(WorkshopId(102));
+    let ids: Vec<_> = (1..=102).map(|id| id.to_string()).collect();
+    let (status, data) = json_request(
+        &app,
+        "POST",
+        "/api/v1/items/batch",
+        vec![],
+        Some(json!({ "ids": ids, "forceRefresh": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let batch: BatchItemsResponse = serde_json::from_slice(&data).unwrap();
+    assert_eq!(batch.items.len(), 101);
+    assert_eq!(
+        batch.items[100].file_url.as_deref(),
+        Some("https://example.test/cached.vpk")
+    );
+    assert_eq!(batch.missing_ids, vec![WorkshopId(102)]);
 }

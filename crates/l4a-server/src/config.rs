@@ -1,3 +1,4 @@
+use crate::credentials::write_private_file;
 use l4a_protocol::{CatalogSyncConfigDto, SteamAuthMode};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -35,6 +36,7 @@ pub struct AdminSection {
     pub username: String,
     pub password: String,
     pub session_ttl_hours: u64,
+    pub allow_insecure_http: bool,
 }
 
 impl Default for AdminSection {
@@ -43,6 +45,7 @@ impl Default for AdminSection {
             username: "admin".to_string(),
             password: generate_initial_password(),
             session_ttl_hours: 168,
+            allow_insecure_http: false,
         }
     }
 }
@@ -132,14 +135,26 @@ pub fn generate_initial_password() -> String {
 }
 
 impl CatalogConfig {
-    /// 读取 `catalog.toml`；若不存在则自动初始化并写入带随机管理员密码的默认配置文件。
-    /// 返回 `(config, created_new_file)`。
+    /// 读取或初始化配置。返回值中的布尔值表示是否生成并保存了初始管理员密码。
     pub fn load_or_init(path: &Path) -> anyhow::Result<(Self, bool)> {
         if path.exists() {
             let raw = fs::read_to_string(path)?;
-            let mut parsed: Self = toml::from_str(&raw)?;
+            let mut document: toml::Table = toml::from_str(&raw)?;
+            let mut parsed: Self = toml::Value::Table(document.clone()).try_into()?;
             parsed.normalize();
-            Ok((parsed, false))
+            let admin = document
+                .entry("admin")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            // Deserializing the config above already rejects a non-table [admin].
+            let admin = admin
+                .as_table_mut()
+                .ok_or_else(|| anyhow::anyhow!("admin 必须为 TOML 表"))?;
+            let generated_password = !admin.contains_key("password");
+            if generated_password {
+                admin.insert("password".into(), parsed.admin.password.clone().into());
+                write_private_file(path, toml::to_string_pretty(&document)?.as_bytes())?;
+            }
+            Ok((parsed, generated_password))
         } else {
             let mut default_cfg = Self::default();
             default_cfg.normalize();
@@ -165,23 +180,11 @@ impl CatalogConfig {
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
         let body = format!(
             "# Left4Addons Catalog Server 配置文件\n# 修改将由控制台自动持久化，也可手动编辑后重启服务。\n\n{}",
             toml::to_string_pretty(self)?
         );
-        let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, body)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp_path, path)?;
+        write_private_file(path, body.as_bytes())?;
         Ok(())
     }
 }
@@ -209,11 +212,43 @@ impl CatalogConfigStore {
 
     pub fn update(&self, f: impl FnOnce(&mut CatalogConfig)) -> anyhow::Result<CatalogConfig> {
         let mut guard = self.inner.write().unwrap();
-        f(&mut guard);
-        guard.normalize();
+        let mut next = guard.clone();
+        f(&mut next);
+        next.normalize();
         if let Some(ref path) = self.path {
-            guard.save_to(path)?;
+            next.save_to(path)?;
         }
-        Ok(guard.clone())
+        *guard = next.clone();
+        Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds_and_persists_missing_admin_password_in_existing_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.toml");
+        fs::write(&path, "[server]\nbind = '127.0.0.1:9555'\n[admin]\nusername = 'operator'\n[custom]\nkeep = 'yes'\n").unwrap();
+        let (first, generated) = CatalogConfig::load_or_init(&path).unwrap();
+        assert!(generated);
+        let (second, generated) = CatalogConfig::load_or_init(&path).unwrap();
+        assert!(!generated);
+        assert_eq!(first.admin.password, second.admin.password);
+        assert!(!second.admin.password.is_empty());
+        assert_eq!(second.admin.username, "operator");
+        assert_eq!(second.server.bind, "127.0.0.1:9555");
+        let document: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(document["custom"]["keep"].as_str(), Some("yes"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

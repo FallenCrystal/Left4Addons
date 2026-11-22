@@ -1,11 +1,16 @@
 use crate::auth::{build_clear_session_cookie, build_session_cookie};
 use crate::db::ServerRepo;
+use crate::sync::with_catalog_source;
 use crate::web_assets;
 use crate::ServerState;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    extract::{Path, Query, Request, State},
+    http::{
+        header::{CACHE_CONTROL, SET_COOKIE},
+        HeaderMap, HeaderValue, StatusCode,
+    },
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
@@ -52,6 +57,7 @@ impl RouteState {
 }
 
 pub fn router(state: ServerState) -> Router {
+    let state = RouteState { server: state };
     let public_routes = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/items/search", get(search_items))
@@ -102,6 +108,7 @@ pub fn router(state: ServerState) -> Router {
             "/api/v1/admin/steam/auth/anonymous",
             post(admin_steam_switch_anonymous),
         )
+        .route("/api/v1/admin/items/search", get(admin_search_items))
         .route(
             "/api/v1/admin/items/{workshop_id}",
             get(admin_get_item_detail),
@@ -113,16 +120,44 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/v1/admin/items/{workshop_id}/override",
             post(admin_override_item).delete(admin_clear_item_override),
-        );
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_admin_api,
+        ));
 
     Router::new()
         .merge(public_routes)
         .merge(admin_routes)
-        .with_state(RouteState { server: state })
+        .with_state(state)
         .layer(TraceLayer::new_for_http())
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
+
+async fn guard_admin_api(
+    State(state): State<RouteState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let is_admin_api = request.uri().path().starts_with("/api/v1/admin/");
+    if is_admin_api
+        && !request.method().is_safe()
+        && !state.server.auth.allows_admin_write(request.headers())
+    {
+        return Err(err_resp(
+            StatusCode::FORBIDDEN,
+            "管理员会话缺少有效的 CSRF 凭证",
+        ));
+    }
+    let mut response = next.run(request).await;
+    if is_admin_api {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    Ok(response)
+}
 
 fn err_resp(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Value>) {
     (status, Json(json!({ "error": message.into() })))
@@ -200,20 +235,43 @@ struct SearchParams {
     page_size: Option<u32>,
 }
 
+impl From<SearchParams> for SearchQuery {
+    fn from(params: SearchParams) -> Self {
+        Self {
+            query: params.q,
+            tag: params.tag,
+            status: params.status,
+            sort: params.sort,
+            page: params.page.unwrap_or(1),
+            page_size: params.page_size.unwrap_or(30),
+        }
+    }
+}
+
 async fn search_items(
     State(state): State<RouteState>,
     Query(params): Query<SearchParams>,
 ) -> ApiResult<SearchResponse> {
-    let q = SearchQuery {
-        query: params.q,
-        tag: params.tag,
-        status: params.status,
-        sort: params.sort,
-        page: params.page.unwrap_or(1),
-        page_size: params.page_size.unwrap_or(30),
-    };
-    let res = state.db(move |repo| repo.search(&q)).await?;
+    let q = SearchQuery::from(params);
+    let ttl = state.server.config_store.get().sync.item_ttl_secs;
+    let verified_since = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
+    let mut res = state
+        .db(move |repo| repo.search(&q, Some(verified_since)))
+        .await?;
+    res.items = res.items.into_iter().map(with_catalog_source).collect();
     Ok(Json(res))
+}
+
+async fn admin_search_items(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> ApiResult<SearchResponse> {
+    state.require_admin(&headers)?;
+    let q = SearchQuery::from(params);
+    Ok(Json(state.db(move |repo| repo.search(&q, None)).await?))
 }
 
 async fn get_collection(
@@ -223,13 +281,14 @@ async fn get_collection(
 ) -> ApiResult<WorkshopCollectionRecord> {
     let cid = WorkshopId::from_str(&collection_id)
         .map_err(|e| err_resp(StatusCode::BAD_REQUEST, e.to_string()))?;
-    let col = state
+    let mut col = state
         .server
         .sync
         .resolve_collection(cid, query.refresh)
         .await
         .map_err(internal_err)?
         .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, format!("未找到合集 {cid}")))?;
+    col.items = col.items.into_iter().map(with_catalog_source).collect();
     Ok(Json(col))
 }
 
@@ -242,7 +301,8 @@ async fn admin_login(
         .auth
         .login(&req.username, &req.password)
         .map_err(|(c, m)| err_resp(c, m))?;
-    let cookie = build_session_cookie(&session.token, state.server.auth.session_ttl_secs());
+    let secure = !state.server.config_store.get().admin.allow_insecure_http;
+    let cookie = build_session_cookie(&session.token, state.server.auth.session_ttl_secs(), secure);
     let mut headers = HeaderMap::new();
     if let Ok(val) = HeaderValue::from_str(&cookie) {
         headers.insert(SET_COOKIE, val);
@@ -253,7 +313,8 @@ async fn admin_login(
 async fn admin_logout(State(state): State<RouteState>, headers: HeaderMap) -> impl IntoResponse {
     state.server.auth.logout(&headers);
     let mut resp_headers = HeaderMap::new();
-    if let Ok(val) = HeaderValue::from_str(&build_clear_session_cookie()) {
+    let secure = !state.server.config_store.get().admin.allow_insecure_http;
+    if let Ok(val) = HeaderValue::from_str(&build_clear_session_cookie(secure)) {
         resp_headers.insert(SET_COOKIE, val);
     }
     (resp_headers, Json(json!({ "ok": true })))
@@ -272,20 +333,29 @@ async fn admin_change_password(
     Json(req): Json<AdminChangePasswordRequest>,
 ) -> ApiResult<Value> {
     let actor = state.require_admin(&headers)?;
-    let new_pw = req.new_password.trim().to_string();
     state
         .server
         .auth
-        .change_password(&req.current_password, &new_pw, &headers)
+        .change_password(
+            &req.current_password,
+            &req.new_password,
+            &headers,
+            |password| {
+                state
+                    .server
+                    .config_store
+                    .update(|cfg| cfg.admin.password = password.to_owned())
+                    .map(|_| ())
+                    .map_err(|err| {
+                        tracing::error!(error = %err, "无法保存管理员密码");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "无法保存管理员密码".into(),
+                        )
+                    })
+            },
+        )
         .map_err(|(c, m)| err_resp(c, m))?;
-
-    state
-        .server
-        .config_store
-        .update(|cfg| {
-            cfg.admin.password = new_pw;
-        })
-        .map_err(internal_err)?;
 
     let _ = state
         .db(move |repo| {

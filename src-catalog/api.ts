@@ -78,6 +78,7 @@ export interface AdminSessionInfo {
   authenticated: boolean;
   username?: string;
   expiresAt?: string;
+  csrfToken?: string;
 }
 
 export interface SteamAuthFlowStatus {
@@ -206,9 +207,11 @@ export class ApiError extends Error {
 }
 
 let sessionToken: string | null = null;
+let csrfToken: string | null = null;
 
 export function setSessionToken(token: string | null): void {
   sessionToken = token;
+  csrfToken = null;
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -218,6 +221,9 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   }
   if (sessionToken && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${sessionToken}`);
+  }
+  if (csrfToken && init.method && !['GET', 'HEAD', 'OPTIONS'].includes(init.method)) {
+    headers.set('X-L4A-CSRF', csrfToken);
   }
 
   const response = await fetch(path, {
@@ -243,7 +249,9 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
 }
 
 export async function getAdminSession(): Promise<AdminSessionInfo> {
-  return requestJson<AdminSessionInfo>('/api/v1/admin/auth/me');
+  const session = await requestJson<AdminSessionInfo>('/api/v1/admin/auth/me');
+  csrfToken = session.csrfToken ?? null;
+  return session;
 }
 
 export async function loginAdmin(username: string, password: string): Promise<AdminLoginResponse> {
@@ -251,13 +259,13 @@ export async function loginAdmin(username: string, password: string): Promise<Ad
     method: 'POST',
     body: JSON.stringify({ username, password }),
   });
-  sessionToken = res.token;
+  setSessionToken(res.token);
   return res;
 }
 
 export async function logoutAdmin(): Promise<void> {
   await requestJson<{ ok: boolean }>('/api/v1/admin/auth/logout', { method: 'POST' });
-  sessionToken = null;
+  setSessionToken(null);
 }
 
 export async function changeAdminPassword(
@@ -361,7 +369,7 @@ export async function searchCatalogItems(filter: CatalogSearchFilter): Promise<S
   if (filter.sort) params.set('sort', filter.sort);
   params.set('page', String(filter.page ?? 1));
   params.set('pageSize', String(filter.pageSize ?? 25));
-  return requestJson<SearchResponse>(`/api/v1/items/search?${params.toString()}`);
+  return requestJson<SearchResponse>(`/api/v1/admin/items/search?${params.toString()}`);
 }
 
 export async function getAdminItemDetail(workshopId: string): Promise<AdminItemDetailResponse> {

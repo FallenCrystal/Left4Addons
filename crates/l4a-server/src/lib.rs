@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+mod credentials;
 pub mod db;
 pub mod routes;
 pub mod sync;
@@ -25,8 +26,15 @@ pub struct ServerState {
 
 impl ServerState {
     pub fn from_config_store(config_store: Arc<CatalogConfigStore>) -> anyhow::Result<Self> {
-        let cfg = config_store.get();
-        let repo = Arc::new(ServerRepo::open(&cfg.server.db_path)?);
+        let db_path = config_store.get().server.db_path;
+        Self::from_config_store_with_db_path(config_store, &db_path)
+    }
+
+    pub fn from_config_store_with_db_path(
+        config_store: Arc<CatalogConfigStore>,
+        db_path: &Path,
+    ) -> anyhow::Result<Self> {
+        let repo = Arc::new(ServerRepo::open(db_path)?);
         let upstream: Arc<dyn WorkshopUpstream> =
             Arc::new(SteamCmClient::new(config_store.clone()));
         Ok(Self::with_components(config_store, repo, upstream))

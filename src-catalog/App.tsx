@@ -34,9 +34,11 @@ export function App() {
   });
   const [checkingSession, setCheckingSession] = useState(true);
   const [username, setUsername] = useState<string | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [activeTab, setActiveTab] = useState<NavTab>('overview');
   const [overview, setOverview] = useState<CatalogOverviewResponse | null>(null);
   const [inspectId, setInspectId] = useState<string | null>(null);
+  const closeInspector = useCallback(() => setInspectId(null), []);
   const [toast, setToast] = useState<{ msg: string; tone: 'default' | 'error' } | null>(null);
 
   useEffect(() => {
@@ -93,13 +95,18 @@ export function App() {
   }, [refreshOverview, username]);
 
   const handleLogout = async () => {
+    setLoggingOut(true);
     try {
       await logoutAdmin();
-    } catch {
-      // clear client state regardless
+      setUsername(null);
+      setOverview(null);
+      closeInspector();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      notify(`退出未完成，请重试。 ${message}`, 'error');
+    } finally {
+      setLoggingOut(false);
     }
-    setUsername(null);
-    setOverview(null);
   };
 
   const handleSteamUpdated = useCallback((nextSteam: CatalogSteamStatus) => {
@@ -215,6 +222,7 @@ export function App() {
               type="button"
               className="cat-btn cat-btn-sm"
               onClick={() => void handleLogout()}
+              disabled={loggingOut}
             >
               <LogOut size={14} />
               <span>退出 ({username})</span>
@@ -262,8 +270,9 @@ export function App() {
       </main>
 
       <ItemInspectorDrawer
+        key={inspectId}
         workshopId={inspectId}
-        onClose={() => setInspectId(null)}
+        onClose={closeInspector}
         onSelectWorkshopId={(nextId) => setInspectId(nextId)}
         onUpdated={() => void refreshOverview()}
         onNotify={notify}

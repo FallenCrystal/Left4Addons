@@ -32,32 +32,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let (mut cfg, created_new) = l4a_server::config::CatalogConfig::load_or_init(&cli.config)?;
-    if let Some(bind) = cli.bind {
-        cfg.server.bind = bind;
-    }
-    if let Some(db_path) = cli.db_path {
-        cfg.server.db_path = db_path;
-    }
-
+    let (cfg, generated_password) = l4a_server::config::CatalogConfig::load_or_init(&cli.config)?;
+    let bind_addr = cli.bind.unwrap_or_else(|| cfg.server.bind.clone());
+    let db_path = cli.db_path.unwrap_or_else(|| cfg.server.db_path.clone());
     let initial_user = cfg.admin.username.clone();
     let initial_pass = cfg.admin.password.clone();
-    let bind_addr = cfg.server.bind.clone();
-    let db_display = cfg.server.db_path.display().to_string();
 
     let store = std::sync::Arc::new(l4a_server::config::CatalogConfigStore::new(
         Some(cli.config.clone()),
         cfg,
     ));
-    let state = ServerState::from_config_store(store)?;
+    let state = ServerState::from_config_store_with_db_path(store, &db_path)?;
     let _worker_token = state.sync.spawn_background_workers();
 
-    if created_new {
+    if generated_password {
         tracing::info!(
             config = %cli.config.display(),
             username = %initial_user,
             password = %initial_pass,
-            "已自动初始化 catalog.toml，请使用上述初始管理员账号密码登录控制台（登录后可在界面修改）"
+            "已生成并保存初始管理员密码，请使用上述账号密码登录控制台"
         );
     }
 
@@ -65,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         bind = %bind_addr,
         config = %cli.config.display(),
-        db = %db_display,
+        db = %db_path.display(),
         console = %format!("http://{bind_addr}/admin/"),
         "l4a-server (SteamKit CM Catalog) 已启动"
     );
