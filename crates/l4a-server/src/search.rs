@@ -1,12 +1,13 @@
 use pinyin::ToPinyinMulti;
 use std::collections::HashSet;
+use url::Url;
 
-pub const SEARCH_INDEX_VERSION: &str = "1";
+pub const SEARCH_INDEX_VERSION: &str = "2";
 
 const MAX_COMPACT_SPAN: usize = 4;
 const MAX_COMPACT_LEN: usize = 40;
 const MAX_PINYIN_SPAN: usize = 6;
-const MAX_PINYIN_VARIANTS_PER_SPAN: usize = 6;
+const PINYIN_PAIR_KEY_LEN: usize = 8;
 const MIN_PREFIX_LEN: usize = 2;
 const MIN_COMPACT_PREFIX_LEN: usize = 4;
 const MIN_CREATOR_PREFIX_LEN: usize = 4;
@@ -41,6 +42,14 @@ pub struct IndexedDocument {
     pub title_pinyin: String,
     pub creator_tokens: String,
     pub desc_tokens: String,
+    pub desc_aliases: String,
+}
+
+#[derive(Default)]
+struct TokenizedText {
+    tokens: Vec<Token>,
+    // The original word and the position of its first split token.
+    unsplit_words: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +71,13 @@ pub struct ParsedQuery {
     pub terms: Vec<QueryTerm>,
     pub whole_compact: Option<String>,
     pub literal_substrings: Vec<String>,
+    compact_all: String,
+}
+
+impl ParsedQuery {
+    fn contains_required_literals(&self, folded: &str) -> bool {
+        self.literal_substrings.iter().all(|s| folded.contains(s))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -81,18 +97,18 @@ pub fn build_indexed_document(
     creator_name: Option<&str>,
     description: Option<&str>,
 ) -> IndexedDocument {
-    let title_toks = tokenize_text(title);
-    let title_tokens = tokens_to_fts_string(&title_toks);
-    let title_compact = build_compact_tokens(title, &title_toks, MAX_COMPACT_SPAN);
+    let title_toks = tokenize_with_aliases(title);
+    let title_tokens = tokens_to_fts_string(&title_toks.tokens);
+    let title_compact = build_compact_tokens(&title_toks, MAX_COMPACT_SPAN);
     let title_pinyin = build_pinyin_tokens(title);
 
     let creator_tokens = creator_name
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|creator| {
-            let toks = tokenize_text(creator);
-            let base = tokens_to_fts_string(&toks);
-            let compact = build_compact_tokens(creator, &toks, 3);
+            let toks = tokenize_with_aliases(creator);
+            let base = tokens_to_fts_string(&toks.tokens);
+            let compact = build_compact_tokens(&toks, 3);
             if compact.is_empty() {
                 base
             } else if base.is_empty() {
@@ -103,9 +119,9 @@ pub fn build_indexed_document(
         })
         .unwrap_or_default();
 
-    let desc_tokens = description
+    let desc = description
         .map(strip_bbcode_and_urls)
-        .map(|cleaned| tokens_to_fts_string(&tokenize_text(&cleaned)))
+        .map(|cleaned| tokenize_with_aliases(&cleaned))
         .unwrap_or_default();
 
     IndexedDocument {
@@ -113,7 +129,13 @@ pub fn build_indexed_document(
         title_compact,
         title_pinyin,
         creator_tokens,
-        desc_tokens,
+        desc_tokens: tokens_to_fts_string(&desc.tokens),
+        desc_aliases: desc
+            .unsplit_words
+            .iter()
+            .map(|(_, word)| word.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -135,6 +157,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
             terms: Vec::new(),
             whole_compact: None,
             literal_substrings: Vec::new(),
+            compact_all: String::new(),
         });
     }
 
@@ -166,6 +189,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
     }
 
     let terms = parse_query_terms(trimmed, &exact_only_words);
+    let compact_all = query_terms_compact_all(&terms);
 
     let all_words = !terms.is_empty()
         && terms.iter().all(|t| {
@@ -189,15 +213,8 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
             MAX_COMPACT_SPAN
         };
         if terms.len() <= max_span {
-            let joined: String = terms
-                .iter()
-                .filter_map(|t| match t {
-                    QueryTerm::Word { compact, .. } => Some(compact.as_str()),
-                    QueryTerm::Cjk(_) => None,
-                })
-                .collect();
-            if joined.len() <= MAX_COMPACT_LEN {
-                Some(joined)
+            if compact_all.len() <= MAX_COMPACT_LEN {
+                Some(compact_all.clone())
             } else {
                 None
             }
@@ -216,6 +233,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
         terms,
         whole_compact,
         literal_substrings,
+        compact_all,
     })
 }
 
@@ -277,8 +295,8 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
                     branches.push(format!("{{title_tokens creator_tokens}} : ({sub_expr})"));
                 }
 
-                if !*exact_only && is_pure_ascii_alpha(compact) && compact.len() >= MIN_PINYIN_LEN {
-                    branches.push(format!("title_pinyin : {q}"));
+                if !*exact_only {
+                    branches.extend(pinyin_fts_clause(compact));
                 }
 
                 term_clauses.push(format!("({})", branches.join(" OR ")));
@@ -295,9 +313,7 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
         } else {
             wc_branches.push(format!("creator_tokens : {wq}"));
         }
-        if is_pure_ascii_alpha(wc) && wc.len() >= MIN_PINYIN_LEN {
-            wc_branches.push(format!("title_pinyin : {wq}"));
-        }
+        wc_branches.extend(pinyin_fts_clause(wc));
         Some(format!("({and_expr}) OR ({})", wc_branches.join(" OR ")))
     } else {
         Some(and_expr)
@@ -323,9 +339,9 @@ pub fn build_desc_fts_query(query: &ParsedQuery) -> Option<String> {
             } => {
                 let q = fts_quote(compact);
                 let base = if *exact_only || compact.chars().count() < MIN_PREFIX_LEN {
-                    format!("desc_tokens : {q}")
+                    format!("{{desc_tokens desc_aliases}} : {q}")
                 } else {
-                    format!("desc_tokens : {q}*")
+                    format!("{{desc_tokens desc_aliases}} : {q}*")
                 };
                 if sub_tokens.len() >= 2 {
                     let sub_expr = sub_tokens
@@ -355,7 +371,9 @@ pub fn build_desc_fts_query(query: &ParsedQuery) -> Option<String> {
     let and_expr = term_clauses.join(" AND ");
     if let Some(ref wc) = query.whole_compact {
         let wq = fts_quote(wc);
-        Some(format!("({and_expr}) OR desc_tokens : {wq}*"))
+        Some(format!(
+            "({and_expr}) OR {{desc_tokens desc_aliases}} : {wq}*"
+        ))
     } else {
         Some(and_expr)
     }
@@ -379,38 +397,20 @@ pub fn score_primary_candidate(
     }
 
     let title_folded = fold_text(title);
-    let creator_folded = creator_name.map(fold_text);
-    let title_has_literals = query.literal_substrings.is_empty()
-        || query
-            .literal_substrings
-            .iter()
-            .all(|s| title_folded.contains(s));
-    let creator_has_literals = creator_folded.as_deref().is_some_and(|c| {
-        query.literal_substrings.is_empty()
-            || query.literal_substrings.iter().all(|s| c.contains(s))
-    });
-
-    if !title_has_literals && !creator_has_literals {
-        return None;
+    if title_folded == query.raw_folded {
+        return Some(MatchRank {
+            tier: 0,
+            sub_rank: 1,
+        });
     }
 
-    let title_tokens = tokenize_text(title);
-    let mut best: Option<MatchRank> = None;
-
-    if title_has_literals {
-        if let Some(rank) = score_title_direct(query, &title_folded, &title_tokens) {
-            best = Some(best.map_or(rank, |cur| cur.min(rank)));
+    let title_tokens = tokenize_with_aliases(title);
+    if query.contains_required_literals(&title_folded) {
+        if let Some(rank) = score_title_direct(query, &title_folded, &title_tokens)
+            .or_else(|| score_title_pinyin(query, title, &title_tokens))
+        {
+            return Some(rank);
         }
-
-        if best.is_none() || best.is_some_and(|r| r.tier > 4) {
-            if let Some(rank) = score_title_pinyin(query, title, &title_tokens) {
-                best = Some(best.map_or(rank, |cur| cur.min(rank)));
-            }
-        }
-    }
-
-    if best.is_some() {
-        return best;
     }
 
     if let Some(ref prefix) = query.numeric_prefix {
@@ -422,26 +422,28 @@ pub fn score_primary_candidate(
         }
     }
 
-    if let (Some(creator), Some(c_folded)) = (creator_name, creator_folded.as_deref()) {
-        let creator_tokens = tokenize_text(creator);
-        if creator_has_literals {
-            if c_folded == query.raw_folded {
-                return Some(MatchRank {
-                    tier: 5,
-                    sub_rank: 1,
-                });
-            }
-            if matches_all_terms_in_tokens(query, &creator_tokens, MIN_CREATOR_PREFIX_LEN).is_some()
-                || query.whole_compact.as_deref().is_some_and(|wc| {
-                    match_compact_in_tokens(wc, &creator_tokens, false, MIN_CREATOR_PREFIX_LEN)
-                        .is_some()
-                })
-            {
-                return Some(MatchRank {
-                    tier: 5,
-                    sub_rank: 2,
-                });
-            }
+    if let Some(creator) = creator_name {
+        let creator_folded = fold_text(creator);
+        if !query.contains_required_literals(&creator_folded) {
+            return None;
+        }
+        if creator_folded == query.raw_folded {
+            return Some(MatchRank {
+                tier: 5,
+                sub_rank: 1,
+            });
+        }
+        let creator_tokens = tokenize_with_aliases(creator);
+        if matches_all_terms_in_tokens(query, &creator_tokens, MIN_CREATOR_PREFIX_LEN).is_some()
+            || query.whole_compact.as_deref().is_some_and(|wc| {
+                match_compact_in_tokens(wc, &creator_tokens, false, MIN_CREATOR_PREFIX_LEN)
+                    .is_some()
+            })
+        {
+            return Some(MatchRank {
+                tier: 5,
+                sub_rank: 2,
+            });
         }
 
         // Cross-field author + title query (e.g. "perfect_buddy early")
@@ -464,28 +466,15 @@ pub fn score_primary_candidate(
     None
 }
 
-pub fn score_desc_candidate(
-    query: &ParsedQuery,
-    indexed_desc_tokens: &str,
-    raw_description: Option<&str>,
-) -> Option<MatchRank> {
-    if indexed_desc_tokens.is_empty() || query.terms.is_empty() {
+pub fn score_desc_candidate(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
+    let cleaned = strip_bbcode_and_urls(description);
+    if !query.literal_substrings.is_empty()
+        && !query.contains_required_literals(&fold_text(&cleaned))
+    {
         return None;
     }
 
-    if !query.literal_substrings.is_empty() {
-        let desc = raw_description?;
-        let desc_folded = fold_text(desc);
-        if !query
-            .literal_substrings
-            .iter()
-            .all(|s| desc_folded.contains(s))
-        {
-            return None;
-        }
-    }
-
-    let desc_tokens = parse_indexed_tokens(indexed_desc_tokens);
+    let desc_tokens = tokenize_with_aliases(&cleaned);
 
     if let Some((_, kind)) = find_contiguous_query_match(query, &desc_tokens) {
         return Some(MatchRank {
@@ -513,36 +502,12 @@ pub fn score_desc_candidate(
     None
 }
 
-fn parse_indexed_tokens(indexed: &str) -> Vec<Token> {
-    indexed
-        .split_whitespace()
-        .map(|part| {
-            let mut chars = part.chars();
-            if let (Some(ch), None) = (chars.next(), chars.next()) {
-                if is_cjk_split_char(ch) {
-                    return Token::Cjk(ch);
-                }
-            }
-            Token::Word(part.to_string())
-        })
-        .collect()
-}
-
 fn score_title_direct(
     query: &ParsedQuery,
     title_folded: &str,
-    title_tokens: &[Token],
+    title_tokens: &TokenizedText,
 ) -> Option<MatchRank> {
-    if title_folded == query.raw_folded {
-        return Some(MatchRank {
-            tier: 0,
-            sub_rank: 1,
-        });
-    }
-
-    let title_compact_all = tokens_compact_all(title_tokens);
-    let query_compact_all = query_terms_compact_all(&query.terms);
-    if !title_compact_all.is_empty() && title_compact_all == query_compact_all {
+    if tokens_match_compact_all(&title_tokens.tokens, &query.compact_all) {
         return Some(MatchRank {
             tier: 0,
             sub_rank: 2,
@@ -622,9 +587,9 @@ fn score_title_direct(
 fn score_title_pinyin(
     query: &ParsedQuery,
     title: &str,
-    title_tokens: &[Token],
+    title_tokens: &TokenizedText,
 ) -> Option<MatchRank> {
-    if !query.literal_substrings.is_empty() {
+    if title.is_ascii() || !query.literal_substrings.is_empty() {
         return None;
     }
 
@@ -684,8 +649,9 @@ fn score_title_pinyin(
 
 fn find_contiguous_query_match(
     query: &ParsedQuery,
-    tokens: &[Token],
+    text: &TokenizedText,
 ) -> Option<(usize, TermMatch)> {
+    let tokens = &text.tokens;
     // 1. Check whole-query compact match at token boundaries first for single-word queries
     //    (e.g. "DayBreak" / "daybreak" against ["day", "break", "v2"]).
     if query.terms.len() == 1 {
@@ -698,13 +664,12 @@ fn find_contiguous_query_match(
                 sub_tokens,
                 exact_only,
             } => {
-                let mut best: Option<(usize, TermMatch)> = None;
-                if let Some(hit) =
-                    find_compact_in_tokens(compact, tokens, *exact_only, MIN_COMPACT_PREFIX_LEN)
-                {
-                    best = pick_better_pos_match(best, hit);
+                let mut best = find_word_in_tokens(compact, tokens, *exact_only, MIN_PREFIX_LEN);
+                if best == Some((0, TermMatch::Exact)) {
+                    return best;
                 }
-                if let Some(hit) = find_word_in_tokens(compact, tokens, *exact_only, MIN_PREFIX_LEN)
+                if let Some(hit) =
+                    find_compact_in_tokens(compact, text, *exact_only, MIN_COMPACT_PREFIX_LEN)
                 {
                     best = pick_better_pos_match(best, hit);
                 }
@@ -796,7 +761,7 @@ fn pick_better_pos_match(
 
 fn matches_all_terms_in_tokens(
     query: &ParsedQuery,
-    tokens: &[Token],
+    tokens: &TokenizedText,
     min_prefix_len: usize,
 ) -> Option<TermMatch> {
     if query.terms.is_empty() {
@@ -814,9 +779,10 @@ fn matches_all_terms_in_tokens(
 
 fn match_term_in_tokens(
     term: &QueryTerm,
-    tokens: &[Token],
+    text: &TokenizedText,
     min_prefix_len: usize,
 ) -> Option<TermMatch> {
+    let tokens = &text.tokens;
     match term {
         QueryTerm::Cjk(chars) => find_cjk_seq_in_tokens(chars, tokens).map(|_| TermMatch::Exact),
         QueryTerm::Word {
@@ -830,7 +796,7 @@ fn match_term_in_tokens(
                 if kind == TermMatch::Exact {
                     return Some(TermMatch::Exact);
                 }
-                if find_compact_in_tokens(compact, tokens, *exact_only, MIN_COMPACT_PREFIX_LEN)
+                if find_compact_in_tokens(compact, text, *exact_only, MIN_COMPACT_PREFIX_LEN)
                     .is_some_and(|(_, k)| k == TermMatch::Exact)
                 {
                     return Some(TermMatch::Exact);
@@ -839,7 +805,7 @@ fn match_term_in_tokens(
             }
 
             if let Some((_, kind)) =
-                find_compact_in_tokens(compact, tokens, *exact_only, MIN_COMPACT_PREFIX_LEN)
+                find_compact_in_tokens(compact, text, *exact_only, MIN_COMPACT_PREFIX_LEN)
             {
                 return Some(kind);
             }
@@ -935,59 +901,60 @@ fn find_word_seq_in_tokens(
 
 fn match_compact_in_tokens(
     needle: &str,
-    tokens: &[Token],
+    tokens: &TokenizedText,
     exact_only: bool,
     min_prefix_len: usize,
 ) -> Option<TermMatch> {
     find_compact_in_tokens(needle, tokens, exact_only, min_prefix_len).map(|(_, kind)| kind)
 }
 
-/// Checks if `needle` matches a contiguous span of 2..=MAX_COMPACT_SPAN word tokens
-/// starting at a token boundary in `tokens`.
+/// Matches an original word or a bounded span of adjacent word tokens.
 fn find_compact_in_tokens(
     needle: &str,
-    tokens: &[Token],
+    text: &TokenizedText,
     exact_only: bool,
     min_prefix_len: usize,
 ) -> Option<(usize, TermMatch)> {
     let allow_prefix = !exact_only && needle.chars().count() >= min_prefix_len;
-    let mut best: Option<(usize, TermMatch)> = None;
-    let mut buf = String::new();
-
-    for start in 0..tokens.len() {
-        if tokens[start].as_word().is_none() {
-            continue;
+    let mut best = None;
+    for (start, word) in &text.unsplit_words {
+        if word == needle {
+            best = pick_better_pos_match(best, (*start, TermMatch::Exact));
+            if *start == 0 {
+                return best;
+            }
+        } else if allow_prefix && word.starts_with(needle) {
+            best = pick_better_pos_match(best, (*start, TermMatch::Prefix));
         }
-        buf.clear();
+    }
+
+    let tokens = &text.tokens;
+    for start in 0..tokens.len() {
+        let mut remaining = needle;
+        let mut joined_len = 0;
         let max_end = (start + MAX_COMPACT_SPAN).min(tokens.len());
-        for (span_len, tok) in tokens[start..max_end].iter().enumerate() {
+        for tok in &tokens[start..max_end] {
             let Some(w) = tok.as_word() else {
                 break;
             };
-            if buf.len() + w.len() > MAX_COMPACT_LEN {
+            joined_len += w.len();
+            if joined_len > MAX_COMPACT_LEN {
                 break;
             }
-            buf.push_str(w);
-            if span_len == 0 {
-                // Single token handled by `find_word_in_tokens`, except when called via `whole_compact`
-                if buf == needle {
-                    best = pick_better_pos_match(best, (start, TermMatch::Exact));
-                } else if allow_prefix && buf.starts_with(needle) {
+            let Some(rest) = remaining.strip_prefix(w) else {
+                if allow_prefix && w.starts_with(remaining) {
                     best = pick_better_pos_match(best, (start, TermMatch::Prefix));
                 }
-                continue;
-            }
-            if buf == needle {
+                break;
+            };
+            if rest.is_empty() {
                 best = pick_better_pos_match(best, (start, TermMatch::Exact));
                 if start == 0 {
                     return best;
                 }
-            } else if allow_prefix && buf.starts_with(needle) {
-                best = pick_better_pos_match(best, (start, TermMatch::Prefix));
-            }
-            if buf.len() >= needle.len() && !buf.starts_with(needle) {
                 break;
             }
+            remaining = rest;
         }
     }
 
@@ -1099,45 +1066,40 @@ fn matches_pinyin_from(rest: &str, readings: &[Vec<String>], matched_chars: usiz
 }
 
 fn build_pinyin_tokens(title: &str) -> String {
-    let spans = collect_han_pinyin_spans(title);
-    if spans.is_empty() {
+    if title.is_ascii() {
         return String::new();
     }
 
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
-    for span in &spans {
-        let n = span.readings.len();
-        for start in 0..n {
-            let max_end = (start + MAX_PINYIN_SPAN).min(n);
-            let mut prefixes = vec![String::new()];
-            for (offset, char_readings) in span.readings[start..max_end].iter().enumerate() {
-                let mut next = Vec::new();
-                'outer: for prefix in &prefixes {
-                    for reading in char_readings {
-                        let mut combined = String::with_capacity(prefix.len() + reading.len());
-                        combined.push_str(prefix);
-                        combined.push_str(reading);
-                        if combined.len() <= MAX_COMPACT_LEN {
-                            next.push(combined);
-                            if next.len() >= MAX_PINYIN_VARIANTS_PER_SPAN {
-                                break 'outer;
-                            }
-                        }
-                    }
-                }
-                prefixes = next;
-                if offset >= 1 {
-                    for candidate in &prefixes {
-                        if emitted.insert(candidate.clone()) {
-                            out.push(candidate.clone());
-                        }
+    for span in collect_han_pinyin_spans(title) {
+        for pair in span.readings.windows(2) {
+            for first in &pair[0] {
+                for second in &pair[1] {
+                    let mut key = format!("{first}{second}");
+                    key.truncate(key.len().min(PINYIN_PAIR_KEY_LEN));
+                    if emitted.insert(key.clone()) {
+                        out.push(key);
                     }
                 }
             }
         }
     }
     out.join(" ")
+}
+
+fn pinyin_fts_clause(needle: &str) -> Option<String> {
+    if needle.len() < MIN_PINYIN_LEN || !is_pure_ascii_alpha(needle) {
+        return None;
+    }
+
+    // Every reading the scorer accepts starts with an adjacent pair. Probe all possible
+    // lengths of that pair's key and let the scorer verify the full reading in order.
+    let keys = (2..=needle.len().min(PINYIN_PAIR_KEY_LEN))
+        .map(|len| fts_quote(&needle[..len]))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(format!("title_pinyin : ({keys})"))
 }
 
 fn han_pinyin_readings(ch: char) -> Vec<String> {
@@ -1180,11 +1142,12 @@ fn han_pinyin_readings(ch: char) -> Vec<String> {
     out
 }
 
-fn build_compact_tokens(raw: &str, tokens: &[Token], max_span: usize) -> String {
+fn build_compact_tokens(text: &TokenizedText, max_span: usize) -> String {
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
     let mut buf = String::new();
 
+    let tokens = &text.tokens;
     for start in 0..tokens.len() {
         if tokens[start].as_word().is_none() {
             continue;
@@ -1205,34 +1168,9 @@ fn build_compact_tokens(raw: &str, tokens: &[Token], max_span: usize) -> String 
         }
     }
 
-    // Preserve very long unsplit CamelCase runs (> max_span pieces) as compact tokens too.
-    let mut run = String::new();
-    for ch in raw.chars() {
-        let ch = fold_char(ch);
-        if ch.is_alphanumeric() && !is_cjk_split_char(ch) {
-            run.push(ch);
-        } else {
-            if !run.is_empty() {
-                let lowered = fold_text(&run);
-                let pieces = split_word_run(&run);
-                if pieces.len() > max_span
-                    && lowered.len() <= MAX_COMPACT_LEN
-                    && emitted.insert(lowered.clone())
-                {
-                    out.push(lowered);
-                }
-                run.clear();
-            }
-        }
-    }
-    if !run.is_empty() {
-        let lowered = fold_text(&run);
-        let pieces = split_word_run(&run);
-        if pieces.len() > max_span
-            && lowered.len() <= MAX_COMPACT_LEN
-            && emitted.insert(lowered.clone())
-        {
-            out.push(lowered);
+    for (_, word) in &text.unsplit_words {
+        if emitted.insert(word.clone()) {
+            out.push(word.clone());
         }
     }
 
@@ -1288,69 +1226,52 @@ fn parse_query_terms(raw: &str, exact_only_words: &HashSet<String>) -> Vec<Query
 }
 
 pub fn tokenize_text(raw: &str) -> Vec<Token> {
-    let mut tokens = Vec::new();
+    tokenize_with_aliases(raw).tokens
+}
+
+fn tokenize_with_aliases(raw: &str) -> TokenizedText {
+    let mut text = TokenizedText::default();
     let mut word_buf = String::new();
 
-    let flush_word = |buf: &mut String, out: &mut Vec<Token>| {
+    let flush_word = |buf: &mut String, out: &mut TokenizedText| {
         if buf.is_empty() {
             return;
         }
-        for sub in split_word_run(buf) {
-            if !sub.is_empty() {
-                out.push(Token::Word(sub));
-            }
+        let parts = split_word_run(buf);
+        if parts.len() > 1 {
+            out.unsplit_words.push((out.tokens.len(), parts.concat()));
         }
+        out.tokens.extend(parts.into_iter().map(Token::Word));
         buf.clear();
     };
 
     for ch in raw.chars() {
         let ch = fold_char(ch);
         if is_cjk_split_char(ch) {
-            flush_word(&mut word_buf, &mut tokens);
-            tokens.push(Token::Cjk(ch));
+            flush_word(&mut word_buf, &mut text);
+            text.tokens.push(Token::Cjk(ch));
         } else if ch.is_alphanumeric() {
             word_buf.push(ch);
         } else {
-            flush_word(&mut word_buf, &mut tokens);
+            flush_word(&mut word_buf, &mut text);
         }
     }
-    flush_word(&mut word_buf, &mut tokens);
-    tokens
+    flush_word(&mut word_buf, &mut text);
+    text
 }
 
 /// Splits an alphanumeric run on CamelCase transitions (e.g. `DayBreak` -> `["day", "break"]`,
 /// `YiChangCity2` -> `["yi", "chang", "city", "2"]`, `HTMLParser` -> `["html", "parser"]`) while
 /// preserving single-letter suffixes like `MissionX` and compact codes like `L4D2`, `M60`, `v2`.
 fn split_word_run(run: &str) -> Vec<String> {
-    let chars: Vec<char> = run.chars().collect();
-    if chars.is_empty() {
+    let mut chars = run.char_indices().peekable();
+    let Some((_, mut prev)) = chars.next() else {
         return Vec::new();
-    }
+    };
 
-    let mut camel_parts: Vec<String> = Vec::new();
-    let mut start = 0usize;
-    for i in 1..chars.len() {
-        let prev = chars[i - 1];
-        let curr = chars[i];
-        let next = chars.get(i + 1).copied();
-
-        let lower_to_upper_word =
-            prev.is_lowercase() && curr.is_uppercase() && next.is_some_and(char::is_lowercase);
-        let acronym_to_word =
-            prev.is_uppercase() && curr.is_uppercase() && next.is_some_and(char::is_lowercase);
-        let digit_to_upper_word =
-            prev.is_ascii_digit() && curr.is_uppercase() && next.is_some_and(char::is_lowercase);
-
-        if lower_to_upper_word || acronym_to_word || digit_to_upper_word {
-            camel_parts.push(chars[start..i].iter().collect());
-            start = i;
-        }
-    }
-    camel_parts.push(chars[start..].iter().collect());
-
-    let mut out = Vec::with_capacity(camel_parts.len());
-    for part in camel_parts {
-        let lowered = fold_text(&part);
+    let mut out = Vec::new();
+    let mut push_part = |part: &str| {
+        let lowered = fold_text(part);
         // Split trailing digits off long words (e.g. "city2" -> "city", "2"; "part1" -> "part", "1";
         // "cyberpunk2077" -> "cyberpunk", "2077"), while keeping codes like "l4d2", "m60", "v2", "lv8".
         if let Some((prefix, digits)) = split_long_word_trailing_digits(&lowered) {
@@ -1359,7 +1280,19 @@ fn split_word_run(run: &str) -> Vec<String> {
         } else if !lowered.is_empty() {
             out.push(lowered);
         }
+    };
+    let mut start = 0;
+    while let Some((pos, curr)) = chars.next() {
+        if curr.is_uppercase()
+            && chars.peek().is_some_and(|(_, next)| next.is_lowercase())
+            && (prev.is_lowercase() || prev.is_uppercase() || prev.is_ascii_digit())
+        {
+            push_part(&run[start..pos]);
+            start = pos;
+        }
+        prev = curr;
     }
+    push_part(&run[start..]);
     out
 }
 
@@ -1382,19 +1315,9 @@ pub fn strip_bbcode_and_urls(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let bytes = raw.as_bytes();
     let mut i = 0usize;
-    let mut skip_until_close: Option<&'static str> = None;
+    let mut missing_closers = HashSet::new();
 
     while i < bytes.len() {
-        if let Some(close_tag) = skip_until_close {
-            if let Some(rel) = find_ascii_case_insensitive(&raw[i..], close_tag) {
-                i += rel + close_tag.len();
-                skip_until_close = None;
-                out.push(' ');
-                continue;
-            }
-            break;
-        }
-
         if bytes[i] == b'[' {
             if let Some(close_rel) = raw[i..].find(']') {
                 let tag_inner = &raw[i + 1..i + close_rel];
@@ -1408,33 +1331,39 @@ pub fn strip_bbcode_and_urls(raw: &str) -> String {
                     .to_ascii_lowercase();
 
                 if is_bbcode_tag(&lower_name) {
-                    let is_closing = trimmed_tag.starts_with('/');
-                    if !is_closing && lower_name == "img" {
-                        skip_until_close = Some("[/img]");
-                    } else if !is_closing && lower_name == "url" && !trimmed_tag.contains('=') {
-                        skip_until_close = Some("[/url]");
-                    } else if !is_closing && lower_name == "previewyoutube" {
-                        skip_until_close = Some("[/previewyoutube]");
-                    }
                     i += close_rel + 1;
+                    if !trimmed_tag.starts_with('/') {
+                        let close_tag = match lower_name.as_str() {
+                            "img" => Some("[/img]"),
+                            "url" if !trimmed_tag.contains('=') => Some("[/url]"),
+                            "previewyoutube" => Some("[/previewyoutube]"),
+                            _ => None,
+                        };
+                        if let Some(tag) = close_tag.filter(|tag| !missing_closers.contains(tag)) {
+                            if let Some(pos) = find_ascii_case_insensitive(&raw[i..], tag) {
+                                i += pos + tag.len();
+                            } else {
+                                missing_closers.insert(tag);
+                            }
+                        }
+                    }
                     out.push(' ');
                     continue;
                 }
             }
         }
 
-        // Strip bare http(s):// URLs
-        if raw[i..].starts_with("http://")
-            || raw[i..].starts_with("https://")
-            || raw[i..].starts_with("HTTP://")
-            || raw[i..].starts_with("HTTPS://")
+        if matches!(bytes[i], b'h' | b'H' | b's' | b'S')
+            && ["http://", "https://", "steam://"].iter().any(|scheme| {
+                bytes[i..]
+                    .get(..scheme.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme.as_bytes()))
+            })
         {
-            while i < bytes.len()
-                && !bytes[i].is_ascii_whitespace()
-                && !matches!(bytes[i], b']' | b')' | b'>' | b'"' | b'\'')
-            {
-                i += 1;
-            }
+            let rest = &raw[i..];
+            i += rest
+                .find(|ch: char| ch.is_whitespace() || matches!(ch, ']' | ')' | '>' | '"' | '\''))
+                .unwrap_or(rest.len());
             out.push(' ');
             continue;
         }
@@ -1496,17 +1425,54 @@ fn is_bbcode_tag(name: &str) -> bool {
 }
 
 fn extract_steam_url_id(raw: &str) -> Option<u64> {
-    let lower = raw.to_ascii_lowercase();
-    if !lower.contains("steamcommunity.com/") {
+    let (scheme, _) = raw.split_once("://")?;
+    if !["http", "https", "steam"]
+        .iter()
+        .any(|supported| scheme.eq_ignore_ascii_case(supported))
+        || raw.contains('\\')
+        || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
         return None;
     }
-    let idx = lower.find("?id=").or_else(|| lower.find("&id="))?;
-    let rest = &raw[idx + 4..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    if digits.is_empty() {
+
+    let url = Url::parse(raw).ok()?;
+    if !url.username().is_empty() || url.password().is_some() || url.port().is_some() {
         return None;
     }
-    digits.parse::<u64>().ok().filter(|id| *id > 0)
+    let host = url.host_str()?;
+    let path = url.path().strip_suffix('/').unwrap_or(url.path());
+    match url.scheme() {
+        "http" | "https"
+            if matches!(host, "steamcommunity.com" | "www.steamcommunity.com")
+                && ["/sharedfiles/filedetails", "/workshop/filedetails"]
+                    .iter()
+                    .any(|workshop_path| path.eq_ignore_ascii_case(workshop_path)) =>
+        {
+            let (_, id) = url
+                .query_pairs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("id"))?;
+            parse_positive_id(&id)
+        }
+        "steam"
+            if host.eq_ignore_ascii_case("url")
+                && url.query().is_none()
+                && url.fragment().is_none() =>
+        {
+            let (page, id) = path.rsplit_once('/')?;
+            if !page.eq_ignore_ascii_case("/CommunityFilePage") {
+                return None;
+            }
+            parse_positive_id(id)
+        }
+        _ => None,
+    }
+}
+
+fn parse_positive_id(id: &str) -> Option<u64> {
+    if !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    id.parse::<u64>().ok().filter(|id| *id > 0)
 }
 
 fn tokens_to_fts_string(tokens: &[Token]) -> String {
@@ -1523,15 +1489,18 @@ fn tokens_to_fts_string(tokens: &[Token]) -> String {
     out
 }
 
-fn tokens_compact_all(tokens: &[Token]) -> String {
-    let mut out = String::new();
+fn tokens_match_compact_all(tokens: &[Token], mut compact: &str) -> bool {
     for tok in tokens {
-        match tok {
-            Token::Word(w) => out.push_str(w),
-            Token::Cjk(c) => out.push(*c),
-        }
+        let remainder = match tok {
+            Token::Word(w) => compact.strip_prefix(w.as_str()),
+            Token::Cjk(c) => compact.strip_prefix(*c),
+        };
+        let Some(remainder) = remainder else {
+            return false;
+        };
+        compact = remainder;
     }
-    out
+    compact.is_empty()
 }
 
 fn query_terms_compact_all(terms: &[QueryTerm]) -> String {
@@ -1565,6 +1534,9 @@ fn fts_quote(token: &str) -> String {
 }
 
 pub fn fold_text(raw: &str) -> String {
+    if raw.is_ascii() {
+        return raw.to_ascii_lowercase();
+    }
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         let ch = fold_char(ch);
@@ -1667,9 +1639,12 @@ mod tests {
     fn chinese_pinyin_matches_guangzhou_and_yichang_without_english_false_positives() {
         let gz_title = "广州增城 （Zengcheng）Lv8.06";
         let gz_doc = build_indexed_document(gz_title, Some("长远的梦"), None);
-        assert!(gz_doc.title_pinyin.contains("guangzhou"));
-        assert!(gz_doc.title_pinyin.contains("zengcheng"));
-        assert!(gz_doc.title_pinyin.contains("guangzhouzengcheng"));
+        for prefix in ["guangzho", "zengchen"] {
+            assert!(gz_doc
+                .title_pinyin
+                .split_whitespace()
+                .any(|key| key == prefix));
+        }
 
         for q_str in [
             "guangzhou",
@@ -1700,12 +1675,16 @@ mod tests {
             ("xiamen", "厦门鼓浪屿"),
             ("chengdu", "成都春熙路"),
             ("nvwu", "月光女巫替换"),
+            ("yinhanghangzhang", "银行行长"),
         ] {
             let q = parse_query(q_str).unwrap();
             let doc = build_indexed_document(title, None, None);
+            let clause = pinyin_fts_clause(q_str).unwrap();
             assert!(
-                doc.title_pinyin.split_whitespace().any(|t| t == q_str),
-                "expected {q_str} in pinyin index for {title}: {}",
+                doc.title_pinyin
+                    .split_whitespace()
+                    .any(|key| clause.contains(&fts_quote(key))),
+                "expected pinyin candidate for {q_str} in {title}: {}",
                 doc.title_pinyin
             );
             assert!(score_primary_candidate(&q, 1, title, None).is_some());

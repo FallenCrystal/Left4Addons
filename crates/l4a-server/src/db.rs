@@ -7,9 +7,11 @@ use l4a_protocol::{
     WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemRecord,
     WorkshopItemStatus, WorkshopPreview,
 };
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OptionalExtension, Row, Rows, Transaction, TransactionBehavior,
+};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, RwLock};
@@ -17,6 +19,10 @@ use std::sync::{Mutex, MutexGuard, RwLock};
 const READER_POOL_SIZE: usize = 4;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
 const STATE_SEARCH_INDEX_VERSION: &str = "search_index_version";
+const INSERT_SEARCH_DOCUMENT: &str = "
+    INSERT INTO workshop_items_fts (
+        rowid, title_tokens, title_compact, title_pinyin, creator_tokens, desc_tokens, desc_aliases
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
 
 pub struct ServerRepo {
     writer: Mutex<Connection>,
@@ -253,13 +259,16 @@ impl ServerRepo {
             )?;
         }
 
+        let index_current = Self::search_index_is_current(conn)?;
         // Older CM builds may have cached account-visible details as full private rows.
-        Self::scrub_private_details_tx(conn, None)?;
-        Self::ensure_search_index_tx(conn)?;
+        Self::scrub_private_details_tx(conn, None, index_current)?;
+        if !index_current {
+            Self::rebuild_search_index_tx(conn)?;
+        }
         Ok(())
     }
 
-    fn ensure_search_index_tx(tx: &Transaction<'_>) -> anyhow::Result<()> {
+    fn search_index_is_current(tx: &Transaction<'_>) -> anyhow::Result<bool> {
         let current_version: Option<String> = tx
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
@@ -267,12 +276,11 @@ impl ServerRepo {
                 |r| r.get(0),
             )
             .optional()?;
-        if has_table(tx, "workshop_items_fts")?
-            && current_version.as_deref() == Some(SEARCH_INDEX_VERSION)
-        {
-            return Ok(());
-        }
+        Ok(current_version.as_deref() == Some(SEARCH_INDEX_VERSION)
+            && has_table(tx, "workshop_items_fts")?)
+    }
 
+    fn rebuild_search_index_tx(tx: &Transaction<'_>) -> anyhow::Result<()> {
         tx.execute_batch(
             r#"
             DROP TABLE IF EXISTS workshop_items_fts;
@@ -282,6 +290,7 @@ impl ServerRepo {
                 title_pinyin,
                 creator_tokens,
                 desc_tokens,
+                desc_aliases,
                 tokenize = 'unicode61 remove_diacritics 0'
             );
             "#,
@@ -297,11 +306,7 @@ impl ServerRepo {
                 r.get::<_, Option<String>>(3)?,
             ))
         })?;
-        let mut insert_stmt = tx.prepare(
-            "INSERT INTO workshop_items_fts (
-                rowid, title_tokens, title_compact, title_pinyin, creator_tokens, desc_tokens
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
+        let mut insert_stmt = tx.prepare(INSERT_SEARCH_DOCUMENT)?;
         for row in rows {
             let (wid, title, creator_name, description) = row?;
             let doc = search::build_indexed_document(
@@ -316,6 +321,7 @@ impl ServerRepo {
                 doc.title_pinyin,
                 doc.creator_tokens,
                 doc.desc_tokens,
+                doc.desc_aliases,
             ])?;
         }
         drop(insert_stmt);
@@ -337,23 +343,17 @@ impl ServerRepo {
         description: Option<&str>,
     ) -> anyhow::Result<()> {
         let doc = search::build_indexed_document(title, creator_name, description);
-        tx.execute(
-            "DELETE FROM workshop_items_fts WHERE rowid = ?1",
-            params![wid],
-        )?;
-        tx.execute(
-            "INSERT INTO workshop_items_fts (
-                rowid, title_tokens, title_compact, title_pinyin, creator_tokens, desc_tokens
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                wid,
-                doc.title_tokens,
-                doc.title_compact,
-                doc.title_pinyin,
-                doc.creator_tokens,
-                doc.desc_tokens,
-            ],
-        )?;
+        tx.prepare_cached("DELETE FROM workshop_items_fts WHERE rowid = ?1")?
+            .execute(params![wid])?;
+        tx.prepare_cached(INSERT_SEARCH_DOCUMENT)?.execute(params![
+            wid,
+            doc.title_tokens,
+            doc.title_compact,
+            doc.title_pinyin,
+            doc.creator_tokens,
+            doc.desc_tokens,
+            doc.desc_aliases,
+        ])?;
         Ok(())
     }
 
@@ -533,11 +533,19 @@ impl ServerRepo {
             _ => None,
         };
 
-        let (persisted_title, persisted_creator, persisted_desc): (
-            String,
-            Option<String>,
-            Option<String>,
-        ) = tx.query_row(
+        let searchable_fields_unchanged = tx
+            .prepare_cached(
+                "SELECT 1 FROM workshop_items WHERE workshop_id = ?1 AND title IS ?2
+                    AND creator_name IS COALESCE(?3, creator_name)
+                    AND description IS COALESCE(?4, description)",
+            )?
+            .exists(params![
+                wid,
+                record.title,
+                record.creator_name,
+                record.description,
+            ])?;
+        let mut upsert = tx.prepare_cached(
             r#"
             INSERT INTO workshop_items (
                 workshop_id, file_type, status, title, description, creator_steam_id,
@@ -575,6 +583,8 @@ impl ServerRepo {
                 steam_version = COALESCE(excluded.steam_version, workshop_items.steam_version)
             RETURNING title, creator_name, description
             "#,
+        )?;
+        let updated_search_fields = upsert.query_row(
             params![
                 wid,
                 serialize_json_enum(&record.file_type),
@@ -600,16 +610,29 @@ impl ServerRepo {
                 listed,
                 listed.and(record.time_updated),
             ],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| {
+                if searchable_fields_unchanged {
+                    Ok(None)
+                } else {
+                    Ok(Some((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    )))
+                }
+            },
         )?;
+        drop(upsert);
 
-        Self::upsert_search_index_tx(
-            tx,
-            wid,
-            &persisted_title,
-            persisted_creator.as_deref(),
-            persisted_desc.as_deref(),
-        )?;
+        if let Some((title, creator, description)) = updated_search_fields {
+            Self::upsert_search_index_tx(
+                tx,
+                wid,
+                &title,
+                creator.as_deref(),
+                description.as_deref(),
+            )?;
+        }
 
         if replace_deps {
             tx.execute(
@@ -873,7 +896,7 @@ impl ServerRepo {
             ],
         )?;
         if next_status == WorkshopItemStatus::PrivateOrUnavailable {
-            Self::scrub_private_details_tx(tx, Some(wid))?;
+            Self::scrub_private_details_tx(tx, Some(wid), true)?;
         }
         if prev.record.status != next_status {
             let rev_record = Self::get_item_tx(tx, wid)?
@@ -893,7 +916,11 @@ impl ServerRepo {
         Ok(())
     }
 
-    fn scrub_private_details_tx(tx: &Connection, wid: Option<WorkshopId>) -> anyhow::Result<()> {
+    fn scrub_private_details_tx(
+        tx: &Connection,
+        wid: Option<WorkshopId>,
+        update_index: bool,
+    ) -> anyhow::Result<()> {
         let wid = wid.map(|id| id.as_u64() as i64);
         tx.execute(
             "UPDATE workshop_item_dependencies SET dep_title = NULL
@@ -912,7 +939,19 @@ impl ServerRepo {
             )",
             params![wid],
         )?;
-        let mut scrub_stmt = tx.prepare(
+        let mut changed_ids = Vec::new();
+        if update_index {
+            let mut stmt = tx.prepare_cached(
+                "SELECT workshop_id FROM workshop_items
+                 WHERE status = 'private_or_unavailable' AND is_admin_override = 0
+                   AND (?1 IS NULL OR workshop_id = ?1)
+                   AND (title IS NOT 'Workshop #' || workshop_id
+                        OR description IS NOT NULL OR creator_name IS NOT NULL)",
+            )?;
+            let rows = stmt.query_map(params![wid], |r| r.get::<_, i64>(0))?;
+            changed_ids = rows.collect::<Result<Vec<_>, _>>()?;
+        }
+        tx.execute(
             "UPDATE workshop_items
              SET title = 'Workshop #' || workshop_id, description = NULL,
                  creator_steam_id = NULL, creator_name = NULL, preview_url = NULL,
@@ -920,18 +959,17 @@ impl ServerRepo {
                  time_created = NULL, time_updated = NULL, tags_json = '[]',
                  collection_children_json = '[]', subscriptions = NULL, favorites = NULL
              WHERE status = 'private_or_unavailable' AND is_admin_override = 0
-               AND (?1 IS NULL OR workshop_id = ?1)
-             RETURNING workshop_id, title",
+               AND (?1 IS NULL OR workshop_id = ?1)",
+            params![wid],
         )?;
-        let scrubbed: Vec<(i64, String)> = scrub_stmt
-            .query_map(params![wid], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(scrub_stmt);
-
-        if !scrubbed.is_empty() && has_table(tx, "workshop_items_fts")? {
-            for (scrub_wid, scrub_title) in scrubbed {
-                Self::upsert_search_index_tx(tx, scrub_wid, &scrub_title, None, None)?;
-            }
+        for scrub_wid in changed_ids {
+            Self::upsert_search_index_tx(
+                tx,
+                scrub_wid,
+                &format!("Workshop #{scrub_wid}"),
+                None,
+                None,
+            )?;
         }
         Ok(())
     }
@@ -1048,54 +1086,41 @@ impl ServerRepo {
         query: &SearchQuery,
         verified_since: Option<i64>,
     ) -> anyhow::Result<SearchResponse> {
-        self.with_read_snapshot(|conn| {
-            let page = query.page.max(1);
-            let page_size = query.page_size.clamp(1, 100);
-            let offset_u64 = u64::from(page - 1) * u64::from(page_size);
-            let tag_filter = query
+        let page = query.page.max(1);
+        let page_size = query.page_size.clamp(1, 100);
+        let offset = u64::from(page - 1) * u64::from(page_size);
+        let filters = SearchFilters {
+            tag: query
                 .tag
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_ascii_lowercase);
-            let status_filter = query.status.map(|s| serialize_json_enum(&s));
+                .map(str::to_ascii_lowercase),
+            status: query.status.map(|status| serialize_json_enum(&status)),
+            verified_since,
+        };
+        let sort = SearchSort::from_name(query.sort.as_deref());
+        let parsed = query.query.as_deref().and_then(search::parse_query);
 
-            let Some(parsed) = query.query.as_deref().and_then(search::parse_query) else {
-                return Self::browse_items(
-                    conn,
-                    tag_filter.as_deref(),
-                    status_filter.as_deref(),
-                    verified_since,
-                    query.sort.as_deref(),
-                    page,
-                    page_size,
-                    offset_u64,
-                );
-            };
-
-            let (total, page_ids) = if parsed.terms.is_empty() && parsed.exact_workshop_id.is_none()
-            {
-                Self::search_symbol_only(
-                    conn,
-                    &parsed,
-                    tag_filter.as_deref(),
-                    status_filter.as_deref(),
-                    verified_since,
-                    query.sort.as_deref(),
-                    page_size,
-                    offset_u64,
-                )?
-            } else {
-                Self::search_indexed(
-                    conn,
-                    &parsed,
-                    tag_filter.as_deref(),
-                    status_filter.as_deref(),
-                    verified_since,
-                    query.sort.as_deref(),
-                    page_size,
-                    offset_u64,
-                )?
+        self.with_read_snapshot(|conn| {
+            let (total, page_ids) = match &parsed {
+                None => Self::browse_items(conn, &filters, sort, page_size, offset)?,
+                Some(parsed) => {
+                    if let Some(id) = parsed
+                        .exact_workshop_id
+                        .filter(|_| parsed.numeric_prefix.is_none())
+                    {
+                        Self::search_exact_id(conn, &filters, id, offset)?
+                    } else {
+                        let mut selection = SearchPage::new(sort, page_size, offset);
+                        if parsed.terms.is_empty() {
+                            Self::search_symbol_only(conn, parsed, &filters, &mut selection)?;
+                        } else {
+                            Self::search_indexed(conn, parsed, &filters, &mut selection)?;
+                        }
+                        selection.finish()
+                    }
+                }
             };
 
             let mut items = Vec::with_capacity(page_ids.len());
@@ -1115,403 +1140,194 @@ impl ServerRepo {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn browse_items(
         conn: &Connection,
-        tag_filter: Option<&str>,
-        status_filter: Option<&str>,
-        verified_since: Option<i64>,
-        sort: Option<&str>,
-        page: u32,
+        filters: &SearchFilters,
+        sort: SearchSort,
         page_size: u32,
-        offset_u64: u64,
-    ) -> anyhow::Result<SearchResponse> {
-        let offset = i64::try_from(offset_u64).unwrap_or(i64::MAX);
-        let where_clause = r#"
-            WHERE (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(tags_json) WHERE LOWER(value) = ?1))
-              AND (?2 IS NULL OR status = ?2)
-              AND (?3 IS NULL OR (is_listed = 1 AND (
-                  is_admin_override = 1 OR status IN ('removed', 'private_or_unavailable')
-                  OR unixepoch(last_verified_at) > ?3
-              )))
-        "#;
-        let total_i64: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM workshop_items {where_clause}"),
-            params![tag_filter, status_filter, verified_since],
+        offset: u64,
+    ) -> anyhow::Result<(u64, Vec<WorkshopId>)> {
+        let total: u64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"),
+            params![filters.tag, filters.status, filters.verified_since],
             |r| r.get(0),
         )?;
-        let total = u64::try_from(total_i64).unwrap_or(0);
 
-        let order_by = match sort {
-            Some("updated_asc") => "ORDER BY COALESCE(time_updated, 0) ASC, workshop_id ASC",
-            Some("title") => "ORDER BY title COLLATE NOCASE ASC, workshop_id ASC",
-            Some("subscriptions") => "ORDER BY COALESCE(subscriptions, 0) DESC, workshop_id ASC",
-            Some("newest") => "ORDER BY COALESCE(time_created, 0) DESC, workshop_id DESC",
-            Some("updated") => "ORDER BY COALESCE(time_updated, 0) DESC, workshop_id DESC",
-            _ => {
-                "ORDER BY COALESCE(subscriptions, 0) DESC, COALESCE(time_updated, 0) DESC, workshop_id ASC"
-            }
-        };
-        let page_sql = format!(
-            "SELECT workshop_id FROM workshop_items {where_clause} {order_by} LIMIT ?4 OFFSET ?5"
+        let order_by = sort.browse_order();
+        let sql = format!(
+            "SELECT w.workshop_id FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}
+             ORDER BY {order_by} LIMIT ?4 OFFSET ?5"
         );
-        let mut stmt = conn.prepare(&page_sql)?;
-        let page_ids: Vec<WorkshopId> = stmt
-            .query_map(
-                params![
-                    tag_filter,
-                    status_filter,
-                    verified_since,
-                    i64::from(page_size),
-                    offset
-                ],
-                |r| {
-                    let raw: i64 = r.get(0)?;
-                    parse_workshop_id_col(0, raw)
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let mut items = Vec::with_capacity(page_ids.len());
-        for id in page_ids {
-            if let Some(meta) = Self::get_item_with_conn(conn, id)? {
-                items.push(meta.record);
-            }
-        }
-
-        Ok(SearchResponse {
-            items,
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        })
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                filters.tag,
+                filters.status,
+                filters.verified_since,
+                page_size,
+                offset
+            ],
+            |row| parse_workshop_id_col(0, row.get(0)?),
+        )?;
+        Ok((total, rows.collect::<Result<Vec<_>, _>>()?))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn search_exact_id(
+        conn: &Connection,
+        filters: &SearchFilters,
+        id: u64,
+        offset: u64,
+    ) -> anyhow::Result<(u64, Vec<WorkshopId>)> {
+        let Ok(id) = i64::try_from(id) else {
+            return Ok((0, Vec::new()));
+        };
+        let matched = conn
+            .prepare_cached(&format!(
+                "SELECT 1 FROM workshop_items w WHERE w.workshop_id = ?4 AND {SEARCH_ITEM_FILTERS}"
+            ))?
+            .exists(params![
+                filters.tag,
+                filters.status,
+                filters.verified_since,
+                id
+            ])?;
+        let ids = if matched && offset == 0 {
+            vec![WorkshopId(id as u64)]
+        } else {
+            Vec::new()
+        };
+        Ok((u64::from(matched), ids))
+    }
+
     fn search_indexed(
         conn: &Connection,
         parsed: &ParsedQuery,
-        tag_filter: Option<&str>,
-        status_filter: Option<&str>,
-        verified_since: Option<i64>,
-        sort: Option<&str>,
-        page_size: u32,
-        offset_u64: u64,
-    ) -> anyhow::Result<(u64, Vec<WorkshopId>)> {
-        let base_filter = r#"
-            (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(w.tags_json) WHERE LOWER(value) = ?1))
-            AND (?2 IS NULL OR w.status = ?2)
-            AND (?3 IS NULL OR (w.is_listed = 1 AND (
-                w.is_admin_override = 1 OR w.status IN ('removed', 'private_or_unavailable')
-                OR unixepoch(w.last_verified_at) > ?3
-            )))
-        "#;
-
-        let mut seen = HashSet::new();
-        let mut scored: Vec<ScoredCandidate> = Vec::new();
-
-        // Stage 1a: Exact workshop ID or numeric ID prefix match
-        if parsed.exact_workshop_id.is_some() || parsed.numeric_prefix.is_some() {
-            let exact_i64 = parsed.exact_workshop_id.map(|id| id as i64);
-            let prefix_like = parsed
-                .numeric_prefix
-                .as_deref()
-                .map(|p| format!("{}%", escape_like(p)));
-            let sql = format!(
-                "SELECT w.workshop_id, w.title, w.creator_name, w.subscriptions, w.time_updated, w.time_created
-                 FROM workshop_items w
-                 WHERE {base_filter}
-                   AND ((?4 IS NOT NULL AND w.workshop_id = ?4)
-                        OR (?5 IS NOT NULL AND CAST(w.workshop_id AS TEXT) LIKE ?5 ESCAPE '\\'))"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                params![
-                    tag_filter,
-                    status_filter,
-                    verified_since,
-                    exact_i64,
-                    prefix_like
-                ],
-                |r| {
-                    let wid = parse_workshop_id_col(0, r.get(0)?)?;
-                    Ok((
-                        wid,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (wid, title, creator_name, subscriptions, time_updated, time_created) = row?;
-                if seen.insert(wid) {
-                    if let Some(rank) = search::score_primary_candidate(
-                        parsed,
-                        wid.as_u64(),
-                        &title,
-                        creator_name.as_deref(),
-                    ) {
-                        scored.push(ScoredCandidate {
-                            workshop_id: wid,
-                            title,
-                            subscriptions: subscriptions.unwrap_or(0),
-                            time_updated: time_updated.unwrap_or(0),
-                            time_created: time_created.unwrap_or(0),
-                            rank,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Stage 1b: Primary FTS5 search (title, compact title, Chinese title pinyin, creator)
+        filters: &SearchFilters,
+        page: &mut SearchPage,
+    ) -> anyhow::Result<()> {
         if let Some(fts_query) = search::build_primary_fts_query(parsed) {
-            let sql = format!(
-                "SELECT w.workshop_id, w.title, w.creator_name, w.subscriptions, w.time_updated, w.time_created
-                 FROM workshop_items_fts fts
-                 JOIN workshop_items w ON w.workshop_id = fts.rowid
-                 WHERE workshop_items_fts MATCH ?4
-                   AND {base_filter}"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(
-                params![tag_filter, status_filter, verified_since, fts_query],
-                |r| {
-                    let wid = parse_workshop_id_col(0, r.get(0)?)?;
-                    Ok((
-                        wid,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (wid, title, creator_name, subscriptions, time_updated, time_created) = row?;
-                if seen.insert(wid) {
-                    if let Some(rank) = search::score_primary_candidate(
-                        parsed,
-                        wid.as_u64(),
-                        &title,
-                        creator_name.as_deref(),
-                    ) {
-                        scored.push(ScoredCandidate {
-                            workshop_id: wid,
-                            title,
-                            subscriptions: subscriptions.unwrap_or(0),
-                            time_updated: time_updated.unwrap_or(0),
-                            time_created: time_created.unwrap_or(0),
-                            rank,
-                        });
-                    }
-                }
+            let (source, match_filter) = if parsed.numeric_prefix.is_some() {
+                (
+                    "FROM (
+                         SELECT rowid AS workshop_id FROM workshop_items_fts WHERE workshop_items_fts MATCH ?4
+                         UNION
+                         SELECT workshop_id FROM workshop_items
+                         WHERE workshop_id = ?5 OR CAST(workshop_id AS TEXT) LIKE ?6
+                     ) candidates JOIN workshop_items w ON w.workshop_id = candidates.workshop_id",
+                    "",
+                )
+            } else {
+                (SEARCH_FTS_SOURCE, "AND workshop_items_fts MATCH ?4")
+            };
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name
+                 {source} WHERE {SEARCH_ITEM_FILTERS} {match_filter}"
+            ))?;
+            let rows = if let Some(prefix) = &parsed.numeric_prefix {
+                let exact = parsed
+                    .exact_workshop_id
+                    .and_then(|id| i64::try_from(id).ok());
+                stmt.query(params![
+                    filters.tag,
+                    filters.status,
+                    filters.verified_since,
+                    fts_query,
+                    exact,
+                    format!("{prefix}%")
+                ])?
+            } else {
+                stmt.query(params![
+                    filters.tag,
+                    filters.status,
+                    filters.verified_since,
+                    fts_query
+                ])?
+            };
+            page.collect(rows, |row, id| {
+                let title = row.get_ref(1)?.as_str()?;
+                let creator = row.get_ref(5)?.as_str_or_null()?;
+                Ok(search::score_primary_candidate(
+                    parsed,
+                    id.as_u64(),
+                    title,
+                    creator,
+                ))
+            })?;
+        }
+
+        if page.total == 0 {
+            if let Some(desc_query) = search::build_desc_fts_query(parsed) {
+                let mut stmt = conn.prepare_cached(&format!(
+                    "SELECT {SEARCH_ORDER_COLUMNS}, w.description {SEARCH_FTS_SOURCE}
+                     WHERE workshop_items_fts MATCH ?4 AND {SEARCH_ITEM_FILTERS}"
+                ))?;
+                let rows = stmt.query(params![
+                    filters.tag,
+                    filters.status,
+                    filters.verified_since,
+                    desc_query
+                ])?;
+                page.collect(rows, |row, _| {
+                    let description = row.get_ref(5)?.as_str_or_null()?;
+                    Ok(description.and_then(|desc| search::score_desc_candidate(parsed, desc)))
+                })?;
             }
         }
 
-        // Stage 2: Description fallback ONLY when primary fields yielded zero matches.
-        if scored.is_empty() {
-            if let Some(desc_fts_query) = search::build_desc_fts_query(parsed) {
-                let need_raw_desc = !parsed.literal_substrings.is_empty();
-                let sql = if need_raw_desc {
-                    format!(
-                        "SELECT w.workshop_id, w.title, fts.desc_tokens, w.description, w.subscriptions, w.time_updated, w.time_created
-                         FROM workshop_items_fts fts
-                         JOIN workshop_items w ON w.workshop_id = fts.rowid
-                         WHERE workshop_items_fts MATCH ?4
-                           AND {base_filter}"
-                    )
-                } else {
-                    format!(
-                        "SELECT w.workshop_id, w.title, fts.desc_tokens, NULL, w.subscriptions, w.time_updated, w.time_created
-                         FROM workshop_items_fts fts
-                         JOIN workshop_items w ON w.workshop_id = fts.rowid
-                         WHERE workshop_items_fts MATCH ?4
-                           AND {base_filter}"
-                    )
-                };
-                let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map(
-                    params![tag_filter, status_filter, verified_since, desc_fts_query],
-                    |r| {
-                        let wid = parse_workshop_id_col(0, r.get(0)?)?;
-                        Ok((
-                            wid,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                            r.get::<_, Option<i64>>(4)?,
-                            r.get::<_, Option<i64>>(5)?,
-                            r.get::<_, Option<i64>>(6)?,
-                        ))
-                    },
-                )?;
-                for row in rows {
-                    let (
-                        wid,
-                        title,
-                        desc_tokens,
-                        raw_description,
-                        subscriptions,
-                        time_updated,
-                        time_created,
-                    ) = row?;
-                    if let Some(rank) = search::score_desc_candidate(
-                        parsed,
-                        &desc_tokens,
-                        raw_description.as_deref(),
-                    ) {
-                        scored.push(ScoredCandidate {
-                            workshop_id: wid,
-                            title,
-                            subscriptions: subscriptions.unwrap_or(0),
-                            time_updated: time_updated.unwrap_or(0),
-                            time_created: time_created.unwrap_or(0),
-                            rank,
-                        });
-                    }
-                }
-            }
-        }
-
-        let total = scored.len() as u64;
-        sort_scored_candidates(&mut scored, sort);
-
-        let start = usize::try_from(offset_u64).unwrap_or(usize::MAX);
-        let page_ids = if start >= scored.len() {
-            Vec::new()
-        } else {
-            let end = start.saturating_add(page_size as usize).min(scored.len());
-            scored[start..end].iter().map(|c| c.workshop_id).collect()
-        };
-
-        Ok((total, page_ids))
+        Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn search_symbol_only(
         conn: &Connection,
         parsed: &ParsedQuery,
-        tag_filter: Option<&str>,
-        status_filter: Option<&str>,
-        verified_since: Option<i64>,
-        sort: Option<&str>,
-        page_size: u32,
-        offset_u64: u64,
-    ) -> anyhow::Result<(u64, Vec<WorkshopId>)> {
-        let like_pattern = format!("%{}%", escape_like(&parsed.raw_folded));
-        let base_filter = r#"
-            (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(tags_json) WHERE LOWER(value) = ?1))
-            AND (?2 IS NULL OR status = ?2)
-            AND (?3 IS NULL OR (is_listed = 1 AND (
-                is_admin_override = 1 OR status IN ('removed', 'private_or_unavailable')
-                OR unixepoch(last_verified_at) > ?3
-            )))
-        "#;
-
-        let mut scored = Vec::new();
-        let title_sql = format!(
-            "SELECT workshop_id, title, subscriptions, time_updated, time_created
-             FROM workshop_items
-             WHERE {base_filter} AND LOWER(title) LIKE ?4 ESCAPE '\\'"
-        );
-        let mut stmt = conn.prepare(&title_sql)?;
-        let rows = stmt.query_map(
-            params![tag_filter, status_filter, verified_since, like_pattern],
-            |r| {
-                let wid = parse_workshop_id_col(0, r.get(0)?)?;
-                Ok((
-                    wid,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
-                    r.get::<_, Option<i64>>(3)?,
-                    r.get::<_, Option<i64>>(4)?,
-                ))
-            },
-        )?;
-        for row in rows {
-            let (wid, title, subscriptions, time_updated, time_created) = row?;
-            let folded = search::fold_text(&title);
-            let rank = if folded == parsed.raw_folded {
-                MatchRank {
+        filters: &SearchFilters,
+        page: &mut SearchPage,
+    ) -> anyhow::Result<()> {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"
+        ))?;
+        let rows = stmt.query(params![filters.tag, filters.status, filters.verified_since])?;
+        page.collect(rows, |row, _| {
+            let title = search::fold_text(row.get_ref(1)?.as_str()?);
+            let rank = if title == parsed.raw_folded {
+                Some(MatchRank {
                     tier: 0,
                     sub_rank: 1,
-                }
-            } else if folded.starts_with(&parsed.raw_folded) {
-                MatchRank {
+                })
+            } else if title.starts_with(&parsed.raw_folded) {
+                Some(MatchRank {
                     tier: 1,
                     sub_rank: 0,
-                }
-            } else {
-                MatchRank {
+                })
+            } else if title.contains(&parsed.raw_folded) {
+                Some(MatchRank {
                     tier: 2,
                     sub_rank: 0,
-                }
+                })
+            } else {
+                None
             };
-            scored.push(ScoredCandidate {
-                workshop_id: wid,
-                title,
-                subscriptions: subscriptions.unwrap_or(0),
-                time_updated: time_updated.unwrap_or(0),
-                time_created: time_created.unwrap_or(0),
-                rank,
-            });
-        }
-        drop(stmt);
+            Ok(rank)
+        })?;
 
-        if scored.is_empty() {
-            let desc_sql = format!(
-                "SELECT workshop_id, title, subscriptions, time_updated, time_created
-                 FROM workshop_items
-                 WHERE {base_filter} AND LOWER(COALESCE(description, '')) LIKE ?4 ESCAPE '\\'"
-            );
-            let mut stmt = conn.prepare(&desc_sql)?;
-            let rows = stmt.query_map(
-                params![tag_filter, status_filter, verified_since, like_pattern],
-                |r| {
-                    let wid = parse_workshop_id_col(0, r.get(0)?)?;
-                    Ok((
-                        wid,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<i64>>(2)?,
-                        r.get::<_, Option<i64>>(3)?,
-                        r.get::<_, Option<i64>>(4)?,
-                    ))
-                },
-            )?;
-            for row in rows {
-                let (wid, title, subscriptions, time_updated, time_created) = row?;
-                scored.push(ScoredCandidate {
-                    workshop_id: wid,
-                    title,
-                    subscriptions: subscriptions.unwrap_or(0),
-                    time_updated: time_updated.unwrap_or(0),
-                    time_created: time_created.unwrap_or(0),
-                    rank: MatchRank {
-                        tier: 6,
-                        sub_rank: 0,
-                    },
-                });
-            }
+        if page.total == 0 {
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT {SEARCH_ORDER_COLUMNS}, w.description FROM workshop_items w
+                 WHERE {SEARCH_ITEM_FILTERS} AND w.description IS NOT NULL"
+            ))?;
+            let rows = stmt.query(params![filters.tag, filters.status, filters.verified_since])?;
+            page.collect(rows, |row, _| {
+                let description = row.get_ref(5)?.as_str()?;
+                let cleaned = search::strip_bbcode_and_urls(description);
+                let matches = search::fold_text(&cleaned).contains(&parsed.raw_folded);
+                Ok(matches.then_some(MatchRank {
+                    tier: 6,
+                    sub_rank: 0,
+                }))
+            })?;
         }
 
-        let total = scored.len() as u64;
-        sort_scored_candidates(&mut scored, sort);
-
-        let start = usize::try_from(offset_u64).unwrap_or(usize::MAX);
-        let page_ids = if start >= scored.len() {
-            Vec::new()
-        } else {
-            let end = start.saturating_add(page_size as usize).min(scored.len());
-            scored[start..end].iter().map(|c| c.workshop_id).collect()
-        };
-
-        Ok((total, page_ids))
+        Ok(())
     }
 
     pub fn get_collection(
@@ -1751,47 +1567,148 @@ fn open_configured_conn(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
-struct ScoredCandidate {
-    workshop_id: WorkshopId,
-    title: String,
-    subscriptions: i64,
-    time_updated: i64,
-    time_created: i64,
-    rank: MatchRank,
+const SEARCH_ITEM_FILTERS: &str = "
+    (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(w.tags_json) WHERE LOWER(value) = ?1))
+    AND (?2 IS NULL OR w.status = ?2)
+    AND (?3 IS NULL OR (w.is_listed = 1 AND (
+        w.is_admin_override = 1 OR w.status IN ('removed', 'private_or_unavailable')
+        OR unixepoch(w.last_verified_at) > ?3
+    )))";
+
+const SEARCH_ORDER_COLUMNS: &str = "
+    w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
+    COALESCE(w.time_updated, 0), COALESCE(w.time_created, 0)";
+const SEARCH_FTS_SOURCE: &str = "
+    FROM workshop_items_fts JOIN workshop_items w ON w.workshop_id = workshop_items_fts.rowid";
+
+struct SearchFilters {
+    tag: Option<String>,
+    status: Option<String>,
+    verified_since: Option<i64>,
 }
 
-fn sort_scored_candidates(candidates: &mut [ScoredCandidate], sort: Option<&str>) {
-    match sort {
-        Some("updated_asc") => {
-            candidates.sort_by_key(|c| (c.time_updated, c.workshop_id.as_u64()));
+#[derive(Clone, Copy)]
+enum SearchSort {
+    Updated,
+    UpdatedAscending,
+    Title,
+    Subscriptions,
+    Newest,
+    Relevance,
+}
+
+impl SearchSort {
+    fn from_name(sort: Option<&str>) -> Self {
+        match sort {
+            Some("updated") => Self::Updated,
+            Some("updated_asc") => Self::UpdatedAscending,
+            Some("title") => Self::Title,
+            Some("subscriptions") => Self::Subscriptions,
+            Some("newest") => Self::Newest,
+            _ => Self::Relevance,
         }
-        Some("title") => {
-            candidates.sort_by(|a, b| {
-                a.title
-                    .to_ascii_lowercase()
-                    .cmp(&b.title.to_ascii_lowercase())
-                    .then_with(|| a.workshop_id.as_u64().cmp(&b.workshop_id.as_u64()))
-            });
+    }
+
+    fn browse_order(self) -> &'static str {
+        match self {
+            Self::Updated => "COALESCE(w.time_updated, 0) DESC, w.workshop_id DESC",
+            Self::UpdatedAscending => "COALESCE(w.time_updated, 0) ASC, w.workshop_id ASC",
+            Self::Title => "w.title COLLATE NOCASE ASC, w.workshop_id ASC",
+            Self::Subscriptions => "COALESCE(w.subscriptions, 0) DESC, w.workshop_id ASC",
+            Self::Newest => "COALESCE(w.time_created, 0) DESC, w.workshop_id DESC",
+            Self::Relevance => {
+                "COALESCE(w.subscriptions, 0) DESC, COALESCE(w.time_updated, 0) DESC, w.workshop_id ASC"
+            }
         }
-        Some("subscriptions") => {
-            candidates.sort_by_key(|c| (Reverse(c.subscriptions), c.workshop_id.as_u64()));
+    }
+
+    fn entry(self, row: &Row<'_>, id: WorkshopId, rank: MatchRank) -> rusqlite::Result<PageEntry> {
+        Ok(match self {
+            Self::Updated => PageEntry::TimeDescending(Reverse((row.get(3)?, id))),
+            Self::UpdatedAscending => PageEntry::TimeAscending(row.get(3)?, id),
+            Self::Title => PageEntry::Title(row.get_ref(1)?.as_str()?.to_ascii_lowercase(), id),
+            Self::Subscriptions => PageEntry::Subscriptions(Reverse(row.get(2)?), id),
+            Self::Newest => PageEntry::TimeDescending(Reverse((row.get(4)?, id))),
+            Self::Relevance => {
+                PageEntry::Relevance(rank, Reverse(row.get(2)?), Reverse(row.get(3)?), id)
+            }
+        })
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum PageEntry {
+    TimeDescending(Reverse<(i64, WorkshopId)>),
+    TimeAscending(i64, WorkshopId),
+    Title(String, WorkshopId),
+    Subscriptions(Reverse<i64>, WorkshopId),
+    Relevance(MatchRank, Reverse<i64>, Reverse<i64>, WorkshopId),
+}
+
+impl PageEntry {
+    fn id(self) -> WorkshopId {
+        match self {
+            Self::TimeDescending(Reverse((_, id)))
+            | Self::TimeAscending(_, id)
+            | Self::Title(_, id)
+            | Self::Subscriptions(_, id)
+            | Self::Relevance(_, _, _, id) => id,
         }
-        Some("newest") => {
-            candidates.sort_by_key(|c| (Reverse(c.time_created), Reverse(c.workshop_id.as_u64())));
+    }
+}
+
+struct SearchPage {
+    sort: SearchSort,
+    offset: u64,
+    limit: u64,
+    total: u64,
+    best: BinaryHeap<PageEntry>,
+}
+
+impl SearchPage {
+    fn new(sort: SearchSort, page_size: u32, offset: u64) -> Self {
+        Self {
+            sort,
+            offset,
+            limit: offset + u64::from(page_size),
+            total: 0,
+            best: BinaryHeap::new(),
         }
-        Some("updated") => {
-            candidates.sort_by_key(|c| (Reverse(c.time_updated), Reverse(c.workshop_id.as_u64())));
+    }
+
+    fn collect(
+        &mut self,
+        mut rows: Rows<'_>,
+        score: impl Fn(&Row<'_>, WorkshopId) -> rusqlite::Result<Option<MatchRank>>,
+    ) -> rusqlite::Result<()> {
+        while let Some(row) = rows.next()? {
+            let id = parse_workshop_id_col(0, row.get(0)?)?;
+            if let Some(rank) = score(row, id)? {
+                self.total += 1;
+                let entry = self.sort.entry(row, id, rank)?;
+                // Count every validated match and keep only the best entries through this page.
+                if (self.best.len() as u64) < self.limit {
+                    self.best.push(entry);
+                } else if let Some(mut last) = self.best.peek_mut() {
+                    if entry < *last {
+                        *last = entry;
+                    }
+                }
+            }
         }
-        _ => {
-            candidates.sort_by_key(|c| {
-                (
-                    c.rank,
-                    Reverse(c.subscriptions),
-                    Reverse(c.time_updated),
-                    c.workshop_id.as_u64(),
-                )
-            });
-        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> (u64, Vec<WorkshopId>) {
+        let offset = usize::try_from(self.offset).unwrap_or(usize::MAX);
+        let page_len = self.best.len().saturating_sub(offset);
+        // The requested page is at the end of the retained entries in sort order.
+        let mut ids: Vec<_> = std::iter::from_fn(|| self.best.pop())
+            .take(page_len)
+            .map(PageEntry::id)
+            .collect();
+        ids.reverse();
+        (self.total, ids)
     }
 }
 
@@ -1834,17 +1751,6 @@ fn parse_workshop_id_col(col: usize, raw: i64) -> rusqlite::Result<WorkshopId> {
                 format!("invalid workshop_id in SQLite row: {raw}").into(),
             )
         })
-}
-
-fn escape_like(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(ch);
-    }
-    out
 }
 
 #[cfg(test)]

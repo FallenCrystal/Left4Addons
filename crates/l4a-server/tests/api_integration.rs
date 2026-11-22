@@ -208,18 +208,167 @@ async fn search_items_supports_catalog_sorts_and_title_relevance() {
     for params in ["?q=%20MiSSIon_%20", "?q=mission_&sort=relevance"] {
         assert_eq!(search(params).await, (4, vec![9001, 9002, 9003, 9004]));
     }
-    assert_eq!(
-        search("?q=mission_&sort=updated").await,
-        (4, vec![9004, 9002, 9001, 9003])
-    );
-    assert_eq!(
-        search("?q=mission_&page=2&pageSize=2").await,
-        (4, vec![9003, 9004])
-    );
+    for (sort, expected) in [
+        ("relevance", [9001, 9002, 9003, 9004]),
+        ("updated", [9004, 9002, 9001, 9003]),
+        ("updated_asc", [9003, 9001, 9002, 9004]),
+        ("title", [9004, 9001, 9003, 9002]),
+        ("subscriptions", [9004, 9002, 9003, 9001]),
+        ("newest", [9003, 9002, 9004, 9001]),
+    ] {
+        for (page, items) in [(1, &expected[..2]), (2, &expected[2..]), (3, &[][..])] {
+            let params = format!("?q=mission_&sort={sort}&page={page}&pageSize=2");
+            assert_eq!(search(&params).await, (4, items.to_vec()), "{params}");
+        }
+    }
     assert_eq!(
         search("?q=in%20the%20description").await,
         (2, vec![9005, 9006])
     );
+}
+
+#[tokio::test]
+async fn search_keeps_camel_case_aliases_and_validates_polyphonic_readings() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    for (id, title, description) in [
+        (41, "[L4D2] Left4Dead2Remastered", None),
+        (42, "Fixture A", Some("[b]DayBreak[/b]")),
+        (43, "Fixture B", Some("NightOfTheLivingDead2Remastered")),
+        (44, "银行行长", None),
+        (45, "银行转账", None),
+        (46, "银行 行长", None),
+    ] {
+        let mut item = sample_item(id, title, 100, None);
+        item.description = description.map(str::to_owned);
+        state.repo.upsert_item(&item, false, false).unwrap();
+    }
+    let app = build_router(state);
+
+    for (query, id) in [
+        ("Left4Dead2Remastered", 41),
+        ("left4dead2remastered", 41),
+        ("left4dead2remaster", 41),
+        ("DayBreak", 42),
+        ("daybreak", 42),
+        ("nightofthelivingdead2remastered", 43),
+        ("yinhanghangzhang", 44),
+        ("yin+hang+hang+zhang", 44),
+    ] {
+        let params = format!("q={query}");
+        assert_eq!(
+            search_result_ids(&app, &params).await,
+            (1, vec![id]),
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn description_fallback_checks_only_visible_text() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    for (id, title, description) in [
+        (
+            41,
+            "Fixture A",
+            Some("[img]HtTpS://example.test/mixedcasefilename.png\n[b]Still visible[/b] mission [url=https://example.test/mission_backup?x=%21]Read more[/url] Steam://url/CommunityFilePage/123456"),
+        ),
+        (42, "Fixture B", Some("Visible mission_ text, 80％ complete")),
+        (43, "Download 100％", None),
+    ] {
+        let mut item = sample_item(id, title, 100, None);
+        item.description = description.map(str::to_owned);
+        if id == 42 {
+            item.tags.push("Description only".into());
+        }
+        state.repo.upsert_item(&item, false, false).unwrap();
+    }
+    let app = build_router(state);
+    for (params, expected) in [
+        ("q=still+visible", vec![41]),
+        ("q=read+more", vec![41]),
+        ("q=mission_", vec![42]),
+        ("q=_", vec![42]),
+        ("q=mixedcasefilename", vec![]),
+        ("q=123456", vec![]),
+        ("q=%25", vec![43]),
+        ("q=%EF%BC%85", vec![43]),
+        ("q=%EF%BC%85&tag=DESCRIPTION+ONLY", vec![42]),
+    ] {
+        let total = expected.len() as u64;
+        assert_eq!(
+            search_result_ids(&app, params).await,
+            (total, expected),
+            "{params}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workshop_links_are_exact_and_numeric_search_merges_distinct_candidates() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    for (id, title) in [(42, "Fixture 42"), (421, "Fixture A"), (88, "Another 42")] {
+        let mut item = sample_item(id, title, 100, None);
+        item.description = None;
+        state.repo.upsert_item(&item, false, false).unwrap();
+    }
+    let app = build_router(state);
+
+    for link in [
+        "steam://url/CommunityFilePage/42",
+        "https://steamcommunity.com/sharedfiles/filedetails/?searchtext=fixture&id=42",
+        "https://steamcommunity.com/workshop/filedetails/?id=42",
+    ] {
+        let params = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", link)
+            .finish();
+        assert_eq!(search_result_ids(&app, &params).await, (1, vec![42]));
+        assert_eq!(
+            search_result_ids(&app, &format!("{params}&page=2")).await,
+            (1, vec![])
+        );
+        assert_eq!(
+            search_result_ids(&app, &format!("{params}&tag=Missing")).await,
+            (0, vec![])
+        );
+    }
+    for invalid in [
+        "https://steamcommunity.com/groups/example?id=42",
+        "https://example.test/steamcommunity.com/sharedfiles/filedetails/?id=42",
+        "https://steamcommunity.com/sharedfiles/filedetails/?id=42extra",
+    ] {
+        let params = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("q", invalid)
+            .finish();
+        assert_eq!(
+            search_result_ids(&app, &params).await,
+            (0, vec![]),
+            "{invalid}"
+        );
+    }
+    assert_eq!(
+        search_result_ids(&app, "q=42").await,
+        (3, vec![42, 88, 421])
+    );
+    assert_eq!(search_result_ids(&app, "q=%2300042").await, (1, vec![42]));
+}
+
+async fn search_result_ids(app: &axum::Router, params: &str) -> (u64, Vec<u64>) {
+    let (status, bytes) = json_request(
+        app,
+        "GET",
+        &format!("/api/v1/items/search?{params}"),
+        vec![],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{params}");
+    let response: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+    let ids = response
+        .items
+        .iter()
+        .map(|item| item.workshop_id.0)
+        .collect();
+    (response.total, ids)
 }
 
 #[tokio::test]
@@ -932,6 +1081,7 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
     {
         let repo = ServerRepo::open(&path).unwrap();
         let mut override_item = sample_item(8001, "Legacy override", 100, None);
+        override_item.description = Some("LegacyDayBreak".into());
         override_item.source = MetadataSource::AdminOverride;
         repo.upsert_item(&override_item, true, true).unwrap();
         let mut private = sample_item(
@@ -944,7 +1094,7 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
         repo.upsert_item(&private, false, true).unwrap();
     }
 
-    // Reproduce the previous release's constrained revision column and missing lock column.
+    // Reproduce an older cache with a version 1 search index.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "DROP INDEX idx_revisions_wid;
@@ -962,7 +1112,14 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
          DROP TABLE revision_fixture;
          CREATE INDEX idx_revisions_wid ON workshop_item_revisions(workshop_id, id DESC);
          ALTER TABLE workshop_items DROP COLUMN is_admin_override;
-         ALTER TABLE workshop_items DROP COLUMN previews_json;",
+         ALTER TABLE workshop_items DROP COLUMN previews_json;
+         DROP TABLE workshop_items_fts;
+         CREATE VIRTUAL TABLE workshop_items_fts USING fts5(
+             title_tokens, title_compact, title_pinyin, creator_tokens, desc_tokens
+         );
+         INSERT INTO workshop_items_fts (rowid, title_tokens, desc_tokens)
+         VALUES (8001, 'legacy override', 'legacy day break'), (8003, 'account only', '');
+         UPDATE sync_state SET value = '1' WHERE key = 'search_index_version';",
     )
     .unwrap();
     drop(conn);
@@ -989,6 +1146,18 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
     assert_eq!(private.status, WorkshopItemStatus::PrivateOrUnavailable);
     assert_eq!(private.title, "Workshop #8003");
     assert!(private.file_url.is_none());
+    for (query, expected) in [("legacydaybreak", 1), ("account only", 0)] {
+        let res = repo
+            .search(
+                &l4a_protocol::SearchQuery {
+                    query: Some(query.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(res.total, expected, "{query}");
+    }
     let written = repo.list_revisions(WorkshopId(8002)).unwrap();
     assert_eq!(written.len(), 1);
     assert!(written[0].id > historical[0].id);
@@ -1014,6 +1183,78 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
         .unwrap();
     assert_eq!(res.total, 1);
     assert_eq!(res.items[0].workshop_id, WorkshopId(8001));
+}
+
+#[test]
+fn upstream_refresh_reindexes_only_changed_effective_search_fields() {
+    let repo = ServerRepo::open_in_memory().unwrap();
+    let mut item = sample_item(8501, "Original map", 100, None);
+    item.description = Some("DayBreak".into());
+    repo.upsert_item(&item, false, true).unwrap();
+
+    // Abort the refresh if it tries to touch an FTS content row.
+    repo.with_transaction(|tx| {
+        tx.execute_batch(
+            "CREATE TEMP TRIGGER fail_search_delete BEFORE DELETE ON workshop_items_fts_content
+              BEGIN SELECT RAISE(ABORT, 'unexpected search index delete'); END;
+             CREATE TEMP TRIGGER fail_search_insert BEFORE INSERT ON workshop_items_fts_content
+              BEGIN SELECT RAISE(ABORT, 'unexpected search index insert'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let refresh = |item: &WorkshopItemRecord| {
+        let observation = WorkshopFetchOutcome::Found { item: item.clone() }.into();
+        let summary = repo.apply_upstream_outcomes(&[observation]).unwrap();
+        assert_eq!(summary.active_upserted, 1);
+    };
+    item.fetched_at += chrono::TimeDelta::seconds(1);
+    refresh(&item);
+    item.creator_name = None;
+    item.description = None;
+    item.fetched_at += chrono::TimeDelta::seconds(1);
+    refresh(&item);
+    let stored = repo.get_item(item.workshop_id).unwrap().unwrap();
+    assert_eq!(stored.last_verified_at, item.fetched_at);
+    assert_eq!(stored.record.creator_name.as_deref(), Some("Mapper"));
+    assert_eq!(stored.record.description.as_deref(), Some("DayBreak"));
+
+    repo.with_transaction(|tx| {
+        tx.execute_batch("DROP TRIGGER fail_search_delete; DROP TRIGGER fail_search_insert;")?;
+        Ok(())
+    })
+    .unwrap();
+    let total = |query: &str| {
+        repo.search(
+            &l4a_protocol::SearchQuery {
+                query: Some(query.into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap()
+        .total
+    };
+    item.creator_name = Some("OtherAuthor".into());
+    item.fetched_at += chrono::TimeDelta::seconds(1);
+    refresh(&item);
+    assert_eq!(total("otherauthor"), 1);
+    assert_eq!(total("mapper"), 0);
+    assert_eq!(total("daybreak"), 1);
+
+    item.creator_name = None;
+    item.description = Some("EarlyDays".into());
+    item.fetched_at += chrono::TimeDelta::seconds(1);
+    refresh(&item);
+    assert_eq!(total("earlydays"), 1);
+    assert_eq!(total("daybreak"), 0);
+    assert_eq!(total("otherauthor"), 1);
+
+    item.title = "Renamed map".into();
+    item.fetched_at += chrono::TimeDelta::seconds(1);
+    refresh(&item);
+    assert_eq!(total("renamed"), 1);
+    assert_eq!(total("original"), 0);
 }
 
 #[tokio::test]
