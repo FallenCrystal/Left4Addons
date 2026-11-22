@@ -594,6 +594,120 @@ export function Tabs<T extends string>({
   );
 }
 
+const M3E_SAMPLES = 72;
+const M3E_CENTER = 24;
+const M3E_STEP_MS = 650;
+
+function roundedNgonRadius(
+  theta: number,
+  sides: number,
+  vertexRadius: number,
+  cornerRadius: number,
+  rotation = -Math.PI / 2,
+): number {
+  const step = (2 * Math.PI) / sides;
+  const half = Math.PI / sides;
+  let rel = (theta - rotation) % step;
+  if (rel < 0) rel += step;
+  const delta = Math.abs(rel - half);
+  const phi = half - delta;
+  const faceDist = vertexRadius * Math.cos(half) + cornerRadius;
+  const maxTan = (vertexRadius * Math.sin(half)) / faceDist;
+  if (delta < half - 1e-6 && Math.tan(delta) <= maxTan) {
+    return faceDist / Math.cos(delta);
+  }
+  const perp = vertexRadius * Math.sin(phi);
+  return (
+    vertexRadius * Math.cos(phi) +
+    Math.sqrt(Math.max(0, cornerRadius * cornerRadius - perp * perp))
+  );
+}
+
+const M3E_RADIUS_FNS: ReadonlyArray<(theta: number) => number> = [
+  // 0: SoftBurst (10-pointed soft starburst)
+  (t) => 16.6 + 2.5 * (Math.cos(10 * t) + 0.16 * Math.cos(20 * t)),
+  // 1: Cookie9Sided (9-lobed scalloped cookie)
+  (t) => 17.2 + 2.1 * (Math.cos(9 * t) - 0.22 * Math.cos(18 * t)),
+  // 2: Pentagon (rounded regular pentagon)
+  (t) => roundedNgonRadius(t, 5, 11.4, 7.6, -Math.PI / 2),
+  // 3: Pill (rounded stadium capsule)
+  (t) => roundedNgonRadius(t, 2, 6.2, 13.0, -Math.PI / 4),
+  // 4: Sunny (8-pointed soft sun)
+  (t) => 16.8 + 2.4 * (Math.cos(8 * t) + 0.1 * Math.cos(16 * t)),
+  // 5: Cookie4Sided (4-lobed clover cookie)
+  (t) =>
+    16.2 +
+    3.1 *
+      (Math.cos(4 * (t - Math.PI / 4)) - 0.2 * Math.cos(8 * (t - Math.PI / 4))),
+  // 6: Oval (expressive ellipse)
+  (t) => {
+    const a = 19.2;
+    const b = 14.4;
+    const c = Math.cos(t - Math.PI / 4);
+    const s = Math.sin(t - Math.PI / 4);
+    return (a * b) / Math.hypot(b * c, a * s);
+  },
+];
+
+// Precompute cubic Bezier control points (startX, startY, followed by N * 6 floats: c1x, c1y, c2x, c2y, ex, ey)
+const M3E_BEZIER_SHAPES: ReadonlyArray<Float32Array> = M3E_RADIUS_FNS.map((fn) => {
+  const ptsX = new Float32Array(M3E_SAMPLES);
+  const ptsY = new Float32Array(M3E_SAMPLES);
+  for (let i = 0; i < M3E_SAMPLES; i += 1) {
+    const theta = (2 * Math.PI * i) / M3E_SAMPLES;
+    const r = fn(theta);
+    ptsX[i] = M3E_CENTER + r * Math.cos(theta);
+    ptsY[i] = M3E_CENTER + r * Math.sin(theta);
+  }
+  const out = new Float32Array(2 + M3E_SAMPLES * 6);
+  out[0] = ptsX[0];
+  out[1] = ptsY[0];
+  for (let i = 0; i < M3E_SAMPLES; i += 1) {
+    const i0 = (i - 1 + M3E_SAMPLES) % M3E_SAMPLES;
+    const i1 = i;
+    const i2 = (i + 1) % M3E_SAMPLES;
+    const i3 = (i + 2) % M3E_SAMPLES;
+    const base = 2 + i * 6;
+    out[base] = ptsX[i1] + (ptsX[i2] - ptsX[i0]) / 6;
+    out[base + 1] = ptsY[i1] + (ptsY[i2] - ptsY[i0]) / 6;
+    out[base + 2] = ptsX[i2] - (ptsX[i3] - ptsX[i1]) / 6;
+    out[base + 3] = ptsY[i2] - (ptsY[i3] - ptsY[i1]) / 6;
+    out[base + 4] = ptsX[i2];
+    out[base + 5] = ptsY[i2];
+  }
+  return out;
+});
+
+function formatMorphPath(shapeA: Float32Array, shapeB: Float32Array, u: number): string {
+  const v = 1 - u;
+  const sx = (shapeA[0] * v + shapeB[0] * u).toFixed(2);
+  const sy = (shapeA[1] * v + shapeB[1] * u).toFixed(2);
+  let d = `M${sx} ${sy}`;
+  for (let i = 0; i < M3E_SAMPLES; i += 1) {
+    const base = 2 + i * 6;
+    const c1x = (shapeA[base] * v + shapeB[base] * u).toFixed(2);
+    const c1y = (shapeA[base + 1] * v + shapeB[base + 1] * u).toFixed(2);
+    const c2x = (shapeA[base + 2] * v + shapeB[base + 2] * u).toFixed(2);
+    const c2y = (shapeA[base + 3] * v + shapeB[base + 3] * u).toFixed(2);
+    const ex = (shapeA[base + 4] * v + shapeB[base + 4] * u).toFixed(2);
+    const ey = (shapeA[base + 5] * v + shapeB[base + 5] * u).toFixed(2);
+    d += `C${c1x} ${c1y} ${c2x} ${c2y} ${ex} ${ey}`;
+  }
+  return `${d}Z`;
+}
+
+const M3E_INITIAL_PATH = formatMorphPath(M3E_BEZIER_SHAPES[0], M3E_BEZIER_SHAPES[0], 0);
+
+function m3eSpringEase(p: number): number {
+  if (p <= 0) return 0;
+  if (p >= 0.88) return 1;
+  const t = p / 0.88;
+  const raw = (x: number) =>
+    1 - Math.exp(-5.6 * x) * (Math.cos(4.4 * x) + 0.55 * Math.sin(4.4 * x));
+  const end = raw(1);
+  return raw(t) + (1 - end) * (t * t * (3 - 2 * t));
+}
+
 export function LoadingIndicator({
   size = 'md',
   contained = false,
@@ -603,6 +717,53 @@ export function LoadingIndicator({
   contained?: boolean;
   label?: string;
 }) {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const pathRef = useRef<SVGPathElement>(null);
+
+  useEffect(() => {
+    if (
+      typeof window === 'undefined' ||
+      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    ) {
+      return;
+    }
+
+    const shapeCount = M3E_BEZIER_SHAPES.length;
+    const stepAngle = 360 / shapeCount;
+    let frameId = 0;
+    const startTime = performance.now();
+
+    const tick = (now: number) => {
+      const elapsed = Math.max(0, now - startTime);
+      const totalSteps = elapsed / M3E_STEP_MS;
+      const stepIndex = Math.floor(totalSteps);
+      const stepProgress = totalSteps - stepIndex;
+      const eased = m3eSpringEase(stepProgress);
+
+      const fromShape = M3E_BEZIER_SHAPES[stepIndex % shapeCount];
+      const toShape = M3E_BEZIER_SHAPES[(stepIndex + 1) % shapeCount];
+
+      if (pathRef.current) {
+        pathRef.current.setAttribute('d', formatMorphPath(fromShape, toShape, eased));
+      }
+      if (svgRef.current) {
+        const angle = ((stepIndex + eased) * stepAngle) % 360;
+        const pulse =
+          stepProgress < 0.72
+            ? 1 - 0.05 * Math.sin((Math.PI * stepProgress) / 0.72)
+            : 1;
+        svgRef.current.style.transform = `rotate(${angle.toFixed(2)}deg) scale(${pulse.toFixed(4)})`;
+      }
+
+      frameId = window.requestAnimationFrame(tick);
+    };
+
+    frameId = window.requestAnimationFrame(tick);
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, []);
+
   return (
     <span
       className="md-loading-indicator"
@@ -613,28 +774,13 @@ export function LoadingIndicator({
     >
       <span className="md-loading-rotor" aria-hidden="true">
         <svg
-          className="md-loading-shape md-loading-shape-1"
+          ref={svgRef}
+          className="md-loading-shape"
           viewBox="0 0 48 48"
           fill="currentColor"
           shapeRendering="geometricPrecision"
         >
-          <path d="M 24.00 5.80 C 26.05 5.80 27.23 9.53 29.59 10.51 C 31.95 11.49 35.42 9.68 36.87 11.13 C 38.32 12.58 36.51 16.05 37.49 18.41 C 38.47 20.77 42.20 21.95 42.20 24.00 C 42.20 26.05 38.47 27.23 37.49 29.59 C 36.51 31.95 38.32 35.42 36.87 36.87 C 35.42 38.32 31.95 36.51 29.59 37.49 C 27.23 38.47 26.05 42.20 24.00 42.20 C 21.95 42.20 20.77 38.47 18.41 37.49 C 16.05 36.51 12.58 38.32 11.13 36.87 C 9.68 35.42 11.49 31.95 10.51 29.59 C 9.53 27.23 5.80 26.05 5.80 24.00 C 5.80 21.95 9.53 20.77 10.51 18.41 C 11.49 16.05 9.68 12.58 11.13 11.13 C 12.58 9.68 16.05 11.49 18.41 10.51 C 20.77 9.53 21.95 5.80 24.00 5.80 Z" />
-        </svg>
-        <svg
-          className="md-loading-shape md-loading-shape-2"
-          viewBox="0 0 48 48"
-          fill="currentColor"
-          shapeRendering="geometricPrecision"
-        >
-          <path d="M 24.00 5.50 C 27.06 5.50 28.95 12.26 32.34 15.66 C 35.74 19.05 42.50 20.94 42.50 24.00 C 42.50 27.06 35.74 28.95 32.34 32.34 C 28.95 35.74 27.06 42.50 24.00 42.50 C 20.94 42.50 19.05 35.74 15.66 32.34 C 12.26 28.95 5.50 27.06 5.50 24.00 C 5.50 20.94 12.26 19.05 15.66 15.66 C 19.05 12.26 20.94 5.50 24.00 5.50 Z" />
-        </svg>
-        <svg
-          className="md-loading-shape md-loading-shape-3"
-          viewBox="0 0 48 48"
-          fill="currentColor"
-          shapeRendering="geometricPrecision"
-        >
-          <path d="M 24.00 5.60 C 26.49 5.60 27.88 10.54 30.80 12.22 C 33.72 13.91 38.69 12.64 39.93 14.80 C 41.18 16.96 37.60 20.63 37.60 24.00 C 37.60 27.37 41.18 31.04 39.93 33.20 C 38.69 35.36 33.72 34.09 30.80 35.78 C 27.88 37.46 26.49 42.40 24.00 42.40 C 21.51 42.40 20.12 37.46 17.20 35.78 C 14.28 34.09 9.31 35.36 8.07 33.20 C 6.82 31.04 10.40 27.37 10.40 24.00 C 10.40 20.63 6.82 16.96 8.07 14.80 C 9.31 12.64 14.28 13.91 17.20 12.22 C 20.12 10.54 21.51 5.60 24.00 5.60 Z" />
+          <path ref={pathRef} d={M3E_INITIAL_PATH} />
         </svg>
       </span>
     </span>
@@ -876,8 +1022,12 @@ export function TooltipHost() {
 
     const hide = () => {
       clearTimer();
-      targetRef.current = null;
-      setActive(null);
+      if (targetRef.current !== null) {
+        targetRef.current = null;
+        setActive((prev) => (prev ? null : prev));
+      } else {
+        setActive((prev) => (prev ? null : prev));
+      }
     };
 
     const showForTarget = (el: HTMLElement, delayMs: number) => {

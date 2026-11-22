@@ -75,8 +75,8 @@
 :root[data-theme='dark'] {
   color-scheme: dark;
 
-  --md-sys-elevation-1: 0 1px 3px 1px rgba(0, 0, 0, 0.32), 0 1px 2px rgba(0, 0, 0, 0.45);
-  --md-sys-elevation-2: 0 2px 6px 2px rgba(0, 0, 0, 0.36), 0 1px 2px rgba(0, 0, 0, 0.5);
+  --md-sys-elevation-1: 0 1px 2px rgba(0, 0, 0, 0.45), 0 1px 3px 1px rgba(0, 0, 0, 0.32);
+  --md-sys-elevation-2: 0 1px 2px rgba(0, 0, 0, 0.5), 0 2px 6px 2px rgba(0, 0, 0, 0.36);
   --md-sys-elevation-3: 0 4px 10px 3px rgba(0, 0, 0, 0.44), 0 1px 3px rgba(0, 0, 0, 0.55);
 
   --md-sys-color-primary: #8fd5b2;
@@ -772,7 +772,10 @@ input:-webkit-autofill:focus {
 .l4a-view-scroll {
   flex: 1;
   min-height: 0;
+  overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 4px 24px 28px;
 }
 
@@ -819,18 +822,18 @@ input:-webkit-autofill:focus {
   content: '';
   position: absolute;
   inset: 0;
-  background-color: currentColor;
-  opacity: 0;
+  border-radius: inherit;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-btn:hover:not(:disabled)::after {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .md-btn:active:not(:disabled)::after {
-  opacity: 0.12;
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .md-btn:focus-visible {
@@ -929,18 +932,17 @@ input:-webkit-autofill:focus {
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background-color: currentColor;
-  opacity: 0;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-icon-btn:hover:not(:disabled)::after {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .md-icon-btn:active:not(:disabled)::after {
-  opacity: 0.12;
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .md-icon-btn:focus-visible {
@@ -996,10 +998,10 @@ input:-webkit-autofill:focus {
   content: '';
   position: absolute;
   inset: 0;
-  background-color: currentColor;
-  opacity: 0;
+  border-radius: inherit;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-fab:hover:not(:disabled) {
@@ -1007,11 +1009,11 @@ input:-webkit-autofill:focus {
 }
 
 .md-fab:hover:not(:disabled)::after {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .md-fab:active:not(:disabled)::after {
-  opacity: 0.12;
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .md-fab:focus-visible {
@@ -1094,22 +1096,25 @@ input:-webkit-autofill:focus {
   position: absolute;
   inset: -8px;
   border-radius: 9999px;
-  background-color: var(--md-sys-color-on-surface);
-  opacity: 0;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
-}
-
-.md-switch[data-checked='true'] .md-switch-thumb::before {
-  background-color: var(--md-sys-color-primary);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-switch:hover:not(:disabled) .md-switch-thumb::before {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, var(--md-sys-color-on-surface) 8%, transparent);
 }
 
 .md-switch:active:not(:disabled) .md-switch-thumb::before {
-  opacity: 0.14;
+  background-color: color-mix(in srgb, var(--md-sys-color-on-surface) 14%, transparent);
+}
+
+.md-switch[data-checked='true']:hover:not(:disabled) .md-switch-thumb::before {
+  background-color: color-mix(in srgb, var(--md-sys-color-primary) 8%, transparent);
+}
+
+.md-switch[data-checked='true']:active:not(:disabled) .md-switch-thumb::before {
+  background-color: color-mix(in srgb, var(--md-sys-color-primary) 14%, transparent);
 }
 
 .md-switch-thumb {
@@ -1172,18 +1177,17 @@ input:-webkit-autofill:focus {
   position: absolute;
   inset: -10px;
   border-radius: 9999px;
-  background-color: currentColor;
-  opacity: 0;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-checkbox:hover::before {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .md-checkbox:active::before {
-  opacity: 0.12;
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .md-checkbox[data-checked='true'] {
@@ -1236,18 +1240,17 @@ input:-webkit-autofill:focus {
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background-color: currentColor;
-  opacity: 0;
+  background-color: transparent;
   pointer-events: none;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-chip:hover::after {
-  opacity: 0.08;
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
 }
 
 .md-chip:active::after {
-  opacity: 0.12;
+  background-color: color-mix(in srgb, currentColor 12%, transparent);
 }
 
 .md-chip:focus-visible {
@@ -1558,7 +1561,7 @@ input:-webkit-autofill:focus {
   flex: 1;
   display: grid;
   place-items: center;
-  min-height: 220px;
+  min-height: max(220px, calc(100% - 32px));
 }
 
 .md-loading-indicator {
@@ -1568,6 +1571,8 @@ input:-webkit-autofill:focus {
   place-items: center;
   width: var(--md-li-size);
   height: var(--md-li-size);
+  max-width: var(--md-li-size);
+  max-height: var(--md-li-size);
   border-radius: var(--md-sys-shape-corner-full);
   color: var(--md-sys-color-primary);
   flex-shrink: 0;
@@ -1584,104 +1589,35 @@ input:-webkit-autofill:focus {
 .md-loading-indicator[data-contained='true'] {
   background-color: var(--md-sys-color-primary-container);
   color: var(--md-sys-color-on-primary-container);
-  padding: 16%;
+  padding: calc(var(--md-li-size) * 0.125);
 }
 
 .md-loading-rotor {
   position: relative;
   width: 100%;
   height: 100%;
-  display: block;
+  display: grid;
+  place-items: center;
   overflow: visible;
-  animation: md-expressive-spin 2.4s cubic-bezier(0.35, 0.1, 0.25, 1) infinite;
+  transform-origin: 50% 50%;
+  animation: md-expressive-spin 3.2s linear infinite;
 }
 
 .md-loading-shape {
-  position: absolute;
-  inset: 0;
+  display: block;
   width: 100%;
   height: 100%;
   overflow: visible;
-  transform-origin: center;
-  will-change: transform, opacity;
-}
-
-.md-loading-shape-1 {
-  animation: md-expressive-morph-1 2.4s ease-in-out infinite;
-}
-
-.md-loading-shape-2 {
-  animation: md-expressive-morph-2 2.4s ease-in-out infinite;
-}
-
-.md-loading-shape-3 {
-  animation: md-expressive-morph-3 2.4s ease-in-out infinite;
+  transform-origin: 50% 50%;
+  will-change: transform;
 }
 
 @keyframes md-expressive-spin {
-  0% {
+  from {
     transform: rotate(0deg);
   }
-  33.33% {
-    transform: rotate(120deg);
-  }
-  66.66% {
-    transform: rotate(240deg);
-  }
-  100% {
+  to {
     transform: rotate(360deg);
-  }
-}
-
-@keyframes md-expressive-morph-1 {
-  0%,
-  22% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  33%,
-  88% {
-    opacity: 0;
-    transform: scale(0.72);
-  }
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-}
-
-@keyframes md-expressive-morph-2 {
-  0%,
-  22% {
-    opacity: 0;
-    transform: scale(0.72);
-  }
-  33%,
-  55% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  66%,
-  100% {
-    opacity: 0;
-    transform: scale(0.72);
-  }
-}
-
-@keyframes md-expressive-morph-3 {
-  0%,
-  55% {
-    opacity: 0;
-    transform: scale(0.72);
-  }
-  66%,
-  88% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  100% {
-    opacity: 0;
-    transform: scale(0.72);
   }
 }
 
@@ -1747,6 +1683,9 @@ input:-webkit-autofill:focus {
   border-radius: var(--md-sys-shape-corner-medium);
   background-color: var(--md-sys-color-surface-container-low);
   border: 1px solid var(--md-sys-color-outline-variant);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0),
+    0 1px 3px 1px rgba(0, 0, 0, 0);
   overflow: hidden;
   transition:
     background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
@@ -1803,9 +1742,19 @@ input:-webkit-autofill:focus {
   position: relative;
   aspect-ratio: 16 / 9;
   width: 100%;
+  min-height: 0;
   flex-shrink: 0;
   background-color: var(--md-sys-color-surface-container-highest);
   overflow: hidden;
+}
+
+.l4a-addon-cover-wrap > .l4a-card-trigger,
+.l4a-addon-cover-wrap > .l4a-cover-img,
+.l4a-addon-cover-wrap > .l4a-cover-fallback {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
 }
 
 .l4a-cover-img {
@@ -1854,14 +1803,15 @@ input:-webkit-autofill:focus {
   background-color: color-mix(in srgb, var(--md-sys-color-surface) 84%, transparent);
   display: grid;
   place-items: center;
+  visibility: hidden;
   opacity: 0;
-  transition: opacity var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
 }
 
 .md-card:hover .l4a-card-check,
 .md-card:focus-within .l4a-card-check,
 .md-card[data-selected='true'] .l4a-card-check,
 .l4a-card-check[data-visible='true'] {
+  visibility: visible;
   opacity: 1;
 }
 
