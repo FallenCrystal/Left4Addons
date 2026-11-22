@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   extractWorkshopIdInput,
   formatBytes,
+  formatSpeed,
   getFileBaseName,
   previewFilenameByRules,
   summarizeBatchReport,
@@ -12,6 +13,14 @@ describe('format utilities', () => {
     expect(formatBytes(0)).toBe('0 B');
     expect(formatBytes(512)).toBe('512 B');
     expect(formatBytes(1024 * 1024 * 12.5)).toBe('12.5 MB');
+  });
+
+  it('formats transfer speeds including explicit 0 B/s', () => {
+    expect(formatSpeed(0)).toBe('0 B/s');
+    expect(formatSpeed(-100)).toBe('0 B/s');
+    expect(formatSpeed(Number.NaN)).toBe('0 B/s');
+    expect(formatSpeed(1536)).toBe('1.5 KB/s');
+    expect(formatSpeed(1024 * 1024 * 12.5)).toBe('12.5 MB/s');
   });
 
   it('validates positive u64 workshop IDs from numbers, Steam HTTPS URLs, and steam:// URIs', () => {

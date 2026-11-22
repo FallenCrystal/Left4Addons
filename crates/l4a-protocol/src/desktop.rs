@@ -529,6 +529,8 @@ pub struct TaskRecord {
     pub kind: TaskKind,
     pub status: TaskStatus,
     pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_title: Option<String>,
     pub progress_percent: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -564,9 +566,13 @@ pub enum CoreEvent {
     DownloadProgress {
         task_id: TaskId,
         workshop_id: WorkshopId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
         downloaded: u64,
         total: Option<u64>,
         percent: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speed_bps: Option<u64>,
     },
     ReconcileIssuesDetected {
         count: usize,

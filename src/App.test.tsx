@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './i18n';
 import { setAppLanguage } from './i18n';
@@ -297,5 +297,111 @@ describe('Left4Addons v2 Material 3 frontend', () => {
 
     expect(sortTrigger.getAttribute('aria-expanded')).toBe('false');
     expect(sortTrigger.textContent).toContain('Size');
+  });
+
+  it('displays addon titles in the task queue and refreshes download speed every second', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.tasks = [
+      {
+        id: 'task-dl-history',
+        kind: 'download',
+        status: 'completed',
+        targetId: '99887766',
+        targetTitle: 'Dead Air Redux',
+        progressPercent: 100,
+        message: 'Done',
+        createdAt: '2026-11-22T10:00:00Z',
+        updatedAt: '2026-11-22T10:01:00Z',
+      },
+    ];
+    invokeMock.mockResolvedValue(snapshot);
+
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+    await waitFor(() => expect(eventHandler).not.toBeNull());
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Tasks' });
+    expect(within(sheet).getByText('Dead Air Redux')).toBeTruthy();
+    expect(within(sheet).getByText(/#99887766/)).toBeTruthy();
+
+    vi.useFakeTimers();
+    try {
+      // Simulate rapid chunks (<50ms apart) without backend speedBps — speed should still refresh every 1s.
+      act(() => {
+        eventHandler?.({
+          payload: {
+            type: 'download_progress',
+            taskId: 'dl-1',
+            workshopId: '55443322',
+            title: 'Cold Stream Overhaul',
+            downloaded: 0,
+            total: 10 * 1024 * 1024,
+            percent: 0,
+          },
+        });
+      });
+
+      expect(within(sheet).getByText('Cold Stream Overhaul')).toBeTruthy();
+      expect(within(sheet).getByText('#55443322')).toBeTruthy();
+      expect(within(sheet).getByText('0 B/s')).toBeTruthy();
+
+      for (let i = 1; i <= 4; i += 1) {
+        act(() => {
+          vi.advanceTimersByTime(10);
+          eventHandler?.({
+            payload: {
+              type: 'download_progress',
+              taskId: 'dl-1',
+              workshopId: '55443322',
+              title: 'Cold Stream Overhaul',
+              downloaded: i * 512 * 1024,
+              total: 10 * 1024 * 1024,
+              percent: i * 5,
+            },
+          });
+        });
+      }
+
+      // Before the 1-second tick, speed has not flickered yet.
+      expect(within(sheet).getByText('0 B/s')).toBeTruthy();
+
+      // Advance to the 1-second speed refresh tick (2 MB downloaded in 1s -> 2.0 MB/s).
+      act(() => {
+        vi.advanceTimersByTime(960);
+      });
+      expect(within(sheet).getByText('2.0 MB/s')).toBeTruthy();
+
+      // Stall for 1 second with no new bytes -> speed refreshes back to 0 B/s.
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(within(sheet).getByText('0 B/s')).toBeTruthy();
+
+      // Backend-authoritative speedBps updates cleanly and drops to 0 B/s if events stop > 1.5s.
+      act(() => {
+        eventHandler?.({
+          payload: {
+            type: 'download_progress',
+            taskId: 'dl-1',
+            workshopId: '55443322',
+            title: 'Cold Stream Overhaul',
+            downloaded: 6 * 1024 * 1024,
+            total: 10 * 1024 * 1024,
+            percent: 60,
+            speedBps: 4 * 1024 * 1024,
+          },
+        });
+      });
+      expect(within(sheet).getByText('4.0 MB/s')).toBeTruthy();
+
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(within(sheet).getByText('0 B/s')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

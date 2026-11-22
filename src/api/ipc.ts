@@ -146,6 +146,7 @@ export interface TaskRecord {
   kind: 'download' | 'sync' | 'scan';
   status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   targetId: string;
+  targetTitle?: string;
   progressPercent: number;
   message?: string;
   error?: string;
@@ -351,9 +352,11 @@ export type CoreEvent =
       type: 'download_progress';
       taskId: string;
       workshopId: string;
+      title?: string | null;
       downloaded: number;
       total?: number | null;
       percent: number;
+      speedBps?: number | null;
     }
   | { type: 'reconcile_issues_detected'; count: number }
   | { type: 'watch_error'; message: string };
@@ -586,7 +589,9 @@ export async function subscribeCoreEvents(
     if (payload.type === 'download_progress') {
       handler({
         ...payload,
+        title: payload.title ?? undefined,
         total: payload.total ?? undefined,
+        speedBps: payload.speedBps ?? undefined,
       });
       return;
     }

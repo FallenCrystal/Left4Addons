@@ -233,7 +233,7 @@ describe('v2 IPC client wrapper', () => {
     expect(invokeMock).toHaveBeenCalledWith('save_config', { config });
   });
 
-  it('normalizes serialized CoreEvent payloads including nullable total bytes', async () => {
+  it('normalizes serialized CoreEvent payloads including nullable optional fields', async () => {
     const received: CoreEvent[] = [];
     const unlisten = await subscribeCoreEvents((ev) => received.push(ev));
 
@@ -243,9 +243,23 @@ describe('v2 IPC client wrapper', () => {
         type: 'download_progress',
         taskId: 't-1',
         workshopId: '2814104912',
+        title: null,
         downloaded: 1024,
         total: null,
         percent: 42,
+        speedBps: null,
+      },
+    });
+    listenCallback?.({
+      payload: {
+        type: 'download_progress',
+        taskId: 't-2',
+        workshopId: '3011942811',
+        title: 'Yama Campaign Remastered',
+        downloaded: 2048,
+        total: 4096,
+        percent: 50,
+        speedBps: 1048576,
       },
     });
     expect(received).toEqual([
@@ -253,9 +267,21 @@ describe('v2 IPC client wrapper', () => {
         type: 'download_progress',
         taskId: 't-1',
         workshopId: '2814104912',
+        title: undefined,
         downloaded: 1024,
         total: undefined,
         percent: 42,
+        speedBps: undefined,
+      },
+      {
+        type: 'download_progress',
+        taskId: 't-2',
+        workshopId: '3011942811',
+        title: 'Yama Campaign Remastered',
+        downloaded: 2048,
+        total: 4096,
+        percent: 50,
+        speedBps: 1048576,
       },
     ]);
     unlisten();

@@ -162,6 +162,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
             kind TEXT NOT NULL,
             status TEXT NOT NULL,
             target_id TEXT NOT NULL,
+            target_title TEXT,
             progress_percent INTEGER NOT NULL DEFAULT 0,
             message TEXT,
             error TEXT,
@@ -176,6 +177,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
         "reconcile_issues",
         "state_fingerprint",
         "ALTER TABLE reconcile_issues ADD COLUMN state_fingerprint TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column_exists(
+        conn,
+        "tasks",
+        "target_title",
+        "ALTER TABLE tasks ADD COLUMN target_title TEXT",
     )?;
 
     // Force the next scan to re-extract metadata with the corrected VPK parser.

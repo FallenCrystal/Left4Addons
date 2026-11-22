@@ -23,6 +23,7 @@ fn stage_vpk(
         downloaded: size,
         total: Some(size),
         percent: 100,
+        speed_bps: Some(size),
     });
     Ok(DownloadResult {
         dest_path: request.dest_path,
@@ -222,11 +223,27 @@ async fn workshop_update_preserves_customization_and_links_and_rolls_back_on_err
     let task = &snapshot.tasks[0];
     assert_eq!(task.kind, TaskKind::Download);
     assert_eq!(task.status, TaskStatus::Completed);
+    assert_eq!(
+        task.target_title.as_deref(),
+        Some("Updated remote metadata")
+    );
     assert_eq!(task.progress_percent, 100);
     assert!(matches!(events.drain().as_slice(), [..,
-        CoreEvent::DownloadProgress { task_id, workshop_id, downloaded, total: Some(total), percent: 100 },
+        CoreEvent::DownloadProgress {
+            task_id,
+            workshop_id,
+            title,
+            downloaded,
+            total: Some(total),
+            percent: 100,
+            ..
+        },
         CoreEvent::SnapshotUpdated { external_change: false },
-    ] if task_id == &task.id && *workshop_id == wid && *downloaded == file_size && *total == file_size));
+    ] if task_id == &task.id
+        && *workshop_id == wid
+        && title.as_deref() == Some("Updated remote metadata")
+        && *downloaded == file_size
+        && *total == file_size));
 }
 
 #[tokio::test]
@@ -536,4 +553,95 @@ async fn workshop_update_detects_a_rename_during_transfer() {
     );
     assert!(engine.db().get_workshop_snapshot(wid).unwrap().is_none());
     assert_eq!(download_status(&engine, wid), Some(TaskStatus::Failed));
+}
+
+#[tokio::test]
+async fn download_migrates_legacy_tasks_table_and_emits_title_in_progress() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir(&loading).unwrap();
+
+    // Seed an older SQLite database whose `tasks` table lacks `target_title`.
+    let db_path = AppPaths::from_runtime_dir(dir.path().join("runtime")).db_path;
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE tasks (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                progress_percent INTEGER NOT NULL DEFAULT 0,
+                message TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO tasks (id, kind, status, target_id, progress_percent, message, error, created_at, updated_at)
+            VALUES ('legacy-1', 'download', 'completed', '111222', 100, '下载完成', NULL, '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+            "#,
+        )
+        .unwrap();
+    }
+
+    let wid = WorkshopId(890006);
+    let fixture = dir.path().join("campaign.vpk");
+    create_test_vpk(
+        &fixture,
+        "Dark Carnival Remix",
+        "Author",
+        true,
+        None,
+        b"vpk",
+    );
+    let bytes = std::fs::read(&fixture).unwrap();
+
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let mut item = item_record(wid.0, "Dark Carnival Remix", 1700000100, vec![]);
+    item.file_url = Some(format!("https://example.invalid/{wid}.vpk"));
+    item.file_size = Some(bytes.len() as u64);
+    bridge.insert_item(item);
+
+    let events = Arc::new(RecordedEvents::default());
+    let engine = make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_str().unwrap().into(),
+            ..Default::default()
+        },
+        bridge,
+        events.clone(),
+    );
+
+    engine
+        .transfer_workshop_item_with(wid, false, |request, _, progress| async move {
+            stage_vpk(request, progress, &bytes)
+        })
+        .await
+        .unwrap();
+
+    let tasks = engine.db().list_tasks().unwrap();
+    let newest = tasks
+        .iter()
+        .find(|t| t.target_id == wid.to_string())
+        .unwrap();
+    assert_eq!(newest.target_title.as_deref(), Some("Dark Carnival Remix"));
+    let legacy = tasks.iter().find(|t| t.id.as_str() == "legacy-1").unwrap();
+    assert_eq!(legacy.target_title, None);
+
+    let progress_events: Vec<_> = events
+        .drain()
+        .into_iter()
+        .filter(|ev| matches!(ev, CoreEvent::DownloadProgress { .. }))
+        .collect();
+    assert!(progress_events.len() >= 2);
+    assert!(progress_events.iter().all(|ev| matches!(
+        ev,
+        CoreEvent::DownloadProgress {
+            title: Some(title),
+            ..
+        } if title == "Dark Carnival Remix"
+    )));
 }

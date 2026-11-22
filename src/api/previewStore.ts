@@ -719,6 +719,7 @@ class PreviewEngine {
     this.activeDownloads.set(workshopId, token);
 
     const catalogItem = PREVIEW_CATALOG.find((i) => i.workshopId === workshopId);
+    const title = existing?.title ?? catalogItem?.title ?? `Workshop Addon #${workshopId}`;
     const taskId = `dl-${workshopId}-${Date.now()}`;
     const total = catalogItem?.fileSize ?? 32_000_000;
 
@@ -727,6 +728,7 @@ class PreviewEngine {
       kind: 'download',
       status: 'running',
       targetId: workshopId,
+      targetTitle: title,
       progressPercent: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -735,6 +737,7 @@ class PreviewEngine {
     this.emit({ type: 'snapshot_updated', externalChange: false });
 
     try {
+      let prevBytes = 0;
       for (const percent of [25, 60, 90, 100]) {
         await new Promise((r) => setTimeout(r, 100));
         if (token.cancelled) {
@@ -743,14 +746,19 @@ class PreviewEngine {
           this.emit({ type: 'snapshot_updated', externalChange: false });
           throw new IpcError('cancelled', `Cancelled ${workshopId}`);
         }
+        const downloaded = Math.round((total * percent) / 100);
+        const speedBps = Math.max(0, Math.round((downloaded - prevBytes) / 0.1));
+        prevBytes = downloaded;
         taskRecord.progressPercent = percent;
         this.emit({
           type: 'download_progress',
           taskId,
           workshopId,
-          downloaded: Math.round((total * percent) / 100),
+          title,
+          downloaded,
           total,
           percent,
+          speedBps,
         });
       }
 
@@ -768,7 +776,6 @@ class PreviewEngine {
       }
 
       const id = `ws:${workshopId}`;
-      const title = catalogItem?.title ?? `Workshop Addon #${workshopId}`;
       const fileName = previewFilenameByRules(this.state.config.renameRules, {
         workshopId,
         title,

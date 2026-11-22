@@ -267,8 +267,8 @@ export function App() {
             onBatchAddToGroup={(ids) => setAddToGroupIds(ids)}
             onBatchCreateBundle={(ids) => setBundleDialogIds(ids)}
             onBatchDelete={(items) => setDeleteTargets(items)}
-            onDownloadItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
-            onUpdateItem={(wid) => void ctrl.updateWorkshopItem(wid)}
+            onDownloadItem={(wid, title) => void ctrl.downloadWorkshopItem(wid, title)}
+            onUpdateItem={(wid, title) => void ctrl.updateWorkshopItem(wid, title)}
             onOpenInFileManager={handleOpenInFileManager}
           />
         )}
@@ -287,7 +287,7 @@ export function App() {
             onToggleBundleLock={(id, locked) => void ctrl.setBundleLocked(id, locked)}
             onTrackCollection={() => setTrackDialogOpen(true)}
             onUntrackCollection={(id) => void ctrl.untrackCollection(id)}
-            onDownloadWorkshopItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
+            onDownloadWorkshopItem={(wid, title) => void ctrl.downloadWorkshopItem(wid, title)}
             onCreateGroup={() => setGroupDialogState({ open: true, initial: null })}
             onEditGroup={(group) => setGroupDialogState({ open: true, initial: group })}
             onSaveUserGroup={ctrl.saveUserGroup}
@@ -378,8 +378,8 @@ export function App() {
         onMove={handleMoveSingle}
         onRename={(addon) => setSingleRenameAddon(addon)}
         onDelete={(addon) => setDeleteTargets([addon])}
-        onDownload={(wid) => void ctrl.downloadWorkshopItem(wid)}
-        onUpdate={(wid) => void ctrl.updateWorkshopItem(wid)}
+        onDownload={(wid, title) => void ctrl.downloadWorkshopItem(wid, title)}
+        onUpdate={(wid, title) => void ctrl.updateWorkshopItem(wid, title)}
         onAddToGroup={(addon) => setAddToGroupIds([addon.id])}
         onRemoveFromGroup={(group, addonId) => {
           void ctrl.saveUserGroup({
@@ -405,8 +405,8 @@ export function App() {
         busy={ctrl.busy}
         onSync={() => void handleSyncAndNotify()}
         onCancelDownload={(wid) => void ctrl.cancelDownload(wid)}
-        onDownloadItem={(wid) => void ctrl.downloadWorkshopItem(wid)}
-        onUpdateItem={(wid) => void ctrl.updateWorkshopItem(wid)}
+        onDownloadItem={(wid, title) => void ctrl.downloadWorkshopItem(wid, title)}
+        onUpdateItem={(wid, title) => void ctrl.updateWorkshopItem(wid, title)}
         onSafeDeleteObsolete={(wid) => void ctrl.safeDeleteObsoleteDependency(wid, true, false)}
       />
 

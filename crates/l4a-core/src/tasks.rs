@@ -7,6 +7,7 @@ pub fn create_task(
     db: &LocalDb,
     kind: TaskKind,
     target_id: impl Into<String>,
+    target_title: Option<String>,
 ) -> Result<TaskRecord, CoreError> {
     let now = Utc::now();
     let task = TaskRecord {
@@ -14,6 +15,7 @@ pub fn create_task(
         kind,
         status: TaskStatus::Queued,
         target_id: target_id.into(),
+        target_title,
         progress_percent: 0,
         message: None,
         error: None,

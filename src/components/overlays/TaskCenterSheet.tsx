@@ -35,8 +35,8 @@ export interface TaskCenterSheetProps {
   busy: boolean;
   onSync: () => void;
   onCancelDownload: (workshopId: string) => void;
-  onDownloadItem: (workshopId: string) => void;
-  onUpdateItem: (workshopId: string) => void;
+  onDownloadItem: (workshopId: string, title?: string) => void;
+  onUpdateItem: (workshopId: string, title?: string) => void;
   onSafeDeleteObsolete: (workshopId: string) => void;
 }
 
@@ -70,6 +70,20 @@ export function TaskCenterSheet({
     return map;
   }, [addons]);
 
+  const activeTasksByWid = useMemo(() => {
+    const map = new Map<string, TaskRecord>();
+    for (const task of tasks) {
+      if (
+        task.kind === 'download' &&
+        (task.status === 'running' || task.status === 'queued') &&
+        !map.has(task.targetId)
+      ) {
+        map.set(task.targetId, task);
+      }
+    }
+    return map;
+  }, [tasks]);
+
   const activeTaskIds = useMemo(
     () => new Set(activeList.map((dl) => dl.taskId)),
     [activeList],
@@ -84,7 +98,11 @@ export function TaskCenterSheet({
       tasks.filter(
         (task) =>
           !activeTaskIds.has(task.id) &&
-          !(task.kind === 'download' && task.status === 'running' && activeWids.has(task.targetId)),
+          !(
+            task.kind === 'download' &&
+            (task.status === 'running' || task.status === 'queued') &&
+            activeWids.has(task.targetId)
+          ),
       ),
     [tasks, activeTaskIds, activeWids],
   );
@@ -146,41 +164,77 @@ export function TaskCenterSheet({
                   <span className="md-label-medium" style={{ color: 'var(--md-sys-color-primary)' }}>
                     {t('tasks.active')}
                   </span>
-                  {activeList.map((dl) => (
-                    <div key={dl.workshopId} className="l4a-section-card" style={{ padding: 14, gap: 8 }}>
-                      <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
-                        <span className="md-title-small md-mono">#{dl.workshopId}</span>
-                        <div className="l4a-row-wrap">
-                          <span className="md-label-medium">
-                            {dl.cancelling ? t('common.cancelling') : `${dl.percent}%`}
+                  {activeList.map((dl) => {
+                    const taskRecord = activeTasksByWid.get(dl.workshopId);
+                    const resolvedTitle =
+                      dl.title?.trim() ||
+                      addonsByWid.get(dl.workshopId)?.title ||
+                      taskRecord?.targetTitle?.trim() ||
+                      undefined;
+                    const isQueued =
+                      !dl.hasProgress && !dl.cancelling && taskRecord?.status === 'queued';
+                    const statusLabel = dl.cancelling
+                      ? t('common.cancelling')
+                      : isQueued
+                        ? t('tasks.status.queued')
+                        : `${dl.percent}%`;
+                    const progressLabel = resolvedTitle ?? `#${dl.workshopId}`;
+
+                    return (
+                      <div key={dl.workshopId} className="l4a-section-card" style={{ padding: 14, gap: 8 }}>
+                        <div
+                          className="l4a-row-wrap"
+                          style={{
+                            justifyContent: 'space-between',
+                            flexWrap: 'nowrap',
+                            alignItems: 'flex-start',
+                          }}
+                        >
+                          <div className="l4a-list-main" style={{ gap: 2 }}>
+                            {resolvedTitle ? (
+                              <>
+                                <span className="md-title-small l4a-truncate">{resolvedTitle}</span>
+                                <span
+                                  className="md-body-small md-mono"
+                                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                                >
+                                  #{dl.workshopId}
+                                </span>
+                              </>
+                            ) : (
+                              <span className="md-title-small md-mono">#{dl.workshopId}</span>
+                            )}
+                          </div>
+                          <div className="l4a-row-wrap" style={{ flexShrink: 0, flexWrap: 'nowrap' }}>
+                            <span className="md-label-medium">{statusLabel}</span>
+                            <IconButton
+                              size="sm"
+                              disabled={dl.cancelling}
+                              label={t('common.cancel')}
+                              onClick={() => onCancelDownload(dl.workshopId)}
+                            >
+                              <X size={15} />
+                            </IconButton>
+                          </div>
+                        </div>
+                        <LinearProgress
+                          value={dl.percent}
+                          indeterminate={dl.cancelling || isQueued || dl.percent === 0}
+                          label={progressLabel}
+                        />
+                        <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                          <span className="md-body-small" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                            {dl.total
+                              ? `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)}`
+                              : formatBytes(dl.downloaded)}
                           </span>
-                          <IconButton
-                            size="sm"
-                            disabled={dl.cancelling}
-                            label={t('common.cancel')}
-                            onClick={() => onCancelDownload(dl.workshopId)}
-                          >
-                            <X size={15} />
-                          </IconButton>
+                          <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                            {dl.hasProgress && !isQueued ? formatSpeed(dl.speedBps) : ''}
+                          </span>
                         </div>
                       </div>
-                      <LinearProgress
-                        value={dl.percent}
-                        indeterminate={dl.cancelling || dl.percent === 0}
-                        label={`#${dl.workshopId}`}
-                      />
-                      <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
-                        <span className="md-body-small" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                          {dl.total
-                            ? `${formatBytes(dl.downloaded)} / ${formatBytes(dl.total)}`
-                            : formatBytes(dl.downloaded)}
-                        </span>
-                        <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                          {formatSpeed(dl.speedBps)}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
 
@@ -199,6 +253,12 @@ export function TaskCenterSheet({
                             : task.status === 'running' || task.status === 'queued'
                               ? 'tertiary'
                               : 'surface';
+                      const resolvedTitle =
+                        task.kind === 'download'
+                          ? task.targetTitle?.trim() || addonsByWid.get(task.targetId)?.title
+                          : undefined;
+                      const detailText =
+                        task.error || task.message || formatTimestamp(task.updatedAt);
                       return (
                         <div
                           key={task.id}
@@ -206,17 +266,39 @@ export function TaskCenterSheet({
                           style={{ minHeight: 56, cursor: 'default' }}
                         >
                           <div className="l4a-list-main">
-                            <div className="l4a-row-wrap">
-                              <span className="md-title-small">
-                                {t(`tasks.kind.${task.kind}`)}
-                              </span>
-                              <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                                {task.targetId}
-                              </span>
-                            </div>
-                            <span className="md-body-small l4a-truncate" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                              {task.error || task.message || formatTimestamp(task.updatedAt)}
-                            </span>
+                            {resolvedTitle ? (
+                              <>
+                                <div className="l4a-row-wrap" style={{ flexWrap: 'nowrap', minWidth: 0 }}>
+                                  <span className="md-title-small l4a-truncate">{resolvedTitle}</span>
+                                </div>
+                                <span
+                                  className="md-body-small l4a-truncate"
+                                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                                >
+                                  {t(`tasks.kind.${task.kind}`)} · #{task.targetId} · {detailText}
+                                </span>
+                              </>
+                            ) : (
+                              <>
+                                <div className="l4a-row-wrap">
+                                  <span className="md-title-small">
+                                    {t(`tasks.kind.${task.kind}`)}
+                                  </span>
+                                  <span
+                                    className="md-body-small md-mono"
+                                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                                  >
+                                    {task.kind === 'download' ? `#${task.targetId}` : task.targetId}
+                                  </span>
+                                </div>
+                                <span
+                                  className="md-body-small l4a-truncate"
+                                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                                >
+                                  {detailText}
+                                </span>
+                              </>
+                            )}
                           </div>
                           <span className="md-pill" data-tone={tone}>
                             {t(`tasks.status.${task.status}`)}
@@ -275,7 +357,7 @@ export function TaskCenterSheet({
                             variant="tonal"
                             disabled={downloading}
                             label={t('common.update')}
-                            onClick={() => onUpdateItem(item.workshopId)}
+                            onClick={() => onUpdateItem(item.workshopId, item.title)}
                           >
                             <ArrowUpCircle size={15} />
                           </IconButton>
@@ -391,7 +473,7 @@ export function TaskCenterSheet({
                                 size="sm"
                                 disabled={installed || Boolean(liveDownloads[id])}
                                 icon={<Download size={12} />}
-                                onClick={() => onDownloadItem(id)}
+                                onClick={() => onDownloadItem(id, addonsByWid.get(id)?.title)}
                               >
                                 +{id}
                               </Button>
@@ -437,7 +519,7 @@ export function TaskCenterSheet({
                                 size="sm"
                                 disabled={installed || Boolean(liveDownloads[id])}
                                 icon={<Download size={12} />}
-                                onClick={() => onDownloadItem(id)}
+                                onClick={() => onDownloadItem(id, addonsByWid.get(id)?.title)}
                               >
                                 +{addonsByWid.get(id)?.title ?? id}
                               </Button>

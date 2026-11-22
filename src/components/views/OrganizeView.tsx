@@ -61,7 +61,7 @@ export interface OrganizeViewProps {
   onToggleBundleLock: (bundleId: string, locked: boolean) => void;
   onTrackCollection: () => void;
   onUntrackCollection: (collectionId: string) => void;
-  onDownloadWorkshopItem: (workshopId: string) => void;
+  onDownloadWorkshopItem: (workshopId: string, title?: string) => void;
   onCreateGroup: () => void;
   onEditGroup: (group: UserGroup) => void;
   onSaveUserGroup: (group: UserGroup) => Promise<boolean>;
@@ -662,7 +662,9 @@ export function OrganizeView({
                             size="sm"
                             icon={<Download size={13} />}
                             onClick={() => {
-                              for (const id of missing) onDownloadWorkshopItem(id);
+                              for (const id of missing) {
+                                onDownloadWorkshopItem(id, addonsByWorkshopId.get(id)?.title);
+                              }
                             }}
                           >
                             {t('organize.downloadMissing', { count: missing.length })}
@@ -1072,7 +1074,9 @@ export function OrganizeView({
                     size="sm"
                     icon={<Download size={14} />}
                     onClick={() => {
-                      for (const wid of missing) onDownloadWorkshopItem(wid);
+                      for (const wid of missing) {
+                        onDownloadWorkshopItem(wid, addonsByWorkshopId.get(wid)?.title);
+                      }
                     }}
                   >
                     {t('organize.downloadMissing', { count: missing.length })}
@@ -1166,7 +1170,7 @@ export function OrganizeView({
                           variant="tonal"
                           size="sm"
                           icon={<Download size={13} />}
-                          onClick={() => onDownloadWorkshopItem(wid)}
+                          onClick={() => onDownloadWorkshopItem(wid, local?.title)}
                         >
                           {t('common.download')}
                         </Button>

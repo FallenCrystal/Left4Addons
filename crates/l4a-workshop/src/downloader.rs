@@ -12,12 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(200);
+const SPEED_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadProgress {
     pub workshop_id: WorkshopId,
     pub downloaded: u64,
     pub total: Option<u64>,
     pub percent: u8,
+    pub speed_bps: Option<u64>,
 }
 
 pub type ProgressSink = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
@@ -53,6 +57,8 @@ pub struct ResilientDownloader {
     mirror: Arc<MirrorRouter>,
     connect_timeout: Duration,
     read_timeout: Duration,
+    progress_emit_interval: Duration,
+    speed_refresh_interval: Duration,
 }
 
 impl ResilientDownloader {
@@ -62,7 +68,19 @@ impl ResilientDownloader {
             mirror,
             connect_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(60),
+            progress_emit_interval: PROGRESS_EMIT_INTERVAL,
+            speed_refresh_interval: SPEED_REFRESH_INTERVAL,
         }
+    }
+
+    pub fn with_progress_intervals(
+        mut self,
+        progress_emit_interval: Duration,
+        speed_refresh_interval: Duration,
+    ) -> Self {
+        self.progress_emit_interval = progress_emit_interval;
+        self.speed_refresh_interval = speed_refresh_interval.max(Duration::from_millis(1));
+        self
     }
 
     pub async fn download(
@@ -273,28 +291,73 @@ impl ResilientDownloader {
 
         let mut downloaded = resume_from;
         let mut stream = response.bytes_stream();
+        let start = tokio::time::Instant::now();
+        let mut last_speed_at = start;
+        let mut last_speed_bytes = downloaded;
+        let mut current_speed_bps = 0u64;
+        let mut last_emit_at = start;
+        let mut speed_tick = tokio::time::interval_at(
+            start + self.speed_refresh_interval,
+            self.speed_refresh_interval,
+        );
+        speed_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        if let Some(sink) = on_progress {
+            sink(DownloadProgress {
+                workshop_id: req.workshop_id,
+                downloaded,
+                total: total_size,
+                percent: calc_percent(downloaded, total_size),
+                speed_bps: Some(0),
+            });
+        }
+
         loop {
             tokio::select! {
+                biased;
                 _ = cancel.cancelled() => {
                     drop(file);
                     return Err(WorkshopError::Cancelled);
+                }
+                _ = speed_tick.tick() => {
+                    let now = tokio::time::Instant::now();
+                    let elapsed = now.duration_since(last_speed_at).as_secs_f64();
+                    let delta = downloaded.saturating_sub(last_speed_bytes);
+                    current_speed_bps = if elapsed > 0.0 {
+                        (delta as f64 / elapsed).round() as u64
+                    } else {
+                        0
+                    };
+                    last_speed_at = now;
+                    last_speed_bytes = downloaded;
+                    last_emit_at = now;
+                    if let Some(sink) = on_progress {
+                        sink(DownloadProgress {
+                            workshop_id: req.workshop_id,
+                            downloaded,
+                            total: total_size,
+                            percent: calc_percent(downloaded, total_size),
+                            speed_bps: Some(current_speed_bps),
+                        });
+                    }
                 }
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
                             file.write_all(&bytes)?;
                             downloaded += bytes.len() as u64;
-                            if let Some(sink) = on_progress {
-                                let percent = total_size
-                                    .filter(|t| *t > 0)
-                                    .map(|t| (((downloaded as f64 / t as f64) * 100.0) as u8).min(99))
-                                    .unwrap_or(0);
-                                sink(DownloadProgress {
-                                    workshop_id: req.workshop_id,
-                                    downloaded,
-                                    total: total_size,
-                                    percent,
-                                });
+                            let now = tokio::time::Instant::now();
+                            if now.duration_since(last_emit_at) >= self.progress_emit_interval {
+                                last_emit_at = now;
+                                if let Some(sink) = on_progress {
+                                    sink(DownloadProgress {
+                                        workshop_id: req.workshop_id,
+                                        downloaded,
+                                        total: total_size,
+                                        percent: calc_percent(downloaded, total_size),
+                                        speed_bps: Some(current_speed_bps),
+                                    });
+                                }
                             }
                         }
                         Some(Err(err)) => {
@@ -337,6 +400,7 @@ impl ResilientDownloader {
                 downloaded,
                 total: total_size.or(Some(downloaded)),
                 percent: 100,
+                speed_bps: Some(current_speed_bps),
             });
         }
 
@@ -359,6 +423,13 @@ impl ResilientDownloader {
         let _ = fs::remove_file(self.partial_path(id));
         let _ = fs::remove_file(self.meta_path(id));
     }
+}
+
+fn calc_percent(downloaded: u64, total_size: Option<u64>) -> u8 {
+    total_size
+        .filter(|t| *t > 0)
+        .map(|t| (((downloaded as f64 / t as f64) * 100.0) as u8).min(99))
+        .unwrap_or(0)
 }
 
 fn header_str(

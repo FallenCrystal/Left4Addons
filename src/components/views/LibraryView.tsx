@@ -77,8 +77,8 @@ export interface LibraryViewProps {
   onBatchAddToGroup: (addonIds: string[]) => void;
   onBatchCreateBundle: (addonIds: string[]) => void;
   onBatchDelete: (addons: AddonSummary[]) => void;
-  onDownloadItem: (workshopId: string) => void;
-  onUpdateItem: (workshopId: string) => void;
+  onDownloadItem: (workshopId: string, title?: string) => void;
+  onUpdateItem: (workshopId: string, title?: string) => void;
   onOpenInFileManager: (path: string) => void;
 }
 
@@ -789,7 +789,7 @@ export function LibraryView({
                           size="sm"
                           disabled={Boolean(dl)}
                           icon={<Download size={13} />}
-                          onClick={() => onDownloadItem(addon.workshopId!)}
+                          onClick={() => onDownloadItem(addon.workshopId!, addon.title)}
                         >
                           {dl ? (dl.cancelling ? t('common.cancelling') : `${dl.percent}%`) : t('common.download')}
                         </Button>
@@ -913,7 +913,7 @@ export function LibraryView({
                         size="sm"
                         disabled={Boolean(dl)}
                         icon={<Download size={13} />}
-                        onClick={() => onDownloadItem(addon.workshopId!)}
+                        onClick={() => onDownloadItem(addon.workshopId!, addon.title)}
                       >
                         {dl ? (dl.cancelling ? t('common.cancelling') : `${dl.percent}%`) : t('common.download')}
                       </Button>

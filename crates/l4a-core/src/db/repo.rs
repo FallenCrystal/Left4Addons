@@ -1103,10 +1103,11 @@ impl LocalDb {
     pub(crate) fn save_task_tx(conn: &Connection, task: &TaskRecord) -> Result<(), CoreError> {
         conn.execute(
             r#"
-            INSERT INTO tasks (id, kind, status, target_id, progress_percent, message, error, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            INSERT INTO tasks (id, kind, status, target_id, target_title, progress_percent, message, error, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
+                target_title = COALESCE(excluded.target_title, tasks.target_title),
                 progress_percent = excluded.progress_percent,
                 message = excluded.message,
                 error = excluded.error,
@@ -1117,6 +1118,7 @@ impl LocalDb {
                 serialize_enum(&task.kind),
                 serialize_enum(&task.status),
                 task.target_id,
+                task.target_title,
                 task.progress_percent as i64,
                 task.message,
                 task.error,
@@ -1130,22 +1132,23 @@ impl LocalDb {
     pub fn list_tasks(&self) -> Result<Vec<TaskRecord>, CoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT id, kind, status, target_id, progress_percent, message, error, created_at, updated_at
+            "SELECT id, kind, status, target_id, target_title, progress_percent, message, error, created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT 500",
         )?;
         let rows = stmt.query_map([], |r| {
             let kind_s: String = r.get(1)?;
             let status_s: String = r.get(2)?;
-            let c_s: String = r.get(7)?;
-            let u_s: String = r.get(8)?;
+            let c_s: String = r.get(8)?;
+            let u_s: String = r.get(9)?;
             Ok(TaskRecord {
                 id: TaskId(r.get(0)?),
                 kind: parse_enum(&kind_s, TaskKind::Scan),
                 status: parse_enum(&status_s, TaskStatus::Queued),
                 target_id: r.get(3)?,
-                progress_percent: r.get::<_, i64>(4)?.clamp(0, 100) as u8,
-                message: r.get(5)?,
-                error: r.get(6)?,
+                target_title: r.get(4)?,
+                progress_percent: r.get::<_, i64>(5)?.clamp(0, 100) as u8,
+                message: r.get(6)?,
+                error: r.get(7)?,
                 created_at: DateTime::parse_from_rfc3339(&c_s)
                     .map(|d| d.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now()),

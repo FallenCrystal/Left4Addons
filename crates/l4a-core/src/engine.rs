@@ -459,7 +459,7 @@ impl L4aEngine {
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
         let resolver = self.resolver.read().unwrap().clone();
 
-        let mut task = create_task(&self.db, TaskKind::Sync, "workshop-sync")?;
+        let mut task = create_task(&self.db, TaskKind::Sync, "workshop-sync", None)?;
         update_task(&self.db, &mut task, TaskStatus::Running, 10, None, None)?;
 
         match sync_lifecycle(&self.db, &resolver).await {
@@ -600,7 +600,34 @@ impl L4aEngine {
             (cfg, self.resolver.read().unwrap().clone(), installed)
         };
 
-        let mut task = create_task(&self.db, TaskKind::Download, workshop_id.to_string())?;
+        let initial_title = installed
+            .as_ref()
+            .map(|addon| addon.title.trim())
+            .filter(|t| !t.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                self.db
+                    .get_addon_by_workshop_id(workshop_id)
+                    .ok()
+                    .flatten()
+                    .map(|addon| addon.title.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            })
+            .or_else(|| {
+                self.db
+                    .get_workshop_snapshot(workshop_id)
+                    .ok()
+                    .flatten()
+                    .map(|snap| snap.title.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            });
+
+        let mut task = create_task(
+            &self.db,
+            TaskKind::Download,
+            workshop_id.to_string(),
+            initial_title.clone(),
+        )?;
         let result = async {
             let _slot = tokio::select! {
                 biased;
@@ -616,6 +643,13 @@ impl L4aEngine {
                 _ = cancel.cancelled() => return Err(WorkshopError::Cancelled.into()),
                 result = fetch_workshop_item(&resolver, workshop_id) => result?,
             };
+            let resolved_title = (!item.title.trim().is_empty())
+                .then(|| item.title.trim().to_string())
+                .or_else(|| initial_title.clone());
+            if resolved_title != task.target_title {
+                task.target_title = resolved_title.clone();
+                update_task(&self.db, &mut task, TaskStatus::Running, 0, None, None)?;
+            }
             let file_url = item.file_url.clone().ok_or_else(|| {
                 CoreError::InvalidInput(format!("条目 {workshop_id} 无可用下载直链"))
             })?;
@@ -645,15 +679,27 @@ impl L4aEngine {
                 .file_name()
                 .ok_or_else(|| CoreError::InvalidInput("无效的下载目标文件名".into()))?;
             let staged_path = staged.path().join(staged_name);
+            self.events.emit(CoreEvent::DownloadProgress {
+                task_id: task.id.clone(),
+                workshop_id,
+                title: resolved_title.clone(),
+                downloaded: 0,
+                total: item.file_size,
+                percent: 0,
+                speed_bps: Some(0),
+            });
             let events = self.events.clone();
             let task_id = task.id.clone();
+            let sink_title = resolved_title.clone();
             let sink = Arc::new(move |p: DownloadProgress| {
                 events.emit(CoreEvent::DownloadProgress {
                     task_id: task_id.clone(),
                     workshop_id: p.workshop_id,
+                    title: sink_title.clone(),
                     downloaded: p.downloaded,
                     total: p.total,
                     percent: p.percent.min(99),
+                    speed_bps: p.speed_bps,
                 });
             });
             let transfer = download(
@@ -787,9 +833,11 @@ impl L4aEngine {
             self.events.emit(CoreEvent::DownloadProgress {
                 task_id: task.id.clone(),
                 workshop_id,
+                title: resolved_title.clone(),
                 downloaded: transfer.bytes_written,
                 total: Some(transfer.bytes_written),
                 percent: 100,
+                speed_bps: None,
             });
             Ok(summary)
         }

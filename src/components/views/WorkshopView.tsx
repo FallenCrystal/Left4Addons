@@ -65,8 +65,8 @@ export interface WorkshopViewProps {
   onSearch: (query: SearchQuery) => Promise<SearchResponse>;
   onFetchItem: (workshopId: string) => Promise<WorkshopItemRecord | null>;
   onImportSubscribed: () => Promise<string[] | null>;
-  onDownload: (workshopId: string) => Promise<AddonSummary | null>;
-  onUpdate: (workshopId: string) => Promise<AddonSummary | null>;
+  onDownload: (workshopId: string, title?: string) => Promise<AddonSummary | null>;
+  onUpdate: (workshopId: string, title?: string) => Promise<AddonSummary | null>;
   onCancelDownload: (workshopId: string) => void;
   onTrackCollection: (
     collectionId: string,
@@ -192,7 +192,9 @@ export function WorkshopView({
       } else if (kind === 'download') {
         const local = localByWorkshopId.get(id);
         const result =
-          local?.installState === 'installed' ? await onUpdate(id) : await onDownload(id);
+          local?.installState === 'installed'
+            ? await onUpdate(id, local.title)
+            : await onDownload(id, local?.title);
         if (result) setDirectInput('');
       } else {
         const tracked = await onTrackCollection(id, true);
@@ -272,7 +274,7 @@ export function WorkshopView({
             icon={<ArrowUpCircle size={14} />}
             onClick={(e) => {
               if (stopProp) e.stopPropagation();
-              void onUpdate(item.workshopId);
+              void onUpdate(item.workshopId, item.title);
             }}
           >
             {t('common.update')}
@@ -293,7 +295,7 @@ export function WorkshopView({
         icon={<Download size={14} />}
         onClick={(e) => {
           if (stopProp) e.stopPropagation();
-          void onDownload(item.workshopId);
+          void onDownload(item.workshopId, item.title);
         }}
       >
         {t('common.download')}
@@ -747,7 +749,7 @@ export function WorkshopView({
                           size="sm"
                           disabled={installed || Boolean(liveDownloads[dep.workshopId])}
                           icon={<Download size={13} />}
-                          onClick={() => void onDownload(dep.workshopId)}
+                          onClick={() => void onDownload(dep.workshopId, dep.title)}
                         >
                           {installed ? t('workshop.status.installed') : t('common.download')}
                         </Button>
@@ -773,7 +775,7 @@ export function WorkshopView({
                         size="sm"
                         disabled={installed || Boolean(liveDownloads[cid])}
                         icon={<Download size={12} />}
-                        onClick={() => void onDownload(cid)}
+                        onClick={() => void onDownload(cid, localByWorkshopId.get(cid)?.title)}
                       >
                         #{cid}
                       </Button>

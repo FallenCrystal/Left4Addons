@@ -38,8 +38,8 @@ export interface AddonDetailSheetProps {
   onMove: (addon: AddonSummary) => void;
   onRename: (addon: AddonSummary) => void;
   onDelete: (addon: AddonSummary) => void;
-  onDownload: (workshopId: string) => void;
-  onUpdate: (workshopId: string) => void;
+  onDownload: (workshopId: string, title?: string) => void;
+  onUpdate: (workshopId: string, title?: string) => void;
   onAddToGroup: (addon: AddonSummary) => void;
   onRemoveFromGroup: (group: UserGroup, addonId: string) => void;
   onOpenExternal: (url: string) => void;
@@ -155,7 +155,7 @@ export function AddonDetailSheet({
               size="sm"
               disabled={busy}
               icon={<Download size={15} />}
-              onClick={() => onDownload(addon.workshopId!)}
+              onClick={() => onDownload(addon.workshopId!, addon.title)}
             >
               {t('common.download')}
             </Button>
@@ -166,7 +166,7 @@ export function AddonDetailSheet({
               size="sm"
               disabled={busy}
               icon={<ArrowUpCircle size={15} />}
-              onClick={() => onUpdate(addon.workshopId!)}
+              onClick={() => onUpdate(addon.workshopId!, addon.title)}
             >
               {t('common.update')}
             </Button>

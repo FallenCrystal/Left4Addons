@@ -32,12 +32,22 @@ export interface LiveDownloadState {
   requestId: number;
   taskId: string;
   workshopId: string;
+  title?: string;
   downloaded: number;
   total?: number;
   percent: number;
   speedBps: number;
+  hasProgress: boolean;
   cancelling: boolean;
   updatedAt: number;
+}
+
+interface DownloadSpeedTracker {
+  latestDownloaded: number;
+  lastSampleBytes: number;
+  lastSampleAt: number;
+  lastEventAt: number;
+  backendSpeed: boolean;
 }
 
 export interface SnackbarItem {
@@ -220,6 +230,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   const refreshQueuedRef = useRef(false);
   const downloadSeqRef = useRef(0);
   const liveDownloadsRef = useRef<Record<string, LiveDownloadState>>({});
+  const speedTrackersRef = useRef<Map<string, DownloadSpeedTracker>>(new Map());
   const snapshotRef = useRef<DashboardSnapshot | null>(null);
   const tRef = useRef(t);
   const onOpenReconcileRef = useRef(onOpenReconcile);
@@ -386,32 +397,50 @@ export function useAppController(onOpenReconcile?: () => void) {
           void refresh();
         } else if (ev.type === 'download_progress') {
           const now = Date.now();
-          setLiveDownloads((prev) => {
-            if (ev.percent >= 100) {
+          if (ev.percent >= 100) {
+            speedTrackersRef.current.delete(ev.workshopId);
+            setLiveDownloads((prev) => {
               if (!(ev.workshopId in prev)) return prev;
               const copy = { ...prev };
               delete copy[ev.workshopId];
               return copy;
-            }
+            });
+            return;
+          }
+          const hasBackendSpeed =
+            typeof ev.speedBps === 'number' && Number.isFinite(ev.speedBps) && ev.speedBps >= 0;
+          const prevTracker = speedTrackersRef.current.get(ev.workshopId);
+          if (!prevTracker || ev.downloaded < prevTracker.lastSampleBytes) {
+            speedTrackersRef.current.set(ev.workshopId, {
+              latestDownloaded: ev.downloaded,
+              lastSampleBytes: ev.downloaded,
+              lastSampleAt: now,
+              lastEventAt: now,
+              backendSpeed: hasBackendSpeed,
+            });
+          } else {
+            prevTracker.latestDownloaded = ev.downloaded;
+            prevTracker.lastEventAt = now;
+            prevTracker.backendSpeed = hasBackendSpeed;
+          }
+          setLiveDownloads((prev) => {
             const existing = prev[ev.workshopId];
-            let speedBps = existing?.speedBps ?? 0;
-            if (existing && now > existing.updatedAt) {
-              const dt = (now - existing.updatedAt) / 1000;
-              const delta = ev.downloaded - existing.downloaded;
-              if (dt > 0.05 && delta >= 0) {
-                speedBps = Math.round(delta / dt);
-              }
-            }
+            const fallbackTitle = snapshotRef.current?.addons.find(
+              (a) => a.workshopId === ev.workshopId,
+            )?.title;
+            const title = ev.title?.trim() || existing?.title || fallbackTitle;
             return {
               ...prev,
               [ev.workshopId]: {
                 requestId: existing?.requestId ?? 0,
                 taskId: ev.taskId,
                 workshopId: ev.workshopId,
+                title,
                 downloaded: ev.downloaded,
-                total: ev.total ?? undefined,
+                total: ev.total ?? existing?.total ?? undefined,
                 percent: ev.percent,
-                speedBps,
+                speedBps: hasBackendSpeed ? Math.round(ev.speedBps!) : (existing?.speedBps ?? 0),
+                hasProgress: true,
                 cancelling: existing?.cancelling ?? false,
                 updatedAt: now,
               },
@@ -446,6 +475,60 @@ export function useAppController(onOpenReconcile?: () => void) {
       }
     };
   }, [client, notify, refresh]);
+
+  const hasLiveDownloads = Object.keys(liveDownloads).length > 0;
+
+  useEffect(() => {
+    if (!hasLiveDownloads) return;
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const current = liveDownloadsRef.current;
+      const updates = new Map<string, number>();
+
+      for (const [wid, dl] of Object.entries(current)) {
+        const tracker = speedTrackersRef.current.get(wid);
+        if (!dl.hasProgress || !tracker) continue;
+
+        if (tracker.backendSpeed) {
+          if (now - tracker.lastEventAt >= 1500 && dl.speedBps !== 0) {
+            updates.set(wid, 0);
+          }
+        } else {
+          const elapsedSec = (now - tracker.lastSampleAt) / 1000;
+          if (elapsedSec > 0) {
+            const delta = Math.max(0, tracker.latestDownloaded - tracker.lastSampleBytes);
+            const nextSpeed = Math.round(delta / elapsedSec);
+            tracker.lastSampleBytes = tracker.latestDownloaded;
+            tracker.lastSampleAt = now;
+            if (nextSpeed !== dl.speedBps) {
+              updates.set(wid, nextSpeed);
+            }
+          }
+        }
+      }
+
+      if (updates.size === 0) return;
+
+      setLiveDownloads((prev) => {
+        let changed = false;
+        const next: Record<string, LiveDownloadState> = {};
+        for (const [wid, dl] of Object.entries(prev)) {
+          const updatedSpeed = updates.get(wid);
+          if (updatedSpeed !== undefined && updatedSpeed !== dl.speedBps) {
+            changed = true;
+            next[wid] = { ...dl, speedBps: updatedSpeed };
+          } else {
+            next[wid] = dl;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }, 1000);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [hasLiveDownloads]);
 
   const handleBatchReport = useCallback(
     (report: AddonBatchReport, refreshOk: boolean) => {
@@ -713,12 +796,15 @@ export function useAppController(onOpenReconcile?: () => void) {
   );
 
   const runTransfer = useCallback(
-    async (workshopId: string, kind: 'download' | 'update') => {
+    async (workshopId: string, kind: 'download' | 'update', titleHint?: string) => {
       if (liveDownloadsRef.current[workshopId]) {
         return null;
       }
       downloadSeqRef.current += 1;
       const requestId = downloadSeqRef.current;
+      const initialTitle =
+        titleHint?.trim() ||
+        snapshotRef.current?.addons.find((a) => a.workshopId === workshopId)?.title;
 
       notify(
         tRef.current(kind === 'update' ? 'toast.updateStarted' : 'toast.downloadStarted', {
@@ -732,9 +818,11 @@ export function useAppController(onOpenReconcile?: () => void) {
           requestId,
           taskId: `pending-${requestId}-${workshopId}`,
           workshopId,
+          title: initialTitle,
           downloaded: 0,
           percent: 0,
           speedBps: 0,
+          hasProgress: false,
           cancelling: false,
           updatedAt: Date.now(),
         },
@@ -745,6 +833,7 @@ export function useAppController(onOpenReconcile?: () => void) {
           kind === 'update'
             ? await client.updateWorkshopItem(workshopId)
             : await client.downloadWorkshopItem(workshopId);
+        speedTrackersRef.current.delete(workshopId);
         setLiveDownloads((prev) => {
           if (prev[workshopId]?.requestId !== requestId) return prev;
           const copy = { ...prev };
@@ -759,6 +848,7 @@ export function useAppController(onOpenReconcile?: () => void) {
         );
         return summary;
       } catch (err) {
+        speedTrackersRef.current.delete(workshopId);
         setLiveDownloads((prev) => {
           if (prev[workshopId]?.requestId !== requestId) return prev;
           const copy = { ...prev };
@@ -778,12 +868,12 @@ export function useAppController(onOpenReconcile?: () => void) {
   );
 
   const downloadWorkshopItem = useCallback(
-    (workshopId: string) => runTransfer(workshopId, 'download'),
+    (workshopId: string, title?: string) => runTransfer(workshopId, 'download', title),
     [runTransfer],
   );
 
   const updateWorkshopItem = useCallback(
-    (workshopId: string) => runTransfer(workshopId, 'update'),
+    (workshopId: string, title?: string) => runTransfer(workshopId, 'update', title),
     [runTransfer],
   );
 
@@ -797,6 +887,7 @@ export function useAppController(onOpenReconcile?: () => void) {
       try {
         const accepted = await client.cancelDownload(workshopId);
         if (!accepted) {
+          speedTrackersRef.current.delete(workshopId);
           setLiveDownloads((prev) => {
             if (!(workshopId in prev)) return prev;
             const copy = { ...prev };
