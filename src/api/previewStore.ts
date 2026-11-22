@@ -176,7 +176,6 @@ function createInitialSnapshot(): DashboardSnapshot {
       forceSteamworksSdkDownload: false,
       httpsOnly: true,
       catalogServerUrl: null,
-      catalogContributorToken: '',
       sourceOrder: ['catalog-server', 'steamworks-sdk', 'steam-web-api'],
       renameRules: {
         enableWorkshopIdPrefix: true,

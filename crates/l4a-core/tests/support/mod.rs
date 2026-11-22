@@ -74,7 +74,7 @@ pub(super) fn make_engine_with_events(
         ],
         SourceRoutingPolicy::default(),
     ));
-    L4aEngine::with_dependencies(paths, db, config, mirror, bridge, resolver, None, events).unwrap()
+    L4aEngine::with_dependencies(paths, db, config, mirror, bridge, resolver, events).unwrap()
 }
 
 #[derive(Default)]
@@ -102,6 +102,7 @@ pub(super) fn item_record(id: u64, title: &str, ts: i64, deps: Vec<u64>) -> Work
         creator_steam_id: Some("76561198000000001".into()),
         creator_name: Some("Mapper".into()),
         preview_url: None,
+        previews: Vec::new(),
         file_url: None,
         file_size: Some(1024),
         time_created: Some(1_700_000_000),

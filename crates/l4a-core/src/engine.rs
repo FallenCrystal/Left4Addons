@@ -68,7 +68,6 @@ pub struct L4aEngine {
     steam_bridge: Arc<dyn SteamBridge>,
     dynamic_bridge: Option<Arc<DynamicSteamBridge>>,
     resolver: RwLock<Arc<WorkshopResolver>>,
-    catalog_reporter: RwLock<Option<Arc<CatalogBackendProvider>>>,
     downloader: ResilientDownloader,
     watcher: Mutex<AddonWatcher>,
     watcher_rescan_cb: Mutex<Option<RescanCallback>>,
@@ -118,8 +117,7 @@ impl L4aEngine {
         let steam_bridge: Arc<dyn SteamBridge> = dynamic_bridge.clone();
 
         let db = Arc::new(LocalDb::open(&paths.db_path)?);
-        let (resolver, reporter) =
-            build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
+        let resolver = build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -131,7 +129,6 @@ impl L4aEngine {
             steam_bridge,
             dynamic_bridge: Some(dynamic_bridge),
             resolver: RwLock::new(resolver),
-            catalog_reporter: RwLock::new(reporter),
             watcher: Mutex::new(AddonWatcher::default()),
             watcher_rescan_cb: Mutex::new(None),
             events,
@@ -139,7 +136,6 @@ impl L4aEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn with_dependencies(
         paths: AppPaths,
         db: Arc<LocalDb>,
@@ -147,7 +143,6 @@ impl L4aEngine {
         mirror: Arc<MirrorRouter>,
         steam_bridge: Arc<dyn SteamBridge>,
         resolver: Arc<WorkshopResolver>,
-        catalog_reporter: Option<Arc<CatalogBackendProvider>>,
         events: Arc<dyn EventSink>,
     ) -> Result<Self, CoreError> {
         paths.ensure_dirs()?;
@@ -163,7 +158,6 @@ impl L4aEngine {
             steam_bridge,
             dynamic_bridge: None,
             resolver: RwLock::new(resolver),
-            catalog_reporter: RwLock::new(catalog_reporter),
             watcher: Mutex::new(AddonWatcher::default()),
             watcher_rescan_cb: Mutex::new(None),
             events,
@@ -241,10 +235,9 @@ impl L4aEngine {
         if let Some(ref dyn_bridge) = self.dynamic_bridge {
             dyn_bridge.set_enabled(!next.disable_steamworks_sdk);
         }
-        let (new_resolver, new_reporter) =
+        let new_resolver =
             build_resolver_from_config(&next, self.mirror.clone(), self.steam_bridge.clone());
         *self.resolver.write().unwrap() = new_resolver;
-        *self.catalog_reporter.write().unwrap() = new_reporter;
         self.download_gate.set_limit(next.download_concurrency);
 
         let watch_error = if dirs_changed {
@@ -464,14 +457,12 @@ impl L4aEngine {
     }
 
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
-        let cfg = self.config();
         let resolver = self.resolver.read().unwrap().clone();
-        let reporter = self.catalog_reporter.read().unwrap().clone();
 
         let mut task = create_task(&self.db, TaskKind::Sync, "workshop-sync")?;
         update_task(&self.db, &mut task, TaskStatus::Running, 10, None, None)?;
 
-        match sync_lifecycle(&self.db, &cfg, &resolver, reporter).await {
+        match sync_lifecycle(&self.db, &resolver).await {
             Ok(report) => {
                 if let Ok(_workspace) = self.lock_workspace() {
                     let _ = rebuild_auto_bundles(&self.db);
@@ -1280,9 +1271,8 @@ fn build_resolver_from_config(
     config: &AppConfig,
     mirror: Arc<MirrorRouter>,
     steam_bridge: Arc<dyn SteamBridge>,
-) -> (Arc<WorkshopResolver>, Option<Arc<CatalogBackendProvider>>) {
+) -> Arc<WorkshopResolver> {
     let mut providers: Vec<Arc<dyn WorkshopProvider>> = Vec::new();
-    let mut reporter = None;
 
     let catalog = config
         .catalog_server_url
@@ -1290,10 +1280,6 @@ fn build_resolver_from_config(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|url| Arc::new(CatalogBackendProvider::new(url, mirror.clone())));
-
-    if let Some(ref c) = catalog {
-        reporter = Some(c.clone());
-    }
 
     for source in &config.source_order {
         match source.as_str() {
@@ -1317,13 +1303,10 @@ fn build_resolver_from_config(
         }
     }
 
-    (
-        Arc::new(WorkshopResolver::new(
-            providers,
-            SourceRoutingPolicy::default(),
-        )),
-        reporter,
-    )
+    Arc::new(WorkshopResolver::new(
+        providers,
+        SourceRoutingPolicy::default(),
+    ))
 }
 
 #[cfg(test)]

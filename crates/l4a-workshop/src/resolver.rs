@@ -47,15 +47,19 @@ impl WorkshopResolver {
 
         let mut remaining: Vec<WorkshopId> = ids.to_vec();
         let mut results: HashMap<WorkshopId, WorkshopFetchOutcome> = HashMap::new();
+        let mut deps_authoritative: HashSet<WorkshopId> = HashSet::new();
         let mut warnings = Vec::new();
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            if remaining.is_empty() && !self.needs_enrichment(&results, &self.providers[idx..]) {
+            let caps = provider.capabilities();
+            if remaining.is_empty()
+                && !self.needs_enrichment(&results, &deps_authoritative, &self.providers[idx..])
+            {
                 break;
             }
 
             let mut query_ids: HashSet<WorkshopId> = remaining.iter().copied().collect();
-            if self.policy.enrich_missing_file_url && provider.capabilities().provides_file_url {
+            if self.policy.enrich_missing_file_url && caps.provides_file_url {
                 for (id, outcome) in &results {
                     if let WorkshopFetchOutcome::Found { item } = outcome {
                         if item.file_url.is_none() {
@@ -64,12 +68,10 @@ impl WorkshopResolver {
                     }
                 }
             }
-            if self.policy.enrich_missing_dependencies
-                && provider.capabilities().provides_dependencies
-            {
+            if self.policy.enrich_missing_dependencies && caps.provides_dependencies {
                 for (id, outcome) in &results {
                     if let WorkshopFetchOutcome::Found { item } = outcome {
-                        if item.dependencies.is_empty() {
+                        if item.dependencies.is_empty() && !deps_authoritative.contains(id) {
                             query_ids.insert(*id);
                         }
                     }
@@ -92,6 +94,11 @@ impl WorkshopResolver {
                 Ok(outcomes) => {
                     for outcome in outcomes {
                         let id = outcome.workshop_id();
+                        if caps.provides_dependencies
+                            && matches!(outcome, WorkshopFetchOutcome::Found { .. })
+                        {
+                            deps_authoritative.insert(id);
+                        }
                         match (results.get_mut(&id), outcome) {
                             (
                                 Some(WorkshopFetchOutcome::Found { item: existing }),
@@ -192,6 +199,7 @@ impl WorkshopResolver {
     fn needs_enrichment(
         &self,
         results: &HashMap<WorkshopId, WorkshopFetchOutcome>,
+        deps_authoritative: &HashSet<WorkshopId>,
         remaining_providers: &[Arc<dyn WorkshopProvider>],
     ) -> bool {
         let can_fill_url = self.policy.enrich_missing_file_url
@@ -206,10 +214,12 @@ impl WorkshopResolver {
             .iter()
             .any(|p| p.source_kind() == MetadataSource::SteamworksSdk);
 
-        results.values().any(|outcome| match outcome {
+        results.iter().any(|(id, outcome)| match outcome {
             WorkshopFetchOutcome::Found { item } => {
                 (can_fill_url && item.file_url.is_none())
-                    || (can_fill_deps && item.dependencies.is_empty())
+                    || (can_fill_deps
+                        && item.dependencies.is_empty()
+                        && !deps_authoritative.contains(id))
             }
             WorkshopFetchOutcome::PrivateOrUnavailable { .. } => has_sdk,
             WorkshopFetchOutcome::Removed { .. } => false,
@@ -236,7 +246,13 @@ fn merge_item_fields(existing: &mut WorkshopItemRecord, incoming: WorkshopItemRe
         if incoming.file_url.is_some() {
             existing.file_url = incoming.file_url.clone();
         }
-        if incoming.source == MetadataSource::SteamworksSdk && !incoming.dependencies.is_empty() {
+        if matches!(
+            incoming.source,
+            MetadataSource::SteamworksSdk
+                | MetadataSource::SteamKit
+                | MetadataSource::CatalogServer
+        ) && !incoming.dependencies.is_empty()
+        {
             existing.dependencies = incoming.dependencies.clone();
         }
     }
@@ -255,6 +271,9 @@ fn merge_item_fields(existing: &mut WorkshopItemRecord, incoming: WorkshopItemRe
     }
     if existing.preview_url.is_none() {
         existing.preview_url = incoming.preview_url;
+    }
+    if existing.previews.is_empty() && !incoming.previews.is_empty() {
+        existing.previews = incoming.previews;
     }
     if existing.file_url.is_none() {
         existing.file_url = incoming.file_url;

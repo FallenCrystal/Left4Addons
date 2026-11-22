@@ -111,6 +111,7 @@ async fn resolver_merges_sdk_dependencies_with_web_api_file_url_and_skips_scrape
         creator_steam_id: Some("76561198000000010".into()),
         creator_name: Some("Author".into()),
         preview_url: None,
+        previews: Vec::new(),
         file_url: None,
         file_size: Some(4096),
         time_created: None,
@@ -188,6 +189,54 @@ async fn resolver_merges_sdk_dependencies_with_web_api_file_url_and_skips_scrape
     }
 
     assert!(matches!(outcomes[1], WorkshopFetchOutcome::Removed { .. }));
+}
+
+#[tokio::test]
+async fn catalog_backend_provider_resolves_zero_dep_item_without_falling_back_to_sdk() {
+    let catalog_app = Router::new().route(
+        "/api/v1/items/batch",
+        post(|| async {
+            Json(json!({
+                "items": [
+                    {
+                        "workshopId": "901",
+                        "fileType": "item",
+                        "status": "active",
+                        "title": "Standalone Skin",
+                        "fileUrl": "https://cdn.steamusercontent.com/ugc/901/skin.vpk",
+                        "dependencies": [],
+                        "source": "catalog_server",
+                        "fetchedAt": "2026-11-21T00:00:00Z"
+                    }
+                ],
+                "missingIds": []
+            }))
+        }),
+    );
+    let catalog_url = start_router(catalog_app).await;
+
+    // Unavailable SDK bridge: if resolver wrongly falls through for empty dependencies, it would emit a warning!
+    let broken_sdk = Arc::new(MockSteamBridge::new(false));
+    let resolver = WorkshopResolver::new(
+        vec![
+            Arc::new(l4a_workshop::CatalogBackendProvider::new(
+                catalog_url,
+                Arc::new(MirrorRouter::empty()),
+            )),
+            Arc::new(SteamBridgeProvider::new(broken_sdk)),
+        ],
+        SourceRoutingPolicy::default(),
+    );
+
+    let (outcomes, warnings) = resolver
+        .fetch_items(&[WorkshopId::new(901).unwrap()])
+        .await
+        .unwrap();
+    assert!(
+        warnings.is_empty(),
+        "Catalog hit with file_url and authoritative empty dependencies should not invoke SDK: {warnings:?}"
+    );
+    assert_eq!(outcomes.len(), 1);
 }
 
 #[tokio::test]

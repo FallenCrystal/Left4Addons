@@ -47,4 +47,6 @@ known_addons.json
 *.sqlite*
 .env
 .env.*
+catalog.toml
+crates/l4a-server/web-dist/
 

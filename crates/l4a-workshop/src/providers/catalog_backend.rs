@@ -5,8 +5,7 @@ use chrono::Utc;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     BatchItemsRequest, BatchItemsResponse, MetadataSource, SearchQuery, SearchResponse,
-    SubmissionBatchRequest, SubmissionBatchResponse, WorkshopCollectionRecord,
-    WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+    WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,41 +22,8 @@ impl CatalogBackendProvider {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             mirror,
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(15),
         }
-    }
-
-    pub async fn submit_observations(
-        &self,
-        contributor_token: &str,
-        request: &SubmissionBatchRequest,
-    ) -> Result<SubmissionBatchResponse, WorkshopError> {
-        let url = format!("{}/api/v1/submissions", self.base_url);
-        let (client, _) = self
-            .mirror
-            .build_client_for(&url, Some(self.timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
-        let (req, _) = self.mirror.prepare_post(&client, &url);
-        let resp = req
-            .bearer_auth(contributor_token)
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(WorkshopError::HttpStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        resp.json::<SubmissionBatchResponse>()
-            .await
-            .map_err(|e| WorkshopError::Parse(e.to_string()))
     }
 }
 
@@ -97,7 +63,10 @@ impl WorkshopProvider for CatalogBackendProvider {
 
         let (req, _) = self.mirror.prepare_post(&client, &url);
         let resp = req
-            .json(&BatchItemsRequest { ids: ids.to_vec() })
+            .json(&BatchItemsRequest {
+                ids: ids.to_vec(),
+                force_refresh: false,
+            })
             .send()
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?;

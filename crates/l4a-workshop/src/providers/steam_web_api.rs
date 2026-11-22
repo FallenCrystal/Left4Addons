@@ -195,6 +195,7 @@ impl WorkshopProvider for SteamWebApiProvider {
                                 creator_steam_id,
                                 creator_name: None,
                                 preview_url,
+                                previews: Vec::new(),
                                 file_url,
                                 file_size,
                                 time_created,

@@ -1,34 +1,14 @@
-use crate::ids::{ContributorId, WorkshopId};
-use crate::workshop::{
-    MetadataSource, WorkshopDependency, WorkshopFileType, WorkshopItemRecord, WorkshopItemStatus,
-};
+use crate::ids::WorkshopId;
+use crate::workshop::{MetadataSource, WorkshopDependency, WorkshopItemRecord, WorkshopItemStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustTier {
-    Community,
-    TrustedPlayer,
-    Maintainer,
-    Official,
-}
-
-impl TrustTier {
-    pub fn default_weight(self) -> i32 {
-        match self {
-            Self::Official => 100,
-            Self::Maintainer => 80,
-            Self::TrustedPlayer => 50,
-            Self::Community => 20,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchItemsRequest {
     pub ids: Vec<WorkshopId>,
+    #[serde(default)]
+    pub force_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,118 +18,183 @@ pub struct BatchItemsResponse {
     pub missing_ids: Vec<WorkshopId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ItemSubmission {
-    pub workshop_id: WorkshopId,
-    #[serde(default)]
-    pub file_type: WorkshopFileType,
-    #[serde(default)]
-    pub status: WorkshopItemStatus,
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creator_steam_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub creator_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preview_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_size: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub time_created: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub time_updated: Option<i64>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub dependencies: Vec<WorkshopDependency>,
-    #[serde(default)]
-    pub collection_children: Vec<WorkshopId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscriptions: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub favorites: Option<u64>,
-    pub observed_source: MetadataSource,
-    pub observed_at: DateTime<Utc>,
+pub struct AdminLoginRequest {
+    pub username: String,
+    pub password: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubmissionBatchRequest {
-    pub items: Vec<ItemSubmission>,
+pub struct AdminLoginResponse {
+    pub token: String,
+    pub username: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminSessionInfo {
+    pub authenticated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SteamAuthMode {
+    #[default]
+    Anonymous,
+    Account,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SteamConnectionState {
+    #[default]
+    Disconnected,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConflictDecision {
-    Accepted,
-    Merged,
-    RejectedLowerTrust,
-    RejectedStale,
-    FlaggedForReview,
+pub enum SteamAuthFlowKind {
+    Qr,
+    Credentials,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SteamAuthFlowState {
+    WaitingForScan,
+    WaitingForCode,
+    Authenticating,
+    Succeeded,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubmissionReceipt {
-    pub workshop_id: WorkshopId,
-    pub decision: ConflictDecision,
-    pub reason: String,
+pub struct SteamAuthFlowStatus {
+    pub flow_id: String,
+    pub kind: SteamAuthFlowKind,
+    pub state: SteamAuthFlowState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qr_svg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SubmissionBatchResponse {
-    pub receipts: Vec<SubmissionReceipt>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ContributorSummary {
-    pub id: ContributorId,
-    pub name: String,
+pub struct CatalogSteamStatus {
+    pub provider_name: String,
+    pub mode: SteamAuthMode,
+    pub connection_state: SteamConnectionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steam_id: Option<String>,
-    pub trust_tier: TrustTier,
-    pub trust_weight: i32,
-    pub enabled: bool,
-    pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_seen_at: Option<DateTime<Utc>>,
+    pub account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connected_since: Option<DateTime<Utc>>,
+    pub total_requests: u64,
+    pub failed_requests: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_auth_flow: Option<SteamAuthFlowStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateContributorRequest {
-    pub name: String,
-    #[serde(default)]
-    pub steam_id: Option<String>,
-    pub trust_tier: TrustTier,
-    #[serde(default)]
-    pub trust_weight: Option<i32>,
+pub struct StartCredentialsAuthRequest {
+    pub account_name: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateContributorResponse {
-    pub contributor: ContributorSummary,
-    /// 明文 Token 仅在创建时返回一次，服务端只持久化 SHA-256 哈希。
-    pub token: String,
+pub struct SubmitSteamGuardRequest {
+    pub flow_id: String,
+    pub code: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateContributorRequest {
-    #[serde(default)]
-    pub trust_tier: Option<TrustTier>,
-    #[serde(default)]
-    pub trust_weight: Option<i32>,
-    #[serde(default)]
-    pub enabled: Option<bool>,
+pub struct SetRefreshTokenRequest {
+    pub account_name: String,
+    pub refresh_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSyncConfigDto {
+    pub enable_read_through: bool,
+    pub item_ttl_secs: u64,
+    pub enable_incremental_sync: bool,
+    pub incremental_interval_secs: u64,
+    pub incremental_pages_per_tick: u32,
+    pub enable_backfill: bool,
+    pub backfill_interval_secs: u64,
+    pub backfill_batch_size: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogSyncStatus {
+    pub config: CatalogSyncConfigDto,
+    pub incremental_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_incremental_at: Option<DateTime<Utc>>,
+    pub last_incremental_upserted: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_water_time_updated: Option<i64>,
+    pub backfill_running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_cursor: Option<String>,
+    pub backfill_synced_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workshop_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminFetchUpstreamRequest {
+    pub ids: Vec<WorkshopId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminFetchUpstreamResponse {
+    pub items: Vec<WorkshopItemRecord>,
+    pub removed_ids: Vec<WorkshopId>,
+    pub unavailable_ids: Vec<WorkshopId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,19 +215,44 @@ pub struct AdminItemOverrideRequest {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemRevisionEntry {
+    pub id: i64,
+    pub status: WorkshopItemStatus,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_updated: Option<i64>,
+    #[serde(default)]
+    pub dependencies: Vec<WorkshopDependency>,
+    pub source: MetadataSource,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminItemDetailResponse {
+    pub item: WorkshopItemRecord,
+    pub is_admin_override: bool,
+    pub last_verified_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<DateTime<Utc>>,
+    pub revisions: Vec<ItemRevisionEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditLogEntry {
     pub id: i64,
-    pub workshop_id: WorkshopId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contributor_id: Option<ContributorId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contributor_name: Option<String>,
-    pub decision: ConflictDecision,
+    pub workshop_id: Option<WorkshopId>,
+    pub actor: String,
+    pub action: String,
     pub reason: String,
-    pub submitted_status: WorkshopItemStatus,
-    pub submitted_time_updated: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkshopItemStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_updated: Option<i64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -194,18 +264,20 @@ pub struct CatalogStats {
     pub removed_items: u64,
     pub private_items: u64,
     pub collections_count: u64,
-    pub contributors_count: u64,
-    pub flagged_audits_count: u64,
-    pub queued_scraper_jobs: u64,
+    pub overridden_items: u64,
+    pub revisions_count: u64,
+    pub audit_logs_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ScraperPlaceholderStatus {
-    pub implemented: bool,
-    pub provider_name: String,
-    pub queued_jobs: u64,
-    pub message: String,
+pub struct CatalogOverviewResponse {
+    pub stats: CatalogStats,
+    pub steam: CatalogSteamStatus,
+    pub sync: CatalogSyncStatus,
+    pub config_path: Option<String>,
+    pub bind_addr: String,
+    pub db_path: String,
 }
 
 #[cfg(test)]
@@ -213,10 +285,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trust_tier_ordering_matches_weights() {
-        assert!(TrustTier::Official > TrustTier::Maintainer);
-        assert!(TrustTier::Maintainer > TrustTier::TrustedPlayer);
-        assert!(TrustTier::TrustedPlayer > TrustTier::Community);
-        assert!(TrustTier::Official.default_weight() > TrustTier::Community.default_weight());
+    fn batch_items_request_defaults_force_refresh_false() {
+        let parsed: BatchItemsRequest = serde_json::from_str(r#"{"ids":["1001","2002"]}"#).unwrap();
+        assert_eq!(parsed.ids.len(), 2);
+        assert!(!parsed.force_refresh);
     }
 }

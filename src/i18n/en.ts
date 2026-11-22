@@ -403,7 +403,6 @@ export const en = {
     sourceOrder: 'Provider Order',
     httpsOnly: 'Require Secure HTTPS Connections',
     catalogUrl: 'Catalog Server URL',
-    catalogToken: 'Contributor Token',
     disableSdk: 'Disable Steamworks SDK',
     forceSdkDownload: 'Force SDK Download',
     sdkStatus: 'Steamworks SDK',

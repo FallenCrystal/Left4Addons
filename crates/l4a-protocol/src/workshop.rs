@@ -24,11 +24,11 @@ pub enum WorkshopFileType {
 #[serde(rename_all = "snake_case")]
 pub enum MetadataSource {
     CatalogServer,
+    SteamKit,
     SteamworksSdk,
     SteamWebApi,
     WebScraper,
     LocalVpk,
-    UserContribution,
     AdminOverride,
 }
 
@@ -40,6 +40,19 @@ pub struct WorkshopDependency {
     pub title: Option<String>,
     #[serde(default = "default_true")]
     pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkshopPreview {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub youtube_video_id: Option<String>,
+    #[serde(default)]
+    pub preview_type: u32,
 }
 
 fn default_true() -> bool {
@@ -63,6 +76,8 @@ pub struct WorkshopItemRecord {
     pub creator_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<WorkshopPreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

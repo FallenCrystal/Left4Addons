@@ -1,0 +1,219 @@
+use l4a_protocol::{CatalogSyncConfigDto, SteamAuthMode};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatalogConfig {
+    pub server: ServerSection,
+    pub admin: AdminSection,
+    pub steam: SteamSection,
+    pub sync: SyncSection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSection {
+    pub bind: String,
+    pub db_path: PathBuf,
+}
+
+impl Default for ServerSection {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:8787".to_string(),
+            db_path: PathBuf::from("./l4a-catalog.db"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdminSection {
+    pub username: String,
+    pub password: String,
+    pub session_ttl_hours: u64,
+}
+
+impl Default for AdminSection {
+    fn default() -> Self {
+        Self {
+            username: "admin".to_string(),
+            password: generate_initial_password(),
+            session_ttl_hours: 168,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SteamSection {
+    pub app_id: u32,
+    pub mode: SteamAuthMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    pub guard_data_path: PathBuf,
+    pub request_concurrency: usize,
+}
+
+impl Default for SteamSection {
+    fn default() -> Self {
+        Self {
+            app_id: 550,
+            mode: SteamAuthMode::Anonymous,
+            account_name: None,
+            refresh_token: None,
+            guard_data_path: PathBuf::from("./steam-guard.json"),
+            request_concurrency: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncSection {
+    pub enable_read_through: bool,
+    pub item_ttl_secs: u64,
+    pub enable_incremental_sync: bool,
+    pub incremental_interval_secs: u64,
+    pub incremental_pages_per_tick: u32,
+    pub enable_backfill: bool,
+    pub backfill_interval_secs: u64,
+    pub backfill_batch_size: u32,
+}
+
+impl Default for SyncSection {
+    fn default() -> Self {
+        Self {
+            enable_read_through: true,
+            item_ttl_secs: 900,
+            enable_incremental_sync: true,
+            incremental_interval_secs: 180,
+            incremental_pages_per_tick: 2,
+            enable_backfill: false,
+            backfill_interval_secs: 15,
+            backfill_batch_size: 50,
+        }
+    }
+}
+
+impl SyncSection {
+    pub fn to_dto(&self) -> CatalogSyncConfigDto {
+        CatalogSyncConfigDto {
+            enable_read_through: self.enable_read_through,
+            item_ttl_secs: self.item_ttl_secs,
+            enable_incremental_sync: self.enable_incremental_sync,
+            incremental_interval_secs: self.incremental_interval_secs,
+            incremental_pages_per_tick: self.incremental_pages_per_tick,
+            enable_backfill: self.enable_backfill,
+            backfill_interval_secs: self.backfill_interval_secs,
+            backfill_batch_size: self.backfill_batch_size,
+        }
+    }
+
+    pub fn apply_dto(&mut self, dto: &CatalogSyncConfigDto) {
+        self.enable_read_through = dto.enable_read_through;
+        self.item_ttl_secs = dto.item_ttl_secs.max(30);
+        self.enable_incremental_sync = dto.enable_incremental_sync;
+        self.incremental_interval_secs = dto.incremental_interval_secs.max(30);
+        self.incremental_pages_per_tick = dto.incremental_pages_per_tick.clamp(1, 20);
+        self.enable_backfill = dto.enable_backfill;
+        self.backfill_interval_secs = dto.backfill_interval_secs.max(2);
+        self.backfill_batch_size = dto.backfill_batch_size.clamp(1, 100);
+    }
+}
+
+pub fn generate_initial_password() -> String {
+    format!("cat_{}", uuid::Uuid::new_v4().simple())
+}
+
+impl CatalogConfig {
+    /// 读取 `catalog.toml`；若不存在则自动初始化并写入带随机管理员密码的默认配置文件。
+    /// 返回 `(config, created_new_file)`。
+    pub fn load_or_init(path: &Path) -> anyhow::Result<(Self, bool)> {
+        if path.exists() {
+            let raw = fs::read_to_string(path)?;
+            let mut parsed: Self = toml::from_str(&raw)?;
+            parsed.normalize();
+            Ok((parsed, false))
+        } else {
+            let mut default_cfg = Self::default();
+            default_cfg.normalize();
+            default_cfg.save_to(path)?;
+            Ok((default_cfg, true))
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        if self.admin.username.trim().is_empty() {
+            self.admin.username = "admin".to_string();
+        }
+        self.admin.session_ttl_hours = self.admin.session_ttl_hours.clamp(1, 24 * 90);
+        if self.steam.app_id == 0 {
+            self.steam.app_id = 550;
+        }
+        self.steam.request_concurrency = self.steam.request_concurrency.clamp(1, 16);
+        self.sync.item_ttl_secs = self.sync.item_ttl_secs.max(30);
+        self.sync.incremental_interval_secs = self.sync.incremental_interval_secs.max(30);
+        self.sync.incremental_pages_per_tick = self.sync.incremental_pages_per_tick.clamp(1, 20);
+        self.sync.backfill_interval_secs = self.sync.backfill_interval_secs.max(2);
+        self.sync.backfill_batch_size = self.sync.backfill_batch_size.clamp(1, 100);
+    }
+
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let body = format!(
+            "# Left4Addons Catalog Server 配置文件\n# 修改将由控制台自动持久化，也可手动编辑后重启服务。\n\n{}",
+            toml::to_string_pretty(self)?
+        );
+        let tmp_path = path.with_extension("toml.tmp");
+        fs::write(&tmp_path, body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        }
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+}
+
+pub struct CatalogConfigStore {
+    path: Option<PathBuf>,
+    inner: RwLock<CatalogConfig>,
+}
+
+impl CatalogConfigStore {
+    pub fn new(path: Option<PathBuf>, config: CatalogConfig) -> Self {
+        Self {
+            path,
+            inner: RwLock::new(config),
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn get(&self) -> CatalogConfig {
+        self.inner.read().unwrap().clone()
+    }
+
+    pub fn update(&self, f: impl FnOnce(&mut CatalogConfig)) -> anyhow::Result<CatalogConfig> {
+        let mut guard = self.inner.write().unwrap();
+        f(&mut guard);
+        guard.normalize();
+        if let Some(ref path) = self.path {
+            guard.save_to(path)?;
+        }
+        Ok(guard.clone())
+    }
+}

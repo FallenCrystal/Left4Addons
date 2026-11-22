@@ -2,21 +2,18 @@ use crate::db::LocalDb;
 use crate::error::CoreError;
 use chrono::Utc;
 use l4a_protocol::{
-    AppConfig, CollectionSyncDiff, DependencyDiff, InstallState, ItemSubmission, MetadataSource,
-    ObsoleteDependencyHint, RemovedUpstreamItem, SubmissionBatchRequest, SyncReport,
-    UpdateAvailableItem, WorkshopFetchOutcome, WorkshopFileType, WorkshopId, WorkshopItemStatus,
+    CollectionSyncDiff, DependencyDiff, InstallState, MetadataSource, ObsoleteDependencyHint,
+    RemovedUpstreamItem, SyncReport, UpdateAvailableItem, WorkshopFetchOutcome, WorkshopId,
+    WorkshopItemStatus,
 };
-use l4a_workshop::{CatalogBackendProvider, WorkshopResolver};
+use l4a_workshop::WorkshopResolver;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 /// 远程生命周期同步：检测模组更新、上游下架/私密、父模组依赖新增/移除（含多父引用保护），
 /// 以及追踪合集的新增/移除 Diff。
 pub async fn sync_lifecycle(
     db: &LocalDb,
-    config: &AppConfig,
     resolver: &WorkshopResolver,
-    catalog_reporter: Option<Arc<CatalogBackendProvider>>,
 ) -> Result<SyncReport, CoreError> {
     let addons = db.list_addons()?;
     let collections: Vec<_> = db
@@ -52,7 +49,6 @@ pub async fn sync_lifecycle(
         let (outcomes, warnings) = resolver.fetch_items(&query_ids).await?;
         report.warnings.extend(warnings);
 
-        let mut submissions = Vec::new();
         let addon_by_wid: HashMap<WorkshopId, _> = addons
             .iter()
             .filter_map(|a| a.workshop_id.map(|w| (w, a.clone())))
@@ -115,30 +111,6 @@ pub async fn sync_lifecycle(
                             }
                         }
                     }
-
-                    if item.source != MetadataSource::CatalogServer {
-                        submissions.push(ItemSubmission {
-                            workshop_id: item.workshop_id,
-                            file_type: item.file_type,
-                            status: item.status,
-                            title: item.title,
-                            description: item.description,
-                            creator_steam_id: item.creator_steam_id,
-                            creator_name: item.creator_name,
-                            preview_url: item.preview_url,
-                            file_url: item.file_url,
-                            file_size: item.file_size,
-                            time_created: item.time_created,
-                            time_updated: item.time_updated,
-                            tags: item.tags,
-                            dependencies: item.dependencies,
-                            collection_children: item.collection_children,
-                            subscriptions: item.subscriptions,
-                            favorites: item.favorites,
-                            observed_source: item.source,
-                            observed_at: item.fetched_at,
-                        });
-                    }
                 }
                 WorkshopFetchOutcome::Removed {
                     workshop_id,
@@ -147,7 +119,7 @@ pub async fn sync_lifecycle(
                     ..
                 } => {
                     db.mark_workshop_status(workshop_id, WorkshopItemStatus::Removed, source)?;
-                    let title = if let Some(addon) = addon_by_wid.get(&workshop_id) {
+                    if let Some(addon) = addon_by_wid.get(&workshop_id) {
                         report.removed_upstream.push(RemovedUpstreamItem {
                             addon_id: addon.id.clone(),
                             workshop_id,
@@ -155,32 +127,6 @@ pub async fn sync_lifecycle(
                             status: WorkshopItemStatus::Removed,
                             local_file_preserved: addon.install_state == InstallState::Installed,
                             detected_at: observed_at,
-                        });
-                        addon.title.clone()
-                    } else {
-                        format!("Workshop #{workshop_id}")
-                    };
-                    if source != MetadataSource::CatalogServer {
-                        submissions.push(ItemSubmission {
-                            workshop_id,
-                            file_type: WorkshopFileType::Item,
-                            status: WorkshopItemStatus::Removed,
-                            title,
-                            description: None,
-                            creator_steam_id: None,
-                            creator_name: None,
-                            preview_url: None,
-                            file_url: None,
-                            file_size: None,
-                            time_created: None,
-                            time_updated: None,
-                            tags: Vec::new(),
-                            dependencies: Vec::new(),
-                            collection_children: Vec::new(),
-                            subscriptions: None,
-                            favorites: None,
-                            observed_source: source,
-                            observed_at,
                         });
                     }
                 }
@@ -195,7 +141,7 @@ pub async fn sync_lifecycle(
                         WorkshopItemStatus::PrivateOrUnavailable,
                         source,
                     )?;
-                    let title = if let Some(addon) = addon_by_wid.get(&workshop_id) {
+                    if let Some(addon) = addon_by_wid.get(&workshop_id) {
                         report.removed_upstream.push(RemovedUpstreamItem {
                             addon_id: addon.id.clone(),
                             workshop_id,
@@ -203,32 +149,6 @@ pub async fn sync_lifecycle(
                             status: WorkshopItemStatus::PrivateOrUnavailable,
                             local_file_preserved: addon.install_state == InstallState::Installed,
                             detected_at: observed_at,
-                        });
-                        addon.title.clone()
-                    } else {
-                        format!("Workshop #{workshop_id}")
-                    };
-                    if source != MetadataSource::CatalogServer {
-                        submissions.push(ItemSubmission {
-                            workshop_id,
-                            file_type: WorkshopFileType::Item,
-                            status: WorkshopItemStatus::PrivateOrUnavailable,
-                            title,
-                            description: None,
-                            creator_steam_id: None,
-                            creator_name: None,
-                            preview_url: None,
-                            file_url: None,
-                            file_size: None,
-                            time_created: None,
-                            time_updated: None,
-                            tags: Vec::new(),
-                            dependencies: Vec::new(),
-                            collection_children: Vec::new(),
-                            subscriptions: None,
-                            favorites: None,
-                            observed_source: source,
-                            observed_at,
                         });
                     }
                 }
@@ -296,23 +216,6 @@ pub async fn sync_lifecycle(
         }
         obsolete_list.sort_by_key(|o| o.dependency_workshop_id);
         report.obsolete_dependencies = obsolete_list;
-
-        // 可选地将核验结果提交到自托管 l4a-server
-        if let (Some(reporter), Some(token)) = (
-            catalog_reporter,
-            config.catalog_contributor_token.as_deref(),
-        ) {
-            if !submissions.is_empty() && !token.trim().is_empty() {
-                if let Err(err) = reporter
-                    .submit_observations(token, &SubmissionBatchRequest { items: submissions })
-                    .await
-                {
-                    report
-                        .warnings
-                        .push(format!("向 Catalog Server 上报观测数据失败: {err}"));
-                }
-            }
-        }
     }
 
     // 同步已追踪合集的成员变更 Diff
@@ -395,6 +298,7 @@ pub(crate) fn source_provides_dependencies(source: MetadataSource) -> bool {
     matches!(
         source,
         MetadataSource::SteamworksSdk
+            | MetadataSource::SteamKit
             | MetadataSource::CatalogServer
             | MetadataSource::WebScraper
             | MetadataSource::AdminOverride
