@@ -206,18 +206,215 @@ async fn search_items_supports_catalog_sorts_and_title_relevance() {
         assert_eq!(search(params).await, (7, expected.to_vec()), "{params}");
     }
     for params in ["?q=%20MiSSIon_%20", "?q=mission_&sort=relevance"] {
-        assert_eq!(
-            search(params).await,
-            (6, vec![9001, 9002, 9003, 9005, 9004, 9006])
-        );
+        assert_eq!(search(params).await, (4, vec![9001, 9002, 9003, 9004]));
     }
     assert_eq!(
         search("?q=mission_&sort=updated").await,
-        (6, vec![9005, 9004, 9002, 9001, 9003, 9006])
+        (4, vec![9004, 9002, 9001, 9003])
     );
     assert_eq!(
         search("?q=mission_&page=2&pageSize=2").await,
-        (6, vec![9003, 9005])
+        (4, vec![9003, 9004])
+    );
+    assert_eq!(
+        search("?q=in%20the%20description").await,
+        (2, vec![9005, 9006])
+    );
+}
+
+#[tokio::test]
+async fn search_handles_spaceless_compounds_pinyin_and_avoids_description_noise() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    let insert = |id: u64,
+                  title: &str,
+                  creator: Option<&str>,
+                  desc: Option<&str>,
+                  tags: &[&str],
+                  subs: u64| {
+        let mut item = sample_item(id, title, 1_700_000_000 + id as i64, None);
+        item.creator_name = creator.map(str::to_owned);
+        item.description = desc.map(str::to_owned);
+        item.tags = tags.iter().map(|t| (*t).to_string()).collect();
+        item.subscriptions = Some(subs);
+        state.repo.upsert_item(&item, false, false).unwrap();
+    };
+
+    insert(
+        2750097524,
+        "Day Break v2",
+        Some("Hoangzp"),
+        Some("Re upload the light and old version map"),
+        &["Campaigns", "Co-op"],
+        36_450,
+    );
+    insert(
+        3761588869,
+        "Paradise of Doom (Part 1)",
+        Some("Honest"),
+        Some("Samples: Dannbo: Daybreak Sand Texture"),
+        &["Campaigns", "Co-op"],
+        34_607,
+    );
+    insert(
+        990001,
+        "Friday Breaking",
+        Some("Tester"),
+        None,
+        &["Campaigns"],
+        50_000,
+    );
+    for part in 1..=6u64 {
+        let desc = if part == 1 {
+            Some("[h2]Maps[/h2] [*]Residential (earlydays1.bsp)")
+        } else {
+            Some("[b]Necessary content for [url=https://steamcommunity.com/sharedfiles/filedetails/?id=3560883926]this campaign[/url][/b]")
+        };
+        insert(
+            3560883920 + part,
+            &format!("Early Days PART {part}/6"),
+            Some("perfect_buddy"),
+            desc,
+            &["Campaigns", "Co-op"],
+            46_600 - part * 100,
+        );
+    }
+    insert(
+        3832010631,
+        "L4D2 - Custom Campaigns: Extended Subtitles",
+        Some("Random"),
+        Some("Supported: Prague • Early Days • Hell Ride"),
+        &["UI", "Scripts"],
+        84,
+    );
+    insert(
+        2396847377,
+        "广州增城 （Zengcheng）Lv8.06",
+        Some("长远的梦"),
+        Some("zc1_m1\nzc1_m2\nroutes of Zengcheng"),
+        &["Campaigns", "Single Player", "Co-op"],
+        1_577_877,
+    );
+    insert(
+        2802325803,
+        "宜昌市V5.01",
+        Some("JohNny.R"),
+        Some("图内含有止痛药及M60和女巫MOD"),
+        &["Campaigns", "Co-op"],
+        107_136,
+    );
+    insert(
+        3578078027,
+        "宜昌市2(YiChangCity2) V1.2 Part1/2",
+        Some("JohNny.R"),
+        Some("宜昌市续集（另外有个叫tom汤姆的家伙冒充增城作者，希望大家擦亮眼睛！）"),
+        &["Campaigns", "Co-op"],
+        55_495,
+    );
+    insert(
+        3756711360,
+        "Pearl River Rage v1.0",
+        Some("5号停机坪"),
+        Some("The map scenes are based on Liwan District and Haizhou District, Guangzhou."),
+        &["Campaigns", "Co-op"],
+        105_818,
+    );
+    insert(
+        3087112386,
+        "【Punishing: Gray Raven】曲·启明·泛用式替换Nick",
+        Some("热油糕手"),
+        Some("本模型素材的最终版权归【广州库洛科技有限公司】所有\nThe final copyright of this model material belongs to Guangzhou Kuluo Technology Co., Ltd"),
+        &["Survivors", "Nick"],
+        3_168,
+    );
+    insert(
+        3115675033,
+        "NanningCity V1.16.1",
+        Some("HerobrineAce"),
+        Some("南宁市战役地图"),
+        &["Campaigns", "Co-op"],
+        544_522,
+    );
+
+    let app = build_router(state);
+    let search_ids = async |params: &str| {
+        let (status, bytes) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/items/search?{params}"),
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{params}");
+        let response: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+        let ids: Vec<u64> = response.items.iter().map(|i| i.workshop_id.0).collect();
+        (response.total, ids)
+    };
+
+    // DayBreak & lowercase daybreak find Day Break v2 and exclude Paradise of Doom & Friday Breaking
+    for q in ["q=DayBreak", "q=daybreak", "q=Day%20Break", "q=day_break"] {
+        assert_eq!(search_ids(q).await, (1, vec![2750097524]), "{q}");
+    }
+
+    // EarlyDays & lowercase earlydays find all 6 parts and exclude Extended Subtitles
+    let expected_early: Vec<u64> = (1..=6).map(|p| 3560883920 + p).collect();
+    for q in ["q=EarlyDays", "q=earlydays", "q=Early%20Days"] {
+        assert_eq!(search_ids(q).await, (6, expected_early.clone()), "{q}");
+    }
+
+    // 增城 / zengcheng find 广州增城 without pulling in 宜昌市2 from description rant
+    for q in ["q=zengcheng", "q=%E5%A2%9E%E5%9F%8E"] {
+        assert_eq!(search_ids(q).await, (1, vec![2396847377]), "{q}");
+    }
+
+    // 广州 / guangzhou / guang zhou find 广州增城 without pulling in Pearl River Rage or Kuro models
+    for q in [
+        "q=%E5%B9%BF%E5%B7%9E",
+        "q=guangzhou",
+        "q=guang%20zhou",
+        "q=guangzhouzengcheng",
+    ] {
+        assert_eq!(search_ids(q).await, (1, vec![2396847377]), "{q}");
+    }
+
+    // Explicit Survivors tag with 广州 falls back to description and finds the survivor model
+    assert_eq!(
+        search_ids("q=%E5%B9%BF%E5%B7%9E&tag=Survivors").await,
+        (1, vec![3087112386])
+    );
+
+    // yichang finds both 宜昌市2 (direct title) and 宜昌市V5.01 (pinyin title)
+    assert_eq!(
+        search_ids("q=yichang").await,
+        (2, vec![3578078027, 2802325803])
+    );
+
+    // Description fallback still works when primary fields have zero hits (map code, city in desc, company)
+    assert_eq!(search_ids("q=zc1_m1").await, (1, vec![2396847377]));
+    assert_eq!(
+        search_ids("q=Liwan%20District").await,
+        (1, vec![3756711360])
+    );
+    assert_eq!(
+        search_ids("q=%E5%8D%97%E5%AE%81").await,
+        (1, vec![3115675033])
+    );
+    assert_eq!(
+        search_ids("q=%E5%BA%93%E6%B4%9B").await,
+        (1, vec![3087112386])
+    );
+
+    // Creator search & Steam URL direct search
+    assert_eq!(
+        search_ids("q=%E9%95%BF%E8%BF%9C%E7%9A%84%E6%A2%A6").await,
+        (1, vec![2396847377])
+    );
+    assert_eq!(
+        search_ids(
+            "q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D2396847377"
+        )
+        .await,
+        (1, vec![2396847377])
     );
 }
 
@@ -795,6 +992,28 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
     let written = repo.list_revisions(WorkshopId(8002)).unwrap();
     assert_eq!(written.len(), 1);
     assert!(written[0].id > historical[0].id);
+
+    // Reopening a legacy DB without the FTS5 table automatically builds the search index.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS workshop_items_fts;
+         DELETE FROM sync_state WHERE key = 'search_index_version';",
+    )
+    .unwrap();
+    drop(conn);
+
+    let rebuilt_repo = ServerRepo::open(&path).unwrap();
+    let res = rebuilt_repo
+        .search(
+            &l4a_protocol::SearchQuery {
+                query: Some("LegacyOverride".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(res.total, 1);
+    assert_eq!(res.items[0].workshop_id, WorkshopId(8001));
 }
 
 #[tokio::test]
@@ -945,6 +1164,24 @@ async fn restricted_details_stay_out_of_public_item_and_search_responses() {
     assert_eq!(results.items.len(), 1);
     assert_eq!(results.items[0].source, MetadataSource::CatalogServer);
     assert_eq!(results.items[0].title, "Workshop #8201");
+
+    // Scrubbed private metadata must not linger in the FTS5 search index either.
+    for leaked in ["Public", "Account"] {
+        let (status, bytes) = json_request(
+            &app,
+            "GET",
+            &format!("/api/v1/items/search?q={leaked}"),
+            vec![],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let results: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            results.total, 0,
+            "scrubbed term {leaked} leaked into search"
+        );
+    }
 }
 
 #[tokio::test]

@@ -3,6 +3,7 @@ pub mod config;
 mod credentials;
 pub mod db;
 pub mod routes;
+pub mod search;
 pub mod sync;
 pub mod upstream;
 pub mod web_assets;

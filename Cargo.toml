@@ -64,6 +64,7 @@ steam-vent = "0.5.0"
 steam-vent-proto-steam = "0.5.2"
 steam-vent-proto-common = "0.5.1"
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
+pinyin = "0.11"
 tauri = { version = "2.11.5", features = [] }
 tauri-build = { version = "2.6.3", features = [] }
 tauri-plugin-log = "2"

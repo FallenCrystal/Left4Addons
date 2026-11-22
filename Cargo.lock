@@ -2578,6 +2578,7 @@ dependencies = [
  "l4a-mirror",
  "l4a-protocol",
  "l4a-workshop",
+ "pinyin",
  "qrcode",
  "rusqlite",
  "serde",
@@ -3528,6 +3529,12 @@ name = "pin-project-lite"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
+
+[[package]]
+name = "pinyin"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
 
 [[package]]
 name = "pkcs1"

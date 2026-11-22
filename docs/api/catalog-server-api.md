@@ -25,7 +25,7 @@
 响应：返回命中的 `items`（含已下架条目的墓碑状态）以及未能解析的 `missingIds`。
 
 ### `GET /api/v1/items/search?q=&tag=&status=&sort=&page=1&pageSize=30`
-在本地 SQLite 缓存库中按标题/描述/ID、标签（大小写不敏感匹配）与状态 (`active` / `removed` / `private_or_unavailable`) 分页检索。`sort` 支持 `relevance`、`updated`、`updated_asc`、`newest`、`subscriptions`、`title`。
+在本地 SQLite FTS5 缓存索引中按标题（支持中英文分词、驼峰/忽略空格复合匹配与中文标题拼音检索）、作者名、Workshop ID/链接、标签（大小写不敏感匹配）与状态 (`active` / `removed` / `private_or_unavailable`) 分页检索；仅当主字段无命中时自动回退至去除 BBCode 与链接后的简介检索，避免简介版权声明/致谢名单干扰结果。`sort` 支持 `relevance`、`updated`、`updated_asc`、`newest`、`subscriptions`、`title`。
 
 搜索会排除未列出、尚未核验可见性和已过期的活跃条目。未列出的 Steam 条目仍可按 ID 查询。此前已确认公开的墓碑和管理员锁定的公开覆写可以继续显示。
 
