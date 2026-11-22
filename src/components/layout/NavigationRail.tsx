@@ -68,7 +68,7 @@ export function NavigationRail({
         type="button"
         className="md-fab"
         aria-label={t('nav.scan')}
-        title={t('nav.scan')}
+        data-tooltip={t('nav.scan')}
         disabled={scanning}
         onClick={onScan}
       >

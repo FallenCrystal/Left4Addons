@@ -277,4 +277,25 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(within(reportDialog).getByText('Manual recovery required')).toBeTruthy();
     expect(within(reportDialog).getByText(/Disk busy/)).toBeTruthy();
   });
+
+  it('uses custom M3 select menu and M3 tooltip attributes instead of native browser popups', async () => {
+    const { container } = render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+
+    expect(container.querySelectorAll('select').length).toBe(0);
+    expect(container.querySelectorAll('[title]').length).toBe(0);
+
+    const sortTrigger = screen.getByRole('combobox', { name: 'Sort' });
+    expect(sortTrigger.getAttribute('aria-expanded')).toBe('false');
+
+    fireEvent.click(sortTrigger);
+    expect(sortTrigger.getAttribute('aria-expanded')).toBe('true');
+
+    const listbox = screen.getByRole('listbox', { name: 'Sort' });
+    const sizeOption = within(listbox).getByRole('option', { name: 'Size' });
+    fireEvent.click(sizeOption);
+
+    expect(sortTrigger.getAttribute('aria-expanded')).toBe('false');
+    expect(sortTrigger.textContent).toContain('Size');
+  });
 });

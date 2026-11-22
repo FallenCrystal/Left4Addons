@@ -403,7 +403,7 @@ export function ReconcileView({
                               <button
                                 type="button"
                                 className="l4a-path-chip l4a-path-chip-btn"
-                                title={t('common.openInExplorer')}
+                                data-tooltip={t('common.openInExplorer')}
                                 onClick={() => onOpenInFileManager(issue.loadingPath!)}
                               >
                                 <Folder
@@ -429,7 +429,7 @@ export function ReconcileView({
                               <button
                                 type="button"
                                 className="l4a-path-chip l4a-path-chip-btn"
-                                title={t('common.openInExplorer')}
+                                data-tooltip={t('common.openInExplorer')}
                                 onClick={() => onOpenInFileManager(issue.workshopPath!)}
                               >
                                 <Store

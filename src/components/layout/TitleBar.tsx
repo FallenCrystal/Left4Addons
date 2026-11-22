@@ -166,7 +166,7 @@ export function TitleBar({ activityLabel, isPreview }: TitleBarProps) {
             type="button"
             className="l4a-window-btn"
             aria-label={t('window.minimize')}
-            title={t('window.minimize')}
+            data-tooltip={t('window.minimize')}
             onClick={handleMinimize}
           >
             <Minus size={14} strokeWidth={1.9} />
@@ -175,7 +175,7 @@ export function TitleBar({ activityLabel, isPreview }: TitleBarProps) {
             type="button"
             className="l4a-window-btn"
             aria-label={maximized ? t('window.restore') : t('window.maximize')}
-            title={maximized ? t('window.restore') : t('window.maximize')}
+            data-tooltip={maximized ? t('window.restore') : t('window.maximize')}
             onClick={handleToggleMaximize}
           >
             {maximized ? <RestoreIcon /> : <MaximizeIcon />}
@@ -184,7 +184,7 @@ export function TitleBar({ activityLabel, isPreview }: TitleBarProps) {
             type="button"
             className="l4a-window-btn l4a-window-btn-close"
             aria-label={t('window.close')}
-            title={t('window.close')}
+            data-tooltip={t('window.close')}
             onClick={handleClose}
           >
             <X size={15} strokeWidth={1.9} />

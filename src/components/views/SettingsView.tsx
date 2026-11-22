@@ -620,10 +620,46 @@ export function SettingsView({
                       ...d.renameRules,
                       maxFilenameLength: Math.max(
                         0,
-                        Number.parseInt(e.target.value || '0', 10) || 0,
+                        Math.min(240, Number.parseInt(e.target.value || '0', 10) || 0),
                       ),
                     },
                   }))
+                }
+                trailing={
+                  <div className="l4a-row-wrap" style={{ gap: 4, flexWrap: 'nowrap' }}>
+                    <Button
+                      variant="outlined"
+                      size="sm"
+                      disabled={effective.renameRules.maxFilenameLength <= 0}
+                      onClick={() =>
+                        updateDraft((d) => ({
+                          ...d,
+                          renameRules: {
+                            ...d.renameRules,
+                            maxFilenameLength: Math.max(0, d.renameRules.maxFilenameLength - 10),
+                          },
+                        }))
+                      }
+                    >
+                      −
+                    </Button>
+                    <Button
+                      variant="outlined"
+                      size="sm"
+                      disabled={effective.renameRules.maxFilenameLength >= 240}
+                      onClick={() =>
+                        updateDraft((d) => ({
+                          ...d,
+                          renameRules: {
+                            ...d.renameRules,
+                            maxFilenameLength: Math.min(240, d.renameRules.maxFilenameLength + 10),
+                          },
+                        }))
+                      }
+                    >
+                      +
+                    </Button>
+                  </div>
                 }
               />
             </section>

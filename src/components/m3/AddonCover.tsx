@@ -150,6 +150,7 @@ export function AddonCover({
         alt={title}
         className="l4a-cover-img"
         loading="lazy"
+        draggable={false}
         onError={() => setFailedSrc(resolvedUrl)}
       />
     );

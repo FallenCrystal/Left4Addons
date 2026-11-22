@@ -4,7 +4,7 @@ import { AlertCircle, RefreshCw } from 'lucide-react';
 import type { AddonDirType, AddonSummary, LoadoutProfile, UserGroup } from './api/ipc';
 import { NavigationRail, type NavDestination } from './components/layout/NavigationRail';
 import { TitleBar } from './components/layout/TitleBar';
-import { Button, EmptyState, LoadingIndicator, Snackbar } from './components/m3/primitives';
+import { Button, EmptyState, LoadingIndicator, Snackbar, TooltipHost } from './components/m3/primitives';
 import { AddonDetailSheet } from './components/overlays/AddonDetailSheet';
 import { BatchReportDialog } from './components/overlays/BatchReportDialog';
 import { DeleteDialog } from './components/overlays/DeleteDialog';
@@ -580,6 +580,7 @@ export function App() {
       />
 
       <Snackbar item={ctrl.snackbar} onClose={ctrl.dismissSnackbar} />
+      <TooltipHost />
     </div>
   );
 }

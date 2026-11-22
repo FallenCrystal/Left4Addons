@@ -37,6 +37,7 @@ import {
   IconButton,
   LinearProgress,
   SegmentedButton,
+  Select,
   Switch,
 } from '../m3/primitives';
 
@@ -365,17 +366,17 @@ export function LibraryView({
           />
         </div>
 
-        <select
-          className="l4a-select"
-          aria-label={t('common.sort')}
+        <Select<LibrarySort>
+          ariaLabel={t('common.sort')}
           value={sortBy}
-          onChange={(e) => setSortBy(e.target.value as LibrarySort)}
-        >
-          <option value="title">{t('sort.title')}</option>
-          <option value="size">{t('sort.size')}</option>
-          <option value="workshopId">{t('sort.workshopId')}</option>
-          <option value="status">{t('sort.status')}</option>
-        </select>
+          onChange={setSortBy}
+          options={[
+            { value: 'title', label: t('sort.title') },
+            { value: 'size', label: t('sort.size') },
+            { value: 'workshopId', label: t('sort.workshopId') },
+            { value: 'status', label: t('sort.status') },
+          ]}
+        />
 
         <IconButton
           label={layout === 'grid' ? t('library.listView') : t('library.gridView')}

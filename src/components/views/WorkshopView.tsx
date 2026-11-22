@@ -43,6 +43,7 @@ import {
   IconButton,
   LinearProgress,
   LoadingIndicator,
+  Select,
   SideSheet,
 } from '../m3/primitives';
 
@@ -342,21 +343,21 @@ export function WorkshopView({
           </IconButton>
         </form>
 
-        <select
-          className="l4a-select"
-          aria-label={t('common.sort')}
+        <Select
+          ariaLabel={t('common.sort')}
           value={searchParams.sort}
-          onChange={(e) =>
-            setSearchParams((prev) => ({ ...prev, sort: e.target.value, page: 1 }))
+          onChange={(next) =>
+            setSearchParams((prev) => ({ ...prev, sort: next, page: 1 }))
           }
-        >
-          <option value="relevance">{t('workshop.sort.relevance')}</option>
-          <option value="updated">{t('workshop.sort.updated')}</option>
-          <option value="updated_asc">{t('workshop.sort.updated_asc')}</option>
-          <option value="subscriptions">{t('workshop.sort.subscriptions')}</option>
-          <option value="newest">{t('workshop.sort.newest')}</option>
-          <option value="title">{t('workshop.sort.title')}</option>
-        </select>
+          options={[
+            { value: 'relevance', label: t('workshop.sort.relevance') },
+            { value: 'updated', label: t('workshop.sort.updated') },
+            { value: 'updated_asc', label: t('workshop.sort.updated_asc') },
+            { value: 'subscriptions', label: t('workshop.sort.subscriptions') },
+            { value: 'newest', label: t('workshop.sort.newest') },
+            { value: 'title', label: t('workshop.sort.title') },
+          ]}
+        />
 
         <Button
           variant="outlined"

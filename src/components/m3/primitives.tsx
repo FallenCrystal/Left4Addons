@@ -1,10 +1,10 @@
 import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, RefObject } from 'react';
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Check, X } from 'lucide-react';
+import { Check, ChevronDown, X } from 'lucide-react';
 
 const FOCUSABLE_SELECTOR =
-  'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  'button:not([disabled]):not([tabindex="-1"]), [href]:not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
 
 const overlayStack: symbol[] = [];
 
@@ -102,6 +102,7 @@ export function Button({
   children,
   className = '',
   type = 'button',
+  title,
   ...rest
 }: ButtonProps) {
   return (
@@ -111,6 +112,7 @@ export function Button({
       data-variant={variant}
       data-tone={tone}
       data-size={size}
+      data-tooltip={title}
       {...rest}
     >
       {icon}
@@ -141,7 +143,7 @@ export function IconButton({
     <button
       type={type}
       aria-label={label}
-      title={title ?? label}
+      data-tooltip={title ?? label}
       className={`md-icon-btn ${className}`.trim()}
       data-variant={variant}
       data-size={size}
@@ -339,6 +341,183 @@ export function TextField({ label, trailing, id, ...rest }: TextFieldProps) {
         {trailing}
       </span>
     </label>
+  );
+}
+
+export interface SelectOption<T extends string> {
+  value: T;
+  label: string;
+  icon?: ReactNode;
+  disabled?: boolean;
+}
+
+export interface SelectProps<T extends string> {
+  value: T;
+  options: SelectOption<T>[];
+  onChange: (next: T) => void;
+  ariaLabel?: string;
+  icon?: ReactNode;
+  disabled?: boolean;
+  className?: string;
+}
+
+export function Select<T extends string>({
+  value,
+  options,
+  onChange,
+  ariaLabel,
+  icon,
+  disabled = false,
+  className = '',
+}: SelectProps<T>) {
+  const [open, setOpen] = useState(false);
+  const selectedIndex = options.findIndex((opt) => opt.value === value);
+  const [activeIndex, setActiveIndex] = useState<number>(() => Math.max(0, selectedIndex));
+  const rootRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const listboxId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
+    };
+    window.addEventListener('mousedown', onPointerDown, true);
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown, true);
+      window.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [open]);
+
+  const findNextEnabledIndex = (start: number, delta: 1 | -1): number => {
+    if (options.length === 0) return -1;
+    let idx = start;
+    for (let i = 0; i < options.length; i += 1) {
+      idx = (idx + delta + options.length) % options.length;
+      if (!options[idx]?.disabled) return idx;
+    }
+    return start;
+  };
+
+  const handleTriggerKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (disabled || options.length === 0) return;
+
+    if (!open) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
+        setOpen(true);
+      }
+      return;
+    }
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActiveIndex((curr) => findNextEnabledIndex(curr, 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActiveIndex((curr) => findNextEnabledIndex(curr, -1));
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      setActiveIndex(findNextEnabledIndex(options.length - 1, 1));
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      setActiveIndex(findNextEnabledIndex(0, -1));
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      const target = options[activeIndex];
+      if (target && !target.disabled) {
+        onChange(target.value);
+        setOpen(false);
+      }
+    } else if (e.key === 'Tab') {
+      setOpen(false);
+    }
+  };
+
+  const selectedOption = options[selectedIndex] ?? options[0];
+  const activeOption = options[activeIndex];
+
+  return (
+    <div
+      ref={rootRef}
+      className={`md-select ${className}`.trim()}
+      data-open={open ? 'true' : 'false'}
+    >
+      <button
+        ref={triggerRef}
+        type="button"
+        role="combobox"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={listboxId}
+        aria-activedescendant={
+          open && activeOption ? `${listboxId}-opt-${activeOption.value}` : undefined
+        }
+        disabled={disabled}
+        className="md-select-trigger"
+        onClick={() => {
+          if (disabled) return;
+          if (!open) {
+            setActiveIndex(selectedIndex >= 0 ? selectedIndex : 0);
+          }
+          setOpen((prev) => !prev);
+        }}
+        onKeyDown={handleTriggerKeyDown}
+      >
+        {icon}
+        <span className="md-select-value">{selectedOption?.label ?? value}</span>
+        <ChevronDown size={15} className="md-select-caret" aria-hidden="true" />
+      </button>
+
+      {open && (
+        <div id={listboxId} role="listbox" aria-label={ariaLabel} className="md-select-menu">
+          {options.map((opt, idx) => {
+            const isSelected = opt.value === value;
+            return (
+              <button
+                key={opt.value}
+                id={`${listboxId}-opt-${opt.value}`}
+                type="button"
+                role="option"
+                tabIndex={-1}
+                aria-selected={isSelected}
+                disabled={opt.disabled}
+                className="md-select-option"
+                data-selected={isSelected ? 'true' : 'false'}
+                data-highlighted={idx === activeIndex ? 'true' : 'false'}
+                onMouseEnter={() => {
+                  if (!opt.disabled) setActiveIndex(idx);
+                }}
+                onClick={() => {
+                  if (opt.disabled) return;
+                  onChange(opt.value);
+                  setOpen(false);
+                  triggerRef.current?.focus();
+                }}
+              >
+                <span className="md-select-option-check" aria-hidden="true">
+                  {isSelected ? <Check size={15} strokeWidth={2.5} /> : opt.icon}
+                </span>
+                <span className="md-select-option-label">{opt.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -669,6 +848,143 @@ export function Snackbar({
       >
         <X size={16} />
       </IconButton>
+    </div>
+  );
+}
+
+export function TooltipHost() {
+  const [active, setActive] = useState<{
+    text: string;
+    rect: DOMRect;
+  } | null>(null);
+  const [coords, setCoords] = useState<{ top: number; left: number; placement: 'top' | 'bottom' }>({
+    top: -9999,
+    left: -9999,
+    placement: 'bottom',
+  });
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  const targetRef = useRef<HTMLElement | null>(null);
+  const timerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const clearTimer = () => {
+      if (timerRef.current !== null) {
+        window.clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+
+    const hide = () => {
+      clearTimer();
+      targetRef.current = null;
+      setActive(null);
+    };
+
+    const showForTarget = (el: HTMLElement, delayMs: number) => {
+      const text = el.getAttribute('data-tooltip')?.trim();
+      if (!text || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true') {
+        hide();
+        return;
+      }
+      clearTimer();
+      targetRef.current = el;
+      timerRef.current = window.setTimeout(() => {
+        if (!el.isConnected) {
+          hide();
+          return;
+        }
+        const latestText = el.getAttribute('data-tooltip')?.trim();
+        if (!latestText) {
+          hide();
+          return;
+        }
+        setActive({ text: latestText, rect: el.getBoundingClientRect() });
+      }, delayMs);
+    };
+
+    const onPointerOver = (e: PointerEvent) => {
+      if (e.pointerType === 'touch') return;
+      const el = (e.target as Element | null)?.closest?.('[data-tooltip]') as HTMLElement | null;
+      if (!el) {
+        if (targetRef.current) hide();
+        return;
+      }
+      if (el === targetRef.current) return;
+      showForTarget(el, targetRef.current ? 120 : 360);
+    };
+
+    const onPointerOut = (e: PointerEvent) => {
+      if (!targetRef.current) return;
+      const related = e.relatedTarget as Node | null;
+      if (related && targetRef.current.contains(related)) return;
+      hide();
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const el = (e.target as Element | null)?.closest?.('[data-tooltip]') as HTMLElement | null;
+      if (!el || !el.matches(':focus-visible')) return;
+      showForTarget(el, 150);
+    };
+
+    window.addEventListener('pointerover', onPointerOver, true);
+    window.addEventListener('pointerout', onPointerOut, true);
+    window.addEventListener('focusin', onFocusIn, true);
+    window.addEventListener('focusout', hide, true);
+    window.addEventListener('pointerdown', hide, true);
+    window.addEventListener('keydown', hide, true);
+    window.addEventListener('wheel', hide, { passive: true, capture: true });
+    window.addEventListener('scroll', hide, true);
+    window.addEventListener('blur', hide);
+
+    return () => {
+      clearTimer();
+      window.removeEventListener('pointerover', onPointerOver, true);
+      window.removeEventListener('pointerout', onPointerOut, true);
+      window.removeEventListener('focusin', onFocusIn, true);
+      window.removeEventListener('focusout', hide, true);
+      window.removeEventListener('pointerdown', hide, true);
+      window.removeEventListener('keydown', hide, true);
+      window.removeEventListener('wheel', hide, true);
+      window.removeEventListener('scroll', hide, true);
+      window.removeEventListener('blur', hide);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!active || !tooltipRef.current) return;
+    const tipRect = tooltipRef.current.getBoundingClientRect();
+    const margin = 8;
+    const gap = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    let left = active.rect.left + active.rect.width / 2 - tipRect.width / 2;
+    left = Math.max(margin, Math.min(vw - tipRect.width - margin, left));
+
+    let placement: 'top' | 'bottom' = 'bottom';
+    let top = active.rect.bottom + gap;
+    if (top + tipRect.height + margin > vh && active.rect.top - gap - tipRect.height >= margin) {
+      placement = 'top';
+      top = active.rect.top - gap - tipRect.height;
+    }
+
+    setCoords({ top, left, placement });
+  }, [active]);
+
+  if (!active) return null;
+
+  return (
+    <div
+      ref={tooltipRef}
+      role="tooltip"
+      className="md-tooltip"
+      data-placement={coords.placement}
+      style={{
+        top: `${coords.top}px`,
+        left: `${coords.left}px`,
+      }}
+    >
+      {active.text}
     </div>
   );
 }
