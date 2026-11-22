@@ -266,39 +266,29 @@ export function TaskCenterSheet({
                           style={{ minHeight: 56, cursor: 'default' }}
                         >
                           <div className="l4a-list-main">
-                            {resolvedTitle ? (
-                              <>
-                                <div className="l4a-row-wrap" style={{ flexWrap: 'nowrap', minWidth: 0 }}>
-                                  <span className="md-title-small l4a-truncate">{resolvedTitle}</span>
-                                </div>
-                                <span
-                                  className="md-body-small l4a-truncate"
-                                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                                >
-                                  {t(`tasks.kind.${task.kind}`)} · #{task.targetId} · {detailText}
-                                </span>
-                              </>
-                            ) : (
-                              <>
-                                <div className="l4a-row-wrap">
-                                  <span className="md-title-small">
-                                    {t(`tasks.kind.${task.kind}`)}
-                                  </span>
-                                  <span
-                                    className="md-body-small md-mono"
-                                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                                  >
-                                    {task.kind === 'download' ? `#${task.targetId}` : task.targetId}
-                                  </span>
-                                </div>
-                                <span
-                                  className="md-body-small l4a-truncate"
-                                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                                >
-                                  {detailText}
-                                </span>
-                              </>
+                            {resolvedTitle && (
+                              <span className="md-title-small l4a-truncate">{resolvedTitle}</span>
                             )}
+                            <div className="l4a-row-wrap">
+                              <span className={resolvedTitle ? 'md-body-small' : 'md-title-small'}>
+                                {t(`tasks.kind.${task.kind}`)}
+                              </span>
+                              <span
+                                className="md-body-small md-mono"
+                                style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                              >
+                                {task.kind === 'download' ? `#${task.targetId}` : task.targetId}
+                              </span>
+                            </div>
+                            <span
+                              className={task.error ? 'md-body-small' : 'md-body-small l4a-truncate'}
+                              style={{
+                                color: 'var(--md-sys-color-on-surface-variant)',
+                                overflowWrap: task.error ? 'anywhere' : undefined,
+                              }}
+                            >
+                              {detailText}
+                            </span>
                           </div>
                           <span className="md-pill" data-tone={tone}>
                             {t(`tasks.status.${task.status}`)}

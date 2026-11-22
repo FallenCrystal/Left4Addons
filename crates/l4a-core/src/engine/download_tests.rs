@@ -1,5 +1,5 @@
 use super::*;
-use l4a_protocol::AddonOperationOutcome;
+use l4a_protocol::{AddonOperationOutcome, TaskRecord};
 use l4a_steam::MockSteamBridge;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -38,7 +38,7 @@ async fn update_from_fixture(
     bytes: &[u8],
 ) -> Result<AddonSummary, CoreError> {
     engine
-        .transfer_workshop_item_with(wid, true, |request, _, progress| async move {
+        .transfer_workshop_item_with(wid, true, None, |request, _, progress| async move {
             stage_vpk(request, progress, bytes)
         })
         .await
@@ -337,37 +337,50 @@ impl GatedVpk {
         update: bool,
     ) -> Result<AddonSummary, CoreError> {
         engine
-            .transfer_workshop_item_with(wid, update, |request, cancel, progress| async move {
-                let (release, gated) = oneshot::channel();
-                self.requested.send((request.workshop_id, release)).unwrap();
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(WorkshopError::Cancelled),
-                    result = gated => result.unwrap(),
-                }
-                stage_vpk(request, progress, &self.bytes)
-            })
+            .transfer_workshop_item_with(
+                wid,
+                update,
+                None,
+                |request, cancel, progress| async move {
+                    let (release, gated) = oneshot::channel();
+                    self.requested.send((request.workshop_id, release)).unwrap();
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(WorkshopError::Cancelled),
+                        result = gated => result.unwrap(),
+                    }
+                    stage_vpk(request, progress, &self.bytes)
+                },
+            )
             .await
     }
 }
 
-fn download_status(engine: &L4aEngine, wid: WorkshopId) -> Option<TaskStatus> {
+fn download_task(engine: &L4aEngine, wid: WorkshopId) -> Option<TaskRecord> {
     engine
         .db()
         .list_tasks()
         .unwrap()
         .into_iter()
         .find(|task| task.kind == TaskKind::Download && task.target_id == wid.to_string())
-        .map(|task| task.status)
 }
 
-async fn wait_for_queued_download(engine: &L4aEngine, wid: WorkshopId) {
+fn download_status(engine: &L4aEngine, wid: WorkshopId) -> Option<TaskStatus> {
+    download_task(engine, wid).map(|task| task.status)
+}
+
+async fn wait_for_queued_download(engine: &L4aEngine, wid: WorkshopId) -> TaskRecord {
     timeout(Duration::from_secs(5), async {
-        while download_status(engine, wid) != Some(TaskStatus::Queued) {
+        loop {
+            if let Some(task) =
+                download_task(engine, wid).filter(|t| t.status == TaskStatus::Queued)
+            {
+                return task;
+            }
             sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .expect("download should enter the queue");
+    .expect("download should enter the queue")
 }
 
 async fn expect_vpk_request(
@@ -406,12 +419,13 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
     create_test_vpk(&fixture, "Download", "Author", false, None, b"new");
     let (fixture, mut requests) = GatedVpk::new(std::fs::read(fixture).unwrap());
     let bridge = Arc::new(MockSteamBridge::new(true));
-    for wid in [install_id, update_id, cancelled_id, next_id] {
+    for wid in [install_id, update_id, next_id] {
         let mut item = item_record(wid.0, "Download", 1700000000, vec![]);
         item.file_url = Some(format!("https://example.invalid/{wid}.vpk"));
         bridge.insert_item(item);
     }
-    let engine = Arc::new(make_engine(
+    let events = Arc::new(RecordedEvents::default());
+    let engine = Arc::new(make_engine_with_events(
         dir.path(),
         AppConfig {
             loading_dir: loading.to_str().unwrap().into(),
@@ -421,8 +435,16 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
             ..Default::default()
         },
         bridge,
+        events.clone(),
     ));
     engine.scan().unwrap();
+    engine
+        .db()
+        .upsert_workshop_snapshot(
+            &item_record(next_id.0, "Cached collection title", 1700000000, vec![]),
+            true,
+        )
+        .unwrap();
     let install = |wid| {
         let engine = engine.clone();
         let fixture = fixture.clone();
@@ -434,6 +456,10 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
         download_status(&engine, install_id),
         Some(TaskStatus::Running)
     );
+    events.drain();
+    let snapshot_updated = [CoreEvent::SnapshotUpdated {
+        external_change: false,
+    }];
 
     let update = tokio::spawn({
         let engine = engine.clone();
@@ -441,8 +467,19 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
         async move { fixture.transfer(&engine, update_id, true).await }
     });
     wait_for_queued_download(&engine, update_id).await;
-    let cancelled = install(cancelled_id);
-    wait_for_queued_download(&engine, cancelled_id).await;
+    assert_eq!(events.drain(), snapshot_updated);
+
+    let cancelled = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .download_workshop_item_with_title(cancelled_id, Some(" Search result title "))
+                .await
+        }
+    });
+    let queued = wait_for_queued_download(&engine, cancelled_id).await;
+    assert_eq!(queued.target_title.as_deref(), Some("Search result title"));
+    assert_eq!(events.drain(), snapshot_updated);
     assert!(engine.cancel_download(cancelled_id));
     assert!(matches!(
         timeout(Duration::from_secs(5), cancelled)
@@ -451,10 +488,10 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
             .unwrap(),
         Err(CoreError::Workshop(WorkshopError::Cancelled))
     ));
-    assert_eq!(
-        download_status(&engine, cancelled_id),
-        Some(TaskStatus::Cancelled)
-    );
+    let task = download_task(&engine, cancelled_id).unwrap();
+    assert_eq!(task.status, TaskStatus::Cancelled);
+    assert_eq!(task.target_title, queued.target_title);
+    assert_eq!(events.drain(), snapshot_updated);
     assert!(!engine.cancel_download(cancelled_id));
     assert!(requests.try_recv().is_err());
 
@@ -466,11 +503,20 @@ async fn installs_and_updates_share_a_resizable_queue_with_queued_cancellation()
         download_status(&engine, update_id),
         Some(TaskStatus::Running)
     );
+    assert!(matches!(events.drain().as_slice(), [
+        CoreEvent::SnapshotUpdated { external_change: false },
+        CoreEvent::DownloadProgress { workshop_id, .. },
+    ] if *workshop_id == update_id));
 
     config.download_concurrency = 1;
     engine.save_config(config).unwrap();
     let next = install(next_id);
-    wait_for_queued_download(&engine, next_id).await;
+    let queued = wait_for_queued_download(&engine, next_id).await;
+    assert_eq!(
+        queued.target_title.as_deref(),
+        Some("Cached collection title")
+    );
+    assert_eq!(events.drain(), snapshot_updated);
     release_first.send(()).unwrap();
     timeout(Duration::from_secs(5), first)
         .await
@@ -616,9 +662,12 @@ async fn download_migrates_legacy_tasks_table_and_emits_title_in_progress() {
     );
 
     engine
-        .transfer_workshop_item_with(wid, false, |request, _, progress| async move {
-            stage_vpk(request, progress, &bytes)
-        })
+        .transfer_workshop_item_with(
+            wid,
+            false,
+            Some("Search title"),
+            |request, _, progress| async move { stage_vpk(request, progress, &bytes) },
+        )
         .await
         .unwrap();
 

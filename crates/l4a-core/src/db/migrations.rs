@@ -172,21 +172,21 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
         "#,
     )?;
 
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     ensure_column_exists(
-        conn,
+        &tx,
         "reconcile_issues",
         "state_fingerprint",
         "ALTER TABLE reconcile_issues ADD COLUMN state_fingerprint TEXT NOT NULL DEFAULT ''",
     )?;
     ensure_column_exists(
-        conn,
+        &tx,
         "tasks",
         "target_title",
         "ALTER TABLE tasks ADD COLUMN target_title TEXT",
     )?;
 
     // Force the next scan to re-extract metadata with the corrected VPK parser.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let applied = tx
         .prepare("SELECT 1 FROM schema_migrations WHERE version = 2")?
         .exists([])?;

@@ -20,12 +20,14 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 async fn start_router(app: Router) -> String {
@@ -534,6 +536,23 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
     assert!(!dest_trunc.exists());
 }
 
+async fn wait_for_progress(
+    samples: &mut mpsc::UnboundedReceiver<DownloadProgress>,
+    description: &str,
+    matches: impl Fn(&DownloadProgress) -> bool,
+) -> DownloadProgress {
+    timeout(Duration::from_secs(5), async {
+        while let Some(sample) = samples.recv().await {
+            if matches(&sample) {
+                return sample;
+            }
+        }
+        panic!("progress stream ended before {description}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {description}"))
+}
+
 #[tokio::test]
 async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -544,6 +563,7 @@ async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_
     let burst_two = 8 * 1024usize;
     let tail = 64usize;
     let total = resume_from + burst_one + burst_two + tail;
+    let (send_sample, mut samples) = mpsc::unbounded_channel();
 
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -555,21 +575,40 @@ async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_
             burst_one + burst_two + tail
         );
         stream.write_all(header.as_bytes()).await.unwrap();
-        // Send first burst rapidly across multiple small chunks (<20ms apart).
+        let initial = wait_for_progress(&mut samples, "initial progress", |_| true).await;
+        assert_eq!(initial.downloaded, resume_from as u64);
+        assert_eq!(initial.speed_bps, Some(0));
+
+        // The first speed sample must exclude the resumed bytes while the body is idle.
+        let idle =
+            wait_for_progress(&mut samples, "speed before receiving new bytes", |_| true).await;
+        assert_eq!(idle.downloaded, resume_from as u64);
+        assert_eq!(idle.speed_bps, Some(0));
+
+        // Send the first burst across several chunks and hold the body open during the stall.
         for _ in 0..8 {
             stream.write_all(&vec![0xAB; burst_one / 8]).await.unwrap();
-            stream.flush().await.unwrap();
-            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        // Wait past the first speed tick (120ms) and across a full stalled tick (another 150ms).
-        tokio::time::sleep(Duration::from_millis(260)).await;
-        // Send second burst while keeping the HTTP body open across the next speed tick.
+        let first_offset = (resume_from + burst_one) as u64;
+        wait_for_progress(&mut samples, "positive speed after the first burst", |p| {
+            p.downloaded == first_offset && p.speed_bps.unwrap_or(0) > 0
+        })
+        .await;
+        wait_for_progress(&mut samples, "zero speed while stalled", |p| {
+            p.downloaded == first_offset && p.speed_bps == Some(0)
+        })
+        .await;
+
         stream.write_all(&vec![0xCD; burst_two]).await.unwrap();
-        stream.flush().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(160)).await;
+        wait_for_progress(&mut samples, "speed recovery after the second burst", |p| {
+            p.downloaded == (resume_from + burst_one + burst_two) as u64
+                && p.speed_bps.unwrap_or(0) > 0
+        })
+        .await;
+
         stream.write_all(&vec![0xEF; tail]).await.unwrap();
-        stream.flush().await.unwrap();
-        let _ = stream.shutdown().await;
+        stream.shutdown().await.unwrap();
+        samples
     });
 
     let dir = tempdir().unwrap();
@@ -593,63 +632,33 @@ async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_
 
     let downloader = ResilientDownloader::new(&cache_dir, Arc::new(MirrorRouter::empty()))
         .with_progress_intervals(Duration::from_millis(30), Duration::from_millis(120));
-    let events = Arc::new(Mutex::new(Vec::<DownloadProgress>::new()));
-    let events_sink = events.clone();
 
     let dest = dir.path().join("loading/901.vpk");
-    let res = downloader
+    let result = downloader
         .download(
             &DownloadRequest {
                 workshop_id: wid,
                 url: format!("http://{addr}/stream.vpk"),
-                dest_path: dest.clone(),
+                dest_path: dest,
                 max_retries: 0,
             },
             CancellationToken::new(),
             Some(Arc::new(move |p| {
-                events_sink.lock().unwrap().push(p);
+                let _ = send_sample.send(p);
             })),
         )
+        .await;
+    let mut samples = timeout(Duration::from_secs(5), server)
         .await
+        .unwrap()
         .unwrap();
-    server.await.unwrap();
+    let res = result.unwrap();
 
     assert_eq!(res.resumed_from, resume_from as u64);
     assert_eq!(res.bytes_written, total as u64);
 
-    let recorded = events.lock().unwrap();
-    assert!(!recorded.is_empty());
-    // Initial event starts at resumed offset with 0 B/s.
-    assert_eq!(recorded[0].downloaded, resume_from as u64);
-    assert_eq!(recorded[0].speed_bps, Some(0));
-
-    let non_final_speeds: Vec<u64> = recorded
-        .iter()
-        .filter(|p| p.percent < 100)
-        .filter_map(|p| p.speed_bps)
-        .collect();
-    let first_positive = non_final_speeds
-        .iter()
-        .position(|&bps| bps > 0)
-        .expect("should record positive speed after first burst");
-    // Resumed bytes must not be counted in the first speed sample (~136 KB/s, not ~170 KB/s).
-    assert!(
-        non_final_speeds[first_positive] < 160_000,
-        "resumed bytes inflated speed: {:?}",
-        non_final_speeds[first_positive]
-    );
-    // Should drop back to 0 B/s during the stalled interval.
-    let stall_zero = non_final_speeds[first_positive..]
-        .iter()
-        .position(|&bps| bps == 0)
-        .expect("should drop to 0 B/s while stalled");
-    // Should recover to positive speed after the second burst arrives.
-    assert!(
-        non_final_speeds[first_positive + stall_zero..]
-            .iter()
-            .any(|&bps| bps > 0),
-        "expected speed recovery after stall, got {non_final_speeds:?}"
-    );
-    // Completion event arrives at 100%.
-    assert_eq!(recorded.last().unwrap().percent, 100);
+    let final_sample = std::iter::from_fn(|| samples.try_recv().ok())
+        .last()
+        .unwrap();
+    assert_eq!(final_sample.percent, 100);
 }

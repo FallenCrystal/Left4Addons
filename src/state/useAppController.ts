@@ -78,8 +78,8 @@ export interface DesktopClient {
   searchWorkshop: (query: SearchQuery) => Promise<SearchResponse>;
   fetchWorkshopItem: (workshopId: string) => Promise<WorkshopItemRecord>;
   getSubscribedWorkshopIds: () => Promise<string[]>;
-  downloadWorkshopItem: (workshopId: string) => Promise<AddonSummary>;
-  updateWorkshopItem: (workshopId: string) => Promise<AddonSummary>;
+  downloadWorkshopItem: (workshopId: string, titleHint?: string) => Promise<AddonSummary>;
+  updateWorkshopItem: (workshopId: string, titleHint?: string) => Promise<AddonSummary>;
   cancelDownload: (workshopId: string) => Promise<boolean>;
   resolveReconcileIssue: (
     issueId: string,
@@ -173,8 +173,8 @@ function getClient(tauri: boolean): DesktopClient {
     searchWorkshop: (q) => previewEngine.searchWorkshop(q),
     fetchWorkshopItem: (id) => previewEngine.fetchWorkshopItem(id),
     getSubscribedWorkshopIds: () => previewEngine.getSubscribedWorkshopIds(),
-    downloadWorkshopItem: (id) => previewEngine.downloadWorkshopItem(id),
-    updateWorkshopItem: (id) => previewEngine.updateWorkshopItem(id),
+    downloadWorkshopItem: (id, titleHint) => previewEngine.downloadWorkshopItem(id, titleHint),
+    updateWorkshopItem: (id, titleHint) => previewEngine.updateWorkshopItem(id, titleHint),
     cancelDownload: (id) => previewEngine.cancelDownload(id),
     resolveReconcileIssue: (id, act) => previewEngine.resolveReconcileIssue(id, act),
     resolveReconcileIssuesBatch: (items) => previewEngine.resolveReconcileIssuesBatch(items),
@@ -437,7 +437,7 @@ export function useAppController(onOpenReconcile?: () => void) {
                 workshopId: ev.workshopId,
                 title,
                 downloaded: ev.downloaded,
-                total: ev.total ?? existing?.total ?? undefined,
+                total: ev.total ?? undefined,
                 percent: ev.percent,
                 speedBps: hasBackendSpeed ? Math.round(ev.speedBps!) : (existing?.speedBps ?? 0),
                 hasProgress: true,
@@ -831,8 +831,8 @@ export function useAppController(onOpenReconcile?: () => void) {
       try {
         const summary =
           kind === 'update'
-            ? await client.updateWorkshopItem(workshopId)
-            : await client.downloadWorkshopItem(workshopId);
+            ? await client.updateWorkshopItem(workshopId, initialTitle)
+            : await client.downloadWorkshopItem(workshopId, initialTitle);
         speedTrackersRef.current.delete(workshopId);
         setLiveDownloads((prev) => {
           if (prev[workshopId]?.requestId !== requestId) return prev;

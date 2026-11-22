@@ -232,6 +232,26 @@ impl LocalDb {
             .find(|a| a.workshop_id == Some(wid)))
     }
 
+    pub(crate) fn cached_workshop_title(
+        &self,
+        wid: WorkshopId,
+    ) -> Result<Option<String>, CoreError> {
+        let conn = self.lock_conn()?;
+        let (addon_title, snapshot_title): (Option<String>, Option<String>) = conn
+            .prepare_cached(
+                "SELECT
+                    (SELECT title FROM addons WHERE workshop_id = ?1 ORDER BY title COLLATE NOCASE, id LIMIT 1),
+                    (SELECT title FROM workshop_snapshots WHERE workshop_id = ?1)",
+            )?
+            .query_row([wid.as_u64() as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok([addon_title, snapshot_title]
+            .iter()
+            .flatten()
+            .map(|title| title.trim())
+            .find(|title| !title.is_empty())
+            .map(str::to_owned))
+    }
+
     pub fn upsert_addon(&self, addon: &AddonSummary) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
         Self::upsert_addon_tx(&conn, addon)

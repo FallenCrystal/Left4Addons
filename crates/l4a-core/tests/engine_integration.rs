@@ -14,11 +14,39 @@ use l4a_protocol::{
 use l4a_steam::{MockSteamBridge, SubscribedItemInfo};
 use l4a_workshop::WorkshopError;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
 use support::{create_test_vpk, item_record, make_engine, make_engine_with_events, RecordedEvents};
+
+#[test]
+fn concurrent_opens_migrate_legacy_task_titles() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("legacy.db");
+    drop(LocalDb::open(&db_path).unwrap());
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute_batch("ALTER TABLE tasks DROP COLUMN target_title")
+        .unwrap();
+
+    let workers = 8;
+    let start = Barrier::new(workers);
+    std::thread::scope(|scope| {
+        let openers: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    let db = LocalDb::open(&db_path).unwrap();
+                    assert!(db.list_tasks().unwrap().is_empty());
+                })
+            })
+            .collect();
+        for opener in openers {
+            opener.join().unwrap();
+        }
+    });
+}
 
 #[test]
 fn metadata_cache_migration_reparses_an_unchanged_vpk_once() {

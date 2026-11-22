@@ -697,6 +697,7 @@ class PreviewEngine {
   private async runSimulatedTransfer(
     workshopId: string,
     mode: 'install' | 'update',
+    titleHint?: string,
   ): Promise<AddonSummary> {
     if (!/^\d+$/.test(workshopId)) {
       throw new IpcError('invalid_input', `Invalid Workshop ID: ${workshopId}`);
@@ -719,7 +720,11 @@ class PreviewEngine {
     this.activeDownloads.set(workshopId, token);
 
     const catalogItem = PREVIEW_CATALOG.find((i) => i.workshopId === workshopId);
-    const title = existing?.title ?? catalogItem?.title ?? `Workshop Addon #${workshopId}`;
+    const title =
+      existing?.title.trim() ||
+      catalogItem?.title.trim() ||
+      titleHint?.trim() ||
+      `Workshop Addon #${workshopId}`;
     const taskId = `dl-${workshopId}-${Date.now()}`;
     const total = catalogItem?.fileSize ?? 32_000_000;
 
@@ -836,12 +841,12 @@ class PreviewEngine {
     }
   }
 
-  async downloadWorkshopItem(workshopId: string): Promise<AddonSummary> {
-    return this.runSimulatedTransfer(workshopId, 'install');
+  async downloadWorkshopItem(workshopId: string, titleHint?: string): Promise<AddonSummary> {
+    return this.runSimulatedTransfer(workshopId, 'install', titleHint);
   }
 
-  async updateWorkshopItem(workshopId: string): Promise<AddonSummary> {
-    return this.runSimulatedTransfer(workshopId, 'update');
+  async updateWorkshopItem(workshopId: string, titleHint?: string): Promise<AddonSummary> {
+    return this.runSimulatedTransfer(workshopId, 'update', titleHint);
   }
 
   async cancelDownload(workshopId: string): Promise<boolean> {

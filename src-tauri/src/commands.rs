@@ -273,11 +273,12 @@ pub async fn fetch_workshop_item(
 #[tauri::command]
 pub async fn download_workshop_item(
     workshop_id: WorkshopId,
+    title_hint: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<AddonSummary, DesktopError> {
     state
         .engine
-        .download_workshop_item(workshop_id)
+        .download_workshop_item_with_title(workshop_id, title_hint.as_deref())
         .await
         .map_err(Into::into)
 }
@@ -285,11 +286,12 @@ pub async fn download_workshop_item(
 #[tauri::command]
 pub async fn update_workshop_item(
     workshop_id: WorkshopId,
+    title_hint: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<AddonSummary, DesktopError> {
     state
         .engine
-        .update_workshop_item(workshop_id)
+        .update_workshop_item_with_title(workshop_id, title_hint.as_deref())
         .await
         .map_err(Into::into)
 }

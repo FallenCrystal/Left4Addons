@@ -299,6 +299,69 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(sortTrigger.textContent).toContain('Size');
   });
 
+  it('shows queued Workshop downloads without a speed and keeps failure details readable', async () => {
+    setTauriMode(true);
+    let snapshot: DashboardSnapshot = { ...(await previewEngine.getDashboardSnapshot()), tasks: [] };
+    const item = {
+      ...(await previewEngine.fetchWorkshopItem('3350912881')),
+      workshopId: '55443321',
+      title: 'Uncached Workshop addon',
+    };
+    const task = {
+      id: 'queued-workshop-download',
+      kind: 'download' as const,
+      status: 'queued' as const,
+      targetId: item.workshopId,
+      targetTitle: item.title,
+      progressPercent: 0,
+      createdAt: '2026-11-22T10:00:00Z',
+      updatedAt: '2026-11-22T10:00:00Z',
+    };
+    let rejectDownload!: (reason: { code: string; message: string }) => void;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'search_workshop') {
+        return { items: [item], total: 1, page: 1, pageSize: 24, source: item.source };
+      }
+      if (command === 'download_workshop_item') {
+        return new Promise((_resolve, reject) => {
+          rejectDownload = reject;
+        });
+      }
+      return snapshot;
+    });
+
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+    await waitFor(() => expect(eventHandler).not.toBeNull());
+    fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
+    const card = (await screen.findByText(item.title)).closest('article')!;
+    fireEvent.click(within(card).getByRole('button', { name: 'Download' }));
+    expect(invokeMock).toHaveBeenCalledWith('download_workshop_item', {
+      workshopId: item.workshopId,
+      titleHint: item.title,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Tasks' }));
+    const sheet = within(await screen.findByRole('dialog', { name: 'Tasks' }));
+    snapshot = { ...snapshot, tasks: [task] };
+    act(() => eventHandler?.({ payload: { type: 'snapshot_updated', externalChange: false } }));
+    expect(await sheet.findByText('Queued')).toBeTruthy();
+    expect(sheet.getByText(item.title)).toBeTruthy();
+    expect(sheet.queryByText('0 B/s')).toBeNull();
+
+    snapshot = { ...snapshot, tasks: [{ ...task, status: 'running' }] };
+    act(() => eventHandler?.({ payload: { type: 'snapshot_updated', externalChange: false } }));
+    expect(await sheet.findByText('0%')).toBeTruthy();
+    expect(sheet.queryByText('Queued')).toBeNull();
+
+    const error = 'Remote download returned HTTP status 403: Request rejected by the mirror.';
+    snapshot = { ...snapshot, tasks: [{ ...task, status: 'failed', error }] };
+    act(() => rejectDownload({ code: 'network', message: error }));
+    expect(await sheet.findByText('Failed')).toBeTruthy();
+    expect(sheet.getByText(item.title)).toBeTruthy();
+    expect(sheet.getByText(error).style.overflowWrap).toBe('anywhere');
+  });
+
   it('displays addon titles in the task queue and refreshes download speed every second', async () => {
     setTauriMode(true);
     const snapshot = await previewEngine.getDashboardSnapshot();
@@ -400,6 +463,20 @@ describe('Left4Addons v2 Material 3 frontend', () => {
         vi.advanceTimersByTime(2000);
       });
       expect(within(sheet).getByText('0 B/s')).toBeTruthy();
+
+      act(() => {
+        eventHandler?.({
+          payload: {
+            type: 'download_progress',
+            taskId: 'dl-1',
+            workshopId: '55443322',
+            downloaded: 12 * 1024 * 1024,
+            total: null,
+            percent: 0,
+          },
+        });
+      });
+      expect(within(sheet).getByText('12.0 MB')).toBeTruthy();
     } finally {
       vi.useRealTimers();
     }

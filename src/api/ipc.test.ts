@@ -119,9 +119,16 @@ describe('v2 IPC client wrapper', () => {
       workshopId: '2814104912',
     });
 
-    await updateWorkshopItem('2814104912');
+    await downloadWorkshopItem('2814104912', 'Chernobyl: Chapter One');
+    expect(invokeMock).toHaveBeenLastCalledWith('download_workshop_item', {
+      workshopId: '2814104912',
+      titleHint: 'Chernobyl: Chapter One',
+    });
+
+    await updateWorkshopItem('2814104912', 'Chernobyl: Chapter One');
     expect(invokeMock).toHaveBeenCalledWith('update_workshop_item', {
       workshopId: '2814104912',
+      titleHint: 'Chernobyl: Chapter One',
     });
 
     await cancelDownload('2814104912');

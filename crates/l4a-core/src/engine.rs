@@ -523,24 +523,46 @@ impl L4aEngine {
         &self,
         workshop_id: WorkshopId,
     ) -> Result<AddonSummary, CoreError> {
-        self.transfer_workshop_item(workshop_id, false).await
+        self.download_workshop_item_with_title(workshop_id, None)
+            .await
+    }
+
+    pub async fn download_workshop_item_with_title(
+        &self,
+        workshop_id: WorkshopId,
+        title_hint: Option<&str>,
+    ) -> Result<AddonSummary, CoreError> {
+        self.transfer_workshop_item(workshop_id, false, title_hint)
+            .await
     }
 
     pub async fn update_workshop_item(
         &self,
         workshop_id: WorkshopId,
     ) -> Result<AddonSummary, CoreError> {
-        self.transfer_workshop_item(workshop_id, true).await
+        self.update_workshop_item_with_title(workshop_id, None)
+            .await
+    }
+
+    pub async fn update_workshop_item_with_title(
+        &self,
+        workshop_id: WorkshopId,
+        title_hint: Option<&str>,
+    ) -> Result<AddonSummary, CoreError> {
+        self.transfer_workshop_item(workshop_id, true, title_hint)
+            .await
     }
 
     async fn transfer_workshop_item(
         &self,
         workshop_id: WorkshopId,
         update: bool,
+        title_hint: Option<&str>,
     ) -> Result<AddonSummary, CoreError> {
         self.transfer_workshop_item_with(
             workshop_id,
             update,
+            title_hint,
             |request, cancel, progress| async move {
                 self.downloader
                     .download(&request, cancel, Some(progress))
@@ -554,6 +576,7 @@ impl L4aEngine {
         &self,
         workshop_id: WorkshopId,
         update: bool,
+        title_hint: Option<&str>,
         download: impl FnOnce(DownloadRequest, CancellationToken, ProgressSink) -> F,
     ) -> Result<AddonSummary, CoreError>
     where
@@ -600,34 +623,23 @@ impl L4aEngine {
             (cfg, self.resolver.read().unwrap().clone(), installed)
         };
 
+        let nonempty_title = |title: &str| {
+            let title = title.trim();
+            (!title.is_empty()).then(|| title.to_owned())
+        };
         let initial_title = installed
             .as_ref()
-            .map(|addon| addon.title.trim())
-            .filter(|t| !t.is_empty())
-            .map(ToString::to_string)
-            .or_else(|| {
-                self.db
-                    .get_addon_by_workshop_id(workshop_id)
-                    .ok()
-                    .flatten()
-                    .map(|addon| addon.title.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            })
-            .or_else(|| {
-                self.db
-                    .get_workshop_snapshot(workshop_id)
-                    .ok()
-                    .flatten()
-                    .map(|snap| snap.title.trim().to_string())
-                    .filter(|t| !t.is_empty())
-            });
+            .and_then(|addon| nonempty_title(&addon.title))
+            .or_else(|| self.db.cached_workshop_title(workshop_id).ok().flatten())
+            .or_else(|| title_hint.and_then(nonempty_title));
 
         let mut task = create_task(
             &self.db,
             TaskKind::Download,
             workshop_id.to_string(),
-            initial_title.clone(),
+            initial_title,
         )?;
+        self.emit_workspace_update();
         let result = async {
             let _slot = tokio::select! {
                 biased;
@@ -638,14 +650,13 @@ impl L4aEngine {
                 return Err(WorkshopError::Cancelled.into());
             }
             update_task(&self.db, &mut task, TaskStatus::Running, 0, None, None)?;
+            self.emit_workspace_update();
             let item = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(WorkshopError::Cancelled.into()),
                 result = fetch_workshop_item(&resolver, workshop_id) => result?,
             };
-            let resolved_title = (!item.title.trim().is_empty())
-                .then(|| item.title.trim().to_string())
-                .or_else(|| initial_title.clone());
+            let resolved_title = nonempty_title(&item.title).or_else(|| task.target_title.clone());
             if resolved_title != task.target_title {
                 task.target_title = resolved_title.clone();
                 update_task(&self.db, &mut task, TaskStatus::Running, 0, None, None)?;

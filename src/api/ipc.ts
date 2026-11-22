@@ -425,12 +425,18 @@ export async function getSubscribedWorkshopIds(): Promise<string[]> {
   return invokeCommand<string[]>('get_subscribed_workshop_ids');
 }
 
-export async function downloadWorkshopItem(workshopId: string): Promise<AddonSummary> {
-  return invokeCommand<AddonSummary>('download_workshop_item', { workshopId });
+export async function downloadWorkshopItem(
+  workshopId: string,
+  titleHint?: string,
+): Promise<AddonSummary> {
+  return invokeCommand<AddonSummary>('download_workshop_item', { workshopId, titleHint });
 }
 
-export async function updateWorkshopItem(workshopId: string): Promise<AddonSummary> {
-  return invokeCommand<AddonSummary>('update_workshop_item', { workshopId });
+export async function updateWorkshopItem(
+  workshopId: string,
+  titleHint?: string,
+): Promise<AddonSummary> {
+  return invokeCommand<AddonSummary>('update_workshop_item', { workshopId, titleHint });
 }
 
 export async function cancelDownload(workshopId: string): Promise<boolean> {
