@@ -1,6 +1,18 @@
-use super::*;
-use l4a_protocol::{AddonOperationOutcome, TaskRecord};
+use super::{EventSink, L4aEngine, NullEventSink};
+use crate::config::AppPaths;
+use crate::db::LocalDb;
+use crate::error::CoreError;
+use l4a_protocol::{
+    AddonDirType, AddonId, AddonOperationOutcome, AddonSummary, AppConfig, BundleRecord, CoreEvent,
+    GroupId, LoadoutProfile, ProfileId, TaskKind, TaskRecord, TaskStatus, UserGroup, WorkshopId,
+};
 use l4a_steam::MockSteamBridge;
+use l4a_vpk::{inspect_dummy_vpk, DummyInspection};
+use l4a_workshop::{
+    DownloadProgress, DownloadRequest, DownloadResult, ProgressSink, WorkshopError,
+};
+use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::{mpsc, oneshot};
