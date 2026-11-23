@@ -118,7 +118,12 @@ function summarizeBundle(allMembers: AddonSummary[]) {
   const enabledLoading = loading.filter((m) => m.enabled);
   const enabledInstalled = installed.filter((m) => m.enabled);
   const totalSize = installed.reduce((acc, m) => acc + m.fileSize, 0);
-  const firstCover = allMembers.find((m) => m.coverImage)?.coverImage;
+  const firstCover =
+    allMembers.find((m) => m.maps.length > 0 && m.coverImage)?.coverImage ??
+    allMembers.find((m) => m.coverImage)?.coverImage;
+  const firstLocalCover =
+    allMembers.find((m) => m.maps.length > 0 && m.localCoverImage)?.localCoverImage ??
+    allMembers.find((m) => m.localCoverImage)?.localCoverImage;
   const firstAuthor = allMembers.find((m) => m.author)?.author;
   const firstPath = installed.find((m) => m.currentPath)?.currentPath;
   const firstWorkshopId = allMembers.find((m) => m.workshopId)?.workshopId;
@@ -138,6 +143,7 @@ function summarizeBundle(allMembers: AddonSummary[]) {
     enabledInstalled,
     totalSize,
     firstCover,
+    firstLocalCover,
     firstAuthor,
     firstPath,
     firstWorkshopId,
@@ -152,7 +158,7 @@ function summarizeBundle(allMembers: AddonSummary[]) {
 export function LibraryView({
   addons,
   bundles,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   collapseBundles = true,
   onToggleCollapseBundles,
   snapshotVersion,
@@ -814,9 +820,11 @@ export function LibraryView({
               disabled={busy}
               icon={<Download size={14} />}
               onClick={() => {
+                const titlePref =
+                  namePreference === 'addon_title' ? 'addon_title' : 'workshop_title';
                 for (const item of installableTargets) {
                   if (item.workshopId) {
-                    onDownloadItem(item.workshopId, resolveAddonMetadataTitle(item));
+                    onDownloadItem(item.workshopId, resolveAddonMetadataTitle(item, titlePref));
                   }
                 }
               }}
@@ -831,9 +839,11 @@ export function LibraryView({
               disabled={busy}
               icon={<ArrowUpCircle size={14} />}
               onClick={() => {
+                const titlePref =
+                  namePreference === 'addon_title' ? 'addon_title' : 'workshop_title';
                 for (const item of updatableTargets) {
                   if (item.workshopId) {
-                    onUpdateItem(item.workshopId, resolveAddonMetadataTitle(item));
+                    onUpdateItem(item.workshopId, resolveAddonMetadataTitle(item, titlePref));
                   }
                 }
               }}
@@ -918,6 +928,7 @@ export function LibraryView({
                       >
                         <AddonCover
                           src={bundle.coverImage ?? summary.firstCover}
+                          fallbackSrc={summary.firstLocalCover}
                           title={bundle.name}
                           category="Campaign"
                         />
@@ -1085,6 +1096,7 @@ export function LibraryView({
                     >
                       <AddonCover
                         src={addon.coverImage}
+                        fallbackSrc={addon.localCoverImage}
                         title={displayName}
                         category={addon.categories[0]}
                       />
@@ -1228,7 +1240,15 @@ export function LibraryView({
                           disabled={Boolean(dl)}
                           icon={<Download size={13} />}
                           onClick={() =>
-                            onDownloadItem(addon.workshopId!, resolveAddonMetadataTitle(addon))
+                            onDownloadItem(
+                              addon.workshopId!,
+                              resolveAddonMetadataTitle(
+                                addon,
+                                namePreference === 'addon_title'
+                                  ? 'addon_title'
+                                  : 'workshop_title',
+                              ),
+                            )
                           }
                         >
                           {dl
@@ -1279,6 +1299,7 @@ export function LibraryView({
                       <AddonCover
                         compact
                         src={bundle.coverImage ?? summary.firstCover}
+                        fallbackSrc={summary.firstLocalCover}
                         title={bundle.name}
                         category="Campaign"
                       />
@@ -1404,6 +1425,7 @@ export function LibraryView({
                     <AddonCover
                       compact
                       src={addon.coverImage}
+                      fallbackSrc={addon.localCoverImage}
                       title={displayName}
                       category={addon.categories[0]}
                     />
@@ -1493,7 +1515,15 @@ export function LibraryView({
                         disabled={Boolean(dl)}
                         icon={<Download size={13} />}
                         onClick={() =>
-                          onDownloadItem(addon.workshopId!, resolveAddonMetadataTitle(addon))
+                          onDownloadItem(
+                            addon.workshopId!,
+                            resolveAddonMetadataTitle(
+                              addon,
+                              namePreference === 'addon_title'
+                                ? 'addon_title'
+                                : 'workshop_title',
+                            ),
+                          )
                         }
                       >
                         {dl
@@ -1693,6 +1723,7 @@ export function LibraryView({
                                 <AddonCover
                                   compact
                                   src={member.coverImage}
+                                  fallbackSrc={member.localCoverImage}
                                   title={memberLabel}
                                   category={member.categories[0]}
                                 />
@@ -1786,7 +1817,12 @@ export function LibraryView({
                                     onClick={() =>
                                       onDownloadItem(
                                         member.workshopId!,
-                                        resolveAddonMetadataTitle(member),
+                                        resolveAddonMetadataTitle(
+                                          member,
+                                          namePreference === 'addon_title'
+                                            ? 'addon_title'
+                                            : 'workshop_title',
+                                        ),
                                       )
                                     }
                                   >

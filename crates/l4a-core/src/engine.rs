@@ -24,20 +24,23 @@ use l4a_protocol::{
     ProfileApplyReport, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileBatchReport,
     ReconcileItemResult, RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse,
     SyncReport, TaskKind, TaskStatus, TrackedCollectionRecord, UserGroup, WorkshopFetchOutcome,
-    WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use l4a_steam::{BridgeError, DynamicSteamBridge, SteamBridge, SteamCapabilities};
 use l4a_vpk::{extract_addon_metadata, inspect_dummy_vpk, DummyInspection, DummySpec};
 use l4a_workshop::{
-    CatalogBackendProvider, DownloadProgress, DownloadRequest, DownloadResult, ProgressSink,
-    ResilientDownloader, SourceRoutingPolicy, SteamBridgeProvider, SteamWebApiProvider,
-    WebScraperPlaceholderProvider, WorkshopError, WorkshopProvider, WorkshopResolver,
+    upgrade_steam_cdn_https, CatalogBackendProvider, DownloadProgress, DownloadRequest,
+    DownloadResult, ProgressSink, ResilientDownloader, SourceRoutingPolicy, SteamBridgeProvider,
+    SteamWebApiProvider, WebScraperPlaceholderProvider, WorkshopError, WorkshopProvider,
+    WorkshopResolver,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::future::Future;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -74,6 +77,9 @@ pub struct L4aEngine {
     events: Arc<dyn EventSink>,
     active_cancellations: Mutex<HashMap<WorkshopId, CancellationToken>>,
     download_gate: DownloadGate,
+    hydrating_workshop: AtomicBool,
+    hydration_pending: AtomicBool,
+    attempted_hydration_ids: Mutex<HashSet<WorkshopId>>,
 }
 
 impl L4aEngine {
@@ -133,6 +139,9 @@ impl L4aEngine {
             watcher_rescan_cb: Mutex::new(None),
             events,
             active_cancellations: Mutex::new(HashMap::new()),
+            hydrating_workshop: AtomicBool::new(false),
+            hydration_pending: AtomicBool::new(false),
+            attempted_hydration_ids: Mutex::new(HashSet::new()),
         })
     }
 
@@ -162,6 +171,9 @@ impl L4aEngine {
             watcher_rescan_cb: Mutex::new(None),
             events,
             active_cancellations: Mutex::new(HashMap::new()),
+            hydrating_workshop: AtomicBool::new(false),
+            hydration_pending: AtomicBool::new(false),
+            attempted_hydration_ids: Mutex::new(HashSet::new()),
         })
     }
 
@@ -239,6 +251,7 @@ impl L4aEngine {
             build_resolver_from_config(&next, self.mirror.clone(), self.steam_bridge.clone());
         *self.resolver.write().unwrap() = new_resolver;
         self.download_gate.set_limit(next.download_concurrency);
+        self.attempted_hydration_ids.lock().unwrap().clear();
 
         let watch_error = if dirs_changed {
             let callback = self.watcher_rescan_cb.lock().unwrap().clone();
@@ -251,7 +264,7 @@ impl L4aEngine {
             self.events.emit(CoreEvent::WatchError {
                 message: format!("重新绑定目录监听失败: {err}"),
             });
-        }
+        };
         Ok(next)
     }
 
@@ -339,8 +352,15 @@ impl L4aEngine {
 
     pub async fn fetch_workshop_cover(&self, url: &str) -> Result<(String, Vec<u8>), CoreError> {
         const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
+        const CACHED_COVER_FORMATS: &[(&str, &str)] = &[
+            ("jpg", "image/jpeg"),
+            ("png", "image/png"),
+            ("webp", "image/webp"),
+            ("gif", "image/gif"),
+        ];
 
-        let url = url::Url::parse(url)
+        let normalized = upgrade_steam_cdn_https(url);
+        let url = url::Url::parse(&normalized)
             .ok()
             .filter(|url| {
                 matches!(url.scheme(), "http" | "https")
@@ -348,6 +368,25 @@ impl L4aEngine {
                     && url.password().is_none()
             })
             .ok_or_else(|| CoreError::InvalidInput("无效的封面图片地址".into()))?;
+        self.mirror
+            .validate_url(url.as_str())
+            .map_err(|err| WorkshopError::Network(err.to_string()))?;
+
+        let url_hash = hex::encode(&Sha256::digest(url.as_str().as_bytes())[..16]);
+        for &(ext, cached_mime) in CACHED_COVER_FORMATS {
+            let cache_path = self
+                .paths
+                .image_cache_dir
+                .join(format!("ws_cover_{url_hash}.{ext}"));
+            if let Ok(meta) = fs::symlink_metadata(&cache_path) {
+                if meta.is_file() && meta.len() > 0 && meta.len() <= MAX_COVER_BYTES as u64 {
+                    if let Ok(bytes) = fs::read(&cache_path) {
+                        return Ok((cached_mime.to_string(), bytes));
+                    }
+                }
+            }
+        }
+
         let (client, _) = self
             .mirror
             .build_client_for(url.as_str(), Some(Duration::from_secs(15)))
@@ -358,7 +397,7 @@ impl L4aEngine {
             .await
             .and_then(|response| response.error_for_status())
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
-        let mime = response
+        let header_mime = response
             .headers()
             .get("content-type")
             .and_then(|value| value.to_str().ok())
@@ -377,14 +416,182 @@ impl L4aEngine {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let mime = mime
-            .or_else(|| {
-                image::guess_format(&bytes)
-                    .ok()
-                    .map(|format| format.to_mime_type().into())
-            })
+        if bytes.is_empty() {
+            return Err(CoreError::InvalidInput("封面图片为空".into()));
+        }
+
+        let detected = image::guess_format(&bytes).ok();
+        let mime = detected
+            .map(|format| format.to_mime_type().to_string())
+            .or(header_mime)
             .ok_or_else(|| CoreError::InvalidInput("无法识别封面图片格式".into()))?;
+
+        // 仅当字节头通过真实图片格式探测时才落盘缓存，避免网关 HTML 错误页伪造 Content-Type 污染磁盘缓存。
+        let cache_ext = match detected {
+            Some(image::ImageFormat::Jpeg) => Some("jpg"),
+            Some(image::ImageFormat::Png) => Some("png"),
+            Some(image::ImageFormat::WebP) => Some("webp"),
+            Some(image::ImageFormat::Gif) => Some("gif"),
+            _ => None,
+        };
+        if let Some(ext) = cache_ext {
+            let dest = self
+                .paths
+                .image_cache_dir
+                .join(format!("ws_cover_{url_hash}.{ext}"));
+            if let Ok(mut tmp) = tempfile::Builder::new()
+                .prefix(".ws_cover_")
+                .tempfile_in(&self.paths.image_cache_dir)
+            {
+                if tmp.write_all(&bytes).is_ok() {
+                    let _ = tmp.persist(&dest);
+                }
+            }
+        }
+
         Ok((mime, bytes))
+    }
+
+    /// 自动为尚未缓存工坊快照的本地/工坊模组补齐 Steam 创意工坊元数据（标题、封面 `preview_url`、作者、标签与依赖关系），
+    /// 与 v1 启动/扫描时自动查询工坊元数据的行为保持一致，且使用单飞保护避免重复并发请求。
+    pub async fn hydrate_missing_workshop_metadata(&self) -> Result<usize, CoreError> {
+        const HYDRATE_BATCH_SIZE: usize = 50;
+
+        struct HydrationGuard<'a>(&'a AtomicBool);
+        impl Drop for HydrationGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+
+        self.hydration_pending.store(true, Ordering::SeqCst);
+        let mut total_hydrated = 0usize;
+
+        loop {
+            if self
+                .hydrating_workshop
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return Ok(total_hydrated);
+            }
+            let guard = HydrationGuard(&self.hydrating_workshop);
+
+            while self.hydration_pending.swap(false, Ordering::SeqCst) {
+                let resolver = self.resolver.read().unwrap().clone();
+                if resolver.providers().is_empty() {
+                    break;
+                }
+
+                let snapshots = self.db.list_workshop_snapshots()?;
+                let attempted = self.attempted_hydration_ids.lock().unwrap().clone();
+                let mut missing: BTreeSet<WorkshopId> = self
+                    .db
+                    .list_addons()?
+                    .into_iter()
+                    .filter(|a| a.remote_status == WorkshopItemStatus::Unknown)
+                    .filter_map(|a| a.workshop_id)
+                    .filter(|wid| !snapshots.contains_key(wid) && !attempted.contains(wid))
+                    .collect();
+                for col in self.db.list_tracked_collections()? {
+                    for wid in col.member_workshop_ids {
+                        if !snapshots.contains_key(&wid) && !attempted.contains(&wid) {
+                            missing.insert(wid);
+                        }
+                    }
+                }
+
+                if missing.is_empty() {
+                    break;
+                }
+
+                let missing_ids: Vec<WorkshopId> = missing.into_iter().collect();
+                let mut pass_hydrated = 0usize;
+
+                for chunk in missing_ids.chunks(HYDRATE_BATCH_SIZE) {
+                    {
+                        let mut seen = self.attempted_hydration_ids.lock().unwrap();
+                        seen.extend(chunk.iter().copied());
+                    }
+                    let Ok((outcomes, _warnings)) = resolver.fetch_items(chunk).await else {
+                        continue;
+                    };
+                    if outcomes.is_empty() {
+                        continue;
+                    }
+
+                    let mut chunk_changed = false;
+                    {
+                        let _workspace = self.lock_workspace()?;
+                        for outcome in outcomes {
+                            match outcome {
+                                WorkshopFetchOutcome::Found { item } => {
+                                    if item.file_type == WorkshopFileType::Collection {
+                                        self.db.mark_workshop_status(
+                                            item.workshop_id,
+                                            WorkshopItemStatus::PrivateOrUnavailable,
+                                            item.source,
+                                        )?;
+                                    } else {
+                                        let replace_deps =
+                                            source_provides_dependencies(item.source)
+                                                || !item.dependencies.is_empty();
+                                        self.db.upsert_workshop_snapshot(&item, replace_deps)?;
+                                        pass_hydrated += 1;
+                                    }
+                                    chunk_changed = true;
+                                }
+                                WorkshopFetchOutcome::Removed {
+                                    workshop_id,
+                                    source,
+                                    ..
+                                } => {
+                                    self.db.mark_workshop_status(
+                                        workshop_id,
+                                        WorkshopItemStatus::Removed,
+                                        source,
+                                    )?;
+                                    chunk_changed = true;
+                                }
+                                WorkshopFetchOutcome::PrivateOrUnavailable {
+                                    workshop_id,
+                                    source,
+                                    ..
+                                } => {
+                                    self.db.mark_workshop_status(
+                                        workshop_id,
+                                        WorkshopItemStatus::PrivateOrUnavailable,
+                                        source,
+                                    )?;
+                                    chunk_changed = true;
+                                }
+                            }
+                        }
+                        if chunk_changed {
+                            self.refresh_bundles_logged();
+                        }
+                    }
+
+                    if chunk_changed {
+                        self.events.emit(CoreEvent::SnapshotUpdated {
+                            external_change: false,
+                        });
+                    }
+                }
+
+                total_hydrated += pass_hydrated;
+                if pass_hydrated == 0 {
+                    break;
+                }
+            }
+
+            drop(guard);
+            if !self.hydration_pending.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+
+        Ok(total_hydrated)
     }
 
     fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {
@@ -473,6 +680,7 @@ impl L4aEngine {
     }
 
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
+        self.attempted_hydration_ids.lock().unwrap().clear();
         let resolver = self.resolver.read().unwrap().clone();
 
         let mut task = create_task(&self.db, TaskKind::Sync, "workshop-sync", None)?;
@@ -837,6 +1045,13 @@ impl L4aEngine {
                                     CoreError::Conflict("下载文件发布后已变化".into())
                                 })?;
                             let has_dependencies = !item.dependencies.is_empty();
+                            let workshop_cover = item
+                                .preview_url
+                                .as_deref()
+                                .map(upgrade_steam_cdn_https)
+                                .filter(|s| !s.is_empty());
+                            addon.cover_image =
+                                workshop_cover.or_else(|| addon.local_cover_image.clone());
                             if update {
                                 LocalDb::save_workshop_update_tx(
                                     tx,
@@ -1351,6 +1566,12 @@ fn downloaded_summary(
         .filter(|s| !s.is_empty());
     let categories =
         crate::db::repo::merge_categories(&[], &meta.addon_info, &meta.maps, &item.tags);
+    let local_cover = meta.image_path;
+    let workshop_cover = item
+        .preview_url
+        .as_deref()
+        .map(upgrade_steam_cdn_https)
+        .filter(|s| !s.is_empty());
     let summary = AddonSummary {
         id: aid.clone(),
         workshop_id: Some(wid),
@@ -1370,7 +1591,8 @@ fn downloaded_summary(
         content_hash: Some(meta.content_hash),
         file_size: size,
         files_count: meta.files_count,
-        cover_image: meta.image_path.or_else(|| item.preview_url.clone()),
+        cover_image: workshop_cover.or_else(|| local_cover.clone()),
+        local_cover_image: local_cover,
         categories,
         maps: meta.maps,
         has_dummy_bypass: config.enable_dummy_bypass,

@@ -22,7 +22,7 @@ type PickerFilterMode = 'all' | 'selected' | 'manual';
 
 function AddonPicker({
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   missingIds,
   selected,
   onToggle,
@@ -157,6 +157,7 @@ function AddonPicker({
                   <AddonCover
                     compact
                     src={addon.coverImage}
+                    fallbackSrc={addon.localCoverImage}
                     title={displayName}
                     category={addon.categories[0]}
                   />
@@ -190,7 +191,7 @@ export function UserGroupDialog({
   initial,
   preselectedIds,
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onSave,
@@ -329,7 +330,7 @@ export function ManualBundleDialog({
   open,
   preselectedIds,
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onCreate,
@@ -451,7 +452,7 @@ export function ProfileDialog({
   open,
   initial,
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onSave,

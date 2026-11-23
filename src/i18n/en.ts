@@ -133,6 +133,7 @@ export const en = {
   detail: {
     info: 'Info',
     maps: 'Maps',
+    workshopTitle: 'Workshop Title',
     addonTitle: 'Addon Title',
     fileName: 'Filename',
     directory: 'Directory',
@@ -438,7 +439,8 @@ export const en = {
     language: 'Language',
     addonNamePreference: 'Component Name',
     namePref: {
-      addon_title: 'Addon Title',
+      workshop_title: 'Workshop',
+      addon_title: 'Addon Info',
       file_name: 'Filename',
     },
     collapseCampaignBundles: 'Collapse Campaign Parts in Library',

@@ -163,10 +163,24 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     });
     fireEvent.keyDown(window, { key: 'Escape' });
 
-    // Switch Component Name preference to Filename in Settings -> Appearance
+    // Switch Component Name preference to Addon Info, then Filename in Settings -> Appearance
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
-    const nameGroup = screen.getByRole('group', { name: 'Component Name' });
+    let nameGroup = screen.getByRole('group', { name: 'Component Name' });
+    expect(
+      within(nameGroup)
+        .getByRole('button', { name: 'Workshop' })
+        .getAttribute('aria-pressed'),
+    ).toBe('true');
+    fireEvent.click(within(nameGroup).getByRole('button', { name: 'Addon Info' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    expect(await screen.findByRole('button', { name: 'Yama' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+    nameGroup = screen.getByRole('group', { name: 'Component Name' });
     fireEvent.click(within(nameGroup).getByRole('button', { name: 'Filename' }));
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
@@ -239,18 +253,59 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     });
   });
 
-  it('loads desktop remote covers through the app protocol', async () => {
+  it('loads desktop remote covers through the app protocol and falls back to localCoverImage on error', async () => {
     setTauriMode(true);
     const snapshot = await previewEngine.getDashboardSnapshot();
     const coverUrl = 'http://catalog.example.com/cover.jpg?size=64&v=2';
     snapshot.addons[2].coverImage = coverUrl;
-    invokeMock.mockResolvedValue(snapshot);
+    snapshot.addons[2].localCoverImage = 'abcd1234_cover.jpg';
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'read_cached_image') return [0xff, 0xd8, 0xff];
+      return snapshot;
+    });
     render(<App />);
 
     const img = await screen.findByAltText(snapshot.addons[2].title);
     const src = new URL(img.getAttribute('src')!);
     expect(src.protocol).toBe('l4a-cover:');
     expect(src.searchParams.get('url')).toBe(coverUrl);
+
+    // When the remote Workshop cover fails (e.g. offline), AddonCover falls back to the cached local VPK cover
+    fireEvent.error(img);
+    await waitFor(() => {
+      const fallbackImg = screen.getByAltText(snapshot.addons[2].title);
+      expect(fallbackImg.getAttribute('src')).toMatch(/^blob:/);
+    });
+    expect(invokeMock).toHaveBeenCalledWith('read_cached_image', {
+      cacheKey: 'abcd1234_cover.jpg',
+    });
+  });
+
+  it('settles on placeholder without IPC ping-pong when both primary and fallback cache keys are missing', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.addons[2].coverImage = 'missing_primary.jpg';
+    snapshot.addons[2].localCoverImage = 'missing_fallback.jpg';
+    let cacheReads = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'read_cached_image') {
+        cacheReads += 1;
+        throw new Error('not found');
+      }
+      return snapshot;
+    });
+    render(<App />);
+    await screen.findByText(snapshot.addons[2].title);
+
+    await waitFor(() => {
+      expect(cacheReads).toBe(2);
+    });
+    // Allow microtasks/effects to flush and ensure no infinite re-request loop occurs
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(cacheReads).toBe(2);
+    expect(screen.queryByAltText(snapshot.addons[2].title)).toBeNull();
   });
 
   it('excludes hidden filtered-out addons from batch actions', async () => {

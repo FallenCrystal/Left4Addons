@@ -97,7 +97,12 @@ function summarizeGroupMembers(memberIds: string[], addonsById: Map<string, Addo
   const loading = installed.filter((a) => a.primaryDir === 'loading');
   const enabledLoading = loading.filter((a) => a.enabled);
   const totalSize = installed.reduce((sum, a) => sum + a.fileSize, 0);
-  const firstCover = members.find((a) => a.coverImage)?.coverImage;
+  const firstCover =
+    members.find((a) => a.maps.length > 0 && a.coverImage)?.coverImage ??
+    members.find((a) => a.coverImage)?.coverImage;
+  const firstLocalCover =
+    members.find((a) => a.maps.length > 0 && a.localCoverImage)?.localCoverImage ??
+    members.find((a) => a.localCoverImage)?.localCoverImage;
   const firstPath = installed.find((a) => a.currentPath)?.currentPath;
 
   const allEnabled = loading.length > 0 && enabledLoading.length === loading.length;
@@ -109,6 +114,7 @@ function summarizeGroupMembers(memberIds: string[], addonsById: Map<string, Addo
     enabledLoading,
     totalSize,
     firstCover,
+    firstLocalCover,
     firstPath,
     allEnabled,
     noneEnabled,
@@ -117,7 +123,7 @@ function summarizeGroupMembers(memberIds: string[], addonsById: Map<string, Addo
 
 export function OrganizeView({
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   bundles,
   collections,
   userGroups,
@@ -308,6 +314,7 @@ export function OrganizeView({
           <AddonCover
             compact
             src={addon.coverImage}
+            fallbackSrc={addon.localCoverImage}
             title={displayLabel}
             category={addon.categories[0]}
           />
@@ -497,6 +504,7 @@ export function OrganizeView({
                       >
                         <AddonCover
                           src={bundle.coverImage ?? summary.firstCover}
+                          fallbackSrc={summary.firstLocalCover}
                           title={bundle.name}
                           category="Campaign"
                         />

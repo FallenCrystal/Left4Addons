@@ -65,7 +65,7 @@ function isZeroContentFlag(key: string, value: string): boolean {
 
 export function AddonDetailSheet({
   addon,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   bundles,
   userGroups,
   busy,
@@ -108,7 +108,12 @@ export function AddonDetailSheet({
   if (!addon) return null;
 
   const displayName = formatAddonDisplayName(addon, namePreference);
-  const metadataTitle = resolveAddonMetadataTitle(addon);
+  const metadataTitle = resolveAddonMetadataTitle(
+    addon,
+    namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
+  );
+  const workshopTitle = addon.workshopTitle?.trim();
+  const addonInfoTitle = addon.addonTitle?.trim();
   const hasMaps = addon.maps.length > 0;
   const activeTab: 'info' | 'maps' = hasMaps ? tab : 'info';
   const memberBundles = bundles.filter((b) => b.memberAddonIds.includes(addon.id));
@@ -224,6 +229,7 @@ export function AddonDetailSheet({
             >
               <AddonCover
                 src={addon.coverImage}
+                fallbackSrc={addon.localCoverImage}
                 title={displayName}
                 category={addon.categories[0]}
               />
@@ -340,10 +346,16 @@ export function AddonDetailSheet({
                 <span className="l4a-kv-label">{t('detail.filesCount')}</span>
                 <span className="l4a-kv-value">{addon.filesCount}</span>
               </div>
-              {metadataTitle && metadataTitle !== displayName && (
+              {workshopTitle && workshopTitle !== displayName && (
+                <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
+                  <span className="l4a-kv-label">{t('detail.workshopTitle')}</span>
+                  <span className="l4a-kv-value selectable">{workshopTitle}</span>
+                </div>
+              )}
+              {addonInfoTitle && addonInfoTitle !== displayName && addonInfoTitle !== workshopTitle && (
                 <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                   <span className="l4a-kv-label">{t('detail.addonTitle')}</span>
-                  <span className="l4a-kv-value selectable">{metadataTitle}</span>
+                  <span className="l4a-kv-value selectable">{addonInfoTitle}</span>
                 </div>
               )}
               <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>

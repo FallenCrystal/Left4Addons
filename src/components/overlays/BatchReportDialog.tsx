@@ -17,7 +17,7 @@ export interface BatchReportDialogProps {
 export function BatchReportDialog({
   payload,
   addonsById,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   onClose,
   onRescan,
 }: BatchReportDialogProps) {

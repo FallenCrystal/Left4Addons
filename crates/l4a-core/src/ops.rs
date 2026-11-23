@@ -176,11 +176,19 @@ pub fn preview_batch_rename(
             continue;
         };
         let group_prefix = first_group_by_addon.get(&addon.id).map(String::as_str);
-        let base_title = if addon.workshop_title.is_none() && addon.addon_title.is_none() {
-            strip_leading_bracket_prefixes(&addon.title)
-        } else {
-            addon.title.as_str()
+        let preferred_meta_title = match config.addon_name_preference {
+            l4a_protocol::AddonNamePreference::AddonTitle => addon
+                .addon_title
+                .as_deref()
+                .or(addon.workshop_title.as_deref()),
+            l4a_protocol::AddonNamePreference::WorkshopTitle
+            | l4a_protocol::AddonNamePreference::FileName => addon
+                .workshop_title
+                .as_deref()
+                .or(addon.addon_title.as_deref()),
         };
+        let base_title =
+            preferred_meta_title.unwrap_or_else(|| strip_leading_bracket_prefixes(&addon.title));
         let target_vpk = build_target_vpk_name(addon.workshop_id, group_prefix, base_title, rules);
         let conflict = plan_rename(config, &addon, &target_vpk, &mut seen_targets)
             .err()

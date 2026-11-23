@@ -19,7 +19,7 @@ export interface DeleteDialogProps {
 
 export function DeleteDialog({
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onConfirm,

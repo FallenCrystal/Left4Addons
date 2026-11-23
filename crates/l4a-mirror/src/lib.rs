@@ -164,12 +164,21 @@ impl MirrorRouter {
         }
     }
 
+    pub fn validate_url(&self, url: &str) -> Result<ResolvedRequest, MirrorError> {
+        let resolved = self.resolve(url);
+        let https_only = self.https_only.load(Ordering::Relaxed);
+        if https_only && !url::Url::parse(&resolved.url).is_ok_and(|url| url.scheme() == "https") {
+            return Err(MirrorError::HttpsRequired);
+        }
+        Ok(resolved)
+    }
+
     pub fn build_client_for(
         &self,
         url: &str,
         timeout: Option<Duration>,
     ) -> Result<(Client, ResolvedRequest), MirrorError> {
-        let resolved = self.resolve(url);
+        let resolved = self.validate_url(url)?;
         let mut builder = self.client_builder(&resolved)?;
         if let Some(t) = timeout {
             builder = builder.timeout(t);
@@ -184,7 +193,7 @@ impl MirrorRouter {
         connect_timeout: Duration,
         read_timeout: Duration,
     ) -> Result<(Client, ResolvedRequest), MirrorError> {
-        let resolved = self.resolve(url);
+        let resolved = self.validate_url(url)?;
         let client = self
             .client_builder(&resolved)?
             .connect_timeout(connect_timeout)
@@ -195,9 +204,6 @@ impl MirrorRouter {
 
     fn client_builder(&self, resolved: &ResolvedRequest) -> Result<ClientBuilder, MirrorError> {
         let https_only = self.https_only.load(Ordering::Relaxed);
-        if https_only && !url::Url::parse(&resolved.url).is_ok_and(|url| url.scheme() == "https") {
-            return Err(MirrorError::HttpsRequired);
-        }
         let insecure_tls = resolved.insecure_tls && !https_only;
         if insecure_tls {
             tracing::warn!("镜像规则启用了 insecure-tls 跳过证书校验");

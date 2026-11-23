@@ -66,15 +66,20 @@ describe('format utilities', () => {
     expect(getFileBaseName('/steam/addons/workshop/12345.vpk')).toBe('12345.vpk');
   });
 
-  it('switches cleanly between addon title and filename display preferences', () => {
+  it('switches cleanly across workshop_title, addon_title, and file_name preferences', () => {
     expect(stripVpkExtension('[12345] yama_part1.vpk.disabled')).toBe('[12345] yama_part1');
     const addon = makeSampleAddon({
-      title: 'Yama Campaign',
-      addonTitle: 'Yama Campaign',
+      title: 'Yama Campaign Remastered',
+      workshopTitle: 'Yama Campaign Remastered',
+      addonTitle: 'Yama',
       currentFileName: '[3011942811] Yama_Campaign.vpk.disabled',
     });
-    expect(formatAddonDisplayName(addon, 'addon_title')).toBe('Yama Campaign');
+    expect(formatAddonDisplayName(addon)).toBe('Yama Campaign Remastered');
+    expect(formatAddonDisplayName(addon, 'workshop_title')).toBe('Yama Campaign Remastered');
+    expect(formatAddonDisplayName(addon, 'addon_title')).toBe('Yama');
     expect(formatAddonDisplayName(addon, 'file_name')).toBe('[3011942811] Yama_Campaign');
+    expect(resolveAddonMetadataTitle(addon, 'workshop_title')).toBe('Yama Campaign Remastered');
+    expect(resolveAddonMetadataTitle(addon, 'addon_title')).toBe('Yama');
   });
 
   it('disambiguates multi-part bundle members with identical or generic addon titles', () => {

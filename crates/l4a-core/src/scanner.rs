@@ -142,9 +142,9 @@ pub(crate) fn scan_and_commit<T>(
                 let need_reparse = matches!(p.record.role, FileRole::RealAddon)
                     && (cached_addon.is_none()
                         || cached_addon.is_some_and(|a| {
-                            a.cover_image.as_ref().is_some_and(|c| {
-                                !c.starts_with("http") && !image_cache_dir.join(c).exists()
-                            })
+                            a.local_cover_image
+                                .as_ref()
+                                .is_some_and(|c| !image_cache_dir.join(c).exists())
                         }));
                 if !need_reparse {
                     (
@@ -233,6 +233,8 @@ pub(crate) fn scan_and_commit<T>(
                 enabled,
                 file_size,
                 meta,
+                workshop_dir,
+                image_cache_dir,
                 known_addon,
                 &existing_addons,
             )
@@ -268,6 +270,8 @@ pub(crate) fn scan_and_commit<T>(
                 enabled,
                 file_size,
                 meta,
+                workshop_dir,
+                image_cache_dir,
                 known_addon,
                 &existing_addons,
             )
@@ -467,6 +471,8 @@ fn build_addon_summary(
     enabled: bool,
     file_size: u64,
     meta: l4a_vpk::AddonMetadata,
+    workshop_dir: &Path,
+    image_cache_dir: &Path,
     known_addon: Option<&AddonSummary>,
     existing_addons: &HashMap<AddonId, AddonSummary>,
 ) -> AddonSummary {
@@ -489,7 +495,7 @@ fn build_addon_summary(
     let title = workshop_title
         .clone()
         .or_else(|| addon_title.clone())
-        .unwrap_or(file_stem);
+        .unwrap_or_else(|| file_stem.clone());
     let author = clean_author_name(
         meta.addon_info
             .get("addonauthor")
@@ -503,6 +509,22 @@ fn build_addon_summary(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let categories = merge_categories(&[], &meta.addon_info, &meta.maps, &[]);
+    let local_cover = meta
+        .image_path
+        .or_else(|| {
+            cache_sidecar_jpg(
+                Path::new(path_str),
+                &file_stem,
+                workshop_id,
+                workshop_dir,
+                image_cache_dir,
+                &meta.content_hash,
+            )
+        })
+        .or_else(|| prev.and_then(|p| p.local_cover_image.clone()));
+    let remote_cover = prev
+        .and_then(|p| p.cover_image.clone())
+        .filter(|c| crate::db::repo::is_remote_image_url(c));
 
     AddonSummary {
         id,
@@ -520,9 +542,8 @@ fn build_addon_summary(
         content_hash: Some(meta.content_hash),
         file_size,
         files_count: meta.files_count,
-        cover_image: meta
-            .image_path
-            .or_else(|| prev.and_then(|p| p.cover_image.clone())),
+        cover_image: remote_cover.or_else(|| local_cover.clone()),
+        local_cover_image: local_cover,
         categories,
         maps: meta.maps,
         has_dummy_bypass: false,
@@ -534,6 +555,62 @@ fn build_addon_summary(
         update_available: prev.is_some_and(|p| p.update_available),
         addon_info: meta.addon_info,
     }
+}
+
+fn cache_sidecar_jpg(
+    vpk_path: &Path,
+    file_stem: &str,
+    workshop_id: Option<WorkshopId>,
+    workshop_dir: &Path,
+    image_cache_dir: &Path,
+    content_hash: &str,
+) -> Option<String> {
+    const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(parent) = vpk_path.parent() {
+        candidates.push(parent.join(format!("{file_stem}.jpg")));
+    }
+    if let Some(wid) = workshop_id {
+        if !workshop_dir.as_os_str().is_empty() {
+            candidates.push(workshop_dir.join(format!("{wid}.jpg")));
+        }
+    }
+    let hash_prefix = &content_hash[..content_hash.len().min(16)];
+    for candidate in candidates {
+        let Ok(meta) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_SIDECAR_BYTES {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&candidate) else {
+            continue;
+        };
+        let Ok(fmt) = image::guess_format(&bytes) else {
+            continue;
+        };
+        let ext = match fmt {
+            image::ImageFormat::Png => "png",
+            image::ImageFormat::WebP => "webp",
+            image::ImageFormat::Jpeg => "jpg",
+            _ => continue,
+        };
+        let cache_name = format!("{hash_prefix}_sidecar.{ext}");
+        let dest = image_cache_dir.join(&cache_name);
+        if fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            return Some(cache_name);
+        }
+        if let Ok(mut tmp) = tempfile::Builder::new()
+            .prefix(".sidecar_")
+            .tempfile_in(image_cache_dir)
+        {
+            use std::io::Write;
+            if tmp.write_all(&bytes).is_ok() && tmp.persist(&dest).is_ok() {
+                return Some(cache_name);
+            }
+        }
+    }
+    None
 }
 
 pub fn extract_workshop_id_from_filename(vpk_name: &str) -> Option<WorkshopId> {

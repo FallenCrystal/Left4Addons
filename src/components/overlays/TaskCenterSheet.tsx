@@ -57,7 +57,7 @@ export function TaskCenterSheet({
   onTabChange,
   onClose,
   addons,
-  namePreference = 'addon_title',
+  namePreference = 'workshop_title',
   tasks,
   liveDownloads,
   syncReport,

@@ -150,7 +150,16 @@ impl WorkshopResolver {
             }
         }
 
-        let ordered = ids.iter().filter_map(|id| results.remove(id)).collect();
+        let ordered = ids
+            .iter()
+            .filter_map(|id| {
+                let mut outcome = results.remove(id)?;
+                if let WorkshopFetchOutcome::Found { item } = &mut outcome {
+                    normalize_item_urls(item);
+                }
+                Some(outcome)
+            })
+            .collect();
         Ok((ordered, warnings))
     }
 
@@ -164,7 +173,16 @@ impl WorkshopResolver {
                 continue;
             }
             match provider.fetch_collection(collection_id).await {
-                Ok(record) => return Ok((record, warnings)),
+                Ok(mut record) => {
+                    if let Some(ref url) = record.preview_url {
+                        let normalized = upgrade_steam_cdn_https(url);
+                        record.preview_url = (!normalized.is_empty()).then_some(normalized);
+                    }
+                    for item in &mut record.items {
+                        normalize_item_urls(item);
+                    }
+                    return Ok((record, warnings));
+                }
                 Err(WorkshopError::ScraperNotImplemented(_)) => continue,
                 Err(err) => warnings.push(format!("{}: {err}", provider.name())),
             }
@@ -185,7 +203,12 @@ impl WorkshopResolver {
                 continue;
             }
             match provider.search(query).await {
-                Ok(resp) => return Ok((resp, warnings)),
+                Ok(mut resp) => {
+                    for item in &mut resp.items {
+                        normalize_item_urls(item);
+                    }
+                    return Ok((resp, warnings));
+                }
                 Err(WorkshopError::ScraperNotImplemented(_)) => continue,
                 Err(err) => warnings.push(format!("{}: {err}", provider.name())),
             }
@@ -295,5 +318,62 @@ fn merge_item_fields(existing: &mut WorkshopItemRecord, incoming: WorkshopItemRe
     }
     if existing.collection_children.is_empty() && !incoming.collection_children.is_empty() {
         existing.collection_children = incoming.collection_children;
+    }
+}
+
+/// 将官方 Steam / Valve CDN 的旧版 `http://` 链接自动升级为 `https://`，
+/// 使早期工坊条目返回 `http://cloud-3.steamusercontent.com/...` 等封面/直链时在默认 `https_only` 模式下仍能正常拉取，
+/// 同时不放行任何非官方任意 HTTP 主机。
+pub fn upgrade_steam_cdn_https(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    let Ok(mut parsed) = url::Url::parse(trimmed) else {
+        return trimmed.to_string();
+    };
+    if parsed.scheme() == "http" && parsed.port().is_none() {
+        let is_steam_cdn = parsed.host_str().is_some_and(|host| {
+            let h = host.to_ascii_lowercase();
+            h == "steamusercontent.com"
+                || h.ends_with(".steamusercontent.com")
+                || h == "steamstatic.com"
+                || h.ends_with(".steamstatic.com")
+                || h == "media.steampowered.com"
+                || ((h == "cloud.steampowered.com"
+                    || (h.starts_with("cloud-") && h.ends_with(".steampowered.com")))
+                    && parsed.path().starts_with("/ugc/"))
+                || (h.ends_with(".akamaihd.net")
+                    && matches!(
+                        h.strip_suffix(".akamaihd.net"),
+                        Some("steamuserimages" | "steamcdn")
+                            | Some(_)
+                                if h.starts_with("steamuserimages-")
+                                    || h.starts_with("steamcdn-")
+                                    || h == "steamuserimages.akamaihd.net"
+                                    || h == "steamcdn.akamaihd.net"
+                    ))
+        });
+        if is_steam_cdn && parsed.set_scheme("https").is_ok() {
+            return parsed.into();
+        }
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn normalize_item_urls(item: &mut WorkshopItemRecord) {
+    if let Some(ref url) = item.preview_url {
+        let normalized = upgrade_steam_cdn_https(url);
+        item.preview_url = (!normalized.is_empty()).then_some(normalized);
+    }
+    for preview in &mut item.previews {
+        if let Some(ref url) = preview.url {
+            let normalized = upgrade_steam_cdn_https(url);
+            preview.url = (!normalized.is_empty()).then_some(normalized);
+        }
+    }
+    if let Some(ref url) = item.file_url {
+        let normalized = upgrade_steam_cdn_https(url);
+        item.file_url = (!normalized.is_empty()).then_some(normalized);
     }
 }

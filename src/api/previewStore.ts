@@ -25,7 +25,11 @@ import type {
   WorkshopItemRecord,
 } from './ipc';
 import { IpcError } from './ipc';
-import { previewFilenameByRules, sanitizeVpkFilename } from '../utils/format';
+import {
+  previewFilenameByRules,
+  resolveAddonMetadataTitle,
+  sanitizeVpkFilename,
+} from '../utils/format';
 
 const PREVIEW_CATALOG: WorkshopItemRecord[] = [
   {
@@ -186,7 +190,7 @@ function createInitialSnapshot(): DashboardSnapshot {
         enableTrim: true,
         enableRemoveDoubleSpaces: true,
       },
-      addonNamePreference: 'addon_title',
+      addonNamePreference: 'workshop_title',
       collapseCampaignBundles: true,
     },
     addons: [
@@ -263,7 +267,7 @@ function createInitialSnapshot(): DashboardSnapshot {
         id: 'ws:3011942811',
         workshopId: '3011942811',
         title: 'Yama Campaign Remastered',
-        addonTitle: 'Yama Campaign Remastered',
+        addonTitle: 'Yama',
         workshopTitle: 'Yama Campaign Remastered',
         author: 'Kuroda',
         version: '3.1',
@@ -289,7 +293,7 @@ function createInitialSnapshot(): DashboardSnapshot {
         remoteTimeUpdated: 1763100000,
         updateAvailable: false,
         addonInfo: {
-          addontitle: 'Yama Campaign Remastered',
+          addontitle: 'Yama',
           addonauthor: 'Kuroda',
           addonversion: '3.1',
         },
@@ -1025,7 +1029,12 @@ class PreviewEngine {
         targetFileName: previewFilenameByRules(rules, {
           workshopId: a.workshopId,
           groupName: groupByAddon.get(a.id),
-          title: a.title,
+          title: resolveAddonMetadataTitle(
+            a,
+            this.state.config.addonNamePreference === 'addon_title'
+              ? 'addon_title'
+              : 'workshop_title',
+          ),
         }),
         conflict: a.primaryDir === 'workshop' ? 'workshop/' : undefined,
       }));

@@ -119,26 +119,38 @@ export function stripLeadingBracketPrefixes(raw: string): string {
   return raw.replace(/^(?:\[[^\]]+\]\s*)+/, '').trim();
 }
 
-export function resolveAddonMetadataTitle(addon: AddonSummary): string {
-  const cleaned =
-    cleanMetadataTitle(addon.title) ??
-    cleanMetadataTitle(addon.workshopTitle) ??
-    cleanMetadataTitle(addon.addonTitle) ??
-    cleanMetadataTitle(addon.addonInfo.addontitle);
-  if (cleaned) return cleaned;
+export function resolveAddonMetadataTitle(
+  addon: AddonSummary,
+  preference: 'workshop_title' | 'addon_title' = 'workshop_title',
+): string {
+  const wsTitle = cleanMetadataTitle(addon.workshopTitle);
+  const adTitle =
+    cleanMetadataTitle(addon.addonTitle) ?? cleanMetadataTitle(addon.addonInfo.addontitle);
+  const rawTitle = cleanMetadataTitle(addon.title);
   const fileStem = addon.currentFileName ? stripVpkExtension(addon.currentFileName) : '';
+  const hasCustomOverride = Boolean(
+    rawTitle && rawTitle !== wsTitle && rawTitle !== adTitle && rawTitle !== fileStem,
+  );
+
+  const cleaned =
+    preference === 'addon_title'
+      ? (adTitle ?? (hasCustomOverride ? rawTitle : null) ?? wsTitle ?? rawTitle)
+      : ((hasCustomOverride ? rawTitle : null) ?? wsTitle ?? adTitle ?? rawTitle);
+
+  if (cleaned) return cleaned;
   return fileStem || addon.title;
 }
 
 export function formatAddonDisplayName(
   addon: AddonSummary,
-  preference: AddonNamePreference = 'addon_title',
+  preference: AddonNamePreference = 'workshop_title',
 ): string {
   if (preference === 'file_name') {
     const fileStem = addon.currentFileName ? stripVpkExtension(addon.currentFileName) : '';
     if (fileStem) return fileStem;
+    return resolveAddonMetadataTitle(addon, 'workshop_title');
   }
-  return resolveAddonMetadataTitle(addon);
+  return resolveAddonMetadataTitle(addon, preference);
 }
 
 const PART_OR_ASSET_MARKER_RE =
@@ -147,7 +159,7 @@ const PART_OR_ASSET_MARKER_RE =
 export function formatBundleMemberLabel(
   addon: AddonSummary,
   siblings: readonly AddonSummary[],
-  preference: AddonNamePreference = 'addon_title',
+  preference: AddonNamePreference = 'workshop_title',
   bundleName?: string,
 ): string {
   const primary = formatAddonDisplayName(addon, preference);
@@ -168,10 +180,13 @@ export function formatBundleMemberLabel(
     return primary;
   }
 
-  if (preference === 'addon_title') {
-    const wsTitle = cleanMetadataTitle(addon.workshopTitle);
-    if (wsTitle && wsTitle.toLowerCase() !== key) {
-      return wsTitle;
+  if (preference !== 'file_name') {
+    const altTitle =
+      preference === 'addon_title'
+        ? cleanMetadataTitle(addon.workshopTitle)
+        : cleanMetadataTitle(addon.addonTitle);
+    if (altTitle && altTitle.toLowerCase() !== key) {
+      return altTitle;
     }
   }
   if (fileStem && fileStem.toLowerCase() !== key) {

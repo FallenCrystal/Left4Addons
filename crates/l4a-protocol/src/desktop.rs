@@ -88,6 +88,8 @@ pub struct AddonSummary {
     pub files_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_cover_image: Option<String>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]
@@ -447,6 +449,7 @@ pub enum GameUpdateDummyPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum AddonNamePreference {
     #[default]
+    WorkshopTitle,
     AddonTitle,
     FileName,
 }

@@ -133,6 +133,7 @@ export const zh = {
   detail: {
     info: '信息',
     maps: '地图',
+    workshopTitle: '创意工坊名称',
     addonTitle: 'Addon 名称',
     fileName: '文件名',
     directory: '目录',
@@ -437,6 +438,7 @@ export const zh = {
     language: '语言',
     addonNamePreference: '组件显示名称',
     namePref: {
+      workshop_title: '创意工坊',
       addon_title: 'Addon 名称',
       file_name: '文件名',
     },

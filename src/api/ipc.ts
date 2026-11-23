@@ -14,7 +14,7 @@ export type MetadataSource =
   | 'local_vpk'
   | 'admin_override';
 export type BundleKind = 'dependency_graph' | 'campaign_parts' | 'manual';
-export type AddonNamePreference = 'addon_title' | 'file_name';
+export type AddonNamePreference = 'workshop_title' | 'addon_title' | 'file_name';
 
 export type ReconcileIssueKind =
   | 'dummy_overwritten_by_game_update'
@@ -59,6 +59,7 @@ export interface AddonSummary {
   fileSize: number;
   filesCount: number;
   coverImage?: string;
+  localCoverImage?: string;
   categories: string[];
   maps: MapEntry[];
   hasDummyBypass: boolean;

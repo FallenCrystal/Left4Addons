@@ -2015,3 +2015,182 @@ fn deleting_part_clears_stale_auto_bundle_and_config_roundtrips_preferences() {
     );
     assert!(!reopened.config().collapse_campaign_bundles);
 }
+
+#[tokio::test]
+async fn hydrates_missing_workshop_metadata_prefers_workshop_cover_and_caches_remote_image() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+
+    // Create two campaign parts in loading_dir with Workshop IDs in filename, plus a Steam-style sidecar JPG.
+    create_test_vpk(
+        &loading.join("[910001] yama_main.vpk"),
+        "Yama",
+        "Mapper",
+        true,
+        Some("l4d_yama_1"),
+        b"yama-part-1",
+    );
+    create_test_vpk(
+        &loading.join("[910002] yama_assets.vpk"),
+        "Yama Assets",
+        "Mapper",
+        false,
+        None,
+        b"yama-part-2",
+    );
+    // Minimal JPEG magic header + EOI so image::guess_format detects JPEG for the sidecar.
+    let minimal_jpeg = vec![
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ];
+    std::fs::write(workshop.join("910001.jpg"), &minimal_jpeg).unwrap();
+
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let mut main_item = item_record(
+        910001,
+        "Yama Campaign Remastered",
+        1_710_000_000,
+        vec![910002],
+    );
+    // Legacy HTTP Steam CDN URL must be upgraded to HTTPS automatically.
+    main_item.preview_url =
+        Some("http://cloud-3.steamusercontent.com/ugc/910001/preview.jpg".into());
+    let asset_item = item_record(910002, "Yama Assets Pack", 1_710_000_000, vec![]);
+    bridge.insert_item(main_item);
+    bridge.insert_item(asset_item);
+
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        workshop_dir: workshop.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let engine = make_engine(dir.path(), cfg, bridge);
+    let initial = engine.scan().unwrap();
+    let before = initial
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(910001)))
+        .unwrap();
+    assert_eq!(before.title, "Yama");
+    assert_eq!(before.workshop_title, None);
+    assert!(before
+        .local_cover_image
+        .as_deref()
+        .is_some_and(|name| name.ends_with("_sidecar.jpg")));
+    assert_eq!(before.cover_image, before.local_cover_image);
+
+    let hydrated = engine.hydrate_missing_workshop_metadata().await.unwrap();
+    assert_eq!(hydrated, 2);
+    // Second pass is a no-op once snapshots are hydrated.
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+
+    let after_snap = engine.snapshot().unwrap();
+    let after = after_snap
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(910001)))
+        .unwrap();
+    assert_eq!(
+        after.workshop_title.as_deref(),
+        Some("Yama Campaign Remastered")
+    );
+    assert_eq!(after.addon_title.as_deref(), Some("Yama"));
+    assert_eq!(after.title, "Yama Campaign Remastered");
+    assert_eq!(
+        after.cover_image.as_deref(),
+        Some("https://cloud-3.steamusercontent.com/ugc/910001/preview.jpg")
+    );
+    assert_eq!(after.local_cover_image, before.local_cover_image);
+    assert_eq!(after_snap.bundles.len(), 1);
+    assert_eq!(
+        after_snap.bundles[0].kind,
+        l4a_protocol::BundleKind::DependencyGraph
+    );
+
+    // Batch rename honors WorkshopTitle (default) vs AddonTitle preference.
+    let rules = engine.config().rename_rules;
+    let preview_ws = engine
+        .preview_rename(&rules, std::slice::from_ref(&after.id))
+        .unwrap();
+    assert_eq!(
+        preview_ws[0].target_file_name,
+        "[910001] Yama Campaign Remastered.vpk"
+    );
+    engine
+        .save_config(AppConfig {
+            addon_name_preference: l4a_protocol::AddonNamePreference::AddonTitle,
+            ..engine.config()
+        })
+        .unwrap();
+    let preview_addon = engine
+        .preview_rename(&rules, std::slice::from_ref(&after.id))
+        .unwrap();
+    assert_eq!(preview_addon[0].target_file_name, "[910001] Yama.vpk");
+
+    // Remote cover fetching persists valid images to disk cache, while HTML error pages disguised as image/jpeg are never cached.
+    assert_eq!(
+        l4a_workshop::upgrade_steam_cdn_https("http://cloud.steampowered.com/ugc/123/cover.jpg"),
+        "https://cloud.steampowered.com/ugc/123/cover.jpg"
+    );
+    assert_eq!(
+        l4a_workshop::upgrade_steam_cdn_https("http://evil-steamuserimages.akamaihd.net/x.jpg"),
+        "http://evil-steamuserimages.akamaihd.net/x.jpg"
+    );
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let poison_hits = Arc::new(AtomicUsize::new(0));
+    let hits_route = hits.clone();
+    let poison_route = poison_hits.clone();
+    let jpeg_payload = minimal_jpeg.clone();
+    let app = Router::new()
+        .route(
+            "/ws-cover.jpg",
+            get(move || {
+                let hits_route = hits_route.clone();
+                let body = jpeg_payload.clone();
+                async move {
+                    hits_route.fetch_add(1, Ordering::SeqCst);
+                    ([("content-type", "image/jpeg")], body)
+                }
+            }),
+        )
+        .route(
+            "/captive-portal.jpg",
+            get(move || {
+                let poison_route = poison_route.clone();
+                async move {
+                    poison_route.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [("content-type", "image/jpeg")],
+                        b"<html>Gateway Error</html>".to_vec(),
+                    )
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    engine
+        .save_config(AppConfig {
+            https_only: false,
+            ..engine.config()
+        })
+        .unwrap();
+    let cover_url = format!("http://{addr}/ws-cover.jpg");
+    let first_fetch = engine.fetch_workshop_cover(&cover_url).await.unwrap();
+    let second_fetch = engine.fetch_workshop_cover(&cover_url).await.unwrap();
+    assert_eq!(first_fetch.0, "image/jpeg");
+    assert_eq!(first_fetch, second_fetch);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let poison_url = format!("http://{addr}/captive-portal.jpg");
+    let _ = engine.fetch_workshop_cover(&poison_url).await.unwrap();
+    let _ = engine.fetch_workshop_cover(&poison_url).await.unwrap();
+    // Must re-fetch because non-image HTML payload was not written to ws_cover_* disk cache.
+    assert_eq!(poison_hits.load(Ordering::SeqCst), 2);
+}

@@ -1716,6 +1716,7 @@ mod tests {
             file_size: 1024,
             files_count: 10,
             cover_image: None,
+            local_cover_image: None,
             categories: categories.iter().map(|c| (*c).to_string()).collect(),
             maps: map_codes
                 .iter()

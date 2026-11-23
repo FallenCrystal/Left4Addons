@@ -718,11 +718,12 @@ export function SettingsView({
               <section className="l4a-section-card">
                 <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
                   <span className="md-title-small">{t('settings.addonNamePreference')}</span>
-                  <SegmentedButton<'addon_title' | 'file_name'>
+                  <SegmentedButton<'workshop_title' | 'addon_title' | 'file_name'>
                     ariaLabel={t('settings.addonNamePreference')}
-                    value={effective.addonNamePreference ?? 'addon_title'}
+                    value={effective.addonNamePreference ?? 'workshop_title'}
                     onChange={(v) => updateDraft((d) => ({ ...d, addonNamePreference: v }))}
                     options={[
+                      { value: 'workshop_title', label: t('settings.namePref.workshop_title') },
                       { value: 'addon_title', label: t('settings.namePref.addon_title') },
                       { value: 'file_name', label: t('settings.namePref.file_name') },
                     ]}

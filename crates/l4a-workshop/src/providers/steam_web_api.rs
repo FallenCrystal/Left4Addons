@@ -138,13 +138,13 @@ impl WorkshopProvider for SteamWebApiProvider {
                         let preview_url = entry
                             .get("preview_url")
                             .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string);
+                            .map(crate::resolver::upgrade_steam_cdn_https)
+                            .filter(|s| !s.is_empty());
                         let file_url = entry
                             .get("file_url")
                             .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string);
+                            .map(crate::resolver::upgrade_steam_cdn_https)
+                            .filter(|s| !s.is_empty());
                         let file_size =
                             entry.get("file_size").and_then(Value::as_u64).or_else(|| {
                                 entry.get("file_size").and_then(Value::as_str)?.parse().ok()

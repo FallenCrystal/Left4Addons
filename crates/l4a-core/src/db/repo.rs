@@ -181,9 +181,22 @@ impl LocalDb {
                 (InstallState::Installed, Some(l), Some(rt)) => rt > l,
                 _ => false,
             };
-            let cover = r
-                .get::<_, Option<String>>(13)?
-                .or_else(|| snap.and_then(|s| s.preview_url.clone()));
+            let stored_cover = r.get::<_, Option<String>>(13)?;
+            let local_cover_image = stored_cover
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+                .map(str::to_owned);
+            let workshop_cover = snap
+                .and_then(|s| s.preview_url.as_deref())
+                .map(l4a_workshop::upgrade_steam_cdn_https)
+                .filter(|s| !s.is_empty());
+            let cover = workshop_cover.or_else(|| {
+                stored_cover
+                    .as_deref()
+                    .map(l4a_workshop::upgrade_steam_cdn_https)
+                    .filter(|s| !s.is_empty())
+            });
 
             let stored_title: String = r.get(2)?;
             let stored_author: Option<String> = r.get(3)?;
@@ -240,6 +253,7 @@ impl LocalDb {
                 file_size: r.get::<_, i64>(11)? as u64,
                 files_count: r.get::<_, i64>(12)? as usize,
                 cover_image: cover,
+                local_cover_image,
                 categories,
                 maps,
                 has_dummy_bypass: r.get::<_, i64>(17)? != 0,
@@ -345,7 +359,7 @@ impl LocalDb {
                 addon.content_hash,
                 addon.file_size as i64,
                 addon.files_count as i64,
-                addon.cover_image,
+                local_cover_for_db(addon),
                 serde_json::to_string(&addon.categories).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&addon.maps).unwrap_or_else(|_| "[]".into()),
                 serde_json::to_string(&addon.addon_info).unwrap_or_else(|_| "{}".into()),
@@ -421,14 +435,23 @@ impl LocalDb {
         replace_deps: bool,
     ) -> Result<(), CoreError> {
         Self::upsert_workshop_snapshot_tx(tx, item, replace_deps)?;
+        let preview_url = item
+            .preview_url
+            .as_deref()
+            .map(l4a_workshop::upgrade_steam_cdn_https)
+            .filter(|s| !s.is_empty());
         // Ordinary upserts retain missing fields. A replacement's metadata belongs to the new VPK.
         tx.execute(
             "UPDATE addons SET cover_image = ?2, local_time_updated = ?3 WHERE id = ?1",
-            params![addon.id.as_str(), addon.cover_image, item.time_updated],
+            params![
+                addon.id.as_str(),
+                local_cover_for_db(addon),
+                item.time_updated
+            ],
         )?;
         tx.execute(
             "UPDATE workshop_snapshots SET preview_url = ?2, time_updated = ?3 WHERE workshop_id = ?1",
-            params![item.workshop_id.as_u64() as i64, item.preview_url, item.time_updated],
+            params![item.workshop_id.as_u64() as i64, preview_url, item.time_updated],
         )?;
         Ok(())
     }
@@ -445,6 +468,16 @@ impl LocalDb {
             WorkshopItemStatus::Removed | WorkshopItemStatus::PrivateOrUnavailable
         )
         .then(|| now.clone());
+        let preview_url = item
+            .preview_url
+            .as_deref()
+            .map(l4a_workshop::upgrade_steam_cdn_https)
+            .filter(|s| !s.is_empty());
+        let file_url = item
+            .file_url
+            .as_deref()
+            .map(l4a_workshop::upgrade_steam_cdn_https)
+            .filter(|s| !s.is_empty());
 
         tx.execute(
             r#"
@@ -479,8 +512,8 @@ impl LocalDb {
                 item.description,
                 item.creator_steam_id,
                 item.creator_name,
-                item.preview_url,
-                item.file_url,
+                preview_url,
+                file_url,
                 item.file_size.map(|v| v as i64),
                 item.time_created,
                 item.time_updated,
@@ -835,7 +868,16 @@ impl LocalDb {
                 locked: r.get::<_, i64>(3)? != 0,
                 member_addon_ids: Vec::new(),
                 maps: serde_json::from_str(&maps_json).unwrap_or_default(),
-                cover_image: r.get(5)?,
+                cover_image: r
+                    .get::<_, Option<String>>(5)?
+                    .map(|c| {
+                        if is_remote_image_url(&c) {
+                            l4a_workshop::upgrade_steam_cdn_https(&c)
+                        } else {
+                            c
+                        }
+                    })
+                    .filter(|s| !s.is_empty()),
             })
         })?;
         for row in rows {
@@ -1440,4 +1482,27 @@ pub fn merge_categories(
 
 pub fn collect_installed_addon_maps(addon: &AddonSummary) -> Vec<MapEntry> {
     addon.maps.clone()
+}
+
+pub fn is_remote_image_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed.len() >= 7
+        && (trimmed[..7].eq_ignore_ascii_case("http://")
+            || (trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://"))
+            || trimmed.starts_with("//"))
+}
+
+fn local_cover_for_db(addon: &AddonSummary) -> Option<&str> {
+    addon
+        .local_cover_image
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+        .or_else(|| {
+            addon
+                .cover_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+        })
 }
