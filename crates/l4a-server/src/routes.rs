@@ -253,13 +253,7 @@ async fn search_items(
     Query(params): Query<SearchParams>,
 ) -> ApiResult<SearchResponse> {
     let q = SearchQuery::from(params);
-    let ttl = state.server.config_store.get().sync.item_ttl_secs;
-    let verified_since = chrono::Utc::now()
-        .timestamp()
-        .saturating_sub(i64::try_from(ttl).unwrap_or(i64::MAX));
-    let mut res = state
-        .db(move |repo| repo.search(&q, Some(verified_since)))
-        .await?;
+    let mut res = state.db(move |repo| repo.search(&q, true)).await?;
     res.items = res.items.into_iter().map(with_catalog_source).collect();
     Ok(Json(res))
 }
@@ -271,7 +265,7 @@ async fn admin_search_items(
 ) -> ApiResult<SearchResponse> {
     state.require_admin(&headers)?;
     let q = SearchQuery::from(params);
-    Ok(Json(state.db(move |repo| repo.search(&q, None)).await?))
+    Ok(Json(state.db(move |repo| repo.search(&q, false)).await?))
 }
 
 async fn get_collection(
@@ -687,7 +681,7 @@ async fn admin_refresh_item(
     state
         .server
         .sync
-        .admin_force_fetch(&[wid])
+        .admin_refresh_cached(&[wid])
         .await
         .map_err(|e| err_resp(StatusCode::BAD_GATEWAY, e.to_string()))?;
 
@@ -735,7 +729,7 @@ async fn admin_clear_item_override(
     }
 
     if state.server.config_store.get().sync.enable_read_through {
-        let _ = state.server.sync.admin_force_fetch(&[wid]).await;
+        let _ = state.server.sync.admin_refresh_cached(&[wid]).await;
     }
 
     let detail = state

@@ -1153,7 +1153,7 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
                     query: Some(query.into()),
                     ..Default::default()
                 },
-                None,
+                false,
             )
             .unwrap();
         assert_eq!(res.total, expected, "{query}");
@@ -1178,7 +1178,7 @@ fn upgrades_legacy_revisions_and_locks_existing_admin_overrides() {
                 query: Some("LegacyOverride".into()),
                 ..Default::default()
             },
-            None,
+            false,
         )
         .unwrap();
     assert_eq!(res.total, 1);
@@ -1230,7 +1230,7 @@ fn upstream_refresh_reindexes_only_changed_effective_search_fields() {
                 query: Some(query.into()),
                 ..Default::default()
             },
-            None,
+            false,
         )
         .unwrap()
         .total
@@ -1577,30 +1577,46 @@ fn empty_steam_gallery_replaces_cached_previews_and_dependency_order_is_ignored(
 }
 
 #[tokio::test]
-async fn search_excludes_expired_and_unlisted_rows_but_direct_lookups_still_work() {
+async fn public_search_keeps_indexed_items_past_ttl_and_excludes_read_through_and_unlisted() {
     let upstream = Arc::new(MockWorkshopUpstream::new());
     let state =
         ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
-    state
-        .config_store
-        .update(|cfg| cfg.sync.enable_read_through = false)
-        .unwrap();
     let app = build_router(state.clone());
 
-    let expired = WorkshopItemRecord {
+    // 1. An indexed catalog item older than item_ttl_secs stays visible in public homepage & search.
+    let older_indexed = WorkshopItemRecord {
         fetched_at: Utc::now() - chrono::Duration::hours(2),
+        subscriptions: Some(250_000),
         ..sample_item(
             8501,
-            "Map expired",
+            "Map indexed earlier",
             100,
             Some("https://example.test/old.vpk"),
         )
     };
-    state.repo.upsert_item(&expired, false, true).unwrap();
-    state
-        .repo
-        .upsert_item(&sample_item(8502, "Map listed", 200, None), false, true)
-        .unwrap();
+    state.repo.upsert_item(&older_indexed, false, true).unwrap();
+    let mut newer_indexed = sample_item(8502, "Map indexed recently", 200, None);
+    newer_indexed.subscriptions = Some(10_000);
+    state.repo.upsert_item(&newer_indexed, false, true).unwrap();
+
+    // 2. A client read-through pull (e.g. syncing a user's installed addons) caches items for ID lookup,
+    //    but MUST NOT place them onto the public Workshop homepage or search results.
+    let mut installed_addon_a = sample_item(
+        8504,
+        "Map personal installed A",
+        350,
+        Some("https://example.test/installed_a.vpk"),
+    );
+    installed_addon_a.subscriptions = Some(9_000_000);
+    let mut installed_addon_b = sample_item(
+        8505,
+        "Map personal installed B",
+        360,
+        Some("https://example.test/installed_b.vpk"),
+    );
+    installed_addon_b.subscriptions = Some(8_000_000);
+    upstream.insert_item(installed_addon_a.clone());
+    upstream.insert_item(installed_addon_b);
     upstream.insert_outcome(
         WorkshopId(8503),
         WorkshopObservation {
@@ -1616,34 +1632,55 @@ async fn search_excludes_expired_and_unlisted_rows_but_direct_lookups_still_work
         },
     );
 
-    for id in [8501, 8503] {
-        let suffix = if id == 8503 { "?refresh=true" } else { "" };
-        let (status, data) = json_request(
-            &app,
-            "GET",
-            &format!("/api/v1/items/{id}{suffix}"),
-            vec![],
-            None,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        let item: WorkshopItemRecord = serde_json::from_slice(&data).unwrap();
-        assert!(item.file_url.is_some());
-    }
-
-    let (status, data) = json_request(
+    // Client pulls installed addons via batch read-through and unlisted item via direct GET.
+    let (status, batch_bytes) = json_request(
         &app,
-        "GET",
-        "/api/v1/items/search?q=map&pageSize=1",
+        "POST",
+        "/api/v1/items/batch",
         vec![],
-        None,
+        Some(json!({ "ids": ["8504", "8505"] })),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let items: SearchResponse = serde_json::from_slice(&data).unwrap();
-    assert_eq!(items.total, 1);
-    assert_eq!(items.items[0].workshop_id, WorkshopId(8502));
+    let batch: BatchItemsResponse = serde_json::from_slice(&batch_bytes).unwrap();
+    assert_eq!(batch.items.len(), 2);
+    assert_eq!(upstream.fetch_count(WorkshopId(8504)), 1);
 
+    // Subsequent direct lookup hits SQLite cache without hitting upstream again.
+    let (status, _) = json_request(&app, "GET", "/api/v1/items/8504", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(upstream.fetch_count(WorkshopId(8504)), 1);
+
+    // Direct lookup of unlisted item still works.
+    let (status, data) =
+        json_request(&app, "GET", "/api/v1/items/8503?refresh=true", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let unlisted_item: WorkshopItemRecord = serde_json::from_slice(&data).unwrap();
+    assert!(unlisted_item.file_url.is_some());
+
+    // Public Workshop homepage (no query) shows ONLY catalog-indexed items (including >TTL item 8501),
+    // and NONE of the read-through-only installed addons or unlisted items.
+    assert_eq!(search_result_ids(&app, "").await, (2, vec![8501, 8502]));
+    assert_eq!(
+        search_result_ids(&app, "q=map").await,
+        (2, vec![8501, 8502])
+    );
+    assert_eq!(search_result_ids(&app, "q=personal").await, (0, vec![]));
+
+    // Refreshing an already-indexed item via read-through does not displace other older indexed items.
+    upstream.insert_item(newer_indexed.clone());
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/items/batch",
+        vec![],
+        Some(json!({ "ids": ["8502"], "forceRefresh": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search_result_ids(&app, "").await, (2, vec![8501, 8502]));
+
+    // Admin search still sees all cached rows (indexed + read-through + unlisted).
     let (status, data) = json_request(
         &app,
         "GET",
@@ -1654,36 +1691,298 @@ async fn search_excludes_expired_and_unlisted_rows_but_direct_lookups_still_work
     .await;
     assert_eq!(status, StatusCode::OK);
     let items: SearchResponse = serde_json::from_slice(&data).unwrap();
-    assert_eq!(items.total, 3);
+    assert_eq!(items.total, 5);
 
+    // Admin single-item refresh preserves cache-only status and does NOT leak read-through item onto homepage.
+    let (status, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/items/8505/refresh",
+        vec![("X-Admin-Token", "test-admin-password")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(search_result_ids(&app, "").await, (2, vec![8501, 8502]));
+
+    // The public feed can promote an entry even when the ID lookup has a newer snapshot.
+    upstream.insert_query_page(
+        QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
+        MATCHING_FILE_TYPE_ITEMS,
+        "*",
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopFetchOutcome::Found {
+                item: WorkshopItemRecord {
+                    fetched_at: installed_addon_a.fetched_at - chrono::Duration::seconds(1),
+                    ..installed_addon_a
+                },
+            }
+            .into()],
+        },
+    );
+    assert_eq!(state.sync.run_incremental_once().await.unwrap(), 1);
+    assert_eq!(
+        search_result_ids(&app, "").await,
+        (3, vec![8504, 8501, 8502])
+    );
+
+    // Admin overrides publish a listed cache entry while preserving an unlisted entry's visibility.
+    for id in [8505, 8503] {
+        let (status, _) = json_request(
+            &app,
+            "POST",
+            &format!("/api/v1/admin/items/{id}/override"),
+            vec![("X-Admin-Token", "test-admin-password")],
+            Some(json!({ "status": "active", "title": "Curated map" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(search_result_ids(&app, "q=curated").await, (1, vec![8505]));
+}
+
+#[tokio::test]
+async fn listing_recheck_hides_restricted_metadata_without_incremental_sync() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.sync.enable_incremental_sync = false;
+            cfg.sync.enable_read_through = false;
+        })
+        .unwrap();
+    let app = build_router(state.clone());
+
+    let private_id = WorkshopId(8601);
+    let unlisted_id = WorkshopId(8602);
+    for (id, title) in [
+        (private_id, "Formerly public"),
+        (unlisted_id, "Unlisted map"),
+    ] {
+        let mut item = sample_item(
+            id.as_u64(),
+            title,
+            100,
+            Some("https://example.test/map.vpk"),
+        );
+        item.fetched_at -= chrono::Duration::hours(2);
+        state.repo.upsert_item(&item, false, true).unwrap();
+    }
+    assert_eq!(search_result_ids(&app, "").await, (2, vec![8601, 8602]));
     upstream.insert_outcome(
-        WorkshopId(8501),
+        private_id,
         WorkshopFetchOutcome::PrivateOrUnavailable {
-            workshop_id: WorkshopId(8501),
+            workshop_id: private_id,
             source: MetadataSource::SteamKit,
             observed_at: Utc::now(),
             reason: None,
         },
     );
-    let workers = state.sync.spawn_background_workers();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    upstream.insert_outcome(
+        unlisted_id,
+        WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found {
+                item: sample_item(
+                    8602,
+                    "Unlisted map",
+                    100,
+                    Some("https://example.test/map.vpk"),
+                ),
+            },
+            listed: false,
+        },
+    );
+    let _workers = state.sync.spawn_background_workers().drop_guard();
+    let tombstone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let item = state
-                .repo
-                .get_item(WorkshopId(8501))
-                .unwrap()
-                .unwrap()
-                .record;
+            let item = state.repo.get_item(private_id).unwrap().unwrap().record;
             if item.status == WorkshopItemStatus::PrivateOrUnavailable {
-                assert!(item.file_url.is_none());
-                break;
+                break item;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
     .unwrap();
-    workers.cancel();
+    assert_eq!(tombstone.title, "Workshop #8601");
+    assert!(tombstone.file_url.is_none());
+    assert!(tombstone.preview_url.is_none());
+    assert!(tombstone.previews.is_empty());
+    assert_eq!(search_result_ids(&app, "").await, (1, vec![8601]));
+    assert_eq!(search_result_ids(&app, "q=formerly").await, (0, vec![]));
+    assert_eq!(search_result_ids(&app, "q=8602").await, (0, vec![]));
+    assert!(state
+        .sync
+        .status()
+        .await
+        .unwrap()
+        .last_incremental_at
+        .is_none());
+}
+
+#[tokio::test]
+async fn migration_keeps_legacy_rows_cache_only_until_rediscovered_by_a_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.db");
+    let backfilled = sample_item(9101, "Backfilled item", 100, None);
+    let mut read_through = sample_item(9102, "Personal cached item", 100, None);
+    read_through.fetched_at -= chrono::Duration::hours(2);
+    {
+        let repo = ServerRepo::open(&path).unwrap();
+        repo.upsert_item(&backfilled, false, true).unwrap();
+        repo.upsert_item(&read_through, false, true).unwrap();
+        let mut admin_override = sample_item(9103, "Admin override", 100, None);
+        admin_override.source = MetadataSource::AdminOverride;
+        repo.upsert_item(&admin_override, true, true).unwrap();
+        repo.set_sync_state("incremental_scan", r#"{"checkpoint":100}"#)
+            .unwrap();
+        repo.set_sync_state("backfill_cursor", "DONE").unwrap();
+        repo.set_sync_state("backfill_synced_total", "1").unwrap();
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX idx_workshop_items_catalog_public;
+             ALTER TABLE workshop_items DROP COLUMN catalog_indexed;",
+        )
+        .unwrap();
+    }
+
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let repo = Arc::new(ServerRepo::open(&path).unwrap());
+    let store = Arc::new(CatalogConfigStore::new(None, CatalogConfig::default()));
+    let state = ServerState::with_components(store, repo.clone(), upstream.clone());
+    let app = build_router(state.clone());
+    assert_eq!(search_result_ids(&app, "").await, (1, vec![9103]));
+    assert_eq!(
+        repo.get_item(WorkshopId(9102)).unwrap().unwrap().record,
+        read_through
+    );
+    let sync = state.sync.status().await.unwrap();
+    assert!(sync.high_water_time_updated.is_none());
+    assert!(sync.backfill_cursor.is_none());
+    assert_eq!(sync.backfill_synced_total, 0);
+
+    upstream.insert_query_page(
+        QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+        MATCHING_FILE_TYPE_ITEMS,
+        "*",
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopFetchOutcome::Found { item: backfilled }.into()],
+        },
+    );
+    assert_eq!(state.sync.run_backfill_step_once().await.unwrap(), 1);
+    assert_eq!(search_result_ids(&app, "").await, (2, vec![9101, 9103]));
+    assert_eq!(search_result_ids(&app, "q=personal").await, (0, vec![]));
+
+    let reopened = ServerRepo::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .get_sync_state("backfill_cursor")
+            .unwrap()
+            .as_deref(),
+        Some("DONE")
+    );
+    assert_eq!(reopened.search(&Default::default(), true).unwrap().total, 2);
+}
+
+#[tokio::test]
+async fn backfill_counts_membership_only_promotions_with_its_cursor() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    let app = build_router(state.clone());
+    let repo = &state.repo;
+
+    for id in [9301, 9302, 9303] {
+        upstream.insert_outcome(
+            WorkshopId(id),
+            WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found {
+                    item: sample_item(
+                        id,
+                        "New cache metadata",
+                        200,
+                        Some("https://example.test/new.vpk"),
+                    ),
+                },
+                listed: id != 9303,
+            },
+        );
+    }
+    let ids = [WorkshopId(9301), WorkshopId(9302), WorkshopId(9303)];
+    state.sync.resolve_batch(&ids, false).await.unwrap();
+    assert_eq!(search_result_ids(&app, "").await, (0, vec![]));
+
+    let feed_item = |id: WorkshopId, version, offset| {
+        let last_verified = repo.get_item(id).unwrap().unwrap().last_verified_at;
+        WorkshopFetchOutcome::Found {
+            item: WorkshopItemRecord {
+                fetched_at: last_verified + chrono::Duration::seconds(offset),
+                ..sample_item(id.as_u64(), "Old feed metadata", version, None)
+            },
+        }
+        .into()
+    };
+    upstream.insert_query_page(
+        QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+        MATCHING_FILE_TYPE_ITEMS,
+        "*",
+        WorkshopQueryPage {
+            total: 3,
+            next_cursor: Some("next".into()),
+            outcomes: vec![
+                feed_item(ids[0], 200, -1),
+                feed_item(ids[1], 100, 1),
+                feed_item(ids[2], 200, -1),
+            ],
+        },
+    );
+
+    // Fail checkpointing after the page has been applied, then retry the same stale snapshots.
+    repo.with_transaction(|tx| {
+        tx.execute_batch(
+            "CREATE TRIGGER fail_backfill_checkpoint BEFORE INSERT ON sync_state
+             WHEN NEW.key = 'backfill_cursor'
+             BEGIN SELECT RAISE(ABORT, 'checkpoint write failed'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    assert!(state.sync.run_backfill_step_once().await.is_err());
+    assert_eq!(search_result_ids(&app, "").await, (0, vec![]));
+    let sync = state.sync.status().await.unwrap();
+    assert!(sync.backfill_cursor.is_none());
+    assert_eq!(sync.backfill_synced_total, 0);
+
+    repo.with_transaction(|tx| {
+        tx.execute_batch("DROP TRIGGER fail_backfill_checkpoint")?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(state.sync.run_backfill_step_once().await.unwrap(), 2);
+    let sync = state.sync.status().await.unwrap();
+    assert_eq!(sync.backfill_cursor.as_deref(), Some("next"));
+    assert_eq!(sync.backfill_synced_total, 2);
+    assert_eq!(
+        search_result_ids(&app, "q=new+cache").await,
+        (2, vec![9301, 9302])
+    );
+    for id in &ids[..2] {
+        let item = repo.get_item(*id).unwrap().unwrap().record;
+        assert_eq!(item.title, "New cache metadata");
+        assert_eq!(item.time_updated, Some(200));
+        assert_eq!(
+            item.file_url.as_deref(),
+            Some("https://example.test/new.vpk")
+        );
+    }
 }
 
 #[tokio::test]

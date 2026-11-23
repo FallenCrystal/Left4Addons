@@ -28,7 +28,9 @@ flowchart TD
     CronBackfill["可选后台游标全量回填 (QueryFiles cursor)"] --> CallCM
 ```
 
-缓存按 Steam 版本与请求观测时间合并快照。启用增量同步时，后台也会按 ID 分批复核接近过期及可见性未知的条目。公开搜索排除过期活跃条目，并保留未列出条目的按 ID 查询。增量与回填按消费 App ID 选择工坊。 [Steamworks 可见性定义](https://partner.steamgames.com/doc/api/ISteamRemoteStorage#ERemoteStoragePublishedFileVisibility) [QueryFiles 参数](https://partner.steamgames.com/doc/webapi/IPublishedFileService#QueryFiles)
+缓存按 Steam 版本与请求观测时间合并快照。客户端按 ID Read-Through 穿透拉取的条目仅作为缓存保存，不会直接进入公开工坊首页与公开搜索，避免个人已安装组件列表暴露或覆盖首页内容；公开搜索仅展示经增量同步、全量回填、管理员主动抓取或人工覆写收录的公开条目，不再因 `item_ttl_secs` 到期而大面积隐藏已收录目录。后台会独立于增量同步和回填，按 ID 分批复核接近过期及可见性未知的目录条目。未列出条目仅允许按 ID 查询。增量与回填按消费 App ID 选择工坊。 [Steamworks 可见性定义](https://partner.steamgames.com/doc/api/ISteamRemoteStorage#ERemoteStoragePublishedFileVisibility) [QueryFiles 参数](https://partner.steamgames.com/doc/webapi/IPublishedFileService#QueryFiles)
+
+从缺少目录收录字段的旧库升级时，已确认公开的管理员覆写继续展示，来源不明的条目保留为按 ID 查询的缓存。迁移重置增量水位线、回填游标和回填计数，已启用的同步任务会重新建立目录收录状态。
 
 ## 3. SteamKit CM 双模式会话 (`crates/l4a-server/src/upstream.rs`)
 

@@ -1,5 +1,8 @@
 use crate::config::CatalogConfigStore;
-use crate::db::{ServerRepo, StoredItemMeta};
+use crate::db::{
+    CatalogIndexPolicy, ServerRepo, StoredItemMeta, STATE_BACKFILL_CURSOR,
+    STATE_BACKFILL_SYNCED_TOTAL, STATE_INCREMENTAL_SCAN, STATE_REMOTE_WORKSHOP_TOTAL,
+};
 use crate::upstream::{
     WorkshopObservation, WorkshopUpstream, DETAILS_BATCH_SIZE, MATCHING_FILE_TYPE_COLLECTIONS,
     MATCHING_FILE_TYPE_ITEMS, QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
@@ -19,11 +22,6 @@ use tokio::sync::{broadcast, Mutex, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-// The old checkpoint also included timestamps from outside the incremental feed.
-const STATE_INCREMENTAL_SCAN: &str = "incremental_scan";
-const STATE_BACKFILL_CURSOR: &str = "backfill_cursor";
-const STATE_BACKFILL_SYNCED_TOTAL: &str = "backfill_synced_total";
-const STATE_REMOTE_WORKSHOP_TOTAL: &str = "remote_workshop_total";
 // The desktop HTTP client gives the Catalog 15 seconds, including transfer.
 const PUBLIC_REFRESH_BUDGET: Duration = Duration::from_secs(10);
 const LISTING_RECHECK_INTERVAL: Duration = Duration::from_secs(15);
@@ -272,10 +270,28 @@ impl CatalogSyncCoordinator {
         Ok(Some(col))
     }
 
-    /// 管理员手动强制拉取指定 ID（若包含合集则一并拉取合集内全部子条目）。
+    /// 管理员手动强制拉取指定 ID（若包含合集则一并拉取合集内全部子条目），并将公开条目纳入目录索引。
     pub async fn admin_force_fetch(
         &self,
         ids: &[WorkshopId],
+    ) -> anyhow::Result<AdminFetchUpstreamResponse> {
+        self.admin_force_fetch_with_policy(ids, CatalogIndexPolicy::IndexInCatalog)
+            .await
+    }
+
+    /// 管理员强制重刷已缓存条目，保留原有目录收录状态（避免将仅按 ID 穿透缓存的条目暴露到公开首页）。
+    pub async fn admin_refresh_cached(
+        &self,
+        ids: &[WorkshopId],
+    ) -> anyhow::Result<AdminFetchUpstreamResponse> {
+        self.admin_force_fetch_with_policy(ids, CatalogIndexPolicy::CacheOnly)
+            .await
+    }
+
+    async fn admin_force_fetch_with_policy(
+        &self,
+        ids: &[WorkshopId],
+        index_policy: CatalogIndexPolicy,
     ) -> anyhow::Result<AdminFetchUpstreamResponse> {
         let mut seen = HashSet::new();
         let deduped: Vec<WorkshopId> = ids.iter().copied().filter(|id| seen.insert(*id)).collect();
@@ -312,10 +328,10 @@ impl CatalogSyncCoordinator {
             }
         }
 
-        self.apply_outcomes(outcomes).await?;
+        self.apply_outcomes(outcomes, index_policy).await?;
         if !child_ids.is_empty() {
             if let Ok(child_outcomes) = self.upstream.fetch_details(&child_ids).await {
-                let _ = self.apply_outcomes(child_outcomes).await;
+                let _ = self.apply_outcomes(child_outcomes, index_policy).await;
             }
         }
 
@@ -361,7 +377,9 @@ impl CatalogSyncCoordinator {
                     let outcomes = coordinator.upstream.fetch_details(&ids).await?;
                     let verified: HashSet<_> =
                         outcomes.iter().map(|o| o.outcome.workshop_id()).collect();
-                    coordinator.apply_outcomes(outcomes).await?;
+                    coordinator
+                        .apply_outcomes(outcomes, CatalogIndexPolicy::CacheOnly)
+                        .await?;
                     Ok::<_, anyhow::Error>(verified)
                 }
                 .await
@@ -393,11 +411,15 @@ impl CatalogSyncCoordinator {
         .await?
     }
 
-    async fn apply_outcomes(&self, outcomes: Vec<WorkshopObservation>) -> anyhow::Result<u64> {
+    async fn apply_outcomes(
+        &self,
+        outcomes: Vec<WorkshopObservation>,
+        index_policy: CatalogIndexPolicy,
+    ) -> anyhow::Result<u64> {
         let summary = self
-            .db_call(move |repo| repo.apply_upstream_outcomes(&outcomes))
+            .db_call(move |repo| repo.apply_upstream_outcomes_with_policy(&outcomes, index_policy))
             .await?;
-        Ok(summary.active_upserted)
+        Ok(summary.active_written())
     }
 
     async fn recheck_listings(
@@ -419,6 +441,9 @@ impl CatalogSyncCoordinator {
         } else {
             None
         };
+        if ids.is_empty() {
+            return Ok(());
+        }
         self.singleflight_refresh(&ids, Instant::now() + PUBLIC_REFRESH_BUDGET)
             .await
     }
@@ -492,7 +517,9 @@ impl CatalogSyncCoordinator {
                 .zip(scan.checkpoint)
                 .is_some_and(|(newest, checkpoint)| newest < checkpoint);
 
-            total_upserted += self.apply_outcomes(page.outcomes).await?;
+            total_upserted += self
+                .apply_outcomes(page.outcomes, CatalogIndexPolicy::IndexInCatalog)
+                .await?;
 
             let next = page.next_cursor.filter(|_| !past_boundary);
             let stalled = next.as_ref() == Some(&pending.cursor);
@@ -540,7 +567,9 @@ impl CatalogSyncCoordinator {
             )
             .await
         {
-            total_upserted += self.apply_outcomes(col_page.outcomes).await?;
+            total_upserted += self
+                .apply_outcomes(col_page.outcomes, CatalogIndexPolicy::IndexInCatalog)
+                .await?;
         }
 
         Ok(total_upserted)
@@ -579,18 +608,10 @@ impl CatalogSyncCoordinator {
             .sync
             .backfill_batch_size
             .clamp(1, 100);
-        let (cursor, prev_total) = self
-            .db_call(|r| {
-                let cur = r
-                    .get_sync_state(STATE_BACKFILL_CURSOR)?
-                    .unwrap_or_else(|| "*".to_string());
-                let synced = r
-                    .get_sync_state(STATE_BACKFILL_SYNCED_TOTAL)?
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(0);
-                Ok((cur, synced))
-            })
-            .await?;
+        let cursor = self
+            .db_call(|r| r.get_sync_state(STATE_BACKFILL_CURSOR))
+            .await?
+            .unwrap_or_else(|| "*".to_string());
 
         if cursor == "DONE" {
             return Ok(0);
@@ -606,29 +627,12 @@ impl CatalogSyncCoordinator {
             )
             .await?;
 
-        if page.total > 0 {
-            let total_str = page.total.to_string();
-            let _ = self
-                .db_call(move |r| r.set_sync_state(STATE_REMOTE_WORKSHOP_TOTAL, &total_str))
-                .await;
-        }
-
-        let count = self.apply_outcomes(page.outcomes).await?;
         let next_cursor = page
             .next_cursor
             .filter(|c| c != &cursor)
             .unwrap_or_else(|| "DONE".to_string());
-        let next_total = prev_total + count;
-
-        self.db_call(move |r| {
-            r.set_sync_states(&[
-                (STATE_BACKFILL_CURSOR, &next_cursor),
-                (STATE_BACKFILL_SYNCED_TOTAL, &next_total.to_string()),
-            ])
-        })
-        .await?;
-
-        Ok(count)
+        self.db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
+            .await
     }
 
     pub async fn reset_backfill_cursor(&self) -> anyhow::Result<()> {
@@ -678,15 +682,13 @@ impl CatalogSyncCoordinator {
     pub fn spawn_background_workers(self: &Arc<Self>) -> CancellationToken {
         let token = CancellationToken::new();
         let coordinator = self.clone();
-        let child_token = token.clone();
+        let feed_token = token.clone();
 
         tokio::spawn(async move {
             let mut last_inc = tokio::time::Instant::now()
                 .checked_sub(Duration::from_secs(3600))
                 .unwrap_or_else(tokio::time::Instant::now);
             let mut last_bf = last_inc;
-            let mut last_recheck = last_inc;
-            let mut recheck_cursor = None;
 
             loop {
                 let sync_cfg = coordinator.config_store.get().sync;
@@ -712,22 +714,30 @@ impl CatalogSyncCoordinator {
                     last_bf = tokio::time::Instant::now();
                 }
 
-                if sync_cfg.enable_incremental_sync
-                    && now.duration_since(last_recheck) >= LISTING_RECHECK_INTERVAL
-                {
-                    if let Err(err) = coordinator
-                        .recheck_listings(&mut recheck_cursor, sync_cfg.item_ttl_secs)
-                        .await
-                    {
-                        tracing::warn!(error = %err, "后台公开条目核验未完成");
-                    }
-                    last_recheck = tokio::time::Instant::now();
-                }
-
                 tokio::select! {
-                    _ = child_token.cancelled() => break,
+                    _ = feed_token.cancelled() => break,
                     _ = coordinator.wake_notify.notified() => {},
                     _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                }
+            }
+        });
+
+        let coordinator = self.clone();
+        let listing_token = token.clone();
+        tokio::spawn(async move {
+            let mut cursor = None;
+            let mut interval = tokio::time::interval(LISTING_RECHECK_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    _ = listing_token.cancelled() => break,
+                    _ = interval.tick() => {},
+                }
+
+                let ttl_secs = coordinator.config_store.get().sync.item_ttl_secs;
+                if let Err(err) = coordinator.recheck_listings(&mut cursor, ttl_secs).await {
+                    tracing::warn!(error = %err, "后台公开条目核验未完成");
                 }
             }
         });

@@ -23,10 +23,10 @@ guard_data_path = "./steam-guard.json"
 request_concurrency = 4
 
 [sync]
-# 客户端请求未命中或过期时按 ID 核验。过期活跃条目会暂时退出公开搜索。
+# 客户端请求未命中或过期时按 ID 穿透核验；按 ID 穿透缓存不会污染公开工坊首页。
 enable_read_through = true
 item_ttl_secs = 900
-# 定时拉取工坊增量更新，并按 ID 分批核验接近过期的公开缓存
+# 定时拉取工坊增量更新。目录条目的后台可见性复查独立运行。
 enable_incremental_sync = true
 incremental_interval_secs = 180
 incremental_pages_per_tick = 2

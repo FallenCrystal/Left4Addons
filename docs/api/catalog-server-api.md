@@ -27,7 +27,7 @@
 ### `GET /api/v1/items/search?q=&tag=&status=&sort=&page=1&pageSize=30`
 在本地 SQLite FTS5 缓存索引中按标题（支持中英文分词、驼峰/忽略空格复合匹配与中文标题拼音检索）、作者名、Workshop ID/链接、标签（大小写不敏感匹配）与状态 (`active` / `removed` / `private_or_unavailable`) 分页检索；仅当主字段无命中时自动回退至去除 BBCode 与链接后的简介检索，避免简介版权声明/致谢名单干扰结果。`sort` 支持 `relevance`、`updated`、`updated_asc`、`newest`、`subscriptions`、`title`。
 
-搜索会排除未列出、尚未核验可见性和已过期的活跃条目。未列出的 Steam 条目仍可按 ID 查询。此前已确认公开的墓碑和管理员锁定的公开覆写可以继续显示。
+公开搜索仅展示经目录同步（增量同步、全量回填）或管理员主动预热/覆写收录且已确认公开的条目，排除未列出、尚未核验可见性以及仅由客户端按 ID Read-Through 穿透缓存的条目；已收录条目不会因超过 `sync.item_ttl_secs` 而退出公开搜索，下载或按 ID 查询时仍会按 TTL 自动向 Steam CM 刷新最新直链。未列出的 Steam 条目与 Read-Through 缓存条目仍可按 ID 查询，此前已确认公开的墓碑和管理员锁定的公开覆写可以继续显示。
 
 ### `GET /api/v1/collections/{collection_id}?refresh=false`
 查询合集元数据及其子条目明细（若目标或子条目缺失会自动穿透拉取并补全 `items`；若目标 ID 非合集类型返回 `404`）。

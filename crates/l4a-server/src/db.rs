@@ -18,6 +18,10 @@ use std::sync::{Mutex, MutexGuard, RwLock};
 
 const READER_POOL_SIZE: usize = 4;
 const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
+pub(crate) const STATE_INCREMENTAL_SCAN: &str = "incremental_scan";
+pub(crate) const STATE_BACKFILL_CURSOR: &str = "backfill_cursor";
+pub(crate) const STATE_BACKFILL_SYNCED_TOTAL: &str = "backfill_synced_total";
+pub(crate) const STATE_REMOTE_WORKSHOP_TOTAL: &str = "remote_workshop_total";
 const STATE_SEARCH_INDEX_VERSION: &str = "search_index_version";
 const INSERT_SEARCH_DOCUMENT: &str = "
     INSERT INTO workshop_items_fts (
@@ -44,14 +48,31 @@ pub struct StoredItemMeta {
     pub last_verified_at: DateTime<Utc>,
     pub removed_at: Option<DateTime<Utc>>,
     steam_version: Option<i64>,
+    catalog_indexed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogIndexPolicy {
+    /// 仅写入或刷新按 ID 穿透缓存，不将未收录条目暴露到公开工坊首页与搜索。
+    CacheOnly,
+    /// 将公开条目纳入目录索引，供公开工坊首页与检索展示。
+    IndexInCatalog,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct UpstreamApplySummary {
     pub active_upserted: u64,
+    /// Catalog promotions that preserved a newer cached snapshot.
+    pub catalog_promoted: u64,
     pub tombstoned: u64,
     pub skipped_overrides: u64,
     pub skipped_stale: u64,
+}
+
+impl UpstreamApplySummary {
+    pub(crate) fn active_written(&self) -> u64 {
+        self.active_upserted + self.catalog_promoted
+    }
 }
 
 impl ServerRepo {
@@ -165,7 +186,8 @@ impl ServerRepo {
                 removed_at TEXT,
                 last_verified_at TEXT NOT NULL,
                 is_listed INTEGER,
-                steam_version INTEGER
+                steam_version INTEGER,
+                catalog_indexed INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_workshop_items_status_updated ON workshop_items(status, time_updated DESC);
             CREATE INDEX IF NOT EXISTS idx_workshop_items_file_type ON workshop_items(file_type);
@@ -252,6 +274,30 @@ impl ServerRepo {
                 [],
             )?;
         }
+        if !has_column(conn, "workshop_items", "catalog_indexed")? {
+            conn.execute(
+                "ALTER TABLE workshop_items ADD COLUMN catalog_indexed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            // The legacy cache recorded no per-item catalog provenance beyond admin overrides.
+            conn.execute(
+                "UPDATE workshop_items SET catalog_indexed = 1 WHERE is_admin_override = 1",
+                [],
+            )?;
+            conn.execute(
+                "DELETE FROM sync_state WHERE key IN (?1, ?2, ?3)",
+                params![
+                    STATE_INCREMENTAL_SCAN,
+                    STATE_BACKFILL_CURSOR,
+                    STATE_BACKFILL_SYNCED_TOTAL,
+                ],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public
+             ON workshop_items(catalog_indexed, is_listed)",
+            [],
+        )?;
         if has_column(conn, "workshop_item_revisions", "trust_score")? {
             conn.execute(
                 "ALTER TABLE workshop_item_revisions DROP COLUMN trust_score",
@@ -377,7 +423,8 @@ impl ServerRepo {
                     creator_name, preview_url, previews_json, file_url, file_size,
                     time_created, time_updated, tags_json, collection_children_json,
                     subscriptions, favorites, is_admin_override, source,
-                    fetched_at, removed_at, last_verified_at, steam_version
+                    fetched_at, removed_at, last_verified_at, steam_version,
+                    catalog_indexed
              FROM workshop_items WHERE workshop_id = ?1",
         )?;
 
@@ -393,6 +440,7 @@ impl ServerRepo {
                 let fetched_str: String = r.get(18)?;
                 let removed_str: Option<String> = r.get(19)?;
                 let verified_str: String = r.get(20)?;
+                let catalog_indexed: i64 = r.get(22)?;
 
                 let record = WorkshopItemRecord {
                     workshop_id,
@@ -423,6 +471,7 @@ impl ServerRepo {
                     last_verified_at: verified_str.parse().unwrap_or(DateTime::UNIX_EPOCH),
                     removed_at: removed_str.as_deref().map(parse_rfc3339_or_now),
                     steam_version: r.get(21)?,
+                    catalog_indexed: catalog_indexed != 0,
                 })
             })
             .optional()?;
@@ -512,6 +561,7 @@ impl ServerRepo {
                 replace_deps,
                 true,
                 (!is_admin_override).then_some(true),
+                Some(true),
             )
         })
     }
@@ -523,6 +573,7 @@ impl ServerRepo {
         replace_deps: bool,
         record_revision: bool,
         listed: Option<bool>,
+        catalog_indexed: Option<bool>,
     ) -> anyhow::Result<()> {
         let wid = record.workshop_id.as_u64() as i64;
         let now = Utc::now().to_rfc3339();
@@ -552,10 +603,12 @@ impl ServerRepo {
                 creator_name, preview_url, previews_json, file_url, file_size,
                 time_created, time_updated, tags_json, collection_children_json,
                 subscriptions, favorites, is_admin_override, source,
-                fetched_at, removed_at, last_verified_at, is_listed, steam_version
+                fetched_at, removed_at, last_verified_at, is_listed, steam_version,
+                catalog_indexed
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?20, COALESCE(?22, ?18), ?23
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?20,
+                COALESCE(?22, ?18), ?23, COALESCE(?24, ?18)
             )
             ON CONFLICT(workshop_id) DO UPDATE SET
                 file_type = excluded.file_type,
@@ -580,7 +633,11 @@ impl ServerRepo {
                 removed_at = CASE WHEN excluded.status = 'active' THEN NULL ELSE COALESCE(workshop_items.removed_at, excluded.removed_at) END,
                 last_verified_at = excluded.last_verified_at,
                 is_listed = COALESCE(?22, workshop_items.is_listed),
-                steam_version = COALESCE(excluded.steam_version, workshop_items.steam_version)
+                steam_version = COALESCE(excluded.steam_version, workshop_items.steam_version),
+                catalog_indexed = CASE
+                    WHEN ?24 = 1 THEN 1
+                    ELSE workshop_items.catalog_indexed
+                END
             RETURNING title, creator_name, description
             "#,
         )?;
@@ -609,6 +666,7 @@ impl ServerRepo {
                 removed_at,
                 listed,
                 listed.and(record.time_updated),
+                catalog_indexed,
             ],
             |r| {
                 if searchable_fields_unchanged {
@@ -716,17 +774,73 @@ impl ServerRepo {
         Ok(())
     }
 
-    /// 将 SteamKit CM 上游拉取结果原子写入缓存库：
-    /// - 跳过 `is_admin_override = 1` 的管理员锁定条目；
-    /// - 对更新后的组件刷新 `file_url`、依赖与元数据，并在关键字段变化时追加历史修订；
-    /// - 对上游变为 `Removed` 或 `PrivateOrUnavailable` 的组件执行墓碑归档（清空失效 `file_url`，私密条目清理公开缓存中的详细信息，已下架条目保留历史元数据）。
+    /// 将 SteamKit CM 上游拉取结果原子写入缓存库（默认纳入公开目录索引）。
     pub fn apply_upstream_outcomes(
         &self,
         observations: &[WorkshopObservation],
     ) -> anyhow::Result<UpstreamApplySummary> {
+        self.apply_upstream_outcomes_with_policy(observations, CatalogIndexPolicy::IndexInCatalog)
+    }
+
+    /// 将 SteamKit CM 上游拉取结果原子写入缓存库：
+    /// - 跳过 `is_admin_override = 1` 的管理员锁定条目；
+    /// - 按 `index_policy` 区分公开目录同步 (`IndexInCatalog`) 与客户端按 ID 穿透缓存 (`CacheOnly`)；
+    /// - 对更新后的组件刷新 `file_url`、依赖与元数据，并在关键字段变化时追加历史修订；
+    /// - 对上游变为 `Removed` 或 `PrivateOrUnavailable` 的组件执行墓碑归档（清空失效 `file_url`，私密条目清理公开缓存中的详细信息，已下架条目保留历史元数据）。
+    pub fn apply_upstream_outcomes_with_policy(
+        &self,
+        observations: &[WorkshopObservation],
+        index_policy: CatalogIndexPolicy,
+    ) -> anyhow::Result<UpstreamApplySummary> {
         if observations.is_empty() {
             return Ok(UpstreamApplySummary::default());
         }
+        self.apply_upstream_batch(observations, index_policy, |_, summary| Ok(summary))
+    }
+
+    pub(crate) fn apply_backfill_page(
+        &self,
+        observations: &[WorkshopObservation],
+        next_cursor: &str,
+        remote_total: u64,
+    ) -> anyhow::Result<u64> {
+        // Checkpoint the page with its writes so a retry can still count membership-only updates.
+        self.apply_upstream_batch(
+            observations,
+            CatalogIndexPolicy::IndexInCatalog,
+            |tx, summary| {
+                let count = summary.active_written();
+                let prev_total = Self::get_sync_state_with_conn(tx, STATE_BACKFILL_SYNCED_TOTAL)?
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                Self::set_sync_states_tx(
+                    tx,
+                    &[
+                        (STATE_BACKFILL_CURSOR, next_cursor),
+                        (
+                            STATE_BACKFILL_SYNCED_TOTAL,
+                            &prev_total.saturating_add(count).to_string(),
+                        ),
+                    ],
+                )?;
+                if remote_total > 0 {
+                    Self::set_sync_states_tx(
+                        tx,
+                        &[(STATE_REMOTE_WORKSHOP_TOTAL, &remote_total.to_string())],
+                    )?;
+                }
+                Ok(count)
+            },
+        )
+    }
+
+    fn apply_upstream_batch<T>(
+        &self,
+        observations: &[WorkshopObservation],
+        index_policy: CatalogIndexPolicy,
+        finish: impl FnOnce(&Transaction<'_>, UpstreamApplySummary) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let promote_catalog = index_policy == CatalogIndexPolicy::IndexInCatalog;
         // Negative observations for unknown IDs must take part in the same write ordering.
         let mut writer = self.lock_writer()?;
         let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -743,6 +857,19 @@ impl ServerRepo {
                     summary.skipped_overrides += 1;
                     continue;
                 }
+                let incoming_version = match &observation.outcome {
+                    WorkshopFetchOutcome::Found { item }
+                        if item.status != WorkshopItemStatus::PrivateOrUnavailable =>
+                    {
+                        item.time_updated
+                    }
+                    _ => None,
+                };
+                let stale_version = existing
+                    .as_ref()
+                    .and_then(|prev| prev.steam_version)
+                    .zip(incoming_version)
+                    .is_some_and(|(cached, incoming)| incoming < cached);
                 let latest_negative = pending_negatives
                     .get(&wid)
                     .copied()
@@ -751,8 +878,30 @@ impl ServerRepo {
                     .as_ref()
                     .is_some_and(|prev| observed_at <= prev.last_verified_at)
                     || latest_negative.is_some_and(|prev| observed_at <= prev.observed_at)
+                    || stale_version
                 {
-                    summary.skipped_stale += 1;
+                    let can_promote_existing = promote_catalog
+                        && observation.listed
+                        && matches!(
+                            &observation.outcome,
+                            WorkshopFetchOutcome::Found { item }
+                                if item.status == WorkshopItemStatus::Active
+                        )
+                        && existing.as_ref().is_some_and(|prev| {
+                            !prev.catalog_indexed
+                                && prev.record.status == WorkshopItemStatus::Active
+                        });
+                    let promoted = can_promote_existing
+                        && tx.execute(
+                            "UPDATE workshop_items SET catalog_indexed = 1
+                             WHERE workshop_id = ?1 AND catalog_indexed = 0 AND is_listed = 1",
+                            params![wid.as_u64() as i64],
+                        )? > 0;
+                    if promoted {
+                        summary.catalog_promoted += 1;
+                    } else {
+                        summary.skipped_stale += 1;
+                    }
                     continue;
                 }
 
@@ -760,15 +909,6 @@ impl ServerRepo {
                     WorkshopFetchOutcome::Found { item }
                         if item.status != WorkshopItemStatus::PrivateOrUnavailable =>
                     {
-                        if existing
-                            .as_ref()
-                            .and_then(|prev| prev.steam_version)
-                            .zip(item.time_updated)
-                            .is_some_and(|(cached, incoming)| incoming < cached)
-                        {
-                            summary.skipped_stale += 1;
-                            continue;
-                        }
                         let changed = existing.as_ref().is_none_or(|prev| {
                             prev.record.status != item.status
                                 || prev.record.title != item.title
@@ -784,6 +924,7 @@ impl ServerRepo {
                             true,
                             changed,
                             Some(observation.listed),
+                            (promote_catalog && observation.listed).then_some(true),
                         )?;
                         pending_negatives.insert(wid, None);
                         summary.active_upserted += 1;
@@ -825,6 +966,7 @@ impl ServerRepo {
             }
             summary
         };
+        let result = finish(&tx, summary)?;
         tx.commit()?;
 
         let mut negatives = self.negative_cache.write().unwrap();
@@ -838,7 +980,7 @@ impl ServerRepo {
                 negatives.remove(&wid);
             }
         }
-        Ok(summary)
+        Ok(result)
     }
 
     pub(crate) fn negative_status(
@@ -862,6 +1004,7 @@ impl ServerRepo {
         let mut stmt = conn.prepare(
             "SELECT workshop_id FROM workshop_items
              WHERE workshop_id > ?1 AND status = 'active' AND is_admin_override = 0
+               AND catalog_indexed = 1
                AND (is_listed IS NULL OR (is_listed = 1 AND unixepoch(last_verified_at) <= ?2))
              ORDER BY workshop_id LIMIT ?3",
         )?;
@@ -1042,7 +1185,7 @@ impl ServerRepo {
                 }
             };
 
-            Self::upsert_item_tx(tx, &next_record, true, replace_deps, true, None)?;
+            Self::upsert_item_tx(tx, &next_record, true, replace_deps, true, None, Some(true))?;
             let reason = req
                 .reason
                 .filter(|s| !s.trim().is_empty())
@@ -1081,11 +1224,7 @@ impl ServerRepo {
         })
     }
 
-    pub fn search(
-        &self,
-        query: &SearchQuery,
-        verified_since: Option<i64>,
-    ) -> anyhow::Result<SearchResponse> {
+    pub fn search(&self, query: &SearchQuery, public_only: bool) -> anyhow::Result<SearchResponse> {
         let page = query.page.max(1);
         let page_size = query.page_size.clamp(1, 100);
         let offset = u64::from(page - 1) * u64::from(page_size);
@@ -1097,7 +1236,7 @@ impl ServerRepo {
                 .filter(|s| !s.is_empty())
                 .map(str::to_ascii_lowercase),
             status: query.status.map(|status| serialize_json_enum(&status)),
-            verified_since,
+            public_only,
         };
         let sort = SearchSort::from_name(query.sort.as_deref());
         let parsed = query.query.as_deref().and_then(search::parse_query);
@@ -1149,7 +1288,7 @@ impl ServerRepo {
     ) -> anyhow::Result<(u64, Vec<WorkshopId>)> {
         let total: u64 = conn.query_row(
             &format!("SELECT COUNT(*) FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"),
-            params![filters.tag, filters.status, filters.verified_since],
+            params![filters.tag, filters.status, filters.public_only],
             |r| r.get(0),
         )?;
 
@@ -1163,7 +1302,7 @@ impl ServerRepo {
             params![
                 filters.tag,
                 filters.status,
-                filters.verified_since,
+                filters.public_only,
                 page_size,
                 offset
             ],
@@ -1188,7 +1327,7 @@ impl ServerRepo {
             .exists(params![
                 filters.tag,
                 filters.status,
-                filters.verified_since,
+                filters.public_only,
                 id
             ])?;
         let ids = if matched && offset == 0 {
@@ -1230,7 +1369,7 @@ impl ServerRepo {
                 stmt.query(params![
                     filters.tag,
                     filters.status,
-                    filters.verified_since,
+                    filters.public_only,
                     fts_query,
                     exact,
                     format!("{prefix}%")
@@ -1239,7 +1378,7 @@ impl ServerRepo {
                 stmt.query(params![
                     filters.tag,
                     filters.status,
-                    filters.verified_since,
+                    filters.public_only,
                     fts_query
                 ])?
             };
@@ -1264,7 +1403,7 @@ impl ServerRepo {
                 let rows = stmt.query(params![
                     filters.tag,
                     filters.status,
-                    filters.verified_since,
+                    filters.public_only,
                     desc_query
                 ])?;
                 page.collect(rows, |row, _| {
@@ -1286,7 +1425,7 @@ impl ServerRepo {
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"
         ))?;
-        let rows = stmt.query(params![filters.tag, filters.status, filters.verified_since])?;
+        let rows = stmt.query(params![filters.tag, filters.status, filters.public_only])?;
         page.collect(rows, |row, _| {
             let title = search::fold_text(row.get_ref(1)?.as_str()?);
             let rank = if title == parsed.raw_folded {
@@ -1315,7 +1454,7 @@ impl ServerRepo {
                 "SELECT {SEARCH_ORDER_COLUMNS}, w.description FROM workshop_items w
                  WHERE {SEARCH_ITEM_FILTERS} AND w.description IS NOT NULL"
             ))?;
-            let rows = stmt.query(params![filters.tag, filters.status, filters.verified_since])?;
+            let rows = stmt.query(params![filters.tag, filters.status, filters.public_only])?;
             page.collect(rows, |row, _| {
                 let description = row.get_ref(5)?.as_str()?;
                 let cleaned = search::strip_bbcode_and_urls(description);
@@ -1502,6 +1641,10 @@ impl ServerRepo {
 
     pub fn get_sync_state(&self, key: &str) -> anyhow::Result<Option<String>> {
         let conn = self.lock_reader()?;
+        Self::get_sync_state_with_conn(&conn, key)
+    }
+
+    fn get_sync_state_with_conn(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
         Ok(conn
             .query_row(
                 "SELECT value FROM sync_state WHERE key = ?1",
@@ -1516,15 +1659,17 @@ impl ServerRepo {
     }
 
     pub(crate) fn set_sync_states(&self, entries: &[(&str, &str)]) -> anyhow::Result<()> {
-        self.with_transaction(|tx| {
-            let mut stmt = tx.prepare(
-                "INSERT INTO sync_state (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            )?;
-            for (key, value) in entries {
-                stmt.execute(params![key, value])?;
-            }
-            Ok(())
-        })
+        self.with_transaction(|tx| Self::set_sync_states_tx(tx, entries))
+    }
+
+    fn set_sync_states_tx(tx: &Transaction<'_>, entries: &[(&str, &str)]) -> anyhow::Result<()> {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )?;
+        for (key, value) in entries {
+            stmt.execute(params![key, value])?;
+        }
+        Ok(())
     }
 
     pub fn stats(&self) -> anyhow::Result<CatalogStats> {
@@ -1570,10 +1715,7 @@ fn open_configured_conn(path: &Path) -> anyhow::Result<Connection> {
 const SEARCH_ITEM_FILTERS: &str = "
     (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(w.tags_json) WHERE LOWER(value) = ?1))
     AND (?2 IS NULL OR w.status = ?2)
-    AND (?3 IS NULL OR (w.is_listed = 1 AND (
-        w.is_admin_override = 1 OR w.status IN ('removed', 'private_or_unavailable')
-        OR unixepoch(w.last_verified_at) > ?3
-    )))";
+    AND (?3 = 0 OR (w.catalog_indexed = 1 AND w.is_listed = 1))";
 
 const SEARCH_ORDER_COLUMNS: &str = "
     w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
@@ -1584,7 +1726,7 @@ const SEARCH_FTS_SOURCE: &str = "
 struct SearchFilters {
     tag: Option<String>,
     status: Option<String>,
-    verified_since: Option<i64>,
+    public_only: bool,
 }
 
 #[derive(Clone, Copy)]
