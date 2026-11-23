@@ -2194,3 +2194,211 @@ async fn hydrates_missing_workshop_metadata_prefers_workshop_cover_and_caches_re
     // Must re-fetch because non-image HTML payload was not written to ws_cover_* disk cache.
     assert_eq!(poison_hits.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+
+    // 1. VPK scanned BEFORE Steam writes workshop/<wid>.jpg picks up the sidecar on an unchanged rescan.
+    create_test_vpk(
+        &loading.join("[920001] outpost.vpk"),
+        "Outpost",
+        "Mapper",
+        false,
+        None,
+        b"outpost-vpk",
+    );
+    create_test_vpk(
+        &loading.join("[920002] transient.vpk"),
+        "Transient",
+        "Mapper",
+        false,
+        None,
+        b"transient-vpk",
+    );
+
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        workshop_dir: workshop.to_string_lossy().into_owned(),
+        https_only: false,
+        ..Default::default()
+    };
+    let engine = make_engine(dir.path(), cfg, bridge.clone());
+
+    let snap1 = engine.scan().unwrap();
+    let a1 = snap1
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1.local_cover_image, None);
+
+    let minimal_jpeg = vec![
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ];
+    std::fs::write(workshop.join("920001.jpg"), &minimal_jpeg).unwrap();
+
+    // Rescan without modifying outpost.vpk: must discover 920001.jpg sidecar!
+    let snap2 = engine.scan().unwrap();
+    let a1_after_sidecar = snap2
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    let sidecar_key = a1_after_sidecar
+        .local_cover_image
+        .clone()
+        .expect("sidecar discovered on unchanged scan");
+    assert!(sidecar_key.ends_with("_sidecar.jpg"));
+
+    // 2. Transient missing provider outcome backs off briefly, then retries once backoff expires.
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    let mut item_920002 = item_record(920002, "Transient Hydrated", 1_720_000_000, vec![]);
+    item_920002.tags = vec![];
+    bridge.insert_item(item_920002);
+    // Still inside backoff window -> skipped
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    // Backoff expires -> retried and hydrated!
+    engine.expire_hydration_backoff_for_test();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 1);
+
+    // 3. Non-ASCII invalid relative cover URL (where byte 7/8 fall inside multi-byte UTF-8 chars) never panics
+    // and falls back to local_cover_image; also Workshop Sync snapshot is not overwritten by hydration.
+    let mut item_920001 = item_record(920001, "Outpost Synced", 1_720_000_500, vec![]);
+    item_920001.preview_url = Some("封面图片路径/preview.jpg".into());
+    item_920001.tags = vec!["Weapons".into()];
+    engine
+        .db()
+        .upsert_workshop_snapshot(&item_920001, true)
+        .unwrap();
+
+    // Even if bridge has an older title for 920001, hydration rechecks snapshot presence and keeps "Outpost Synced".
+    let stale_bridge_920001 = item_record(920001, "Stale Hydration Title", 1_700_000_000, vec![]);
+    bridge.insert_item(stale_bridge_920001);
+    engine.expire_hydration_backoff_for_test();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+
+    let snap3 = engine.snapshot().unwrap();
+    let a1_utf8 = snap3
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1_utf8.workshop_title.as_deref(), Some("Outpost Synced"));
+    assert_eq!(a1_utf8.cover_image.as_deref(), Some(sidecar_key.as_str()));
+    assert_eq!(a1_utf8.categories, vec!["Weapon".to_string()]);
+
+    // 4. Unchanged scan + toggle must NOT persist Workshop-derived "Weapon" into local categories_json.
+    let _ = engine.scan().unwrap();
+    engine
+        .toggle_addons(std::slice::from_ref(&a1_utf8.id), false, false)
+        .unwrap();
+    item_920001.tags = vec!["Survivors".into()];
+    engine
+        .db()
+        .upsert_workshop_snapshot(&item_920001, true)
+        .unwrap();
+    let snap4 = engine.snapshot().unwrap();
+    let a1_retagged = snap4
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1_retagged.categories, vec!["Survivor".to_string()]);
+
+    // 5. Expired cached Workshop covers revalidate with origin, and fall back to stale bytes when upstream is 503.
+    let minimal_png: Vec<u8> = vec![
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00,
+    ];
+    let version_two = Arc::new(AtomicBool::new(false));
+    let fail_upstream = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let v2_route = version_two.clone();
+    let fail_route = fail_upstream.clone();
+    let hits_route = hits.clone();
+    let jpg_body = minimal_jpeg.clone();
+    let png_body = minimal_png.clone();
+    let app = Router::new().route(
+        "/rotating.img",
+        get(move || {
+            let v2 = v2_route.load(Ordering::SeqCst);
+            let fail = fail_route.load(Ordering::SeqCst);
+            let hits_route = hits_route.clone();
+            let jpg = jpg_body.clone();
+            let png = png_body.clone();
+            async move {
+                hits_route.fetch_add(1, Ordering::SeqCst);
+                if fail {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("content-type", "text/plain")],
+                        b"upstream down".to_vec(),
+                    );
+                }
+                if v2 {
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "image/png")],
+                        png,
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "image/jpeg")],
+                        jpg,
+                    )
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let rotating_url = format!("http://{addr}/rotating.img");
+    let (mime1, bytes1) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime1, "image/jpeg");
+    assert_eq!(bytes1, minimal_jpeg);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let expire_cache = |cache_dir: &std::path::Path| {
+        let expired_time = SystemTime::now() - Duration::from_secs(90_000);
+        for entry in std::fs::read_dir(cache_dir).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("ws_cover_") {
+                let f = std::fs::File::options()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap();
+                f.set_modified(expired_time).unwrap();
+            }
+        }
+    };
+
+    // Expire cache + switch origin to v2 PNG -> revalidates and updates cached format!
+    let cache_dir = AppPaths::from_runtime_dir(dir.path().join("runtime")).image_cache_dir;
+    expire_cache(&cache_dir);
+    version_two.store(true, Ordering::SeqCst);
+    let (mime2, bytes2) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime2, "image/png");
+    assert_eq!(bytes2, minimal_png);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // Expire cache again + origin returns 503 -> falls back to stale cached PNG!
+    expire_cache(&cache_dir);
+    fail_upstream.store(true, Ordering::SeqCst);
+    let (mime3, bytes3) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime3, "image/png");
+    assert_eq!(bytes3, minimal_png);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
+}

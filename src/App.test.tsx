@@ -308,7 +308,7 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(screen.queryByAltText(snapshot.addons[2].title)).toBeNull();
   });
 
-  it('excludes hidden filtered-out addons from batch actions', async () => {
+  it('excludes hidden filtered-out addons and non-matching bundle siblings from batch actions', async () => {
     render(<App />);
     await screen.findByText('Yama Campaign Remastered');
 
@@ -319,7 +319,20 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Chernobyl: Chapter One' }));
     expect(screen.getByText('3 selected')).toBeTruthy();
 
+    // Searching for one bundle member's exact Workshop ID keeps the bundle card visible,
+    // but excludes the non-matching sibling (Chernobyl Assets Pack) from batch actions!
     const searchInput = screen.getByPlaceholderText('Title, author, ID, filename');
+    fireEvent.change(searchInput, { target: { value: '2814104912' } });
+    expect(screen.getByRole('button', { name: 'Chernobyl: Chapter One' })).toBeTruthy();
+    expect(screen.getByText('1 selected')).toBeTruthy();
+    expect(screen.getByText('2 hidden')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    const deleteDialog = await screen.findByRole('dialog', { name: 'Delete Addons' });
+    expect(within(deleteDialog).getByText('Chernobyl: Chapter One')).toBeTruthy();
+    expect(within(deleteDialog).queryByText('Chernobyl Assets Pack')).toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
     fireEvent.change(searchInput, { target: { value: 'zzzz-no-match' } });
 
     expect(screen.getByText('0 selected')).toBeTruthy();

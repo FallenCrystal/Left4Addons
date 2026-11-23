@@ -185,18 +185,18 @@ impl LocalDb {
             let local_cover_image = stored_cover
                 .as_deref()
                 .map(str::trim)
-                .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+                .filter(|c| is_valid_local_cover_key(c))
                 .map(str::to_owned);
             let workshop_cover = snap
                 .and_then(|s| s.preview_url.as_deref())
-                .map(l4a_workshop::upgrade_steam_cdn_https)
-                .filter(|s| !s.is_empty());
-            let cover = workshop_cover.or_else(|| {
-                stored_cover
-                    .as_deref()
-                    .map(l4a_workshop::upgrade_steam_cdn_https)
-                    .filter(|s| !s.is_empty())
-            });
+                .and_then(normalize_valid_remote_cover_url);
+            let cover = workshop_cover
+                .or_else(|| {
+                    stored_cover
+                        .as_deref()
+                        .and_then(normalize_valid_remote_cover_url)
+                })
+                .or_else(|| local_cover_image.clone());
 
             let stored_title: String = r.get(2)?;
             let stored_author: Option<String> = r.get(3)?;
@@ -371,6 +371,68 @@ impl LocalDb {
         Ok(())
     }
 
+    pub(crate) fn list_stored_addon_categories(
+        &self,
+    ) -> Result<HashMap<AddonId, Vec<String>>, CoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare("SELECT id, categories_json FROM addons")?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let raw: String = r.get(1)?;
+            let cats: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+            Ok((AddonId(id), cats))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (id, cats) = row?;
+            out.insert(id, cats);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn update_addon_file_state(&self, addon: &AddonSummary) -> Result<(), CoreError> {
+        let conn = self.lock_conn()?;
+        let updated = conn.execute(
+            r#"
+            UPDATE addons SET
+                install_state = ?2,
+                primary_dir = ?3,
+                enabled = ?4,
+                current_file_name = ?5,
+                current_path = ?6,
+                has_dummy_bypass = ?7,
+                updated_at = ?8
+            WHERE id = ?1
+            "#,
+            params![
+                addon.id.as_str(),
+                serialize_enum(&addon.install_state),
+                addon.primary_dir.as_ref().map(serialize_enum),
+                if addon.enabled { 1 } else { 0 },
+                addon.current_file_name,
+                addon.current_path,
+                if addon.has_dummy_bypass { 1 } else { 0 },
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        if updated == 0 {
+            Self::upsert_addon_tx(&conn, addon)?;
+        }
+        Ok(())
+    }
+
+    pub fn has_workshop_snapshot(&self, workshop_id: WorkshopId) -> Result<bool, CoreError> {
+        let conn = self.lock_conn()?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM workshop_snapshots WHERE workshop_id = ?1 LIMIT 1",
+                params![workshop_id.as_u64() as i64],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     pub fn mark_addon_uninstalled(&self, id: &AddonId) -> Result<(), CoreError> {
         let conn = self.lock_conn()?;
         Self::mark_addon_uninstalled_tx(&conn, id)
@@ -438,8 +500,7 @@ impl LocalDb {
         let preview_url = item
             .preview_url
             .as_deref()
-            .map(l4a_workshop::upgrade_steam_cdn_https)
-            .filter(|s| !s.is_empty());
+            .and_then(normalize_valid_remote_cover_url);
         // Ordinary upserts retain missing fields. A replacement's metadata belongs to the new VPK.
         tx.execute(
             "UPDATE addons SET cover_image = ?2, local_time_updated = ?3 WHERE id = ?1",
@@ -471,8 +532,7 @@ impl LocalDb {
         let preview_url = item
             .preview_url
             .as_deref()
-            .map(l4a_workshop::upgrade_steam_cdn_https)
-            .filter(|s| !s.is_empty());
+            .and_then(normalize_valid_remote_cover_url);
         let file_url = item
             .file_url
             .as_deref()
@@ -868,16 +928,12 @@ impl LocalDb {
                 locked: r.get::<_, i64>(3)? != 0,
                 member_addon_ids: Vec::new(),
                 maps: serde_json::from_str(&maps_json).unwrap_or_default(),
-                cover_image: r
-                    .get::<_, Option<String>>(5)?
-                    .map(|c| {
-                        if is_remote_image_url(&c) {
-                            l4a_workshop::upgrade_steam_cdn_https(&c)
-                        } else {
-                            c
-                        }
+                cover_image: r.get::<_, Option<String>>(5)?.and_then(|c| {
+                    normalize_valid_remote_cover_url(&c).or_else(|| {
+                        let trimmed = c.trim();
+                        is_valid_local_cover_key(trimmed).then(|| trimmed.to_owned())
                     })
-                    .filter(|s| !s.is_empty()),
+                }),
             })
         })?;
         for row in rows {
@@ -900,6 +956,35 @@ impl LocalDb {
     pub fn save_bundle(&self, bundle: &BundleRecord) -> Result<(), CoreError> {
         let mut conn = self.lock_conn()?;
         let tx = conn.transaction()?;
+        Self::write_bundle_tx(&tx, bundle)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 仅用于自动重建分包：若同 ID 的 Bundle 已被用户锁定或为手动分包，拒绝覆盖以严格保护锁定保证。
+    pub fn save_auto_bundle(&self, bundle: &BundleRecord) -> Result<bool, CoreError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn.transaction()?;
+        let existing_protected: Option<bool> = tx
+            .query_row(
+                "SELECT locked, kind FROM bundles WHERE id = ?1",
+                params![bundle.id.as_str()],
+                |r| {
+                    let locked = r.get::<_, i64>(0)? != 0;
+                    let kind: String = r.get(1)?;
+                    Ok(locked || kind == "manual")
+                },
+            )
+            .optional()?;
+        if existing_protected == Some(true) {
+            return Ok(false);
+        }
+        Self::write_bundle_tx(&tx, bundle)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn write_bundle_tx(tx: &Connection, bundle: &BundleRecord) -> Result<(), CoreError> {
         tx.execute(
             r#"
             INSERT INTO bundles (id, name, kind, locked, maps_json, cover_image)
@@ -936,7 +1021,6 @@ impl LocalDb {
             )?;
             pos += 1;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -1485,11 +1569,45 @@ pub fn collect_installed_addon_maps(addon: &AddonSummary) -> Vec<MapEntry> {
 }
 
 pub fn is_remote_image_url(raw: &str) -> bool {
+    let bytes = raw.trim().as_bytes();
+    bytes
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"http://"))
+        || bytes
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case(b"https://"))
+        || bytes.starts_with(b"//")
+}
+
+pub fn normalize_valid_remote_cover_url(raw: &str) -> Option<String> {
+    let upgraded = l4a_workshop::upgrade_steam_cdn_https(raw);
+    let parsed = url::Url::parse(&upgraded).ok()?;
+    if matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+    {
+        Some(parsed.into())
+    } else {
+        None
+    }
+}
+
+pub fn is_valid_local_cover_key(raw: &str) -> bool {
     let trimmed = raw.trim();
-    trimmed.len() >= 7
-        && (trimmed[..7].eq_ignore_ascii_case("http://")
-            || (trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("https://"))
-            || trimmed.starts_with("//"))
+    if trimmed.is_empty() || trimmed.starts_with('.') || trimmed.contains("..") {
+        return false;
+    }
+    if !trimmed
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    matches!(
+        trimmed.rsplit_once('.').map(|(_, ext)| ext),
+        Some("jpg" | "jpeg" | "png" | "webp")
+    )
 }
 
 fn local_cover_for_db(addon: &AddonSummary) -> Option<&str> {
@@ -1497,12 +1615,12 @@ fn local_cover_for_db(addon: &AddonSummary) -> Option<&str> {
         .local_cover_image
         .as_deref()
         .map(str::trim)
-        .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+        .filter(|c| is_valid_local_cover_key(c))
         .or_else(|| {
             addon
                 .cover_image
                 .as_deref()
                 .map(str::trim)
-                .filter(|c| !c.is_empty() && !is_remote_image_url(c))
+                .filter(|c| is_valid_local_cover_key(c))
         })
 }

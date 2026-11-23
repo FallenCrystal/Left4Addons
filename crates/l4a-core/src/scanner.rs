@@ -60,6 +60,7 @@ pub(crate) fn scan_and_commit<T>(
         .into_iter()
         .map(|a| (a.id.clone(), a))
         .collect();
+    let stored_categories = db.list_stored_addon_categories()?;
 
     let mut seeds_by_path = HashMap::new();
     for addon in seeds {
@@ -254,6 +255,30 @@ pub(crate) fn scan_and_commit<T>(
             next.current_file_name = Some(vpk_name.clone());
             next.current_path = Some(path_str.clone());
             next.file_size = file_size;
+            let stored_cats = stored_categories
+                .get(&next.id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            next.categories = merge_categories(stored_cats, &next.addon_info, &next.maps, &[]);
+            if next.local_cover_image.is_none() {
+                let stem_raw = strip_suffix_ascii_case(&vpk_name, ".disabled").unwrap_or(&vpk_name);
+                let file_stem = strip_suffix_ascii_case(stem_raw, ".vpk").unwrap_or(stem_raw);
+                if let Some(ref hash) = next.content_hash {
+                    if let Some(sidecar) = cache_sidecar_jpg(
+                        &path,
+                        file_stem,
+                        next.workshop_id,
+                        workshop_dir,
+                        image_cache_dir,
+                        hash,
+                    ) {
+                        if next.cover_image.is_none() {
+                            next.cover_image = Some(sidecar.clone());
+                        }
+                        next.local_cover_image = Some(sidecar);
+                    }
+                }
+            }
             if next.workshop_title.is_none() && next.addon_title.is_none() {
                 next.title = strip_suffix_ascii_case(&vpk_name, ".vpk")
                     .unwrap_or(&vpk_name)
@@ -521,10 +546,13 @@ fn build_addon_summary(
                 &meta.content_hash,
             )
         })
-        .or_else(|| prev.and_then(|p| p.local_cover_image.clone()));
+        .or_else(|| {
+            prev.and_then(|p| p.local_cover_image.clone())
+                .filter(|c| image_cache_dir.join(c).exists())
+        });
     let remote_cover = prev
-        .and_then(|p| p.cover_image.clone())
-        .filter(|c| crate::db::repo::is_remote_image_url(c));
+        .and_then(|p| p.cover_image.as_deref())
+        .and_then(crate::db::repo::normalize_valid_remote_cover_url);
 
     AddonSummary {
         id,

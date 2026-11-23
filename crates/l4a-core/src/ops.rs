@@ -448,7 +448,7 @@ pub fn move_addons(
             updated.has_dummy_bypass = has_dummy;
             changes.verify()?;
             require_free(&sibling)?;
-            db.upsert_addon(&updated)?;
+            db.update_addon_file_state(&updated)?;
             Ok(updated)
         })?;
         moved.push(updated);
@@ -643,7 +643,7 @@ fn publish_addon_path(
         if let Some(sibling) = sibling {
             require_free(sibling)?;
         }
-        db.upsert_addon(addon)
+        db.update_addon_file_state(addon)
     })
 }
 

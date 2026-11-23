@@ -109,6 +109,7 @@ type LibraryDisplayItem =
       bundle: BundleRecord;
       allMembers: AddonSummary[];
       visibleMembers: AddonSummary[];
+      matchedMembers: AddonSummary[];
     };
 
 function summarizeBundle(allMembers: AddonSummary[]) {
@@ -378,36 +379,36 @@ export function LibraryView({
           .map((id) => addonsById.get(id))
           .filter(
             (a): a is AddonSummary =>
-              Boolean(a) && a.installState === 'installed' && !claimedAddonIds.has(a.id),
+              a !== undefined && a.installState === 'installed' && !claimedAddonIds.has(a.id),
           );
         if (unclaimedMembers.length < 2) continue;
 
         const scopeMembers = unclaimedMembers.filter(matchesScope);
         if (scopeMembers.length < 2) continue;
 
-        const bundleMatchesCategory =
-          effectiveCategory === 'All' ||
-          (effectiveCategory === 'Other'
-            ? scopeMembers.every(matchesCategory)
-            : scopeMembers.some(matchesCategory));
-        if (!bundleMatchesCategory) continue;
+        const categoryMembers =
+          effectiveCategory === 'All'
+            ? scopeMembers
+            : effectiveCategory === 'Other'
+              ? scopeMembers.every(matchesCategory)
+                ? scopeMembers
+                : []
+              : scopeMembers.filter(matchesCategory);
+        if (categoryMembers.length === 0) continue;
 
-        const queryMembers = scopeMembers.filter(matchesQuery);
+        const matchedMembers = categoryMembers.filter(matchesQuery);
         const bundleNameMatched =
           Boolean(trimmedQuery) &&
           !mapMode &&
           bundle.name.toLowerCase().includes(trimmedQuery.toLowerCase());
 
         const shouldCollapse =
-          queryMembers.length >= 2 ||
-          (bundleNameMatched && scopeMembers.length >= 2) ||
-          (isGeneralBrowse && scopeMembers.length >= 2 && queryMembers.length >= 1);
+          matchedMembers.length >= 2 ||
+          bundleNameMatched ||
+          (isGeneralBrowse && matchedMembers.length >= 1);
 
         if (shouldCollapse) {
-          const visibleMembers =
-            bundleNameMatched || (isGeneralBrowse && scopeMembers.length >= 2)
-              ? scopeMembers
-              : queryMembers;
+          const visibleMembers = matchedMembers.length > 0 ? matchedMembers : categoryMembers;
           for (const member of unclaimedMembers) {
             claimedAddonIds.add(member.id);
           }
@@ -416,6 +417,7 @@ export function LibraryView({
             bundle,
             allMembers: unclaimedMembers,
             visibleMembers,
+            matchedMembers,
           });
         }
       }
@@ -510,10 +512,33 @@ export function LibraryView({
     return next;
   }, [selectedIds, existingIds]);
 
-  const visibleSelectedAddons = useMemo(
-    () => visibleAddons.filter((a) => validSelectedIds.has(a.id)),
-    [visibleAddons, validSelectedIds],
-  );
+  const visibleSelectedAddons = useMemo(() => {
+    const out: AddonSummary[] = [];
+    const seen = new Set<string>();
+    for (const item of displayItems) {
+      if (item.kind === 'addon') {
+        if (validSelectedIds.has(item.addon.id) && !seen.has(item.addon.id)) {
+          seen.add(item.addon.id);
+          out.push(item.addon);
+        }
+      } else {
+        const eligible =
+          item.matchedMembers.length > 0
+            ? item.matchedMembers
+            : item.visibleMembers.length > 0 &&
+                item.visibleMembers.every((m) => validSelectedIds.has(m.id))
+              ? item.visibleMembers
+              : [];
+        for (const m of eligible) {
+          if (validSelectedIds.has(m.id) && !seen.has(m.id)) {
+            seen.add(m.id);
+            out.push(m);
+          }
+        }
+      }
+    }
+    return out;
+  }, [displayItems, validSelectedIds]);
   const visibleSelectedIds = useMemo(
     () => visibleSelectedAddons.map((a) => a.id),
     [visibleSelectedAddons],

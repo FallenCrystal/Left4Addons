@@ -42,7 +42,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -79,7 +79,7 @@ pub struct L4aEngine {
     download_gate: DownloadGate,
     hydrating_workshop: AtomicBool,
     hydration_pending: AtomicBool,
-    attempted_hydration_ids: Mutex<HashSet<WorkshopId>>,
+    hydration_backoff: Mutex<HashMap<WorkshopId, (u32, Instant)>>,
 }
 
 impl L4aEngine {
@@ -141,7 +141,7 @@ impl L4aEngine {
             active_cancellations: Mutex::new(HashMap::new()),
             hydrating_workshop: AtomicBool::new(false),
             hydration_pending: AtomicBool::new(false),
-            attempted_hydration_ids: Mutex::new(HashSet::new()),
+            hydration_backoff: Mutex::new(HashMap::new()),
         })
     }
 
@@ -173,7 +173,7 @@ impl L4aEngine {
             active_cancellations: Mutex::new(HashMap::new()),
             hydrating_workshop: AtomicBool::new(false),
             hydration_pending: AtomicBool::new(false),
-            attempted_hydration_ids: Mutex::new(HashSet::new()),
+            hydration_backoff: Mutex::new(HashMap::new()),
         })
     }
 
@@ -251,7 +251,7 @@ impl L4aEngine {
             build_resolver_from_config(&next, self.mirror.clone(), self.steam_bridge.clone());
         *self.resolver.write().unwrap() = new_resolver;
         self.download_gate.set_limit(next.download_concurrency);
-        self.attempted_hydration_ids.lock().unwrap().clear();
+        self.hydration_backoff.lock().unwrap().clear();
 
         let watch_error = if dirs_changed {
             let callback = self.watcher_rescan_cb.lock().unwrap().clone();
@@ -352,6 +352,7 @@ impl L4aEngine {
 
     pub async fn fetch_workshop_cover(&self, url: &str) -> Result<(String, Vec<u8>), CoreError> {
         const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
+        const COVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
         const CACHED_COVER_FORMATS: &[(&str, &str)] = &[
             ("jpg", "image/jpeg"),
             ("png", "image/png"),
@@ -373,6 +374,7 @@ impl L4aEngine {
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
 
         let url_hash = hex::encode(&Sha256::digest(url.as_str().as_bytes())[..16]);
+        let mut stale_cached: Option<(&'static str, Vec<u8>)> = None;
         for &(ext, cached_mime) in CACHED_COVER_FORMATS {
             let cache_path = self
                 .paths
@@ -381,7 +383,16 @@ impl L4aEngine {
             if let Ok(meta) = fs::symlink_metadata(&cache_path) {
                 if meta.is_file() && meta.len() > 0 && meta.len() <= MAX_COVER_BYTES as u64 {
                     if let Ok(bytes) = fs::read(&cache_path) {
-                        return Ok((cached_mime.to_string(), bytes));
+                        let is_fresh = meta
+                            .modified()
+                            .ok()
+                            .and_then(|m| SystemTime::now().duration_since(m).ok())
+                            .is_some_and(|age| age < COVER_CACHE_TTL);
+                        if is_fresh {
+                            return Ok((cached_mime.to_string(), bytes));
+                        }
+                        stale_cached = Some((cached_mime, bytes));
+                        break;
                     }
                 }
             }
@@ -392,11 +403,29 @@ impl L4aEngine {
             .build_client_for(url.as_str(), Some(Duration::from_secs(15)))
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
         let (request, _) = self.mirror.prepare_get(&client, url.as_str());
-        let mut response = request
-            .send()
-            .await
-            .and_then(|response| response.error_for_status())
-            .map_err(|err| WorkshopError::Network(err.to_string()))?;
+        let mut response = match request.send().await {
+            Ok(resp) => match resp.error_for_status() {
+                Ok(ok_resp) => ok_resp,
+                Err(status_err) => {
+                    if status_err
+                        .status()
+                        .is_some_and(|s| s.is_server_error() || s.as_u16() == 429)
+                    {
+                        if let Some((stale_mime, stale_bytes)) = stale_cached {
+                            return Ok((stale_mime.to_string(), stale_bytes));
+                        }
+                    }
+                    return Err(WorkshopError::Network(status_err.to_string()).into());
+                }
+            },
+            Err(net_err) => {
+                if let Some((stale_mime, stale_bytes)) = stale_cached {
+                    return Ok((stale_mime.to_string(), stale_bytes));
+                }
+                return Err(WorkshopError::Network(net_err.to_string()).into());
+            }
+        };
+
         let header_mime = response
             .headers()
             .get("content-type")
@@ -406,21 +435,36 @@ impl L4aEngine {
             .filter(|mime| mime.starts_with("image/"));
 
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|err| WorkshopError::Network(err.to_string()))?
-        {
-            if bytes.len() + chunk.len() > MAX_COVER_BYTES {
-                return Err(CoreError::InvalidInput("封面图片过大".into()));
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > MAX_COVER_BYTES {
+                        return Err(CoreError::InvalidInput("封面图片过大".into()));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(net_err) => {
+                    if let Some((stale_mime, stale_bytes)) = stale_cached {
+                        return Ok((stale_mime.to_string(), stale_bytes));
+                    }
+                    return Err(WorkshopError::Network(net_err.to_string()).into());
+                }
             }
-            bytes.extend_from_slice(&chunk);
         }
         if bytes.is_empty() {
+            if let Some((stale_mime, stale_bytes)) = stale_cached {
+                return Ok((stale_mime.to_string(), stale_bytes));
+            }
             return Err(CoreError::InvalidInput("封面图片为空".into()));
         }
 
         let detected = image::guess_format(&bytes).ok();
+        if detected.is_none() {
+            if let Some((stale_mime, stale_bytes)) = stale_cached {
+                return Ok((stale_mime.to_string(), stale_bytes));
+            }
+        }
         let mime = detected
             .map(|format| format.to_mime_type().to_string())
             .or(header_mime)
@@ -443,8 +487,16 @@ impl L4aEngine {
                 .prefix(".ws_cover_")
                 .tempfile_in(&self.paths.image_cache_dir)
             {
-                if tmp.write_all(&bytes).is_ok() {
-                    let _ = tmp.persist(&dest);
+                if tmp.write_all(&bytes).is_ok() && tmp.persist(&dest).is_ok() {
+                    for &(other_ext, _) in CACHED_COVER_FORMATS {
+                        if other_ext != ext {
+                            let stale_other = self
+                                .paths
+                                .image_cache_dir
+                                .join(format!("ws_cover_{url_hash}.{other_ext}"));
+                            let _ = fs::remove_file(stale_other);
+                        }
+                    }
                 }
             }
         }
@@ -452,10 +504,21 @@ impl L4aEngine {
         Ok((mime, bytes))
     }
 
+    #[doc(hidden)]
+    pub fn expire_hydration_backoff_for_test(&self) {
+        let now = Instant::now();
+        let mut guard = self.hydration_backoff.lock().unwrap();
+        for (_, retry_at) in guard.values_mut() {
+            *retry_at = now;
+        }
+    }
+
     /// 自动为尚未缓存工坊快照的本地/工坊模组补齐 Steam 创意工坊元数据（标题、封面 `preview_url`、作者、标签与依赖关系），
-    /// 与 v1 启动/扫描时自动查询工坊元数据的行为保持一致，且使用单飞保护避免重复并发请求。
+    /// 与 v1 启动/扫描时自动查询工坊元数据的行为保持一致，且使用单飞保护与有界退避重试避免并发及离线循环请求。
     pub async fn hydrate_missing_workshop_metadata(&self) -> Result<usize, CoreError> {
         const HYDRATE_BATCH_SIZE: usize = 50;
+        const HYDRATION_RETRY_BASE: Duration = Duration::from_secs(15);
+        const HYDRATION_RETRY_MAX: Duration = Duration::from_secs(300);
 
         struct HydrationGuard<'a>(&'a AtomicBool);
         impl Drop for HydrationGuard<'_> {
@@ -463,6 +526,22 @@ impl L4aEngine {
                 self.0.store(false, Ordering::SeqCst);
             }
         }
+
+        let record_unresolved = |ids: &[WorkshopId]| {
+            if ids.is_empty() {
+                return;
+            }
+            let now = Instant::now();
+            let mut guard = self.hydration_backoff.lock().unwrap();
+            for &wid in ids {
+                let attempts = guard.get(&wid).map_or(0, |(n, _)| n.saturating_add(1));
+                let factor = 1u32.checked_shl(attempts.min(5)).unwrap_or(32);
+                let delay = HYDRATION_RETRY_BASE
+                    .saturating_mul(factor)
+                    .min(HYDRATION_RETRY_MAX);
+                guard.insert(wid, (attempts, now + delay));
+            }
+        };
 
         self.hydration_pending.store(true, Ordering::SeqCst);
         let mut total_hydrated = 0usize;
@@ -484,18 +563,25 @@ impl L4aEngine {
                 }
 
                 let snapshots = self.db.list_workshop_snapshots()?;
-                let attempted = self.attempted_hydration_ids.lock().unwrap().clone();
+                let in_backoff: HashSet<WorkshopId> = {
+                    let now = Instant::now();
+                    let backoff = self.hydration_backoff.lock().unwrap();
+                    backoff
+                        .iter()
+                        .filter_map(|(&wid, &(_, retry_at))| (now < retry_at).then_some(wid))
+                        .collect()
+                };
                 let mut missing: BTreeSet<WorkshopId> = self
                     .db
                     .list_addons()?
                     .into_iter()
                     .filter(|a| a.remote_status == WorkshopItemStatus::Unknown)
                     .filter_map(|a| a.workshop_id)
-                    .filter(|wid| !snapshots.contains_key(wid) && !attempted.contains(wid))
+                    .filter(|wid| !snapshots.contains_key(wid) && !in_backoff.contains(wid))
                     .collect();
                 for col in self.db.list_tracked_collections()? {
                     for wid in col.member_workshop_ids {
-                        if !snapshots.contains_key(&wid) && !attempted.contains(&wid) {
+                        if !snapshots.contains_key(&wid) && !in_backoff.contains(&wid) {
                             missing.insert(wid);
                         }
                     }
@@ -509,13 +595,35 @@ impl L4aEngine {
                 let mut pass_hydrated = 0usize;
 
                 for chunk in missing_ids.chunks(HYDRATE_BATCH_SIZE) {
-                    {
-                        let mut seen = self.attempted_hydration_ids.lock().unwrap();
-                        seen.extend(chunk.iter().copied());
-                    }
                     let Ok((outcomes, _warnings)) = resolver.fetch_items(chunk).await else {
+                        record_unresolved(chunk);
                         continue;
                     };
+
+                    let mut resolved_ids = HashSet::with_capacity(outcomes.len());
+                    for outcome in &outcomes {
+                        let wid = match outcome {
+                            WorkshopFetchOutcome::Found { item } => item.workshop_id,
+                            WorkshopFetchOutcome::Removed { workshop_id, .. }
+                            | WorkshopFetchOutcome::PrivateOrUnavailable { workshop_id, .. } => {
+                                *workshop_id
+                            }
+                        };
+                        resolved_ids.insert(wid);
+                    }
+                    if !resolved_ids.is_empty() {
+                        let mut backoff = self.hydration_backoff.lock().unwrap();
+                        for wid in &resolved_ids {
+                            backoff.remove(wid);
+                        }
+                    }
+                    let unresolved: Vec<WorkshopId> = chunk
+                        .iter()
+                        .copied()
+                        .filter(|wid| !resolved_ids.contains(wid))
+                        .collect();
+                    record_unresolved(&unresolved);
+
                     if outcomes.is_empty() {
                         continue;
                     }
@@ -526,6 +634,9 @@ impl L4aEngine {
                         for outcome in outcomes {
                             match outcome {
                                 WorkshopFetchOutcome::Found { item } => {
+                                    if self.db.has_workshop_snapshot(item.workshop_id)? {
+                                        continue;
+                                    }
                                     if item.file_type == WorkshopFileType::Collection {
                                         self.db.mark_workshop_status(
                                             item.workshop_id,
@@ -546,6 +657,9 @@ impl L4aEngine {
                                     source,
                                     ..
                                 } => {
+                                    if self.db.has_workshop_snapshot(workshop_id)? {
+                                        continue;
+                                    }
                                     self.db.mark_workshop_status(
                                         workshop_id,
                                         WorkshopItemStatus::Removed,
@@ -558,6 +672,9 @@ impl L4aEngine {
                                     source,
                                     ..
                                 } => {
+                                    if self.db.has_workshop_snapshot(workshop_id)? {
+                                        continue;
+                                    }
                                     self.db.mark_workshop_status(
                                         workshop_id,
                                         WorkshopItemStatus::PrivateOrUnavailable,
@@ -680,7 +797,7 @@ impl L4aEngine {
     }
 
     pub async fn sync_workshop(&self) -> Result<SyncReport, CoreError> {
-        self.attempted_hydration_ids.lock().unwrap().clear();
+        self.hydration_backoff.lock().unwrap().clear();
         let resolver = self.resolver.read().unwrap().clone();
 
         let mut task = create_task(&self.db, TaskKind::Sync, "workshop-sync", None)?;
@@ -1048,8 +1165,7 @@ impl L4aEngine {
                             let workshop_cover = item
                                 .preview_url
                                 .as_deref()
-                                .map(upgrade_steam_cdn_https)
-                                .filter(|s| !s.is_empty());
+                                .and_then(crate::db::repo::normalize_valid_remote_cover_url);
                             addon.cover_image =
                                 workshop_cover.or_else(|| addon.local_cover_image.clone());
                             if update {
@@ -1570,8 +1686,7 @@ fn downloaded_summary(
     let workshop_cover = item
         .preview_url
         .as_deref()
-        .map(upgrade_steam_cdn_https)
-        .filter(|s| !s.is_empty());
+        .and_then(crate::db::repo::normalize_valid_remote_cover_url);
     let summary = AddonSummary {
         id: aid.clone(),
         workshop_id: Some(wid),
