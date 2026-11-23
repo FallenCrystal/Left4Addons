@@ -1,8 +1,18 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Check, ExternalLink, Search, Sparkles, X } from 'lucide-react';
-import type { AddonSummary, LoadoutProfile, UserGroup } from '../../api/ipc';
-import { extractWorkshopIdInput, formatBytes } from '../../utils/format';
+import type {
+  AddonNamePreference,
+  AddonSummary,
+  LoadoutProfile,
+  UserGroup,
+} from '../../api/ipc';
+import {
+  extractWorkshopIdInput,
+  formatAddonDisplayName,
+  formatBytes,
+  matchesAddonSearch,
+} from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
 import { Button, Checkbox, Dialog, FilterChip, IconButton, Switch, TextField } from '../m3/primitives';
 
@@ -12,6 +22,7 @@ type PickerFilterMode = 'all' | 'selected' | 'manual';
 
 function AddonPicker({
   addons,
+  namePreference = 'addon_title',
   missingIds,
   selected,
   onToggle,
@@ -19,6 +30,7 @@ function AddonPicker({
   onClearAll,
 }: {
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   missingIds?: string[];
   selected: Set<string>;
   onToggle: (id: string) => void;
@@ -30,17 +42,12 @@ function AddonPicker({
   const [mode, setMode] = useState<PickerFilterMode>('all');
 
   const visible = useMemo(() => {
-    const q = filter.trim().toLowerCase();
+    const q = filter.trim();
     return addons.filter((a) => {
       if (mode === 'selected' && !selected.has(a.id)) return false;
       if (mode === 'manual' && a.primaryDir !== 'loading') return false;
       if (!q) return true;
-      return (
-        a.title.toLowerCase().includes(q) ||
-        (a.author ?? '').toLowerCase().includes(q) ||
-        a.workshopId?.includes(q) ||
-        a.currentFileName?.toLowerCase().includes(q)
-      );
+      return matchesAddonSearch(a, q);
     });
   }, [addons, filter, mode, selected]);
 
@@ -133,6 +140,7 @@ function AddonPicker({
         ) : (
           visible.map((addon) => {
             const checked = selected.has(addon.id);
+            const displayName = formatAddonDisplayName(addon, namePreference);
             return (
               <div
                 key={addon.id}
@@ -142,19 +150,19 @@ function AddonPicker({
               >
                 <Checkbox
                   checked={checked}
-                  label={addon.title}
+                  label={displayName}
                   onChange={() => onToggle(addon.id)}
                 />
                 <div className="l4a-picker-thumb">
                   <AddonCover
                     compact
                     src={addon.coverImage}
-                    title={addon.title}
+                    title={displayName}
                     category={addon.categories[0]}
                   />
                 </div>
                 <div className="l4a-list-main">
-                  <span className="md-title-small l4a-truncate">{addon.title}</span>
+                  <span className="md-title-small l4a-truncate">{displayName}</span>
                   <div className="l4a-addon-meta">
                     <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
                     <span>·</span>
@@ -182,6 +190,7 @@ export function UserGroupDialog({
   initial,
   preselectedIds,
   addons,
+  namePreference = 'addon_title',
   busy,
   onClose,
   onSave,
@@ -190,6 +199,7 @@ export function UserGroupDialog({
   initial: UserGroup | null;
   preselectedIds?: string[];
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onSave: (group: UserGroup) => Promise<void>;
@@ -305,6 +315,7 @@ export function UserGroupDialog({
       </div>
       <AddonPicker
         addons={addons}
+        namePreference={namePreference}
         selected={selectedIds}
         onToggle={toggleId}
         onSelectMany={(ids) => setSelectedIds((prev) => new Set([...prev, ...ids]))}
@@ -318,6 +329,7 @@ export function ManualBundleDialog({
   open,
   preselectedIds,
   addons,
+  namePreference = 'addon_title',
   busy,
   onClose,
   onCreate,
@@ -325,6 +337,7 @@ export function ManualBundleDialog({
   open: boolean;
   preselectedIds?: string[];
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onCreate: (name: string, memberAddonIds: string[]) => Promise<void>;
@@ -373,6 +386,7 @@ export function ManualBundleDialog({
       />
       <AddonPicker
         addons={addons}
+        namePreference={namePreference}
         selected={selectedIds}
         onToggle={toggleId}
         onSelectMany={(ids) => setSelectedIds((prev) => new Set([...prev, ...ids]))}
@@ -437,6 +451,7 @@ export function ProfileDialog({
   open,
   initial,
   addons,
+  namePreference = 'addon_title',
   busy,
   onClose,
   onSave,
@@ -444,6 +459,7 @@ export function ProfileDialog({
   open: boolean;
   initial: LoadoutProfile | null;
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onSave: (profile: LoadoutProfile) => Promise<void>;
@@ -532,6 +548,7 @@ export function ProfileDialog({
       </div>
       <AddonPicker
         addons={loadingAddons}
+        namePreference={namePreference}
         missingIds={missingIds}
         selected={selectedIds}
         onToggle={toggleId}

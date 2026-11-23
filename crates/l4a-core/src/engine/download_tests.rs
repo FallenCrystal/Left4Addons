@@ -212,8 +212,13 @@ async fn workshop_update_preserves_customization_and_links_and_rolls_back_on_err
     assert_eq!(meta.original_size, Some(file_size));
     assert_eq!(meta.original_time_updated, new_snapshot.time_updated);
     let snapshot = engine.snapshot().unwrap();
+    let expected_bundle = BundleRecord {
+        maps: updated.maps.clone(),
+        cover_image: updated.cover_image.clone(),
+        ..bundle
+    };
     assert_eq!(snapshot.addons, vec![updated]);
-    assert_eq!(snapshot.bundles, vec![bundle]);
+    assert_eq!(snapshot.bundles, vec![expected_bundle]);
     assert_eq!(snapshot.user_groups, vec![group]);
     assert_eq!(snapshot.profiles, vec![profile]);
     assert_eq!(

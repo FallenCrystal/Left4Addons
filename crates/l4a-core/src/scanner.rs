@@ -1,4 +1,4 @@
-use crate::db::repo::{derive_categories_from_info, PhysicalFileRow};
+use crate::db::repo::{clean_addon_title, clean_author_name, merge_categories, PhysicalFileRow};
 use crate::db::LocalDb;
 use crate::error::CoreError;
 use crate::ops::strip_suffix_ascii_case;
@@ -252,6 +252,11 @@ pub(crate) fn scan_and_commit<T>(
             next.current_file_name = Some(vpk_name.clone());
             next.current_path = Some(path_str.clone());
             next.file_size = file_size;
+            if next.workshop_title.is_none() && next.addon_title.is_none() {
+                next.title = strip_suffix_ascii_case(&vpk_name, ".vpk")
+                    .unwrap_or(&vpk_name)
+                    .to_string();
+            }
             next
         } else {
             let meta = extract_addon_metadata(&path, image_cache_dir);
@@ -476,35 +481,35 @@ fn build_addon_summary(
             None => AddonId::from_content_hash(&meta.content_hash),
         });
     let prev = existing_addons.get(&id);
-    let title = meta
-        .addon_info
-        .get("addontitle")
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| prev.map(|p| p.title.clone()))
-        .unwrap_or_else(|| {
-            strip_suffix_ascii_case(vpk_name, ".vpk")
-                .unwrap_or(vpk_name)
-                .to_string()
-        });
-    let author = meta
-        .addon_info
-        .get("addonauthor")
-        .or_else(|| meta.addon_info.get("author"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| prev.and_then(|p| p.author.clone()));
+    let addon_title = clean_addon_title(meta.addon_info.get("addontitle").map(String::as_str));
+    let workshop_title = prev.and_then(|p| p.workshop_title.clone());
+    let file_stem = strip_suffix_ascii_case(vpk_name, ".vpk")
+        .unwrap_or(vpk_name)
+        .to_string();
+    let title = workshop_title
+        .clone()
+        .or_else(|| addon_title.clone())
+        .unwrap_or(file_stem);
+    let author = clean_author_name(
+        meta.addon_info
+            .get("addonauthor")
+            .or_else(|| meta.addon_info.get("author"))
+            .map(String::as_str),
+    )
+    .or_else(|| prev.and_then(|p| p.author.clone()));
     let version = meta
         .addon_info
         .get("addonversion")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let categories = derive_categories_from_info(&meta.addon_info);
+    let categories = merge_categories(&[], &meta.addon_info, &meta.maps, &[]);
 
     AddonSummary {
         id,
         workshop_id,
         title,
+        addon_title,
+        workshop_title,
         author,
         version,
         install_state: InstallState::Installed,

@@ -546,6 +546,22 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
         None,
         b"w1",
     );
+    create_test_vpk(
+        &loading_dir.join("s1.vpk"),
+        "Zoey Model Part 1",
+        "AuthorS",
+        false,
+        None,
+        b"s1",
+    );
+    create_test_vpk(
+        &loading_dir.join("s2.vpk"),
+        "Zoey Model Part 2",
+        "AuthorS",
+        false,
+        None,
+        b"s2",
+    );
 
     let bridge = Arc::new(MockSteamBridge::new(true));
     let col_id = WorkshopId::new(55555).unwrap();
@@ -594,7 +610,16 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
         .id
         .clone();
 
-    // Auto bundle aggregates Yama Part 1 + Part 2 and combines their maps!
+    // scan() automatically builds the campaign bundle for Yama (clean name "Yama", ordered parts)
+    // and ignores non-campaign Zoey Model Part 1/2!
+    assert_eq!(snap.bundles.len(), 1);
+    assert_eq!(snap.bundles[0].name, "Yama");
+    assert_eq!(
+        snap.bundles[0].member_addon_ids,
+        vec![p1_id.clone(), p2_id.clone()]
+    );
+    assert_eq!(snap.bundles[0].maps.len(), 2);
+
     let bundles = engine.rebuild_bundles().unwrap();
     assert_eq!(bundles.len(), 1);
     assert_eq!(bundles[0].maps.len(), 2);
@@ -665,14 +690,16 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
     let apply_report = engine
         .apply_profile(&ProfileId("prof_clean".into()))
         .unwrap();
-    assert_eq!(apply_report.disabled_count, 1);
-    assert_eq!(apply_report.batch.items[0].addon_id, w1_id);
-    assert_eq!(
-        apply_report.batch.items[0].outcome,
-        AddonOperationOutcome::Applied
-    );
+    assert_eq!(apply_report.disabled_count, 3);
+    assert!(apply_report
+        .batch
+        .items
+        .iter()
+        .any(|i| i.addon_id == w1_id && i.outcome == AddonOperationOutcome::Applied));
     assert_eq!(apply_report.batch.refresh_error, None);
     assert!(loading_dir.join("w1.vpk.disabled").exists());
+    assert!(loading_dir.join("s1.vpk.disabled").exists());
+    assert!(loading_dir.join("s2.vpk.disabled").exists());
     assert!(loading_dir.join("p1.vpk").exists());
 }
 
@@ -1929,4 +1956,62 @@ async fn subscribed_workshop_ids_come_from_the_steam_bridge() {
         engine.subscribed_workshop_ids().await,
         Err(CoreError::Workshop(WorkshopError::Unsupported(_)))
     ));
+}
+
+#[test]
+fn deleting_part_clears_stale_auto_bundle_and_config_roundtrips_preferences() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    create_test_vpk(
+        &loading.join("sakura_1.vpk"),
+        "樱花战役",
+        "Mapper",
+        true,
+        None,
+        b"part-1",
+    );
+    create_test_vpk(
+        &loading.join("sakura_2.vpk"),
+        "樱花战役",
+        "Mapper",
+        false,
+        None,
+        b"part-2",
+    );
+
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        addon_name_preference: l4a_protocol::AddonNamePreference::FileName,
+        collapse_campaign_bundles: false,
+        ..Default::default()
+    };
+    let engine = make_engine(dir.path(), cfg, Arc::new(MockSteamBridge::new(false)));
+    let snap = engine.scan().unwrap();
+    assert_eq!(snap.bundles.len(), 1);
+    assert_eq!(snap.bundles[0].member_addon_ids.len(), 2);
+
+    // Deleting one part immediately drops the 1-member auto-bundle without needing a manual rescan.
+    let first_id = snap.addons[0].id.clone();
+    engine.delete_addons(&[first_id], true, true).unwrap();
+    let after_delete = engine.snapshot().unwrap();
+    assert_eq!(after_delete.addons.len(), 1);
+    assert!(after_delete.bundles.is_empty());
+
+    // Saving config writes valid TOML with scalar preferences preserved across Engine restarts.
+    let updated_cfg = AppConfig {
+        addon_name_preference: l4a_protocol::AddonNamePreference::FileName,
+        collapse_campaign_bundles: false,
+        ..engine.config()
+    };
+    engine.save_config(updated_cfg).unwrap();
+    drop(engine);
+
+    let reopened =
+        L4aEngine::open_default(dir.path().join("runtime"), Arc::new(NullEventSink)).unwrap();
+    assert_eq!(
+        reopened.config().addon_name_preference,
+        l4a_protocol::AddonNamePreference::FileName
+    );
+    assert!(!reopened.config().collapse_campaign_bundles);
 }

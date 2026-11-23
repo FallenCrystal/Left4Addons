@@ -1,4 +1,9 @@
-import type { AddonBatchReport, AddonSummary, RenameRuleConfig } from '../api/ipc';
+import type {
+  AddonBatchReport,
+  AddonNamePreference,
+  AddonSummary,
+  RenameRuleConfig,
+} from '../api/ipc';
 
 const MAX_U64 = 18446744073709551615n;
 
@@ -82,6 +87,102 @@ export function getFileBaseName(path?: string | null): string {
   return parts[parts.length - 1] || path;
 }
 
+export function stripVpkExtension(rawName: string): string {
+  const trimmed = rawName.trim();
+  const lower = trimmed.toLowerCase();
+  const suffix = ['.vpk.disabled', '.disabled', '.vpk'].find((ext) => lower.endsWith(ext));
+  return suffix ? trimmed.slice(0, -suffix.length) : trimmed;
+}
+
+const PLACEHOLDER_ADDON_TITLES = new Set([
+  'addon',
+  'addon_title',
+  'addontitle',
+  'my addon',
+  'my add-on',
+  'my first addon',
+  'my first add-on',
+  'untitled',
+  'none',
+  'n/a',
+]);
+
+function cleanMetadataTitle(value?: string | null): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  if (PLACEHOLDER_ADDON_TITLES.has(trimmed.toLowerCase())) return null;
+  if (/^workshop\s*#\d+$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+export function stripLeadingBracketPrefixes(raw: string): string {
+  return raw.replace(/^(?:\[[^\]]+\]\s*)+/, '').trim();
+}
+
+export function resolveAddonMetadataTitle(addon: AddonSummary): string {
+  const cleaned =
+    cleanMetadataTitle(addon.title) ??
+    cleanMetadataTitle(addon.workshopTitle) ??
+    cleanMetadataTitle(addon.addonTitle) ??
+    cleanMetadataTitle(addon.addonInfo.addontitle);
+  if (cleaned) return cleaned;
+  const fileStem = addon.currentFileName ? stripVpkExtension(addon.currentFileName) : '';
+  return fileStem || addon.title;
+}
+
+export function formatAddonDisplayName(
+  addon: AddonSummary,
+  preference: AddonNamePreference = 'addon_title',
+): string {
+  if (preference === 'file_name') {
+    const fileStem = addon.currentFileName ? stripVpkExtension(addon.currentFileName) : '';
+    if (fileStem) return fileStem;
+  }
+  return resolveAddonMetadataTitle(addon);
+}
+
+const PART_OR_ASSET_MARKER_RE =
+  /(?:part|pt|disc|dvd|vol|chapter|ch|ep|episode|pak|pack|assets?|resources?|models?|materials?|textures?|sounds?|media|分包|材质|模型|贴图|音效|主包|地图包|资源包|音频包)[\s._-]*\d*|第\s*[\d一二三四五六七八九十]+\s*[部章分卷包]|(?:[-_]+|\s+\()0*[1-9]\d?\)?$/i;
+
+export function formatBundleMemberLabel(
+  addon: AddonSummary,
+  siblings: readonly AddonSummary[],
+  preference: AddonNamePreference = 'addon_title',
+  bundleName?: string,
+): string {
+  const primary = formatAddonDisplayName(addon, preference);
+  const key = primary.trim().toLowerCase();
+  const collidingCount = siblings.reduce((acc, item) => {
+    const label = formatAddonDisplayName(item, preference).trim().toLowerCase();
+    return label === key ? acc + 1 : acc;
+  }, 0);
+
+  const fileStem = addon.currentFileName ? stripVpkExtension(addon.currentFileName) : '';
+  const matchesGenericBundleName =
+    siblings.length > 1 &&
+    Boolean(bundleName && bundleName.trim().toLowerCase() === key) &&
+    !PART_OR_ASSET_MARKER_RE.test(primary) &&
+    PART_OR_ASSET_MARKER_RE.test(fileStem);
+
+  if (collidingCount <= 1 && !matchesGenericBundleName) {
+    return primary;
+  }
+
+  if (preference === 'addon_title') {
+    const wsTitle = cleanMetadataTitle(addon.workshopTitle);
+    if (wsTitle && wsTitle.toLowerCase() !== key) {
+      return wsTitle;
+    }
+  }
+  if (fileStem && fileStem.toLowerCase() !== key) {
+    return `${primary} · ${fileStem}`;
+  }
+  if (addon.workshopId) {
+    return `${primary} · #${addon.workshopId}`;
+  }
+  return primary;
+}
+
 const WIN_INVALID_RE = /[\\/:*?"<>|]/g;
 const WIN_RESERVED_RE = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
@@ -101,9 +202,7 @@ export function previewFilenameByRules(
 }
 
 export function sanitizeVpkFilename(rawName: string, rules: RenameRuleConfig): string {
-  const lower = rawName.toLowerCase();
-  const suffix = ['.vpk.disabled', '.disabled', '.vpk'].find((suffix) => lower.endsWith(suffix));
-  const base = suffix ? rawName.slice(0, -suffix.length) : rawName;
+  const base = stripVpkExtension(rawName);
   let out = base.replace(/\p{Cc}/gu, '');
 
   if (rules.cleanSpecialChars) {
@@ -182,6 +281,8 @@ export function matchesAddonSearch(addon: AddonSummary, needle: string): boolean
   const q = needle.trim().toLowerCase();
   if (!q) return true;
   if (addon.title.toLowerCase().includes(q)) return true;
+  if (addon.addonTitle?.toLowerCase().includes(q)) return true;
+  if (addon.workshopTitle?.toLowerCase().includes(q)) return true;
   if (addon.author?.toLowerCase().includes(q)) return true;
   if (addon.workshopId?.toLowerCase().includes(q)) return true;
   if (addon.currentFileName?.toLowerCase().includes(q)) return true;

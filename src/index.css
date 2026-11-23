@@ -3005,10 +3005,72 @@ input:-webkit-autofill:focus {
   color: var(--md-sys-color-on-secondary-container);
 }
 
+.md-select[data-variant='filter'] .md-select-trigger {
+  height: 36px;
+  min-width: 0;
+  gap: 6px;
+  padding: 0 10px 0 12px;
+  border-radius: var(--md-sys-shape-corner-small);
+  background-color: color-mix(in srgb, var(--md-sys-color-surface-container-low) 65%, transparent);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md-select[data-variant='filter'] .md-select-trigger:hover:not(:disabled) {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-on-surface) 8%,
+    var(--md-sys-color-surface-container-low)
+  );
+}
+
+.md-select[data-variant='filter'][data-active='true'] .md-select-trigger {
+  box-shadow: none;
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.md-select[data-variant='filter'][data-active='true'] .md-select-trigger:hover:not(:disabled) {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-on-secondary-container) 8%,
+    var(--md-sys-color-secondary-container)
+  );
+}
+
+.md-select[data-variant='filter'][data-active='true'] .md-select-caret {
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.md-select[data-variant='filter'][data-active='true'][data-open='true'] .md-select-trigger,
+.md-select[data-variant='filter'][data-active='true'] .md-select-trigger:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--md-sys-color-primary);
+}
+
+.md-select[data-align='start'] .md-select-menu {
+  left: 0;
+  right: auto;
+  min-width: max(100%, 192px);
+  transform-origin: top left;
+}
+
 .md-select-option-label {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.md-select-option-count {
+  font-size: 11px;
+  font-family: var(--md-sys-typescale-font-mono);
+  opacity: 0.72;
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+
+.l4a-bundle-card {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--md-sys-color-primary) 26%, transparent),
+    0 3px 0 0 var(--md-sys-color-surface-container-highest);
 }
 
 .md-tooltip {

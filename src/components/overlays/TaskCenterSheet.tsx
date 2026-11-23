@@ -10,9 +10,19 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { AddonSummary, SyncReport, TaskRecord } from '../../api/ipc';
+import type {
+  AddonNamePreference,
+  AddonSummary,
+  SyncReport,
+  TaskRecord,
+} from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
-import { formatBytes, formatSpeed, formatTimestamp } from '../../utils/format';
+import {
+  formatAddonDisplayName,
+  formatBytes,
+  formatSpeed,
+  formatTimestamp,
+} from '../../utils/format';
 import {
   Button,
   EmptyState,
@@ -28,6 +38,7 @@ export interface TaskCenterSheetProps {
   onTabChange: (tab: 'queue' | 'sync') => void;
   onClose: () => void;
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   tasks: TaskRecord[];
   liveDownloads: Record<string, LiveDownloadState>;
   syncReport: SyncReport | null;
@@ -46,6 +57,7 @@ export function TaskCenterSheet({
   onTabChange,
   onClose,
   addons,
+  namePreference = 'addon_title',
   tasks,
   liveDownloads,
   syncReport,
@@ -69,6 +81,11 @@ export function TaskCenterSheet({
     }
     return map;
   }, [addons]);
+
+  const addonLabel = (wid: string): string | undefined => {
+    const found = addonsByWid.get(wid);
+    return found ? formatAddonDisplayName(found, namePreference) : undefined;
+  };
 
   const activeTasksByWid = useMemo(() => {
     const map = new Map<string, TaskRecord>();
@@ -168,7 +185,7 @@ export function TaskCenterSheet({
                     const taskRecord = activeTasksByWid.get(dl.workshopId);
                     const resolvedTitle =
                       dl.title?.trim() ||
-                      addonsByWid.get(dl.workshopId)?.title ||
+                      addonLabel(dl.workshopId) ||
                       taskRecord?.targetTitle?.trim() ||
                       undefined;
                     const isQueued =
@@ -255,7 +272,7 @@ export function TaskCenterSheet({
                               : 'surface';
                       const resolvedTitle =
                         task.kind === 'download'
-                          ? task.targetTitle?.trim() || addonsByWid.get(task.targetId)?.title
+                          ? task.targetTitle?.trim() || addonLabel(task.targetId)
                           : undefined;
                       const detailText =
                         task.error || task.message || formatTimestamp(task.updatedAt);
@@ -401,7 +418,7 @@ export function TaskCenterSheet({
                     const currentAddon = addonsByWid.get(dep.dependencyWorkshopId);
                     const currentlyInstalled = currentAddon?.installState === 'installed';
                     const parentLabels = dep.remainingActiveParents
-                      .map((wid) => addonsByWid.get(wid)?.title ?? `#${wid}`)
+                      .map((wid) => addonLabel(wid) ?? `#${wid}`)
                       .join(', ');
                     return (
                       <div
@@ -511,13 +528,13 @@ export function TaskCenterSheet({
                                 icon={<Download size={12} />}
                                 onClick={() => onDownloadItem(id, addonsByWid.get(id)?.title)}
                               >
-                                +{addonsByWid.get(id)?.title ?? id}
+                                +{addonLabel(id) ?? id}
                               </Button>
                             );
                           })}
                           {diff.removedItems.map((id) => (
                             <span key={`rem-${id}`} className="md-pill md-mono" data-tone="error">
-                              -{addonsByWid.get(id)?.title ?? id}
+                              -{addonLabel(id) ?? id}
                             </span>
                           ))}
                         </div>

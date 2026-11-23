@@ -176,8 +176,12 @@ pub fn preview_batch_rename(
             continue;
         };
         let group_prefix = first_group_by_addon.get(&addon.id).map(String::as_str);
-        let target_vpk =
-            build_target_vpk_name(addon.workshop_id, group_prefix, &addon.title, rules);
+        let base_title = if addon.workshop_title.is_none() && addon.addon_title.is_none() {
+            strip_leading_bracket_prefixes(&addon.title)
+        } else {
+            addon.title.as_str()
+        };
+        let target_vpk = build_target_vpk_name(addon.workshop_id, group_prefix, base_title, rules);
         let conflict = plan_rename(config, &addon, &target_vpk, &mut seen_targets)
             .err()
             .map(|error| error.to_string());
@@ -191,6 +195,21 @@ pub fn preview_batch_rename(
     }
 
     Ok(items)
+}
+
+fn strip_leading_bracket_prefixes(raw: &str) -> &str {
+    let mut rest = raw.trim();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        if let Some((_, tail)) = after_open.split_once(']') {
+            let trimmed_tail = tail.trim();
+            if !trimmed_tail.is_empty() {
+                rest = trimmed_tail;
+                continue;
+            }
+        }
+        break;
+    }
+    rest
 }
 
 struct RenamePlan<'a> {

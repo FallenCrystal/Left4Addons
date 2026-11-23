@@ -347,6 +347,7 @@ export function TextField({ label, trailing, id, ...rest }: TextFieldProps) {
 export interface SelectOption<T extends string> {
   value: T;
   label: string;
+  count?: number;
   icon?: ReactNode;
   disabled?: boolean;
 }
@@ -357,6 +358,9 @@ export interface SelectProps<T extends string> {
   onChange: (next: T) => void;
   ariaLabel?: string;
   icon?: ReactNode;
+  variant?: 'outlined' | 'filter';
+  active?: boolean;
+  align?: 'start' | 'end';
   disabled?: boolean;
   className?: string;
 }
@@ -367,6 +371,9 @@ export function Select<T extends string>({
   onChange,
   ariaLabel,
   icon,
+  variant = 'outlined',
+  active = false,
+  align = 'end',
   disabled = false,
   className = '',
 }: SelectProps<T>) {
@@ -449,11 +456,20 @@ export function Select<T extends string>({
   const selectedOption = options[selectedIndex] ?? options[0];
   const activeOption = options[activeIndex];
 
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    const el = document.getElementById(`${listboxId}-opt-${activeIndex}`);
+    el?.scrollIntoView?.({ block: 'nearest' });
+  }, [open, activeIndex, listboxId]);
+
   return (
     <div
       ref={rootRef}
       className={`md-select ${className}`.trim()}
       data-open={open ? 'true' : 'false'}
+      data-variant={variant}
+      data-active={active ? 'true' : 'false'}
+      data-align={align}
     >
       <button
         ref={triggerRef}
@@ -464,7 +480,7 @@ export function Select<T extends string>({
         aria-expanded={open}
         aria-controls={listboxId}
         aria-activedescendant={
-          open && activeOption ? `${listboxId}-opt-${activeOption.value}` : undefined
+          open && activeOption ? `${listboxId}-opt-${activeIndex}` : undefined
         }
         disabled={disabled}
         className="md-select-trigger"
@@ -477,8 +493,15 @@ export function Select<T extends string>({
         }}
         onKeyDown={handleTriggerKeyDown}
       >
-        {icon}
+        {variant === 'filter' && active ? (
+          <Check size={14} strokeWidth={2.4} aria-hidden="true" />
+        ) : (
+          icon
+        )}
         <span className="md-select-value">{selectedOption?.label ?? value}</span>
+        {variant === 'filter' && active && selectedOption?.count !== undefined && (
+          <span className="md-segmented-count">{selectedOption.count}</span>
+        )}
         <ChevronDown size={15} className="md-select-caret" aria-hidden="true" />
       </button>
 
@@ -489,7 +512,7 @@ export function Select<T extends string>({
             return (
               <button
                 key={opt.value}
-                id={`${listboxId}-opt-${opt.value}`}
+                id={`${listboxId}-opt-${idx}`}
                 type="button"
                 role="option"
                 tabIndex={-1}
@@ -512,6 +535,9 @@ export function Select<T extends string>({
                   {isSelected ? <Check size={15} strokeWidth={2.5} /> : opt.icon}
                 </span>
                 <span className="md-select-option-label">{opt.label}</span>
+                {opt.count !== undefined && (
+                  <span className="md-select-option-count">{opt.count}</span>
+                )}
               </button>
             );
           })}

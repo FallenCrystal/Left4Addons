@@ -583,7 +583,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   }, [client, notify, refresh]);
 
   const saveConfig = useCallback(
-    async (config: AppConfig, forceRescan = false): Promise<boolean> => {
+    async (config: AppConfig, forceRescan = false, silent = false): Promise<boolean> => {
       setBusy(true);
       const prevConfig = snapshotRef.current?.config;
       const dirsChanged =
@@ -623,7 +623,7 @@ export function useAppController(onOpenReconcile?: () => void) {
           } finally {
             setScanning(false);
           }
-        } else {
+        } else if (!silent) {
           notify(tRef.current('settings.saved'));
         }
         return true;

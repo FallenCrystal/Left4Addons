@@ -1,13 +1,15 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, CheckCircle2, MinusCircle, RefreshCw } from 'lucide-react';
-import type { AddonSummary } from '../../api/ipc';
+import type { AddonNamePreference, AddonSummary } from '../../api/ipc';
 import type { BatchDialogPayload } from '../../state/useAppController';
+import { formatAddonDisplayName } from '../../utils/format';
 import { Button, Dialog } from '../m3/primitives';
 
 export interface BatchReportDialogProps {
   payload: BatchDialogPayload | null;
   addonsById: Map<string, AddonSummary>;
+  namePreference?: AddonNamePreference;
   onClose: () => void;
   onRescan: () => Promise<boolean>;
 }
@@ -15,6 +17,7 @@ export interface BatchReportDialogProps {
 export function BatchReportDialog({
   payload,
   addonsById,
+  namePreference = 'addon_title',
   onClose,
   onRescan,
 }: BatchReportDialogProps) {
@@ -127,7 +130,7 @@ export function BatchReportDialog({
                     />
                   )}
                   <span className="md-title-small l4a-truncate">
-                    {addon?.title ?? item.addonId}
+                    {addon ? formatAddonDisplayName(addon, namePreference) : item.addonId}
                   </span>
                 </div>
                 <div className="l4a-row-wrap">

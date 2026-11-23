@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight, Sparkles } from 'lucide-react';
 import type { AddonSummary, RenamePreviewItem, RenameRuleConfig } from '../../api/ipc';
+import { resolveAddonMetadataTitle, stripLeadingBracketPrefixes } from '../../utils/format';
 import { Button, Dialog, FilterChip, LinearProgress, TextField } from '../m3/primitives';
 
 export interface SingleRenameDialogProps {
@@ -19,12 +20,17 @@ export function SingleRenameDialog({
 }: SingleRenameDialogProps) {
   const { t } = useTranslation();
   const [name, setName] = useState(() =>
-    addon ? (addon.currentFileName ?? `${addon.title}.vpk`) : '',
+    addon ? (addon.currentFileName ?? `${resolveAddonMetadataTitle(addon)}.vpk`) : '',
   );
 
   if (!addon) return null;
 
   const trimmed = name.trim();
+  const cleanTitle = resolveAddonMetadataTitle(addon);
+  const hasExplicitTitle = Boolean(addon.workshopTitle?.trim() || addon.addonTitle?.trim());
+  const baseTitle = hasExplicitTitle
+    ? cleanTitle
+    : stripLeadingBracketPrefixes(cleanTitle) || cleanTitle;
 
   return (
     <Dialog
@@ -58,7 +64,7 @@ export function SingleRenameDialog({
           size="sm"
           icon={<Sparkles size={14} />}
           onClick={() =>
-            setName(addon.workshopId ? `[${addon.workshopId}] ${addon.title}.vpk` : `${addon.title}.vpk`)
+            setName(addon.workshopId ? `[${addon.workshopId}] ${baseTitle}.vpk` : `${baseTitle}.vpk`)
           }
         >
           {t('dialogs.useTitle')}

@@ -185,29 +185,69 @@ impl LocalDb {
                 .get::<_, Option<String>>(13)?
                 .or_else(|| snap.and_then(|s| s.preview_url.clone()));
 
+            let stored_title: String = r.get(2)?;
+            let stored_author: Option<String> = r.get(3)?;
+            let current_file_name: Option<String> = r.get(8)?;
+            let stored_cats: Vec<String> = serde_json::from_str(&cats_json).unwrap_or_default();
+            let maps: Vec<MapEntry> = serde_json::from_str(&maps_json).unwrap_or_default();
+            let addon_info: BTreeMap<String, String> =
+                serde_json::from_str(&info_json).unwrap_or_default();
+
+            let addon_title = clean_addon_title(addon_info.get("addontitle").map(String::as_str));
+            let workshop_title = snap.and_then(|s| clean_workshop_title(Some(s.title.as_str())));
+            let title = workshop_title
+                .clone()
+                .or_else(|| addon_title.clone())
+                .or_else(|| clean_addon_title(Some(stored_title.as_str())))
+                .or_else(|| {
+                    current_file_name
+                        .as_deref()
+                        .map(strip_vpk_file_stem)
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or(stored_title);
+            let author = clean_author_name(stored_author.as_deref())
+                .or_else(|| {
+                    clean_author_name(
+                        addon_info
+                            .get("addonauthor")
+                            .or_else(|| addon_info.get("author"))
+                            .map(String::as_str),
+                    )
+                })
+                .or_else(|| snap.and_then(|s| clean_author_name(s.creator_name.as_deref())));
+            let categories = merge_categories(
+                &stored_cats,
+                &addon_info,
+                &maps,
+                snap.map(|s| s.tags.as_slice()).unwrap_or(&[]),
+            );
+
             Ok(AddonSummary {
                 id: AddonId(id_str),
                 workshop_id: wid,
-                title: r.get(2)?,
-                author: r.get(3)?,
+                title,
+                addon_title,
+                workshop_title,
+                author,
                 version: r.get(4)?,
                 install_state,
                 primary_dir: dir_str.map(|s| parse_enum(&s, AddonDirType::Loading)),
                 enabled: r.get::<_, i64>(7)? != 0,
-                current_file_name: r.get(8)?,
+                current_file_name,
                 current_path: r.get(9)?,
                 content_hash: r.get(10)?,
                 file_size: r.get::<_, i64>(11)? as u64,
                 files_count: r.get::<_, i64>(12)? as usize,
                 cover_image: cover,
-                categories: serde_json::from_str(&cats_json).unwrap_or_default(),
-                maps: serde_json::from_str(&maps_json).unwrap_or_default(),
+                categories,
+                maps,
                 has_dummy_bypass: r.get::<_, i64>(17)? != 0,
                 remote_status,
                 local_time_updated: local_ts,
                 remote_time_updated: remote_ts,
                 update_available,
-                addon_info: serde_json::from_str(&info_json).unwrap_or_default(),
+                addon_info,
             })
         })?;
 
@@ -511,6 +551,13 @@ impl LocalDb {
             )?;
         }
         Ok(())
+    }
+
+    pub fn list_workshop_snapshots(
+        &self,
+    ) -> Result<HashMap<WorkshopId, WorkshopItemRecord>, CoreError> {
+        let conn = self.lock_conn()?;
+        Self::load_snapshots_map(&conn)
     }
 
     pub fn get_workshop_snapshot(
@@ -1230,6 +1277,78 @@ pub fn parse_enum<T: serde::de::DeserializeOwned>(raw: &str, fallback: T) -> T {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).unwrap_or(fallback)
 }
 
+fn strip_vpk_file_stem(raw_name: &str) -> String {
+    let trimmed = raw_name.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let cut = if lower.ends_with(".vpk.disabled") {
+        trimmed.len() - ".vpk.disabled".len()
+    } else if lower.ends_with(".disabled") {
+        trimmed.len() - ".disabled".len()
+    } else if lower.ends_with(".vpk") {
+        trimmed.len() - ".vpk".len()
+    } else {
+        trimmed.len()
+    };
+    trimmed[..cut].trim().to_string()
+}
+
+pub fn clean_addon_title(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "addon"
+            | "addon_title"
+            | "addontitle"
+            | "my addon"
+            | "my add-on"
+            | "my first addon"
+            | "my first add-on"
+            | "untitled"
+            | "none"
+            | "n/a"
+    ) {
+        return None;
+    }
+    if let Some(rest) = lower.strip_prefix("workshop #") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn clean_workshop_title(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("workshop #") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
+}
+
+pub fn clean_author_name(raw: Option<&str>) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "author_name" | "addonauthor" | "unknown" | "unknown author" | "none" | "n/a"
+    ) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 pub fn derive_categories_from_info(addon_info: &BTreeMap<String, String>) -> Vec<String> {
     let flag = |keys: &[&str]| -> bool {
         keys.iter().any(|k| {
@@ -1271,6 +1390,52 @@ pub fn derive_categories_from_info(addon_info: &BTreeMap<String, String>) -> Vec
         cats.push("UI".into());
     }
     cats
+}
+
+pub fn merge_categories(
+    existing: &[String],
+    addon_info: &BTreeMap<String, String>,
+    maps: &[MapEntry],
+    workshop_tags: &[String],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |cat: &str| {
+        if !out.iter().any(|c| c == cat) {
+            out.push(cat.to_string());
+        }
+    };
+
+    for cat in existing {
+        if !cat.trim().is_empty() {
+            push_unique(cat.trim());
+        }
+    }
+    for cat in derive_categories_from_info(addon_info) {
+        push_unique(&cat);
+    }
+    if !maps.is_empty() {
+        if maps.len() >= 2 {
+            push_unique("Campaign");
+        }
+        push_unique("Map");
+    }
+    for raw_tag in workshop_tags {
+        let lower = raw_tag.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "campaigns" | "campaign" => push_unique("Campaign"),
+            "maps" | "map" => push_unique("Map"),
+            "survivors" | "survivor" => push_unique("Survivor"),
+            "weapons" | "weapon" => push_unique("Weapon"),
+            "skins" | "skin" => push_unique("Skin"),
+            "scripts" | "script" => push_unique("Script"),
+            "sounds" | "sound" | "music" | "audio" => push_unique("Audio"),
+            "infected" | "common infected" | "special infected" | "tank" | "witch" | "hunter"
+            | "boomer" | "smoker" | "charger" | "jockey" | "spitter" => push_unique("Infected"),
+            "ui" | "hud" => push_unique("UI"),
+            _ => {}
+        }
+    }
+    out
 }
 
 pub fn collect_installed_addon_maps(addon: &AddonSummary) -> Vec<MapEntry> {

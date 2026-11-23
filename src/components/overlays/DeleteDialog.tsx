@@ -1,11 +1,13 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { HardDrive, Store, Trash2 } from 'lucide-react';
-import type { AddonSummary } from '../../api/ipc';
+import type { AddonNamePreference, AddonSummary } from '../../api/ipc';
+import { formatAddonDisplayName } from '../../utils/format';
 import { Button, Dialog, Switch } from '../m3/primitives';
 
 export interface DeleteDialogProps {
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onConfirm: (
@@ -15,7 +17,13 @@ export interface DeleteDialogProps {
   ) => Promise<void>;
 }
 
-export function DeleteDialog({ addons, busy, onClose, onConfirm }: DeleteDialogProps) {
+export function DeleteDialog({
+  addons,
+  namePreference = 'addon_title',
+  busy,
+  onClose,
+  onConfirm,
+}: DeleteDialogProps) {
   const { t } = useTranslation();
   const hasInstalled = addons.some((a) => a.installState === 'installed');
   const [deleteDisk, setDeleteDisk] = useState(hasInstalled);
@@ -89,7 +97,7 @@ export function DeleteDialog({ addons, busy, onClose, onConfirm }: DeleteDialogP
         {addons.map((a) => (
           <div key={a.id} className="l4a-picker-row" style={{ cursor: 'default' }}>
             <span className="md-body-medium l4a-truncate" style={{ flex: 1 }}>
-              {a.title}
+              {formatAddonDisplayName(a, namePreference)}
             </span>
             {a.workshopId ? (
               <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>

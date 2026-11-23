@@ -263,12 +263,19 @@ impl L4aEngine {
         self.scan_internal(true)
     }
 
+    fn refresh_bundles_logged(&self) {
+        if let Err(err) = rebuild_auto_bundles(&self.db) {
+            tracing::warn!(error = %err, "自动重建战役整合包失败");
+        }
+    }
+
     fn scan_internal(&self, external_change: bool) -> Result<DashboardSnapshot, CoreError> {
         let workspace = self.lock_workspace()?;
         let cfg = self.config();
         scan_workspace(&self.db, &cfg, &self.paths.image_cache_dir)?;
         let issues = self.db.list_open_reconcile_issues()?;
         auto_resolve_by_policy(&self.db, &cfg, &self.paths.image_cache_dir, &issues)?;
+        self.refresh_bundles_logged();
         let snapshot = self.snapshot_locked()?;
         drop(workspace);
         if !snapshot.open_issues.is_empty() {
@@ -410,6 +417,8 @@ impl L4aEngine {
         );
         if result.is_err() {
             self.refresh_after_error(&cfg);
+        } else {
+            self.refresh_bundles_logged();
         }
         let snapshot = result.and_then(|()| self.snapshot_locked());
         drop(workspace);
@@ -426,6 +435,7 @@ impl L4aEngine {
         self.suppress_watcher();
 
         let mut results = Vec::with_capacity(items.len());
+        let mut any_ok = false;
         for item in items {
             let error = resolve_reconcile_issue(
                 &self.db,
@@ -439,12 +449,18 @@ impl L4aEngine {
                 self.refresh_after_error(&cfg);
                 err.into()
             });
+            if error.is_none() {
+                any_ok = true;
+            }
             results.push(ReconcileItemResult {
                 issue_id: item.issue_id.clone(),
                 action: item.action,
                 ok: error.is_none(),
                 error,
             });
+        }
+        if any_ok {
+            self.refresh_bundles_logged();
         }
 
         let snapshot = self.snapshot_locked();
@@ -465,7 +481,7 @@ impl L4aEngine {
         match sync_lifecycle(&self.db, &resolver).await {
             Ok(report) => {
                 if let Ok(_workspace) = self.lock_workspace() {
-                    let _ = rebuild_auto_bundles(&self.db);
+                    self.refresh_bundles_logged();
                 }
                 update_task(
                     &self.db,
@@ -832,6 +848,12 @@ impl L4aEngine {
                                 LocalDb::upsert_workshop_snapshot_tx(tx, &item, has_dependencies)?;
                             }
                             LocalDb::save_task_tx(tx, &completed)?;
+                            addon.categories = crate::db::repo::merge_categories(
+                                &addon.categories,
+                                &addon.addon_info,
+                                &addon.maps,
+                                &item.tags,
+                            );
                             addon.remote_status = item.status;
                             addon.remote_time_updated = item.time_updated;
                             addon.update_available = false;
@@ -841,6 +863,9 @@ impl L4aEngine {
                     Ok(addon)
                 })?
             };
+            if let Ok(_workspace) = self.lock_workspace() {
+                self.refresh_bundles_logged();
+            }
             self.events.emit(CoreEvent::DownloadProgress {
                 task_id: task.id.clone(),
                 workshop_id,
@@ -894,6 +919,9 @@ impl L4aEngine {
             addon_ids,
             target_dir_type,
         )?;
+        if report.refresh_error.is_none() {
+            self.refresh_bundles_logged();
+        }
         drop(workspace);
         self.emit_workspace_update();
         Ok(report)
@@ -937,6 +965,9 @@ impl L4aEngine {
         let cfg = self.config();
         self.suppress_watcher();
         let report = apply_renames(&self.db, &cfg, &self.paths.image_cache_dir, renames)?;
+        if report.refresh_error.is_none() {
+            self.refresh_bundles_logged();
+        }
         drop(workspace);
         self.emit_workspace_update();
         Ok(report)
@@ -1004,14 +1035,18 @@ impl L4aEngine {
         purge_known_record: bool,
     ) -> Result<AddonBatchReport, CoreError> {
         self.suppress_watcher();
-        delete_addons(
+        let report = delete_addons(
             &self.db,
             &self.config(),
             &self.paths.image_cache_dir,
             addon_ids,
             delete_disk_file,
             purge_known_record,
-        )
+        )?;
+        if report.refresh_error.is_none() {
+            self.refresh_bundles_logged();
+        }
+        Ok(report)
     }
 
     pub fn rebuild_bundles(&self) -> Result<Vec<BundleRecord>, CoreError> {
@@ -1288,20 +1323,42 @@ fn downloaded_summary(
     }
     let size = fs::metadata(staged_path)?.len();
     let aid = AddonId::from_workshop_id(wid);
-    let summary = AddonSummary {
-        id: aid.clone(),
-        workshop_id: Some(wid),
-        title: if item.title.trim().is_empty() {
+    let addon_title =
+        crate::db::repo::clean_addon_title(meta.addon_info.get("addontitle").map(String::as_str));
+    let workshop_title = crate::db::repo::clean_workshop_title(Some(item.title.as_str()));
+    let title = workshop_title
+        .clone()
+        .or_else(|| addon_title.clone())
+        .unwrap_or_else(|| {
             dest_path
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Workshop Addon")
                 .to_string()
-        } else {
-            item.title.clone()
-        },
-        author: item.creator_name.clone(),
-        version: None,
+        });
+    let author = crate::db::repo::clean_author_name(item.creator_name.as_deref()).or_else(|| {
+        crate::db::repo::clean_author_name(
+            meta.addon_info
+                .get("addonauthor")
+                .or_else(|| meta.addon_info.get("author"))
+                .map(String::as_str),
+        )
+    });
+    let version = meta
+        .addon_info
+        .get("addonversion")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let categories =
+        crate::db::repo::merge_categories(&[], &meta.addon_info, &meta.maps, &item.tags);
+    let summary = AddonSummary {
+        id: aid.clone(),
+        workshop_id: Some(wid),
+        title,
+        addon_title,
+        workshop_title,
+        author,
+        version,
         install_state: InstallState::Installed,
         primary_dir: Some(AddonDirType::Loading),
         enabled: true,
@@ -1314,7 +1371,7 @@ fn downloaded_summary(
         file_size: size,
         files_count: meta.files_count,
         cover_image: meta.image_path.or_else(|| item.preview_url.clone()),
-        categories: crate::db::repo::derive_categories_from_info(&meta.addon_info),
+        categories,
         maps: meta.maps,
         has_dummy_bypass: config.enable_dummy_bypass,
         remote_status: item.status,

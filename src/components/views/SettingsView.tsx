@@ -666,53 +666,81 @@ export function SettingsView({
           )}
 
           {section === 'appearance' && (
-            <section className="l4a-section-card">
-              <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
-                <span className="md-title-small">{t('settings.themeMode')}</span>
-                <SegmentedButton<ThemeMode>
-                  ariaLabel={t('settings.themeMode')}
-                  value={themePref.mode}
-                  onChange={(mode) => onChangeTheme({ ...themePref, mode })}
-                  options={[
-                    { value: 'system', label: t('settings.theme.system') },
-                    { value: 'light', label: t('settings.theme.light') },
-                    { value: 'dark', label: t('settings.theme.dark') },
-                  ]}
-                />
-              </div>
-              <div className="l4a-divider" />
-              <div className="l4a-setting-row">
-                <span className="md-title-small">{t('settings.seedColor')}</span>
-                <div className="l4a-color-swatches">
-                  {THEME_SEEDS.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      className="l4a-swatch"
-                      style={{ backgroundColor: s.swatch }}
-                      data-selected={themePref.seed === s.id ? 'true' : 'false'}
-                      aria-label={s.id}
-                      onClick={() => onChangeTheme({ ...themePref, seed: s.id })}
-                    >
-                      {themePref.seed === s.id && <Check size={15} strokeWidth={2.8} />}
-                    </button>
-                  ))}
+            <>
+              <section className="l4a-section-card">
+                <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+                  <span className="md-title-small">{t('settings.themeMode')}</span>
+                  <SegmentedButton<ThemeMode>
+                    ariaLabel={t('settings.themeMode')}
+                    value={themePref.mode}
+                    onChange={(mode) => onChangeTheme({ ...themePref, mode })}
+                    options={[
+                      { value: 'system', label: t('settings.theme.system') },
+                      { value: 'light', label: t('settings.theme.light') },
+                      { value: 'dark', label: t('settings.theme.dark') },
+                    ]}
+                  />
                 </div>
-              </div>
-              <div className="l4a-divider" />
-              <div className="l4a-setting-row">
-                <span className="md-title-small">{t('settings.language')}</span>
-                <SegmentedButton<'zh' | 'en'>
-                  ariaLabel={t('settings.language')}
-                  value={language}
-                  onChange={onChangeLanguage}
-                  options={[
-                    { value: 'zh', label: '中文' },
-                    { value: 'en', label: 'English' },
-                  ]}
-                />
-              </div>
-            </section>
+                <div className="l4a-divider" />
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.seedColor')}</span>
+                  <div className="l4a-color-swatches">
+                    {THEME_SEEDS.map((s) => (
+                      <button
+                        key={s.id}
+                        type="button"
+                        className="l4a-swatch"
+                        style={{ backgroundColor: s.swatch }}
+                        data-selected={themePref.seed === s.id ? 'true' : 'false'}
+                        aria-label={s.id}
+                        onClick={() => onChangeTheme({ ...themePref, seed: s.id })}
+                      >
+                        {themePref.seed === s.id && <Check size={15} strokeWidth={2.8} />}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div className="l4a-divider" />
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.language')}</span>
+                  <SegmentedButton<'zh' | 'en'>
+                    ariaLabel={t('settings.language')}
+                    value={language}
+                    onChange={onChangeLanguage}
+                    options={[
+                      { value: 'zh', label: '中文' },
+                      { value: 'en', label: 'English' },
+                    ]}
+                  />
+                </div>
+              </section>
+
+              <section className="l4a-section-card">
+                <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+                  <span className="md-title-small">{t('settings.addonNamePreference')}</span>
+                  <SegmentedButton<'addon_title' | 'file_name'>
+                    ariaLabel={t('settings.addonNamePreference')}
+                    value={effective.addonNamePreference ?? 'addon_title'}
+                    onChange={(v) => updateDraft((d) => ({ ...d, addonNamePreference: v }))}
+                    options={[
+                      { value: 'addon_title', label: t('settings.namePref.addon_title') },
+                      { value: 'file_name', label: t('settings.namePref.file_name') },
+                    ]}
+                  />
+                </div>
+                <div className="l4a-divider" />
+                <div className="l4a-setting-row">
+                  <span className="md-title-small">{t('settings.collapseCampaignBundles')}</span>
+                  <Switch
+                    checked={effective.collapseCampaignBundles ?? true}
+                    label={t('settings.collapseCampaignBundles')}
+                    onChange={(v) =>
+                      updateDraft((d) => ({ ...d, collapseCampaignBundles: v }))
+                    }
+                  />
+                </div>
+              </section>
+            </>
           )}
         </div>
       </div>

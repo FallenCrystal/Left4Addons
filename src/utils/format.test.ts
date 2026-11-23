@@ -1,12 +1,37 @@
 import { describe, expect, it } from 'vitest';
+import type { AddonSummary } from '../api/ipc';
 import {
   extractWorkshopIdInput,
+  formatAddonDisplayName,
+  formatBundleMemberLabel,
   formatBytes,
   formatSpeed,
   getFileBaseName,
   previewFilenameByRules,
+  resolveAddonMetadataTitle,
+  stripLeadingBracketPrefixes,
+  stripVpkExtension,
   summarizeBatchReport,
 } from './format';
+
+function makeSampleAddon(overrides: Partial<AddonSummary>): AddonSummary {
+  return {
+    id: 'hash:sample',
+    title: 'Sample Addon',
+    installState: 'installed',
+    primaryDir: 'loading',
+    enabled: true,
+    fileSize: 1024,
+    filesCount: 1,
+    categories: ['Campaign'],
+    maps: [],
+    hasDummyBypass: false,
+    remoteStatus: 'unknown',
+    updateAvailable: false,
+    addonInfo: {},
+    ...overrides,
+  };
+}
 
 describe('format utilities', () => {
   it('formats byte sizes cleanly', () => {
@@ -39,6 +64,93 @@ describe('format utilities', () => {
   it('extracts file base names across Windows and POSIX paths', () => {
     expect(getFileBaseName('C:\\Games\\L4D2\\addons\\sample.vpk')).toBe('sample.vpk');
     expect(getFileBaseName('/steam/addons/workshop/12345.vpk')).toBe('12345.vpk');
+  });
+
+  it('switches cleanly between addon title and filename display preferences', () => {
+    expect(stripVpkExtension('[12345] yama_part1.vpk.disabled')).toBe('[12345] yama_part1');
+    const addon = makeSampleAddon({
+      title: 'Yama Campaign',
+      addonTitle: 'Yama Campaign',
+      currentFileName: '[3011942811] Yama_Campaign.vpk.disabled',
+    });
+    expect(formatAddonDisplayName(addon, 'addon_title')).toBe('Yama Campaign');
+    expect(formatAddonDisplayName(addon, 'file_name')).toBe('[3011942811] Yama_Campaign');
+  });
+
+  it('disambiguates multi-part bundle members with identical or generic addon titles', () => {
+    const localPart1 = makeSampleAddon({
+      id: 'hash:p1',
+      title: 'Silent Hill: Otherside',
+      addonTitle: 'Silent Hill: Otherside',
+      currentFileName: 'silenthill_part1.vpk',
+    });
+    const localPart2 = makeSampleAddon({
+      id: 'hash:p2',
+      title: 'Silent Hill: Otherside',
+      addonTitle: 'Silent Hill: Otherside',
+      currentFileName: 'silenthill_part2.vpk',
+    });
+    const siblings = [localPart1, localPart2];
+    expect(
+      formatBundleMemberLabel(localPart1, siblings, 'addon_title', 'Silent Hill: Otherside'),
+    ).toBe('Silent Hill: Otherside · silenthill_part1');
+    expect(
+      formatBundleMemberLabel(localPart2, siblings, 'addon_title', 'Silent Hill: Otherside'),
+    ).toBe('Silent Hill: Otherside · silenthill_part2');
+    expect(
+      formatBundleMemberLabel(localPart1, siblings, 'file_name', 'Silent Hill: Otherside'),
+    ).toBe('silenthill_part1');
+
+    // Also disambiguates when Part 1 has generic addonTitle == bundleName while Part 2 fell back to filename
+    const mixedPart1 = makeSampleAddon({
+      id: 'hash:m1',
+      title: 'Yama',
+      addonTitle: 'Yama',
+      currentFileName: 'yama_1.vpk',
+    });
+    const mixedPart2 = makeSampleAddon({
+      id: 'hash:m2',
+      title: 'yama_2',
+      currentFileName: 'yama_2.vpk',
+    });
+    expect(
+      formatBundleMemberLabel(mixedPart1, [mixedPart1, mixedPart2], 'addon_title', 'Yama'),
+    ).toBe('Yama · yama_1');
+
+    // Under file_name preference, colliding filenames never leak workshopTitle
+    const collidingFileA = makeSampleAddon({
+      id: 'ws:101',
+      workshopId: '101',
+      title: 'Yama (Part 1)',
+      workshopTitle: 'Yama (Part 1)',
+      currentFileName: 'shared_name.vpk',
+    });
+    const collidingFileB = makeSampleAddon({
+      id: 'ws:102',
+      workshopId: '102',
+      title: 'Yama (Part 2)',
+      workshopTitle: 'Yama (Part 2)',
+      currentFileName: 'shared_name.vpk',
+    });
+    expect(
+      formatBundleMemberLabel(
+        collidingFileA,
+        [collidingFileA, collidingFileB],
+        'file_name',
+        'Yama',
+      ),
+    ).toBe('shared_name · #101');
+  });
+
+  it('falls back to file stem when metadata titles are SDK placeholders and strips bracket prefixes', () => {
+    const placeholderAddon = makeSampleAddon({
+      title: 'My First Add-on',
+      addonTitle: 'My First Add-on',
+      addonInfo: { addontitle: 'My Add-on' },
+      currentFileName: 'sakura_campaign_第1部分.vpk',
+    });
+    expect(resolveAddonMetadataTitle(placeholderAddon)).toBe('sakura_campaign_第1部分');
+    expect(stripLeadingBracketPrefixes('[2814104912] [Campaigns] Chernobyl')).toBe('Chernobyl');
   });
 
   it.each([

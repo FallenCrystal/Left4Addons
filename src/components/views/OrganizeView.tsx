@@ -2,6 +2,7 @@ import { useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Bookmark,
+  Copy,
   Download,
   ExternalLink,
   FolderKanban,
@@ -20,13 +21,20 @@ import {
   X,
 } from 'lucide-react';
 import type {
+  AddonNamePreference,
   AddonSummary,
   BundleRecord,
   LoadoutProfile,
   TrackedCollectionRecord,
   UserGroup,
 } from '../../api/ipc';
-import { formatBytes, formatTimestamp } from '../../utils/format';
+import {
+  formatAddonDisplayName,
+  formatBundleMemberLabel,
+  formatBytes,
+  formatTimestamp,
+  matchesAddonSearch,
+} from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
 import {
   Button,
@@ -50,6 +58,7 @@ type InspectedTarget =
 
 export interface OrganizeViewProps {
   addons: AddonSummary[];
+  namePreference?: AddonNamePreference;
   bundles: BundleRecord[];
   collections: TrackedCollectionRecord[];
   userGroups: UserGroup[];
@@ -75,6 +84,7 @@ export interface OrganizeViewProps {
   onSelectAddon: (addon: AddonSummary) => void;
   onOpenInFileManager: (path: string) => void;
   onOpenFilterInLibrary: (filter: ExternalAddonFilter) => void;
+  onCopy: (text: string) => void;
 }
 
 function summarizeGroupMembers(memberIds: string[], addonsById: Map<string, AddonSummary>) {
@@ -107,6 +117,7 @@ function summarizeGroupMembers(memberIds: string[], addonsById: Map<string, Addo
 
 export function OrganizeView({
   addons,
+  namePreference = 'addon_title',
   bundles,
   collections,
   userGroups,
@@ -132,12 +143,15 @@ export function OrganizeView({
   onSelectAddon,
   onOpenInFileManager,
   onOpenFilterInLibrary,
+  onCopy,
 }: OrganizeViewProps) {
   const { t } = useTranslation();
   const [tab, setTab] = useState<OrganizeTab>('bundles');
   const [query, setQuery] = useState('');
   const [inspected, setInspected] = useState<InspectedTarget>(null);
+  const [bundleSheetTab, setBundleSheetTab] = useState<'members' | 'maps'>('members');
   const tabsId = useId();
+  const bundleTabsId = useId();
 
   const addonsById = useMemo(() => {
     const map = new Map<string, AddonSummary>();
@@ -164,7 +178,10 @@ export function OrganizeView({
     if (!needle) return bundles;
     return bundles.filter((b) => {
       if (b.name.toLowerCase().includes(needle)) return true;
-      return b.memberAddonIds.some((id) => addonsById.get(id)?.title.toLowerCase().includes(needle));
+      return b.memberAddonIds.some((id) => {
+        const addon = addonsById.get(id);
+        return addon ? matchesAddonSearch(addon, needle) : false;
+      });
     });
   }, [bundles, needle, addonsById]);
 
@@ -172,9 +189,10 @@ export function OrganizeView({
     if (!needle) return collections;
     return collections.filter((c) => {
       if (c.title.toLowerCase().includes(needle) || c.collectionId.includes(needle)) return true;
-      return c.memberWorkshopIds.some((wid) =>
-        addonsByWorkshopId.get(wid)?.title.toLowerCase().includes(needle),
-      );
+      return c.memberWorkshopIds.some((wid) => {
+        const addon = addonsByWorkshopId.get(wid);
+        return addon ? matchesAddonSearch(addon, needle) : false;
+      });
     });
   }, [collections, needle, addonsByWorkshopId]);
 
@@ -183,7 +201,10 @@ export function OrganizeView({
     return userGroups.filter((g) => {
       if (g.name.toLowerCase().includes(needle)) return true;
       if (g.tags.some((tag) => tag.toLowerCase().includes(needle))) return true;
-      return g.addonIds.some((id) => addonsById.get(id)?.title.toLowerCase().includes(needle));
+      return g.addonIds.some((id) => {
+        const addon = addonsById.get(id);
+        return addon ? matchesAddonSearch(addon, needle) : false;
+      });
     });
   }, [userGroups, needle, addonsById]);
 
@@ -193,7 +214,10 @@ export function OrganizeView({
       if (p.name.toLowerCase().includes(needle) || p.description.toLowerCase().includes(needle)) {
         return true;
       }
-      return p.enabledAddonIds.some((id) => addonsById.get(id)?.title.toLowerCase().includes(needle));
+      return p.enabledAddonIds.some((id) => {
+        const addon = addonsById.get(id);
+        return addon ? matchesAddonSearch(addon, needle) : false;
+      });
     });
   }, [profiles, needle, addonsById]);
 
@@ -265,11 +289,15 @@ export function OrganizeView({
   const renderMemberRow = (
     addon: AddonSummary,
     options?: {
+      displayLabel?: string;
+      indexBadge?: number;
+      showFileName?: boolean;
       onRemove?: () => void;
       badge?: { text: string; tone: 'primary' | 'secondary' | 'tertiary' | 'error' | 'surface' };
     },
   ) => {
     const installed = addon.installState === 'installed';
+    const displayLabel = options?.displayLabel ?? formatAddonDisplayName(addon, namePreference);
     return (
       <div
         key={addon.id}
@@ -280,7 +308,7 @@ export function OrganizeView({
           <AddonCover
             compact
             src={addon.coverImage}
-            title={addon.title}
+            title={displayLabel}
             category={addon.categories[0]}
           />
         </div>
@@ -290,7 +318,12 @@ export function OrganizeView({
           onClick={() => onSelectAddon(addon)}
         >
           <div className="l4a-row-wrap" style={{ gap: 6 }}>
-            <span className="md-title-small l4a-truncate">{addon.title}</span>
+            {options?.indexBadge !== undefined && (
+              <span className="md-pill md-mono" data-tone="secondary">
+                #{options.indexBadge}
+              </span>
+            )}
+            <span className="md-title-small l4a-truncate">{displayLabel}</span>
             {options?.badge && (
               <span className="md-pill" data-tone={options.badge.tone}>
                 {options.badge.text}
@@ -298,9 +331,22 @@ export function OrganizeView({
             )}
           </div>
           <div className="l4a-addon-meta">
-            <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+            {options?.showFileName && addon.currentFileName ? (
+              <span className="md-mono l4a-truncate">{addon.currentFileName}</span>
+            ) : (
+              <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+            )}
             <span>·</span>
             <span>{formatBytes(addon.fileSize)}</span>
+            {addon.maps.length > 0 && (
+              <>
+                <span>·</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                  <MapIcon size={11} />
+                  {addon.maps.length}
+                </span>
+              </>
+            )}
             {addon.primaryDir && (
               <>
                 <span>·</span>
@@ -328,7 +374,7 @@ export function OrganizeView({
               compact
               checked={addon.enabled}
               disabled={busy}
-              label={addon.title}
+              label={displayLabel}
               onChange={(next) => onToggleSingle(addon, next)}
             />
           )}
@@ -506,7 +552,12 @@ export function OrganizeView({
                           <div className="l4a-member-preview">
                             {summary.members.slice(0, 3).map((m) => (
                               <span key={m.id} className="l4a-member-chip l4a-truncate">
-                                {m.title}
+                                {formatBundleMemberLabel(
+                                  m,
+                                  summary.members,
+                                  namePreference,
+                                  bundle.name,
+                                )}
                               </span>
                             ))}
                             {summary.members.length > 3 && (
@@ -585,9 +636,10 @@ export function OrganizeView({
                 );
                 const installed = total - missing.length;
                 const percent = total > 0 ? Math.round((installed / total) * 100) : 0;
-                const previewTitles = col.memberWorkshopIds
-                  .slice(0, 3)
-                  .map((wid) => addonsByWorkshopId.get(wid)?.title ?? `#${wid}`);
+                const previewTitles = col.memberWorkshopIds.slice(0, 3).map((wid) => {
+                  const found = addonsByWorkshopId.get(wid);
+                  return found ? formatAddonDisplayName(found, namePreference) : `#${wid}`;
+                });
 
                 return (
                   <article
@@ -765,7 +817,7 @@ export function OrganizeView({
                           <div className="l4a-member-preview">
                             {summary.members.slice(0, 3).map((m) => (
                               <span key={m.id} className="l4a-member-chip l4a-truncate">
-                                {m.title}
+                                {formatAddonDisplayName(m, namePreference)}
                               </span>
                             ))}
                             {summary.members.length > 3 && (
@@ -913,7 +965,7 @@ export function OrganizeView({
                         <div className="l4a-member-preview">
                           {previewMembers.slice(0, 3).map((m) => (
                             <span key={m.id} className="l4a-member-chip l4a-truncate">
-                              {m.title}
+                              {formatAddonDisplayName(m, namePreference)}
                             </span>
                           ))}
                           {previewMembers.length > 3 && (
@@ -1018,39 +1070,131 @@ export function OrganizeView({
           (() => {
             const summary = summarizeGroupMembers(inspectedBundle.memberAddonIds, addonsById);
             const toggleableIds = summary.loading.map((a) => a.id);
+            const hasBundleMaps = inspectedBundle.maps.length > 0;
+            const activeBundleTab: 'members' | 'maps' = hasBundleMaps ? bundleSheetTab : 'members';
             return (
-              <div className="md-sheet-body">
-                <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
-                  <div className="md-chip-row">
-                    <span className="md-pill" data-tone="secondary">
-                      {t(`organize.bundleKind.${inspectedBundle.kind}`)}
-                    </span>
-                    {renderStatusPill(summary)}
-                    <span className="md-pill" data-tone="surface">
-                      {formatBytes(summary.totalSize)}
-                    </span>
-                  </div>
-                  {toggleableIds.length > 0 && (
-                    <Switch
-                      compact
-                      checked={summary.allEnabled}
-                      disabled={busy}
-                      label={t('organize.toggleAll')}
-                      onChange={(next) => onBulkToggle(toggleableIds, next)}
-                    />
-                  )}
-                </div>
+              <>
+                {hasBundleMaps && (
+                  <Tabs
+                    compact
+                    idPrefix={bundleTabsId}
+                    value={activeBundleTab}
+                    onChange={setBundleSheetTab}
+                    tabs={[
+                      {
+                        value: 'members',
+                        label: t('organize.members'),
+                        count: summary.members.length,
+                      },
+                      {
+                        value: 'maps',
+                        label: t('detail.maps'),
+                        count: inspectedBundle.maps.length,
+                      },
+                    ]}
+                  />
+                )}
+                <div
+                  className="md-sheet-body"
+                  role={hasBundleMaps ? 'tabpanel' : undefined}
+                  id={hasBundleMaps ? `${bundleTabsId}-panel-${activeBundleTab}` : undefined}
+                  aria-labelledby={
+                    hasBundleMaps ? `${bundleTabsId}-tab-${activeBundleTab}` : undefined
+                  }
+                >
+                  {activeBundleTab === 'members' ? (
+                    <>
+                      <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                        <div className="md-chip-row">
+                          <span className="md-pill" data-tone="secondary">
+                            {t(`organize.bundleKind.${inspectedBundle.kind}`)}
+                          </span>
+                          {renderStatusPill(summary)}
+                          <span className="md-pill" data-tone="surface">
+                            {formatBytes(summary.totalSize)}
+                          </span>
+                        </div>
+                        {toggleableIds.length > 0 && (
+                          <Switch
+                            compact
+                            checked={summary.allEnabled}
+                            disabled={busy}
+                            label={t('organize.toggleAll')}
+                            onChange={(next) => onBulkToggle(toggleableIds, next)}
+                          />
+                        )}
+                      </div>
 
-                <div className="l4a-list">
-                  {summary.members.length === 0 ? (
-                    <div style={{ padding: 20, textAlign: 'center', color: 'var(--md-sys-color-on-surface-variant)' }}>
-                      {t('common.empty')}
-                    </div>
+                      <div className="l4a-list">
+                        {summary.members.length === 0 ? (
+                          <div
+                            style={{
+                              padding: 20,
+                              textAlign: 'center',
+                              color: 'var(--md-sys-color-on-surface-variant)',
+                            }}
+                          >
+                            {t('common.empty')}
+                          </div>
+                        ) : (
+                          summary.members.map((addon, idx) =>
+                            renderMemberRow(addon, {
+                              displayLabel: formatBundleMemberLabel(
+                                addon,
+                                summary.members,
+                                namePreference,
+                                inspectedBundle.name,
+                              ),
+                              indexBadge: idx + 1,
+                              showFileName: true,
+                            }),
+                          )
+                        )}
+                      </div>
+                    </>
                   ) : (
-                    summary.members.map((addon) => renderMemberRow(addon))
+                    <div className="l4a-list">
+                      {inspectedBundle.maps.map((m) => (
+                        <div
+                          key={m.code}
+                          className="l4a-list-row"
+                          style={{ minHeight: 56, cursor: 'default' }}
+                        >
+                          {m.imagePath && (
+                            <div className="l4a-list-thumb">
+                              <AddonCover
+                                compact
+                                src={m.imagePath}
+                                title={m.name}
+                                category="Map"
+                              />
+                            </div>
+                          )}
+                          <div className="l4a-list-main">
+                            <span className="md-title-small">{m.name}</span>
+                            <span
+                              className="md-body-small md-mono"
+                              style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                            >
+                              {m.code}
+                            </span>
+                          </div>
+                          <Button
+                            variant="tonal"
+                            size="sm"
+                            icon={<Copy size={13} />}
+                            title={t('detail.copyMapCode')}
+                            aria-label={`${t('detail.copyMapCode')} ${m.code}`}
+                            onClick={() => onCopy(m.code)}
+                          >
+                            {t('common.copy')}
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
                   )}
                 </div>
-              </div>
+              </>
             );
           })()}
       </SideSheet>
@@ -1155,7 +1299,7 @@ export function OrganizeView({
                   <div key={wid} className="l4a-list-row l4a-list-row-dense" style={{ cursor: 'default' }}>
                     <div className="l4a-list-main">
                       <span className="md-title-small l4a-truncate">
-                        {local?.title ?? `#${wid}`}
+                        {local ? formatAddonDisplayName(local, namePreference) : `#${wid}`}
                       </span>
                       <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
                         #{wid}

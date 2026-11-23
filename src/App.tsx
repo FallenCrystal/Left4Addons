@@ -250,6 +250,17 @@ export function App() {
         {ctrl.snapshot && destination === 'library' && (
           <LibraryView
             addons={ctrl.snapshot.addons}
+            bundles={ctrl.snapshot.bundles}
+            namePreference={ctrl.snapshot.config.addonNamePreference ?? 'addon_title'}
+            collapseBundles={ctrl.snapshot.config.collapseCampaignBundles ?? true}
+            onToggleCollapseBundles={(next) => {
+              if (!ctrl.snapshot) return;
+              void ctrl.saveConfig(
+                { ...ctrl.snapshot.config, collapseCampaignBundles: next },
+                false,
+                true,
+              );
+            }}
             snapshotVersion={ctrl.snapshotVersion}
             liveDownloads={ctrl.liveDownloads}
             externalFilter={externalFilter}
@@ -270,12 +281,14 @@ export function App() {
             onDownloadItem={(wid, title) => void ctrl.downloadWorkshopItem(wid, title)}
             onUpdateItem={(wid, title) => void ctrl.updateWorkshopItem(wid, title)}
             onOpenInFileManager={handleOpenInFileManager}
+            onCopy={(text) => void handleCopy(text)}
           />
         )}
 
         {ctrl.snapshot && destination === 'organize' && (
           <OrganizeView
             addons={ctrl.snapshot.addons}
+            namePreference={ctrl.snapshot.config.addonNamePreference ?? 'addon_title'}
             bundles={ctrl.snapshot.bundles}
             collections={ctrl.snapshot.collections}
             userGroups={ctrl.snapshot.userGroups}
@@ -304,6 +317,7 @@ export function App() {
               setExternalFilter(filter);
               setDestination('library');
             }}
+            onCopy={(text) => void handleCopy(text)}
           />
         )}
 
@@ -370,6 +384,7 @@ export function App() {
 
       <AddonDetailSheet
         addon={activeDetailAddon}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         bundles={ctrl.snapshot?.bundles ?? []}
         userGroups={ctrl.snapshot?.userGroups ?? []}
         busy={ctrl.busy}
@@ -398,6 +413,7 @@ export function App() {
         onTabChange={setTasksTab}
         onClose={() => setTasksOpen(false)}
         addons={addons}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         tasks={ctrl.snapshot?.tasks ?? []}
         liveDownloads={ctrl.liveDownloads}
         syncReport={ctrl.syncReport}
@@ -454,6 +470,7 @@ export function App() {
       <DeleteDialog
         key={`delete:${deleteTargets.map((item) => item.id).join(',') || 'closed'}`}
         addons={deleteTargets}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         busy={ctrl.busy}
         onClose={() => setDeleteTargets([])}
         onConfirm={async (ids, deleteDiskFile, purgeKnownRecord) => {
@@ -484,6 +501,7 @@ export function App() {
       <BatchReportDialog
         payload={ctrl.batchReport}
         addonsById={addonsById}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         onClose={() => ctrl.setBatchReport(null)}
         onRescan={ctrl.scan}
       />
@@ -494,6 +512,7 @@ export function App() {
         initial={groupDialogState.initial}
         preselectedIds={groupDialogState.preselectedIds}
         addons={addons}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         busy={ctrl.busy}
         onClose={() => setGroupDialogState({ open: false, initial: null })}
         onSave={async (group) => {
@@ -507,6 +526,7 @@ export function App() {
         open={bundleDialogIds !== null}
         preselectedIds={bundleDialogIds ?? undefined}
         addons={addons}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         busy={ctrl.busy}
         onClose={() => setBundleDialogIds(null)}
         onCreate={async (name, memberIds) => {
@@ -531,6 +551,7 @@ export function App() {
         open={profileDialogState.open}
         initial={profileDialogState.initial}
         addons={addons}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'addon_title'}
         busy={ctrl.busy}
         onClose={() => setProfileDialogState({ open: false, initial: null })}
         onSave={async (profile) => {
