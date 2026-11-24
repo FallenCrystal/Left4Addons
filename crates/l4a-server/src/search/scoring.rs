@@ -28,7 +28,11 @@ pub fn score_primary_candidate(
     }
 
     if query.terms.is_empty() {
-        return None;
+        return if query.exact_workshop_id.is_some() {
+            None
+        } else {
+            score_symbol_only_title(query, title)
+        };
     }
 
     let title_folded = fold_text(title);
@@ -101,20 +105,9 @@ pub fn score_primary_candidate(
     None
 }
 
-pub fn score_title_only_candidate(
-    query: &ParsedQuery,
-    workshop_id: u64,
-    title: &str,
-) -> Option<MatchRank> {
-    if query.exact_workshop_id == Some(workshop_id) {
-        return Some(MatchRank {
-            tier: 0,
-            sub_rank: 0,
-        });
-    }
-
+pub fn score_title_only_candidate(query: &ParsedQuery, title: &str) -> Option<MatchRank> {
     if query.terms.is_empty() {
-        return None;
+        return score_symbol_only_title(query, title);
     }
 
     let title_folded = fold_text(title);
@@ -137,7 +130,43 @@ pub fn score_title_only_candidate(
     None
 }
 
+pub fn score_symbol_only_title(query: &ParsedQuery, title: &str) -> Option<MatchRank> {
+    let title = fold_text(title);
+    if title == query.raw_folded {
+        Some(MatchRank {
+            tier: 0,
+            sub_rank: 1,
+        })
+    } else if title.starts_with(&query.raw_folded) {
+        Some(MatchRank {
+            tier: 1,
+            sub_rank: 0,
+        })
+    } else if title.contains(&query.raw_folded) {
+        Some(MatchRank {
+            tier: 2,
+            sub_rank: 0,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn score_symbol_only_desc(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
+    let cleaned = strip_bbcode_and_urls(description);
+    fold_text(&cleaned)
+        .contains(&query.raw_folded)
+        .then_some(MatchRank {
+            tier: 6,
+            sub_rank: 0,
+        })
+}
+
 pub fn score_desc_candidate(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
+    if query.terms.is_empty() {
+        return score_symbol_only_desc(query, description);
+    }
+
     let cleaned = strip_bbcode_and_urls(description);
     if !query.literal_substrings.is_empty()
         && !query.contains_required_literals(&fold_text(&cleaned))

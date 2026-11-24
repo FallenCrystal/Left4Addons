@@ -200,7 +200,8 @@ impl CatalogConfig {
         self.sync.incremental_pages_per_tick = self.sync.incremental_pages_per_tick.clamp(1, 20);
         self.sync.backfill_interval_secs = self.sync.backfill_interval_secs.max(2);
         self.sync.backfill_batch_size = self.sync.backfill_batch_size.clamp(1, 100);
-        if self.search.default_language.trim().is_empty() {
+        self.search.default_language = self.search.default_language.trim().to_string();
+        if self.search.default_language.is_empty() {
             self.search.default_language = "english".to_string();
         }
         self.search.steam_timeout_ms = self.search.steam_timeout_ms.clamp(500, 15_000);
@@ -223,7 +224,8 @@ pub struct CatalogConfigStore {
 }
 
 impl CatalogConfigStore {
-    pub fn new(path: Option<PathBuf>, config: CatalogConfig) -> Self {
+    pub fn new(path: Option<PathBuf>, mut config: CatalogConfig) -> Self {
+        config.normalize();
         Self {
             path,
             inner: RwLock::new(config),

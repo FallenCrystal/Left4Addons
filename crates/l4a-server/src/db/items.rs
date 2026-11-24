@@ -1,6 +1,6 @@
 use super::{
-    parse_json_enum, parse_rfc3339_or_now, parse_workshop_id_col, serialize_json_enum, ServerRepo,
-    StoredItemMeta,
+    parse_json_enum, parse_rfc3339_or_now, parse_workshop_id_col, serialize_json_enum,
+    workshop_id_to_i64, OverlayItemMeta, ServerRepo, StoredItemMeta,
 };
 use chrono::{DateTime, Utc};
 use l4a_protocol::{
@@ -8,8 +8,8 @@ use l4a_protocol::{
     WorkshopDependency, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
     WorkshopPreview,
 };
-use rusqlite::{params, Connection, OptionalExtension};
-use std::collections::HashMap;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 
 impl ServerRepo {
     pub fn get_item(&self, workshop_id: WorkshopId) -> anyhow::Result<Option<StoredItemMeta>> {
@@ -27,6 +27,9 @@ impl ServerRepo {
         conn: &Connection,
         workshop_id: WorkshopId,
     ) -> anyhow::Result<Option<StoredItemMeta>> {
+        let Ok(wid_i64) = i64::try_from(workshop_id.as_u64()) else {
+            return Ok(None);
+        };
         let mut stmt = conn.prepare_cached(
             "SELECT file_type, status, title, description, creator_steam_id,
                     creator_name, preview_url, previews_json, file_url, file_size,
@@ -38,7 +41,7 @@ impl ServerRepo {
         )?;
 
         let row = stmt
-            .query_row(params![workshop_id.as_u64() as i64], |r| {
+            .query_row(params![wid_i64], |r| {
                 let file_type_str: String = r.get(0)?;
                 let status_str: String = r.get(1)?;
                 let previews_json: String = r.get(7)?;
@@ -98,6 +101,9 @@ impl ServerRepo {
         conn: &Connection,
         parent_id: WorkshopId,
     ) -> anyhow::Result<Vec<WorkshopDependency>> {
+        let Ok(parent_i64) = i64::try_from(parent_id.as_u64()) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare_cached(
             "SELECT edge.dep_workshop_id,
                     CASE WHEN dep.status = 'private_or_unavailable' THEN NULL ELSE edge.dep_title END,
@@ -107,7 +113,7 @@ impl ServerRepo {
              WHERE edge.parent_workshop_id = ?1 AND edge.status = 'active'
              ORDER BY edge.dep_workshop_id ASC",
         )?;
-        let rows = stmt.query_map(params![parent_id.as_u64() as i64], |r| {
+        let rows = stmt.query_map(params![parent_i64], |r| {
             let dep_raw: i64 = r.get(0)?;
             Ok(WorkshopDependency {
                 workshop_id: parse_workshop_id_col(0, dep_raw)?,
@@ -136,6 +142,73 @@ impl ServerRepo {
                 }
             }
             Ok((found, missing))
+        })
+    }
+
+    /// Lightweight batched lookup for hybrid search local overlays; full records are loaded only for admin overrides.
+    pub(crate) fn get_overlay_batch(
+        &self,
+        ids: &[WorkshopId],
+    ) -> anyhow::Result<HashMap<WorkshopId, OverlayItemMeta>> {
+        let mut seen = HashSet::with_capacity(ids.len());
+        let unique_i64: Vec<i64> = ids
+            .iter()
+            .filter(|id| seen.insert(**id))
+            .filter_map(|id| i64::try_from(id.as_u64()).ok())
+            .collect();
+        if unique_i64.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.with_read_snapshot(|snapshot| {
+            let mut out = HashMap::with_capacity(unique_i64.len());
+            let mut override_ids = Vec::new();
+            for chunk in unique_i64.chunks(500) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT workshop_id, status, is_admin_override, last_verified_at,
+                            catalog_indexed, is_listed, creator_name
+                     FROM workshop_items
+                     WHERE workshop_id IN ({placeholders})"
+                );
+                let mut stmt = snapshot.prepare(&sql)?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter().copied()), |r| {
+                    let wid = parse_workshop_id_col(0, r.get(0)?)?;
+                    let status_str: String = r.get(1)?;
+                    let is_override: i64 = r.get(2)?;
+                    let verified_str: String = r.get(3)?;
+                    let catalog_indexed: i64 = r.get(4)?;
+                    let is_listed: Option<i64> = r.get(5)?;
+                    let creator_name: Option<String> = r.get(6)?;
+                    Ok((
+                        wid,
+                        OverlayItemMeta {
+                            status: parse_json_enum(&status_str, WorkshopItemStatus::Unknown),
+                            is_admin_override: is_override != 0,
+                            last_verified_at: verified_str.parse().unwrap_or(DateTime::UNIX_EPOCH),
+                            catalog_indexed: catalog_indexed != 0,
+                            is_listed: is_listed.map(|v| v != 0),
+                            creator_name,
+                            override_record: None,
+                        },
+                    ))
+                })?;
+                for row in rows {
+                    let (wid, meta) = row?;
+                    if meta.is_admin_override {
+                        override_ids.push(wid);
+                    }
+                    out.insert(wid, meta);
+                }
+            }
+            for wid in override_ids {
+                if let Some(full) = Self::get_item_with_conn(snapshot, wid)? {
+                    if let Some(meta) = out.get_mut(&wid) {
+                        meta.override_record = Some(full.record);
+                    }
+                }
+            }
+            Ok(out)
         })
     }
 
@@ -186,7 +259,7 @@ impl ServerRepo {
         listed: Option<bool>,
         catalog_indexed: Option<bool>,
     ) -> anyhow::Result<()> {
-        let wid = record.workshop_id.as_u64() as i64;
+        let wid = workshop_id_to_i64(record.workshop_id)?;
         let now = Utc::now().to_rfc3339();
         let removed_at = match record.status {
             WorkshopItemStatus::Removed | WorkshopItemStatus::PrivateOrUnavailable => {
@@ -311,10 +384,11 @@ impl ServerRepo {
         }
 
         for dep in &record.dependencies {
+            let dep_wid = workshop_id_to_i64(dep.workshop_id)?;
             let dep_meta = tx
                 .query_row(
                     "SELECT title, status FROM workshop_items WHERE workshop_id = ?1",
-                    params![dep.workshop_id.as_u64() as i64],
+                    params![dep_wid],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .optional()?;
@@ -336,7 +410,7 @@ impl ServerRepo {
                 "#,
                 params![
                     wid,
-                    dep.workshop_id.as_u64() as i64,
+                    dep_wid,
                     resolved_dep_title,
                     if dep.required { 1 } else { 0 },
                     now,
@@ -366,6 +440,7 @@ impl ServerRepo {
         record: &WorkshopItemRecord,
         recorded_at: &str,
     ) -> anyhow::Result<()> {
+        let wid = workshop_id_to_i64(record.workshop_id)?;
         tx.execute(
             r#"
             INSERT INTO workshop_item_revisions (
@@ -373,7 +448,7 @@ impl ServerRepo {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
-                record.workshop_id.as_u64() as i64,
+                wid,
                 serialize_json_enum(&record.status),
                 record.title,
                 record.time_updated,
@@ -429,6 +504,9 @@ impl ServerRepo {
         conn: &Connection,
         workshop_id: WorkshopId,
     ) -> anyhow::Result<Vec<ItemRevisionEntry>> {
+        let Ok(wid) = i64::try_from(workshop_id.as_u64()) else {
+            return Ok(Vec::new());
+        };
         let mut stmt = conn.prepare(
             "SELECT id, status, title, time_updated, dependencies_json, source, recorded_at
              FROM workshop_item_revisions
@@ -436,7 +514,7 @@ impl ServerRepo {
              ORDER BY id DESC
              LIMIT 100",
         )?;
-        let rows = stmt.query_map(params![workshop_id.as_u64() as i64], |r| {
+        let rows = stmt.query_map(params![wid], |r| {
             let status_str: String = r.get(1)?;
             let deps_json: String = r.get(4)?;
             let source_str: String = r.get(5)?;
@@ -459,11 +537,14 @@ impl ServerRepo {
     }
 
     pub fn list_removed_deps(&self, parent_id: WorkshopId) -> anyhow::Result<Vec<WorkshopId>> {
+        let Ok(parent_i64) = i64::try_from(parent_id.as_u64()) else {
+            return Ok(Vec::new());
+        };
         let conn = self.lock_reader()?;
         let mut stmt = conn.prepare(
             "SELECT dep_workshop_id FROM workshop_item_dependencies WHERE parent_workshop_id = ?1 AND status = 'removed_upstream'",
         )?;
-        let rows = stmt.query_map(params![parent_id.as_u64() as i64], |r| {
+        let rows = stmt.query_map(params![parent_i64], |r| {
             let raw: i64 = r.get(0)?;
             parse_workshop_id_col(0, raw)
         })?;

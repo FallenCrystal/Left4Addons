@@ -522,7 +522,8 @@ impl CatalogSyncCoordinator {
                 .await?;
 
             let next = page.next_cursor.filter(|_| !past_boundary);
-            let stalled = next.as_ref() == Some(&pending.cursor);
+            let stalled =
+                next.as_deref() == Some(pending.cursor.as_str()) || next.as_deref() == Some("*");
             let complete = next.is_none();
             if complete {
                 scan.checkpoint = scan.checkpoint.max(pending.newest);
@@ -629,7 +630,7 @@ impl CatalogSyncCoordinator {
 
         let next_cursor = page
             .next_cursor
-            .filter(|c| c != &cursor)
+            .filter(|c| c != &cursor && c != "*" && !page.outcomes.is_empty())
             .unwrap_or_else(|| "DONE".to_string());
         self.db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
             .await

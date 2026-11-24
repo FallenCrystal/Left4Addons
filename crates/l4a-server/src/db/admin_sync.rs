@@ -94,10 +94,11 @@ impl ServerRepo {
     }
 
     pub fn clear_admin_override(&self, wid: WorkshopId, actor: &str) -> anyhow::Result<bool> {
+        let wid_i64 = super::workshop_id_to_i64(wid)?;
         self.with_transaction(|tx| {
             let changed = tx.execute(
                 "UPDATE workshop_items SET is_admin_override = 0, source = 'catalog_server' WHERE workshop_id = ?1",
-                params![wid.as_u64() as i64],
+                params![wid_i64],
             )?;
             if changed > 0 {
                 Self::append_audit_log_tx(
@@ -144,6 +145,7 @@ impl ServerRepo {
         status: Option<WorkshopItemStatus>,
         time_updated: Option<i64>,
     ) -> anyhow::Result<()> {
+        let wid_i64 = workshop_id.map(super::workshop_id_to_i64).transpose()?;
         tx.execute(
             r#"
             INSERT INTO audit_log (
@@ -151,7 +153,7 @@ impl ServerRepo {
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             "#,
             params![
-                workshop_id.map(|id| id.as_u64() as i64),
+                wid_i64,
                 actor,
                 action,
                 reason,

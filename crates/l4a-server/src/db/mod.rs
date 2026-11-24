@@ -56,6 +56,23 @@ impl StoredItemMeta {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OverlayItemMeta {
+    pub status: WorkshopItemStatus,
+    pub is_admin_override: bool,
+    pub last_verified_at: DateTime<Utc>,
+    pub catalog_indexed: bool,
+    pub is_listed: Option<bool>,
+    pub creator_name: Option<String>,
+    pub override_record: Option<WorkshopItemRecord>,
+}
+
+impl OverlayItemMeta {
+    pub(crate) fn is_in_public_catalog(&self) -> bool {
+        self.catalog_indexed && self.is_listed == Some(true)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogIndexPolicy {
     /// 仅写入或刷新按 ID 穿透缓存，不将未收录条目暴露到公开工坊首页与搜索。
@@ -212,6 +229,11 @@ fn parse_workshop_id_col(col: usize, raw: i64) -> rusqlite::Result<WorkshopId> {
                 format!("invalid workshop_id in SQLite row: {raw}").into(),
             )
         })
+}
+
+pub(super) fn workshop_id_to_i64(wid: WorkshopId) -> anyhow::Result<i64> {
+    i64::try_from(wid.as_u64())
+        .map_err(|_| anyhow::anyhow!("WorkshopId 超出 SQLite 整数范围: {wid}"))
 }
 
 #[cfg(test)]

@@ -156,15 +156,27 @@ impl WorkshopProvider for CatalogBackendProvider {
             .build_client_for(&url, Some(SEARCH_TIMEOUT))
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
+        let page = query.page.max(1);
+        let page_size = if query.page_size == 0 {
+            30
+        } else {
+            query.page_size.clamp(1, 100)
+        };
         let mut params = vec![
-            ("page", query.page.to_string()),
-            ("pageSize", query.page_size.to_string()),
+            ("page", page.to_string()),
+            ("pageSize", page_size.to_string()),
         ];
         if let Some(ref q) = query.query {
-            params.push(("q", q.clone()));
+            let trimmed = q.trim();
+            if !trimmed.is_empty() {
+                params.push(("q", trimmed.to_string()));
+            }
         }
         if let Some(ref tag) = query.tag {
-            params.push(("tag", tag.clone()));
+            let trimmed = tag.trim();
+            if !trimmed.is_empty() {
+                params.push(("tag", trimmed.to_string()));
+            }
         }
         if let Some(status) = query.status {
             let status_str = serde_json::to_string(&status)

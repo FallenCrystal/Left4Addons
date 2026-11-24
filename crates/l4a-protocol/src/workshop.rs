@@ -156,7 +156,7 @@ impl WorkshopFetchOutcome {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchQuery {
     #[serde(default)]
@@ -177,6 +177,22 @@ pub struct SearchQuery {
     pub search_target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_type: Option<WorkshopFileType>,
+}
+
+impl Default for SearchQuery {
+    fn default() -> Self {
+        Self {
+            query: None,
+            tag: None,
+            status: None,
+            sort: None,
+            page: default_page(),
+            page_size: default_page_size(),
+            language: None,
+            search_target: None,
+            file_type: None,
+        }
+    }
 }
 
 fn default_page() -> u32 {

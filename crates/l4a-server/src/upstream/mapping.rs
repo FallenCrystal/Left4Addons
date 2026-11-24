@@ -59,7 +59,7 @@ pub(super) fn map_detail(
     Some(WorkshopObservation {
         outcome,
         listed: d.visibility() == 0,
-        consumer_appid: d.consumer_appid,
+        consumer_appid: d.consumer_appid.filter(|id| *id > 0),
     })
 }
 
@@ -187,9 +187,14 @@ pub(super) fn details_to_record(
     let description = d
         .file_description
         .as_deref()
-        .or(d.short_description.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            d.short_description
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
         .map(ToString::to_string);
 
     let preview_url = d

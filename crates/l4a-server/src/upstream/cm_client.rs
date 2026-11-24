@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use l4a_protocol::{
     CatalogSteamStatus, SteamAuthFlowStatus, SteamAuthMode, SteamConnectionState, WorkshopId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -20,6 +20,14 @@ use steam_vent_proto_steam::steammessages_publishedfile_steamclient::{
     CPublishedFile_GetDetails_Request, CPublishedFile_QueryFiles_Request, PublishedFileDetails,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
+
+const MAX_PERSONA_CACHE_ENTRIES: usize = 10_000;
+
+#[derive(Default)]
+pub(super) struct ConnectionSlot {
+    pub(super) generation: u64,
+    pub(super) conn: Option<Connection>,
+}
 
 #[derive(Default)]
 pub(super) struct ConnectionMeta {
@@ -31,11 +39,56 @@ pub(super) struct ConnectionMeta {
     last_error: Option<String>,
 }
 
+struct ConnectStateGuard {
+    meta: Arc<RwLock<ConnectionMeta>>,
+    completed: bool,
+}
+
+impl ConnectStateGuard {
+    fn new(meta: Arc<RwLock<ConnectionMeta>>) -> Self {
+        Self {
+            meta,
+            completed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ConnectStateGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Ok(mut meta) = self.meta.try_write() {
+            if matches!(
+                meta.state,
+                SteamConnectionState::Connecting | SteamConnectionState::Reconnecting
+            ) {
+                meta.state = SteamConnectionState::Disconnected;
+            }
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let meta = Arc::clone(&self.meta);
+            handle.spawn(async move {
+                let mut m = meta.write().await;
+                if matches!(
+                    m.state,
+                    SteamConnectionState::Connecting | SteamConnectionState::Reconnecting
+                ) {
+                    m.state = SteamConnectionState::Disconnected;
+                }
+            });
+        }
+    }
+}
+
 pub(super) struct SteamCmInner {
     pub(super) config_store: Arc<CatalogConfigStore>,
     server_list: Mutex<Option<ServerList>>,
-    pub(super) connection: Mutex<Option<Connection>>,
-    pub(super) meta: RwLock<ConnectionMeta>,
+    pub(super) connection: Mutex<ConnectionSlot>,
+    pub(super) meta: Arc<RwLock<ConnectionMeta>>,
     pub(super) auth_flow: Mutex<AuthFlowSlot>,
     pub(super) guard_file_lock: Arc<StdMutex<()>>,
     pub(super) persona_cache: RwLock<HashMap<u64, String>>,
@@ -56,11 +109,11 @@ impl SteamCmClient {
             inner: Arc::new(SteamCmInner {
                 config_store,
                 server_list: Mutex::new(None),
-                connection: Mutex::new(None),
-                meta: RwLock::new(ConnectionMeta {
+                connection: Mutex::new(ConnectionSlot::default()),
+                meta: Arc::new(RwLock::new(ConnectionMeta {
                     state: SteamConnectionState::Disconnected,
                     ..Default::default()
-                }),
+                })),
                 auth_flow: Mutex::new(AuthFlowSlot::default()),
                 guard_file_lock: Arc::new(StdMutex::new(())),
                 persona_cache: RwLock::new(HashMap::new()),
@@ -77,7 +130,7 @@ impl SteamCmClient {
     ) -> anyhow::Result<Vec<WorkshopObservation>> {
         let _permit = self.inner.request_gate.acquire().await?;
         let app_id = self.inner.config_store.get().steam.app_id;
-        let mut conn = self.inner.get_or_connect().await?;
+        let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
         let make_req = || CPublishedFile_GetDetails_Request {
             publishedfileids: ids.iter().map(|id| id.as_u64()).collect(),
             includetags: Some(true),
@@ -94,7 +147,8 @@ impl SteamCmClient {
         let resp = match conn.service_method(make_req()).await {
             Ok(resp) => resp,
             Err(err) if should_retry_network(&err) => {
-                conn = self.inner.invalidate_and_reconnect().await?;
+                let (_, reconnected) = self.inner.invalidate_and_reconnect(Some(conn_gen)).await?;
+                conn = reconnected;
                 observed_at = Utc::now();
                 conn.service_method(make_req())
                     .await
@@ -124,10 +178,15 @@ impl SteamCmInner {
         Ok(discovered)
     }
 
-    async fn connect_fresh(&self) -> anyhow::Result<Connection> {
+    async fn connect_fresh(&self, reconnecting: bool) -> anyhow::Result<Connection> {
+        let mut state_guard = ConnectStateGuard::new(Arc::clone(&self.meta));
         {
             let mut m = self.meta.write().await;
-            m.state = SteamConnectionState::Connecting;
+            m.state = if reconnecting {
+                SteamConnectionState::Reconnecting
+            } else {
+                SteamConnectionState::Connecting
+            };
         }
         let server_list = match self.ensure_server_list().await {
             Ok(s) => s,
@@ -135,6 +194,7 @@ impl SteamCmInner {
                 let mut m = self.meta.write().await;
                 m.state = SteamConnectionState::Error;
                 m.last_error = Some(err.to_string());
+                state_guard.disarm();
                 return Err(err);
             }
         };
@@ -161,12 +221,14 @@ impl SteamCmInner {
             Ok(mut conn) => {
                 conn.set_timeout(Duration::from_secs(20));
                 self.record_connected(&conn).await;
+                state_guard.disarm();
                 Ok(conn)
             }
             Err(err) => {
                 let mut m = self.meta.write().await;
                 m.state = SteamConnectionState::Error;
                 m.last_error = Some(err.to_string());
+                state_guard.disarm();
                 Err(err)
             }
         }
@@ -185,26 +247,37 @@ impl SteamCmInner {
         m.last_error = None;
     }
 
-    pub(super) async fn get_or_connect(&self) -> anyhow::Result<Connection> {
+    pub(super) async fn get_or_connect(&self) -> anyhow::Result<(u64, Connection)> {
         let mut guard = self.connection.lock().await;
-        if let Some(ref conn) = *guard {
-            return Ok(conn.clone());
+        if let Some(ref conn) = guard.conn {
+            return Ok((guard.generation, conn.clone()));
         }
-        let fresh = self.connect_fresh().await?;
-        *guard = Some(fresh.clone());
-        Ok(fresh)
+        let fresh = self.connect_fresh(false).await?;
+        guard.generation += 1;
+        guard.conn = Some(fresh.clone());
+        Ok((guard.generation, fresh))
     }
 
-    async fn invalidate_and_reconnect(&self) -> anyhow::Result<Connection> {
-        {
-            let mut m = self.meta.write().await;
-            m.state = SteamConnectionState::Reconnecting;
-        }
+    async fn invalidate_and_reconnect(
+        &self,
+        failed_gen: Option<u64>,
+    ) -> anyhow::Result<(u64, Connection)> {
         let mut guard = self.connection.lock().await;
-        *guard = None;
-        let fresh = self.connect_fresh().await?;
-        *guard = Some(fresh.clone());
-        Ok(fresh)
+        if let (Some(failed), Some(ref conn)) = (failed_gen, &guard.conn) {
+            if guard.generation != failed {
+                return Ok((guard.generation, conn.clone()));
+            }
+        }
+        guard.conn = None;
+        let fresh = self.connect_fresh(true).await?;
+        guard.generation += 1;
+        guard.conn = Some(fresh.clone());
+        Ok((guard.generation, fresh))
+    }
+
+    async fn record_request_failure(&self, err_msg: String) {
+        self.failed_requests.fetch_add(1, Ordering::Relaxed);
+        self.meta.write().await.last_error = Some(err_msg);
     }
 
     async fn resolve_persona_names(&self, conn: &Connection, steam_ids: &[u64]) {
@@ -213,10 +286,11 @@ impl SteamCmInner {
         }
         let missing: Vec<u64> = {
             let cache = self.persona_cache.read().await;
+            let mut seen = HashSet::with_capacity(steam_ids.len());
             steam_ids
                 .iter()
                 .copied()
-                .filter(|id| *id > 0 && !cache.contains_key(id))
+                .filter(|id| *id > 0 && !cache.contains_key(id) && seen.insert(*id))
                 .collect()
         };
         if missing.is_empty() {
@@ -235,6 +309,14 @@ impl SteamCmInner {
                     if let Some(ref name) = acc.public_data.persona_name {
                         let trimmed = name.trim();
                         if sid > 0 && !trimmed.is_empty() {
+                            if !cache.contains_key(&sid) && cache.len() >= MAX_PERSONA_CACHE_ENTRIES
+                            {
+                                let drop_n = (MAX_PERSONA_CACHE_ENTRIES / 4).max(1);
+                                let keys: Vec<u64> = cache.keys().take(drop_n).copied().collect();
+                                for key in keys {
+                                    cache.remove(&key);
+                                }
+                            }
                             cache.insert(sid, trimmed.to_string());
                         }
                     }
@@ -290,7 +372,14 @@ impl SteamCmInner {
 }
 
 fn should_retry_network(err: &NetworkError) -> bool {
-    !matches!(err, NetworkError::ApiError(_))
+    matches!(
+        err,
+        NetworkError::IO(_)
+            | NetworkError::Ws(_)
+            | NetworkError::CryptoHandshakeFailed
+            | NetworkError::CryptoError(_)
+            | NetworkError::EOF
+    )
 }
 
 #[async_trait]
@@ -302,8 +391,7 @@ impl WorkshopUpstream for SteamCmClient {
             match self.fetch_details_chunk(ids).await {
                 Ok(outcomes) => all_outcomes.extend(outcomes),
                 Err(err) => {
-                    self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
-                    self.inner.meta.write().await.last_error = Some(err.to_string());
+                    self.inner.record_request_failure(err.to_string()).await;
                     tracing::warn!(%err, count = ids.len(), "Steam CM 详情分块获取失败");
                     last_error = Some(err);
                 }
@@ -327,7 +415,7 @@ impl WorkshopUpstream for SteamCmClient {
     ) -> anyhow::Result<WorkshopQueryPage> {
         let _permit = self.inner.request_gate.acquire().await?;
         let app_id = self.inner.config_store.get().steam.app_id;
-        let mut conn = self.inner.get_or_connect().await?;
+        let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
         let cursor_str = if cursor.trim().is_empty() {
@@ -356,18 +444,27 @@ impl WorkshopUpstream for SteamCmClient {
         let resp = match conn.service_method(make_req()).await {
             Ok(r) => r,
             Err(err) if should_retry_network(&err) => {
-                conn = self.inner.invalidate_and_reconnect().await?;
+                match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
+                    Ok((_, reconnected)) => conn = reconnected,
+                    Err(e) => {
+                        self.inner.record_request_failure(e.to_string()).await;
+                        return Err(e);
+                    }
+                }
                 observed_at = Utc::now();
-                conn.service_method(make_req()).await.map_err(|e| {
-                    self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
-                    anyhow::anyhow!("Steam CM QueryFiles 重试失败: {e}")
-                })?
+                match conn.service_method(make_req()).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("Steam CM QueryFiles 重试失败: {e}");
+                        self.inner.record_request_failure(msg.clone()).await;
+                        return Err(anyhow::anyhow!(msg));
+                    }
+                }
             }
             Err(err) => {
-                self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
-                let mut m = self.inner.meta.write().await;
-                m.last_error = Some(err.to_string());
-                return Err(anyhow::anyhow!("Steam CM QueryFiles 调用失败: {err}"));
+                let msg = format!("Steam CM QueryFiles 调用失败: {err}");
+                self.inner.record_request_failure(err.to_string()).await;
+                return Err(anyhow::anyhow!(msg));
             }
         };
 
@@ -381,7 +478,10 @@ impl WorkshopUpstream for SteamCmClient {
         );
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
-            next_cursor: resp.next_cursor.filter(|s| !s.trim().is_empty()),
+            next_cursor: resp
+                .next_cursor
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             outcomes,
         })
     }
@@ -392,7 +492,7 @@ impl WorkshopUpstream for SteamCmClient {
     ) -> anyhow::Result<WorkshopQueryPage> {
         let _permit = self.inner.request_gate.acquire().await?;
         let app_id = self.inner.config_store.get().steam.app_id;
-        let mut conn = self.inner.get_or_connect().await?;
+        let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
         let mut observed_at = Utc::now();
@@ -402,20 +502,30 @@ impl WorkshopUpstream for SteamCmClient {
         {
             Ok(r) => r,
             Err(err) if should_retry_network(&err) => {
-                conn = self.inner.invalidate_and_reconnect().await?;
+                match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
+                    Ok((_, reconnected)) => conn = reconnected,
+                    Err(e) => {
+                        self.inner.record_request_failure(e.to_string()).await;
+                        return Err(e);
+                    }
+                }
                 observed_at = Utc::now();
-                conn.service_method(build_search_files_proto(app_id, request))
+                match conn
+                    .service_method(build_search_files_proto(app_id, request))
                     .await
-                    .map_err(|e| {
-                        self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
-                        anyhow::anyhow!("Steam CM search_files 重试失败: {e}")
-                    })?
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = format!("Steam CM search_files 重试失败: {e}");
+                        self.inner.record_request_failure(msg.clone()).await;
+                        return Err(anyhow::anyhow!(msg));
+                    }
+                }
             }
             Err(err) => {
-                self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
-                let mut m = self.inner.meta.write().await;
-                m.last_error = Some(err.to_string());
-                return Err(anyhow::anyhow!("Steam CM search_files 调用失败: {err}"));
+                let msg = format!("Steam CM search_files 调用失败: {err}");
+                self.inner.record_request_failure(err.to_string()).await;
+                return Err(anyhow::anyhow!(msg));
             }
         };
 
@@ -423,6 +533,11 @@ impl WorkshopUpstream for SteamCmClient {
             .inner
             .map_details(&conn, &resp.publishedfiledetails, observed_at)
             .await;
+        if !resp.publishedfiledetails.is_empty() && outcomes.is_empty() {
+            let msg = "Steam CM search_files 未核验任何返回的条目".to_string();
+            self.inner.record_request_failure(msg.clone()).await;
+            return Err(anyhow::anyhow!(msg));
+        }
         if outcomes.len() < resp.publishedfiledetails.len() {
             tracing::warn!(
                 returned = resp.publishedfiledetails.len(),
@@ -432,7 +547,10 @@ impl WorkshopUpstream for SteamCmClient {
         }
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
-            next_cursor: resp.next_cursor.filter(|s| !s.trim().is_empty()),
+            next_cursor: resp
+                .next_cursor
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             outcomes,
         })
     }
@@ -442,7 +560,7 @@ impl WorkshopUpstream for SteamCmClient {
     }
 
     async fn reconnect(&self) -> anyhow::Result<CatalogSteamStatus> {
-        self.inner.invalidate_and_reconnect().await?;
+        self.inner.invalidate_and_reconnect(None).await?;
         Ok(self.inner.status().await)
     }
 

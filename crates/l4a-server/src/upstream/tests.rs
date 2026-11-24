@@ -199,3 +199,35 @@ fn details_to_record_prefers_canonical_tags_over_localized_display_names() {
     let record = details_to_record(WorkshopId(9001), &details, None, Utc::now());
     assert_eq!(record.tags, vec!["Campaigns", "Co-op"]);
 }
+
+#[test]
+fn map_detail_normalizes_zero_consumer_appid_and_blank_file_description() {
+    let stub = PublishedFileDetails {
+        publishedfileid: Some(9002),
+        result: Some(9),
+        consumer_appid: Some(0),
+        ..Default::default()
+    };
+    let obs = map_detail(&stub, None, Utc::now()).expect("FileNotFound should map to Removed");
+    assert_eq!(obs.consumer_appid, None);
+    assert!(matches!(obs.outcome, WorkshopFetchOutcome::Removed { .. }));
+
+    let active = PublishedFileDetails {
+        publishedfileid: Some(9003),
+        result: Some(1),
+        visibility: Some(0),
+        consumer_appid: Some(550),
+        title: Some("Short Desc Map".into()),
+        file_description: Some("   ".into()),
+        short_description: Some("Fallback summary".into()),
+        ..Default::default()
+    };
+    let obs = map_detail(&active, None, Utc::now()).unwrap();
+    assert_eq!(obs.consumer_appid, Some(550));
+    match obs.outcome {
+        WorkshopFetchOutcome::Found { item } => {
+            assert_eq!(item.description.as_deref(), Some("Fallback summary"));
+        }
+        other => panic!("expected Found, got {other:?}"),
+    }
+}

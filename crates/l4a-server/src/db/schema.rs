@@ -146,7 +146,7 @@ impl ServerRepo {
         }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public
-             ON workshop_items(catalog_indexed, is_listed)",
+             ON workshop_items(catalog_indexed, is_listed, file_type, subscriptions DESC, workshop_id ASC)",
             [],
         )?;
         if has_column(conn, "workshop_item_revisions", "trust_score")? {

@@ -33,8 +33,8 @@
   - `searchTarget`：支持 `all`（默认，全字段）、`title`（仅标题）、`description`（仅简介）；
   - `fileType`：支持 `item`（组件，默认）与 `collection`（合集）；
   - `sort`：支持 `relevance`、`trend`、`toprated`、`subscriptions`（及 `totalprofiles` / `popular`）、`updated`、`newest`、`updated_asc`、`title`（后两项及 `removed` / `private_or_unavailable` 状态自动走本地索引 `local` 模式）。
-- **本地能力增强与隔离保护**：本地 SQLite FTS5 索引（中英文分词、驼峰/忽略空格复合词、中文标题拼音、`AdminOverride` 人工覆写与直链、下架墓碑）会与 Steam CM 结果智能去重融合；仅通过按需搜索暖缓存 (`CacheOnly`) 的条目不会污染公开首页，本地已知的私密 (`private_or_unavailable`) 与未列出 (`is_listed = 0`) 条目绝不会从公开搜索泄露。
-- **精确 ID / 链接查询**：传入 Steam Workshop 链接或 6 位以上纯数字 ID 时，若本地未收录且未在本地标记为受限/覆写，会自动通过 `GetDetails` 穿透补全公开条目。
+- **本地能力增强与隔离保护**：本地 SQLite FTS5 索引（中英文分词、驼峰/忽略空格复合词、中文标题拼音、`AdminOverride` 人工覆写与直链、下架墓碑）会与 Steam CM 结果智能去重融合；按需搜索暖缓存（英文走 `RefreshUnindexedCache`，非英文走 `InsertOnlyCache`）仅写入按 ID 缓存而不纳入公开目录，本地已知未列出 (`is_listed = 0`) 条目不会从公开搜索泄露，私密 (`private_or_unavailable`) 条目仅在本地墓碑中保留脱敏占位信息（不泄露原始私密标题、简介或直链），且 Steam 实时搜索中的私密/未列出条目会被过滤。
+- **精确 ID / 链接查询**：开启 `sync.enable_read_through` 后，传入 Steam Workshop 链接或 6 位以上纯数字 ID 时，若本地未收录且未在本地标记为受限/覆写，会自动通过 `GetDetails` 穿透补全公开条目。
 
 常规混合检索在去重后计算总数和分页。普通查询的 Steam 命中数超过 2400 时，整次查询使用 Steam 的排序、分页和总数，仍会应用本地覆写及可见性过滤。Steam 超时或失败时仍可回退到本地目录。
 

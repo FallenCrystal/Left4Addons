@@ -250,20 +250,50 @@ async fn batch_items(
     Ok(Json(resp))
 }
 
+const MAX_SEARCH_QUERY_CHARS: usize = 512;
+const MAX_SEARCH_TAG_CHARS: usize = 128;
+
+fn empty_string_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = opt else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_value(Value::String(trimmed.to_string()))
+        .or_else(|_| serde_json::from_str(trimmed))
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchParams {
     q: Option<String>,
     tag: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     status: Option<WorkshopItemStatus>,
     sort: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     page: Option<u32>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     page_size: Option<u32>,
     #[serde(alias = "language")]
     lang: Option<String>,
     #[serde(alias = "search_target", alias = "search_text_target")]
     search_target: Option<String>,
-    #[serde(alias = "filetype", alias = "file_type")]
+    #[serde(
+        default,
+        alias = "filetype",
+        alias = "file_type",
+        deserialize_with = "empty_string_as_none"
+    )]
     file_type: Option<WorkshopFileType>,
 }
 
@@ -283,12 +313,35 @@ impl From<SearchParams> for SearchQuery {
     }
 }
 
+fn validate_search_query(q: &SearchQuery) -> Result<(), (StatusCode, Json<Value>)> {
+    if q.query
+        .as_deref()
+        .is_some_and(|s| s.trim().chars().count() > MAX_SEARCH_QUERY_CHARS)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("搜索关键词长度不能超过 {MAX_SEARCH_QUERY_CHARS} 个字符"),
+        ));
+    }
+    if q.tag
+        .as_deref()
+        .is_some_and(|s| s.trim().chars().count() > MAX_SEARCH_TAG_CHARS)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("标签参数长度不能超过 {MAX_SEARCH_TAG_CHARS} 个字符"),
+        ));
+    }
+    Ok(())
+}
+
 async fn search_items(
     State(state): State<RouteState>,
     headers: HeaderMap,
     Query(params): Query<SearchParams>,
 ) -> Result<(HeaderMap, Json<SearchResponse>), (StatusCode, Json<Value>)> {
     let q = SearchQuery::from(params);
+    validate_search_query(&q)?;
     let accept_language = headers
         .get_all(ACCEPT_LANGUAGE)
         .iter()
@@ -316,6 +369,7 @@ async fn admin_search_items(
 ) -> ApiResult<SearchResponse> {
     state.require_admin(&headers)?;
     let q = SearchQuery::from(params);
+    validate_search_query(&q)?;
     Ok(Json(state.db(move |repo| repo.search(&q, false)).await?))
 }
 

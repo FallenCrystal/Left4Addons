@@ -72,15 +72,34 @@ export function syncPreviewWorkshop(state: DashboardSnapshot, emit: PreviewEmit)
 }
 
 export function searchPreviewWorkshop(query: SearchQuery): SearchResponse {
-  const q = (query.query ?? '').trim().toLowerCase();
+  const rawQuery = (query.query ?? '').trim();
+  const q = rawQuery.toLowerCase();
   const tag = query.tag?.trim().toLowerCase();
+  const target = (query.searchTarget ?? 'all').trim().toLowerCase();
+  const numericOnly = q.replace(/^#/, '');
+  const isDirectIdOrUrl =
+    /^https?:\/\/(www\.)?steamcommunity\.com\/(sharedfiles|workshop)\/filedetails\/?/i.test(
+      rawQuery,
+    ) ||
+    /^steam:\/\/url\/CommunityFilePage\/\d+$/i.test(rawQuery) ||
+    (/^\d{6,}$/.test(numericOnly) && target !== 'description');
+  const effectiveFileType = query.fileType ?? (isDirectIdOrUrl ? undefined : 'item');
+
   let items = PREVIEW_CATALOG.filter((item) => {
+    if (effectiveFileType && item.fileType !== effectiveFileType) {
+      return false;
+    }
     if (q) {
+      const idMatch = item.workshopId === numericOnly || item.workshopId.includes(q);
       const hit =
-        item.title.toLowerCase().includes(q) ||
-        item.workshopId.includes(q) ||
-        (item.creatorName ?? '').toLowerCase().includes(q) ||
-        (item.description ?? '').toLowerCase().includes(q);
+        target === 'title' || target === '1'
+          ? item.title.toLowerCase().includes(q)
+          : target === 'description' || target === 'desc' || target === '2'
+            ? (item.description ?? '').toLowerCase().includes(q)
+            : item.title.toLowerCase().includes(q) ||
+              idMatch ||
+              (item.creatorName ?? '').toLowerCase().includes(q) ||
+              (item.description ?? '').toLowerCase().includes(q);
       if (!hit) return false;
     }
     if (tag && !item.tags.some((t) => t.toLowerCase() === tag)) {
@@ -92,20 +111,25 @@ export function searchPreviewWorkshop(query: SearchQuery): SearchResponse {
     return true;
   });
 
-  if (query.sort === 'updated_asc') {
+  const sort = (query.sort ?? '').trim().toLowerCase();
+  if (sort === 'updated_asc') {
     items = [...items].sort((a, b) => (a.timeUpdated ?? 0) - (b.timeUpdated ?? 0));
-  } else if (query.sort === 'title') {
+  } else if (sort === 'updated' || sort === 'lastupdated') {
+    items = [...items].sort((a, b) => (b.timeUpdated ?? 0) - (a.timeUpdated ?? 0));
+  } else if (sort === 'title') {
     items = [...items].sort((a, b) => a.title.localeCompare(b.title));
-  } else if (query.sort === 'subscriptions') {
-    items = [...items].sort((a, b) => (b.subscriptions ?? 0) - (a.subscriptions ?? 0));
-  } else if (query.sort === 'newest') {
+  } else if (sort === 'newest' || sort === 'mostrecent') {
     items = [...items].sort((a, b) => (b.timeCreated ?? 0) - (a.timeCreated ?? 0));
   } else {
-    items = [...items].sort((a, b) => (b.timeUpdated ?? 0) - (a.timeUpdated ?? 0));
+    items = [...items].sort(
+      (a, b) =>
+        (b.subscriptions ?? 0) - (a.subscriptions ?? 0) ||
+        (b.timeUpdated ?? 0) - (a.timeUpdated ?? 0),
+    );
   }
 
-  const page = query.page ?? 1;
-  const pageSize = query.pageSize ?? 20;
+  const page = Math.max(1, Math.floor(query.page ?? 1));
+  const pageSize = Math.min(100, Math.max(1, Math.floor(query.pageSize ?? 24)));
   const start = (page - 1) * pageSize;
 
   return {

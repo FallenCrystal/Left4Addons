@@ -1,15 +1,9 @@
 use super::{parse_workshop_id_col, serialize_json_enum, ServerRepo};
 use crate::search::{self, MatchRank, ParsedQuery};
 use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopId};
-use rusqlite::{params, Connection, Row, Rows};
+use rusqlite::{params_from_iter, types::Value, Connection, Row, Rows};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-
-const SEARCH_ITEM_FILTERS: &str = "
-    (?1 IS NULL OR EXISTS (SELECT 1 FROM json_each(w.tags_json) WHERE LOWER(value) = ?1))
-    AND (?2 IS NULL OR w.status = ?2)
-    AND (?3 = 0 OR (w.catalog_indexed = 1 AND w.is_listed = 1))
-    AND (?4 IS NULL OR w.file_type = ?4)";
 
 const SEARCH_ORDER_COLUMNS: &str = "
     w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
@@ -25,6 +19,7 @@ pub(crate) struct RankedCatalogMatch {
     pub is_active: bool,
     pub is_admin_override: bool,
     pub sort_value: i64,
+    pub secondary_sort_value: i64,
 }
 
 type RankedMatchPage = (u64, Vec<RankedCatalogMatch>);
@@ -65,6 +60,34 @@ impl SearchFilters {
             status: query.status.map(|status| serialize_json_enum(&status)),
             public_only,
             file_type: query.file_type.map(|ft| serialize_json_enum(&ft)),
+        }
+    }
+
+    /// Build an index-friendly WHERE predicate list without optional-parameter OR disjunctions.
+    fn build_where(&self, params: &mut Vec<Value>) -> String {
+        let mut clauses = Vec::new();
+        if self.public_only {
+            clauses.push("w.catalog_indexed = 1 AND w.is_listed = 1".to_string());
+        }
+        if let Some(ref ft) = self.file_type {
+            params.push(Value::Text(ft.clone()));
+            clauses.push(format!("w.file_type = ?{}", params.len()));
+        }
+        if let Some(ref status) = self.status {
+            params.push(Value::Text(status.clone()));
+            clauses.push(format!("w.status = ?{}", params.len()));
+        }
+        if let Some(ref tag) = self.tag {
+            params.push(Value::Text(tag.clone()));
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(w.tags_json) WHERE LOWER(value) = ?{})",
+                params.len()
+            ));
+        }
+        if clauses.is_empty() {
+            "1 = 1".to_string()
+        } else {
+            clauses.join(" AND ")
         }
     }
 }
@@ -136,6 +159,7 @@ impl SearchSort {
                 Self::Newest => row.get(4)?,
                 _ => 0,
             },
+            secondary_sort_value: row.get(3)?,
         })
     }
 }
@@ -180,7 +204,7 @@ impl SearchPage {
         Self {
             sort,
             offset,
-            limit: page_size.map_or(u64::MAX, |size| offset + u64::from(size)),
+            limit: page_size.map_or(u64::MAX, |size| offset.saturating_add(u64::from(size))),
             total: 0,
             best: BinaryHeap::new(),
         }
@@ -223,6 +247,35 @@ impl SearchPage {
         matches.reverse();
         (self.total, matches)
     }
+}
+
+/// Convert a decimal prefix (e.g. `"610"`) into disjoint `INTEGER PRIMARY KEY` B-tree ranges
+/// matching all positive `i64` values whose decimal representation starts with `prefix`.
+fn numeric_prefix_ranges(prefix: &str) -> Vec<(i64, i64)> {
+    if prefix.is_empty() || prefix.starts_with('0') || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return Vec::new();
+    }
+    let Ok(base) = prefix.parse::<u128>() else {
+        return Vec::new();
+    };
+    let max_i64 = i64::MAX as u128;
+    if base == 0 || base > max_i64 {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut scale: u128 = 1;
+    while let Some(lo) = base.checked_mul(scale) {
+        if lo > max_i64 {
+            break;
+        }
+        let hi = lo.saturating_add(scale - 1).min(max_i64);
+        ranges.push((lo as i64, hi as i64));
+        let Some(next_scale) = scale.checked_mul(10) else {
+            break;
+        };
+        scale = next_scale;
+    }
+    ranges
 }
 
 impl ServerRepo {
@@ -298,35 +351,29 @@ impl ServerRepo {
         page_size: Option<u32>,
         offset: u64,
     ) -> anyhow::Result<RankedMatchPage> {
+        let mut filter_params = Vec::new();
+        let where_clause = filters.build_where(&mut filter_params);
         let order_by = sort.browse_order();
+
+        let mut list_params = filter_params.clone();
+        list_params.push(Value::Integer(page_size.map_or(-1, i64::from)));
+        let limit_idx = list_params.len();
+        list_params.push(Value::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
+        let offset_idx = list_params.len();
+
         let sql = format!(
-            "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}
-             ORDER BY {order_by} LIMIT ?5 OFFSET ?6"
+            "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {where_clause}
+             ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(
-            params![
-                filters.tag,
-                filters.status,
-                filters.public_only,
-                filters.file_type,
-                page_size.map_or(-1, i64::from),
-                offset
-            ],
-            |row| sort.ranked_match(row, parse_workshop_id_col(0, row.get(0)?)?, None),
-        )?;
+        let rows = stmt.query_map(params_from_iter(list_params.iter()), |row| {
+            sort.ranked_match(row, parse_workshop_id_col(0, row.get(0)?)?, None)
+        })?;
         let matches = rows.collect::<Result<Vec<_>, _>>()?;
         let total = if page_size.is_some() {
-            conn.query_row(
-                &format!("SELECT COUNT(*) FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"),
-                params![
-                    filters.tag,
-                    filters.status,
-                    filters.public_only,
-                    filters.file_type
-                ],
-                |r| r.get(0),
-            )?
+            let count_sql = format!("SELECT COUNT(*) FROM workshop_items w WHERE {where_clause}");
+            let mut count_stmt = conn.prepare_cached(&count_sql)?;
+            count_stmt.query_row(params_from_iter(filter_params.iter()), |r| r.get(0))?
         } else {
             matches.len() as u64
         };
@@ -343,17 +390,13 @@ impl ServerRepo {
         let Ok(id) = i64::try_from(id) else {
             return Ok((0, Vec::new()));
         };
+        let mut params = vec![Value::Integer(id)];
+        let where_clause = filters.build_where(&mut params);
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w
-             WHERE w.workshop_id = ?5 AND {SEARCH_ITEM_FILTERS}"
+             WHERE w.workshop_id = ?1 AND {where_clause}"
         ))?;
-        let mut rows = stmt.query(params![
-            filters.tag,
-            filters.status,
-            filters.public_only,
-            filters.file_type,
-            id
-        ])?;
+        let mut rows = stmt.query(params_from_iter(params.iter()))?;
         let Some(row) = rows.next()? else {
             return Ok((0, Vec::new()));
         };
@@ -377,52 +420,71 @@ impl ServerRepo {
         page: &mut SearchPage,
     ) -> anyhow::Result<()> {
         if target != LocalSearchTarget::DescriptionOnly {
-            if let Some(fts_query) = search::build_primary_fts_query(parsed) {
-                let (source, match_filter) = if parsed.numeric_prefix.is_some() {
-                    (
-                        "FROM (
-                             SELECT rowid AS workshop_id FROM workshop_items_fts WHERE workshop_items_fts MATCH ?5
-                             UNION
-                             SELECT workshop_id FROM workshop_items
-                             WHERE workshop_id = ?6 OR CAST(workshop_id AS TEXT) LIKE ?7
-                         ) candidates JOIN workshop_items w ON w.workshop_id = candidates.workshop_id",
-                        "",
+            let fts_query = match target {
+                LocalSearchTarget::TitleOnly => search::build_title_only_fts_query(parsed),
+                LocalSearchTarget::All => search::build_primary_fts_query(parsed),
+                LocalSearchTarget::DescriptionOnly => unreachable!(),
+            };
+            if let Some(fts_query) = fts_query {
+                let mut params = Vec::new();
+                let where_clause = filters.build_where(&mut params);
+                params.push(Value::Text(fts_query));
+                let fts_idx = params.len();
+
+                let mut numeric_ranges = if target == LocalSearchTarget::All {
+                    parsed
+                        .numeric_prefix
+                        .as_deref()
+                        .map(numeric_prefix_ranges)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if target == LocalSearchTarget::All && numeric_ranges.is_empty() {
+                    if let Some(exact) = parsed
+                        .exact_workshop_id
+                        .and_then(|id| i64::try_from(id).ok())
+                    {
+                        numeric_ranges.push((exact, exact));
+                    }
+                }
+
+                let sql = if !numeric_ranges.is_empty() {
+                    let mut union_parts = vec![format!(
+                        "SELECT rowid AS workshop_id FROM workshop_items_fts WHERE workshop_items_fts MATCH ?{fts_idx}"
+                    )];
+                    for (lo, hi) in numeric_ranges {
+                        params.push(Value::Integer(lo));
+                        let lo_idx = params.len();
+                        params.push(Value::Integer(hi));
+                        let hi_idx = params.len();
+                        union_parts.push(format!(
+                            "SELECT workshop_id FROM workshop_items WHERE workshop_id BETWEEN ?{lo_idx} AND ?{hi_idx}"
+                        ));
+                    }
+                    let candidates = union_parts.join(" UNION ");
+                    format!(
+                        "SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name
+                         FROM ({candidates}) candidates
+                         JOIN workshop_items w ON w.workshop_id = candidates.workshop_id
+                         WHERE {where_clause}"
                     )
                 } else {
-                    (SEARCH_FTS_SOURCE, "AND workshop_items_fts MATCH ?5")
+                    format!(
+                        "SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name
+                         {SEARCH_FTS_SOURCE}
+                         WHERE workshop_items_fts MATCH ?{fts_idx} AND {where_clause}"
+                    )
                 };
-                let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name
-                     {source} WHERE {SEARCH_ITEM_FILTERS} {match_filter}"
-                ))?;
-                let rows = if let Some(prefix) = &parsed.numeric_prefix {
-                    let exact = parsed
-                        .exact_workshop_id
-                        .and_then(|id| i64::try_from(id).ok());
-                    stmt.query(params![
-                        filters.tag,
-                        filters.status,
-                        filters.public_only,
-                        filters.file_type,
-                        fts_query,
-                        exact,
-                        format!("{prefix}%")
-                    ])?
-                } else {
-                    stmt.query(params![
-                        filters.tag,
-                        filters.status,
-                        filters.public_only,
-                        filters.file_type,
-                        fts_query
-                    ])?
-                };
+
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let rows = stmt.query(params_from_iter(params.iter()))?;
                 page.collect(rows, |row, id| {
                     let title = row.get_ref(1)?.as_str()?;
                     let creator = row.get_ref(7)?.as_str_or_null()?;
                     Ok(match target {
                         LocalSearchTarget::TitleOnly => {
-                            search::score_title_only_candidate(parsed, id.as_u64(), title)
+                            search::score_title_only_candidate(parsed, title)
                         }
                         LocalSearchTarget::All => {
                             search::score_primary_candidate(parsed, id.as_u64(), title, creator)
@@ -437,17 +499,15 @@ impl ServerRepo {
             || (target == LocalSearchTarget::All && page.total == 0)
         {
             if let Some(desc_query) = search::build_desc_fts_query(parsed) {
+                let mut params = Vec::new();
+                let where_clause = filters.build_where(&mut params);
+                params.push(Value::Text(desc_query));
+                let fts_idx = params.len();
                 let mut stmt = conn.prepare_cached(&format!(
                     "SELECT {SEARCH_ORDER_COLUMNS}, w.description {SEARCH_FTS_SOURCE}
-                     WHERE workshop_items_fts MATCH ?5 AND {SEARCH_ITEM_FILTERS}"
+                     WHERE workshop_items_fts MATCH ?{fts_idx} AND {where_clause}"
                 ))?;
-                let rows = stmt.query(params![
-                    filters.tag,
-                    filters.status,
-                    filters.public_only,
-                    filters.file_type,
-                    desc_query
-                ])?;
+                let rows = stmt.query(params_from_iter(params.iter()))?;
                 page.collect(rows, |row, _| {
                     let description = row.get_ref(7)?.as_str_or_null()?;
                     Ok(description.and_then(|desc| search::score_desc_candidate(parsed, desc)))
@@ -466,60 +526,31 @@ impl ServerRepo {
         page: &mut SearchPage,
     ) -> anyhow::Result<()> {
         if target != LocalSearchTarget::DescriptionOnly {
+            let mut params = Vec::new();
+            let where_clause = filters.build_where(&mut params);
             let mut stmt = conn.prepare_cached(&format!(
-                "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"
+                "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {where_clause}"
             ))?;
-            let rows = stmt.query(params![
-                filters.tag,
-                filters.status,
-                filters.public_only,
-                filters.file_type
-            ])?;
+            let rows = stmt.query(params_from_iter(params.iter()))?;
             page.collect(rows, |row, _| {
-                let title = search::fold_text(row.get_ref(1)?.as_str()?);
-                let rank = if title == parsed.raw_folded {
-                    Some(MatchRank {
-                        tier: 0,
-                        sub_rank: 1,
-                    })
-                } else if title.starts_with(&parsed.raw_folded) {
-                    Some(MatchRank {
-                        tier: 1,
-                        sub_rank: 0,
-                    })
-                } else if title.contains(&parsed.raw_folded) {
-                    Some(MatchRank {
-                        tier: 2,
-                        sub_rank: 0,
-                    })
-                } else {
-                    None
-                };
-                Ok(rank)
+                let title = row.get_ref(1)?.as_str()?;
+                Ok(search::score_symbol_only_title(parsed, title))
             })?;
         }
 
         if target == LocalSearchTarget::DescriptionOnly
             || (target == LocalSearchTarget::All && page.total == 0)
         {
+            let mut params = Vec::new();
+            let where_clause = filters.build_where(&mut params);
             let mut stmt = conn.prepare_cached(&format!(
                 "SELECT {SEARCH_ORDER_COLUMNS}, w.description FROM workshop_items w
-                 WHERE {SEARCH_ITEM_FILTERS} AND w.description IS NOT NULL"
+                 WHERE {where_clause} AND w.description IS NOT NULL"
             ))?;
-            let rows = stmt.query(params![
-                filters.tag,
-                filters.status,
-                filters.public_only,
-                filters.file_type
-            ])?;
+            let rows = stmt.query(params_from_iter(params.iter()))?;
             page.collect(rows, |row, _| {
                 let description = row.get_ref(7)?.as_str()?;
-                let cleaned = search::strip_bbcode_and_urls(description);
-                let matches = search::fold_text(&cleaned).contains(&parsed.raw_folded);
-                Ok(matches.then_some(MatchRank {
-                    tier: 6,
-                    sub_rank: 0,
-                }))
+                Ok(search::score_symbol_only_desc(parsed, description))
             })?;
         }
 

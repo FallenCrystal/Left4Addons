@@ -669,3 +669,77 @@ async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_
         .unwrap();
     assert_eq!(final_sample.percent, 100);
 }
+
+#[tokio::test]
+async fn resolver_search_preserves_provider_errors_and_uses_default_pagination() {
+    use axum::extract::Query;
+    use axum::routing::get;
+    use std::collections::HashMap;
+
+    let seen_query = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
+    let seen_clone = Arc::clone(&seen_query);
+    let ok_app = Router::new().route(
+        "/api/v1/items/search",
+        get(move |Query(params): Query<HashMap<String, String>>| {
+            let seen = Arc::clone(&seen_clone);
+            async move {
+                *seen.lock().unwrap() = params;
+                Json(json!({
+                    "items": [],
+                    "total": 0,
+                    "page": 1,
+                    "pageSize": 30,
+                    "source": "catalog_server"
+                }))
+            }
+        }),
+    );
+    let ok_url = start_router(ok_app).await;
+    let ok_resolver = WorkshopResolver::new(
+        vec![Arc::new(l4a_workshop::CatalogBackendProvider::new(
+            ok_url,
+            Arc::new(MirrorRouter::empty()),
+        ))],
+        SourceRoutingPolicy::default(),
+    );
+    let (resp, warnings) = ok_resolver.search(&SearchQuery::default()).await.unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(resp.page, 1);
+    assert_eq!(resp.page_size, 30);
+    {
+        let recorded = seen_query.lock().unwrap();
+        assert_eq!(recorded.get("page").map(String::as_str), Some("1"));
+        assert_eq!(recorded.get("pageSize").map(String::as_str), Some("30"));
+    }
+
+    let failing_app = Router::new().route(
+        "/api/v1/items/search",
+        get(|| async { (StatusCode::BAD_GATEWAY, "upstream unavailable") }),
+    );
+    let failing_url = start_router(failing_app).await;
+    let failing_resolver = WorkshopResolver::new(
+        vec![Arc::new(l4a_workshop::CatalogBackendProvider::new(
+            failing_url,
+            Arc::new(MirrorRouter::empty()),
+        ))],
+        SourceRoutingPolicy::default(),
+    );
+    let err = failing_resolver
+        .search(&SearchQuery::default())
+        .await
+        .expect_err("502 response should fail search");
+    assert!(
+        matches!(err, WorkshopError::HttpStatus { status: 502, .. }),
+        "expected HttpStatus 502 instead of Unsupported, got {err:?}"
+    );
+
+    let unsupported_resolver = WorkshopResolver::new(
+        vec![Arc::new(WebScraperPlaceholderProvider::placeholder())],
+        SourceRoutingPolicy::default(),
+    );
+    let err = unsupported_resolver
+        .search(&SearchQuery::default())
+        .await
+        .expect_err("placeholder-only resolver should be Unsupported");
+    assert!(matches!(err, WorkshopError::Unsupported(_)));
+}
