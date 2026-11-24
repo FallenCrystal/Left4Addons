@@ -138,13 +138,11 @@ impl WorkshopProvider for SteamWebApiProvider {
                         let preview_url = entry
                             .get("preview_url")
                             .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string);
+                            .and_then(crate::resolver::normalize_workshop_url);
                         let file_url = entry
                             .get("file_url")
                             .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string);
+                            .and_then(crate::resolver::normalize_workshop_url);
                         let file_size =
                             entry.get("file_size").and_then(Value::as_u64).or_else(|| {
                                 entry.get("file_size").and_then(Value::as_str)?.parse().ok()
@@ -222,18 +220,8 @@ impl WorkshopProvider for SteamWebApiProvider {
                         observed_at: now,
                         reason: Some("Steam Web API result=15 (AccessDenied)".into()),
                     }),
-                    Some(other) => outcomes.push(WorkshopFetchOutcome::PrivateOrUnavailable {
-                        workshop_id: wid,
-                        source: MetadataSource::SteamWebApi,
-                        observed_at: now,
-                        reason: Some(format!("Steam Web API result={other}")),
-                    }),
-                    None => outcomes.push(WorkshopFetchOutcome::PrivateOrUnavailable {
-                        workshop_id: wid,
-                        source: MetadataSource::SteamWebApi,
-                        observed_at: now,
-                        reason: Some("Steam Web API 响应缺少 result 字段".into()),
-                    }),
+                    // 超时或缺少状态的条目由其他数据源补查，或留待下次重试。
+                    _ => {}
                 }
             }
         }

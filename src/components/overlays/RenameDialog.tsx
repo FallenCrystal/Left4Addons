@@ -1,11 +1,18 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { ArrowRight, Sparkles } from 'lucide-react';
-import type { AddonSummary, RenamePreviewItem, RenameRuleConfig } from '../../api/ipc';
+import type {
+  AddonNamePreference,
+  AddonSummary,
+  RenamePreviewItem,
+  RenameRuleConfig,
+} from '../../api/ipc';
+import { resolveAddonMetadataTitle, stripLeadingBracketPrefixes } from '../../utils/format';
 import { Button, Dialog, FilterChip, LinearProgress, TextField } from '../m3/primitives';
 
 export interface SingleRenameDialogProps {
   addon: AddonSummary | null;
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onConfirm: (addonId: string, fileName: string) => Promise<void>;
@@ -13,18 +20,27 @@ export interface SingleRenameDialogProps {
 
 export function SingleRenameDialog({
   addon,
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onConfirm,
 }: SingleRenameDialogProps) {
   const { t } = useTranslation();
+  const titlePref = namePreference === 'addon_title' ? 'addon_title' : 'workshop_title';
   const [name, setName] = useState(() =>
-    addon ? (addon.currentFileName ?? `${addon.title}.vpk`) : '',
+    addon
+      ? (addon.currentFileName ?? `${resolveAddonMetadataTitle(addon, titlePref)}.vpk`)
+      : '',
   );
 
   if (!addon) return null;
 
   const trimmed = name.trim();
+  const cleanTitle = resolveAddonMetadataTitle(addon, titlePref);
+  const hasExplicitTitle = Boolean(addon.workshopTitle?.trim() || addon.addonTitle?.trim());
+  const baseTitle = hasExplicitTitle
+    ? cleanTitle
+    : stripLeadingBracketPrefixes(cleanTitle) || cleanTitle;
 
   return (
     <Dialog
@@ -58,7 +74,7 @@ export function SingleRenameDialog({
           size="sm"
           icon={<Sparkles size={14} />}
           onClick={() =>
-            setName(addon.workshopId ? `[${addon.workshopId}] ${addon.title}.vpk` : `${addon.title}.vpk`)
+            setName(addon.workshopId ? `[${addon.workshopId}] ${baseTitle}.vpk` : `${baseTitle}.vpk`)
           }
         >
           {t('dialogs.useTitle')}

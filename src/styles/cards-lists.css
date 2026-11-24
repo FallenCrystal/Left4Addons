@@ -1,0 +1,353 @@
+/* ==========================================================================
+   M3 Cards, Grids & Lists
+   ========================================================================== */
+.l4a-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(256px, 1fr));
+  gap: 14px;
+}
+
+.l4a-card-grid-wide {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  gap: 14px;
+}
+
+.md-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--md-sys-shape-corner-medium);
+  background-color: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0),
+    0 1px 3px 1px rgba(0, 0, 0, 0);
+  overflow: hidden;
+  transition:
+    background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    box-shadow var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.md-card[data-clickable='true'] {
+  cursor: pointer;
+}
+
+.md-card[data-clickable='true']:hover {
+  background-color: var(--md-sys-color-surface-container);
+  box-shadow: var(--md-sys-elevation-1);
+}
+
+.md-card[data-selected='true'] {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-secondary-container) 45%,
+    var(--md-sys-color-surface-container-low)
+  );
+  border-color: var(--md-sys-color-primary);
+  box-shadow: inset 0 0 0 1px var(--md-sys-color-primary);
+}
+
+.md-card[data-muted='true'] {
+  background-color: var(--md-sys-color-surface-container);
+  border-style: dashed;
+}
+
+.md-card[data-muted='true'] .l4a-addon-cover-wrap {
+  filter: saturate(0.35);
+}
+
+.l4a-card-trigger {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.l4a-card-trigger:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: -2px;
+  border-radius: var(--md-sys-shape-corner-small);
+}
+
+.l4a-addon-cover-wrap {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  width: 100%;
+  min-height: 0;
+  flex-shrink: 0;
+  background-color: var(--md-sys-color-surface-container-highest);
+  overflow: hidden;
+}
+
+.l4a-addon-cover-wrap > .l4a-card-trigger,
+.l4a-addon-cover-wrap > .l4a-cover-img,
+.l4a-addon-cover-wrap > .l4a-cover-fallback {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.l4a-cover-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.l4a-cover-fallback {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.l4a-cover-overlay-top {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.l4a-cover-overlay-top > * {
+  pointer-events: auto;
+}
+
+.l4a-cover-overlay-top .md-pill {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--md-sys-color-surface) 55%, transparent),
+    var(--md-sys-elevation-1);
+}
+
+.l4a-card-check {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--md-sys-shape-corner-small);
+  background-color: color-mix(in srgb, var(--md-sys-color-surface) 84%, transparent);
+  display: grid;
+  place-items: center;
+  visibility: hidden;
+  opacity: 0;
+}
+
+.md-card:hover .l4a-card-check,
+.md-card:focus-within .l4a-card-check,
+.md-card[data-selected='true'] .l4a-card-check,
+.l4a-card-check[data-visible='true'] {
+  visibility: visible;
+  opacity: 1;
+}
+
+.l4a-status-pills {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.md-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: var(--md-sys-shape-corner-full);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+}
+
+.md-pill[data-tone='surface'] {
+  background-color: color-mix(in srgb, var(--md-sys-color-surface-container-highest) 92%, transparent);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md-pill[data-tone='primary'] {
+  background-color: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.md-pill[data-tone='secondary'] {
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.md-pill[data-tone='tertiary'] {
+  background-color: var(--md-sys-color-tertiary-container);
+  color: var(--md-sys-color-on-tertiary-container);
+}
+
+.md-pill[data-tone='error'] {
+  background-color: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+
+.l4a-addon-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px 12px;
+  flex: 1;
+}
+
+.l4a-addon-title {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--md-sys-color-on-surface);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 20px;
+}
+
+.l4a-addon-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-sys-color-on-surface-variant);
+  min-width: 0;
+}
+
+.l4a-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.l4a-addon-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--md-sys-color-outline-variant) 55%, transparent);
+}
+
+/* Dense M3 List */
+.l4a-list {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--md-sys-shape-corner-large);
+  background-color: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  overflow: hidden;
+}
+
+.l4a-list-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 64px;
+  padding: 10px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--md-sys-color-outline-variant) 55%, transparent);
+  cursor: pointer;
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.l4a-list-row:last-child {
+  border-bottom: 0;
+}
+
+.l4a-list-row:hover {
+  background-color: var(--md-sys-color-surface-container);
+}
+
+.l4a-list-row[data-selected='true'] {
+  background-color: color-mix(
+    in srgb,
+    var(--md-sys-color-secondary-container) 42%,
+    var(--md-sys-color-surface-container-low)
+  );
+}
+
+.l4a-list-row[data-muted='true'] {
+  background-color: var(--md-sys-color-surface-container);
+}
+
+.l4a-list-row[data-muted='true'] .l4a-list-thumb {
+  filter: saturate(0.35);
+}
+
+.l4a-list-thumb {
+  width: 64px;
+  height: 38px;
+  border-radius: var(--md-sys-shape-corner-small);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.l4a-list-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.l4a-list-trailing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* Contextual Batch Action Bar */
+.l4a-batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 24px 12px;
+  padding: 8px 14px;
+  border-radius: var(--md-sys-shape-corner-large);
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+  box-shadow: var(--md-sys-elevation-1);
+  flex-shrink: 0;
+}
+
+/* ==========================================================================
+   M3 Empty State
+   ========================================================================== */
+.md-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 56px 24px;
+  text-align: center;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md-empty-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--md-sys-shape-corner-large);
+  background-color: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  display: grid;
+  place-items: center;
+}

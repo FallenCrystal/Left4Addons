@@ -48,13 +48,20 @@ fn resolve_writable_runtime_dir(app: &tauri::App, preferred: PathBuf) -> PathBuf
     preferred
 }
 
+pub(crate) fn spawn_workshop_hydration(engine: &Arc<L4aEngine>) {
+    let engine = engine.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = engine.hydrate_missing_workshop_metadata().await;
+    });
+}
+
 async fn workshop_cover_response(
     engine: &L4aEngine,
     request: Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
-    let response = Response::builder().header(header::CACHE_CONTROL, "no-store");
+    let error_response = || Response::builder().header(header::CACHE_CONTROL, "no-store");
     if request.method() != Method::GET || request.uri().path() != "/image" {
-        return response
+        return error_response()
             .status(StatusCode::BAD_REQUEST)
             .body(Vec::new())
             .unwrap();
@@ -69,7 +76,8 @@ async fn workshop_cover_response(
         });
     if let Some(url) = url {
         if let Ok((mime, bytes)) = engine.fetch_workshop_cover(&url).await {
-            return response
+            return Response::builder()
+                .header(header::CACHE_CONTROL, "public, max-age=86400")
                 .header(header::CONTENT_TYPE, mime)
                 .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
                 .header(
@@ -80,7 +88,7 @@ async fn workshop_cover_response(
                 .unwrap();
         }
     }
-    response
+    error_response()
         .status(StatusCode::NOT_FOUND)
         .body(Vec::new())
         .unwrap()
@@ -125,9 +133,13 @@ pub fn run() {
                     .map_err(|e| format!("初始化 L4A v2 引擎失败: {e}"))?,
             );
 
+            spawn_workshop_hydration(&engine);
+
             let watcher_engine = engine.clone();
             if let Err(err) = engine.start_watcher(Arc::new(move || {
-                let _ = watcher_engine.scan_external();
+                if watcher_engine.scan_external().is_ok() {
+                    spawn_workshop_hydration(&watcher_engine);
+                }
             })) {
                 let message = format!("启动模组目录监听失败: {err}");
                 eprintln!("{message}");

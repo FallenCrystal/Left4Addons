@@ -1,0 +1,250 @@
+/* ==========================================================================
+   M3 Search Bar (Docked Pill) & Outlined Text Field
+   ========================================================================== */
+.md-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 48px;
+  padding: 0 12px 0 16px;
+  border-radius: var(--md-sys-shape-corner-extra-large);
+  background-color: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+  flex: 1;
+  min-width: 220px;
+  transition: box-shadow var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.md-search-bar:focus-within {
+  box-shadow: inset 0 0 0 2px var(--md-sys-color-primary);
+}
+
+.md-search-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 15px;
+  line-height: 22px;
+  color: var(--md-sys-color-on-surface);
+}
+
+.md-search-input::placeholder {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.md-field-label {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.md-field-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: var(--md-sys-shape-corner-extra-small);
+  border: 1px solid var(--md-sys-color-outline);
+  background-color: var(--md-sys-color-surface-container-lowest);
+  transition: border-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.md-field-control:focus-within {
+  border-color: var(--md-sys-color-primary);
+  box-shadow: inset 0 0 0 1px var(--md-sys-color-primary);
+}
+
+.md-field-input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 14px;
+  line-height: 20px;
+  padding: 10px 0;
+  color: var(--md-sys-color-on-surface);
+}
+
+.md-field-input::placeholder {
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.72;
+}
+
+/* ==========================================================================
+   M3 Primary Tabs
+   ========================================================================== */
+.md-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  padding: 0 24px;
+  flex-shrink: 0;
+}
+
+.md-tabs[data-compact='true'] {
+  padding: 0 16px;
+}
+
+.md-tab {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 48px;
+  padding: 0 16px;
+  border: 0;
+  background: transparent;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.1px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.md-tab:hover {
+  background-color: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+}
+
+.md-tab:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: -2px;
+  border-radius: var(--md-sys-shape-corner-small);
+}
+
+.md-tab[data-active='true'] {
+  color: var(--md-sys-color-primary);
+}
+
+.md-tab[data-active='true']::after {
+  content: '';
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 0;
+  height: 3px;
+  border-radius: 3px 3px 0 0;
+  background-color: var(--md-sys-color-primary);
+}
+
+/* ==========================================================================
+   M3 Expressive Loading Indicator & Linear Progress
+   ========================================================================== */
+.l4a-loading-center {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  min-height: max(220px, calc(100% - 32px));
+}
+
+.md-loading-indicator {
+  --md-li-size: 28px;
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: var(--md-li-size);
+  height: var(--md-li-size);
+  max-width: var(--md-li-size);
+  max-height: var(--md-li-size);
+  border-radius: var(--md-sys-shape-corner-full);
+  color: var(--md-sys-color-primary);
+  flex-shrink: 0;
+}
+
+.md-loading-indicator[data-size='sm'] {
+  --md-li-size: 18px;
+}
+
+.md-loading-indicator[data-size='lg'] {
+  --md-li-size: 48px;
+}
+
+.md-loading-indicator[data-contained='true'] {
+  background-color: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+  padding: calc(var(--md-li-size) * 0.125);
+}
+
+.md-loading-rotor {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  overflow: visible;
+  transform-origin: 50% 50%;
+  animation: md-expressive-spin 3.2s linear infinite;
+}
+
+.md-loading-shape {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  transform-origin: 50% 50%;
+  will-change: transform;
+}
+
+@keyframes md-expressive-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.md-progress {
+  position: relative;
+  height: 4px;
+  width: 100%;
+  border-radius: var(--md-sys-shape-corner-full);
+  background-color: var(--md-sys-color-surface-container-highest);
+  overflow: hidden;
+}
+
+.md-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  background-color: var(--md-sys-color-primary);
+  transition: width 180ms var(--md-sys-motion-easing-standard);
+}
+
+.md-progress[data-indeterminate='true'] .md-progress-bar {
+  width: 40%;
+  animation: md-indeterminate 1.2s var(--md-sys-motion-easing-standard) infinite;
+}
+
+@keyframes md-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+
+@keyframes md-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.md-spin {
+  animation: md-spin 0.9s linear infinite;
+}

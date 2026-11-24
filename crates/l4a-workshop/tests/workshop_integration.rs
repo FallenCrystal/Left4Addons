@@ -63,6 +63,17 @@ async fn steam_web_api_maps_active_removed_and_private_statuses() {
                         {
                             "publishedfileid": "103",
                             "result": 15
+                        },
+                        {
+                            "publishedfileid": "104",
+                            "result": 16
+                        },
+                        {
+                            "publishedfileid": "105",
+                            "result": 2
+                        },
+                        {
+                            "publishedfileid": "106"
                         }
                     ]
                 }
@@ -72,11 +83,7 @@ async fn steam_web_api_maps_active_removed_and_private_statuses() {
 
     let base_url = start_router(app).await;
     let provider = SteamWebApiProvider::with_base_url(base_url, Arc::new(MirrorRouter::empty()));
-    let ids = vec![
-        WorkshopId::new(101).unwrap(),
-        WorkshopId::new(102).unwrap(),
-        WorkshopId::new(103).unwrap(),
-    ];
+    let ids = [101, 102, 103, 104, 105, 106].map(WorkshopId);
 
     let outcomes = provider.fetch_items(&ids).await.unwrap();
     assert_eq!(outcomes.len(), 3);

@@ -176,8 +176,20 @@ pub fn preview_batch_rename(
             continue;
         };
         let group_prefix = first_group_by_addon.get(&addon.id).map(String::as_str);
-        let target_vpk =
-            build_target_vpk_name(addon.workshop_id, group_prefix, &addon.title, rules);
+        let preferred_meta_title = match config.addon_name_preference {
+            l4a_protocol::AddonNamePreference::AddonTitle => addon
+                .addon_title
+                .as_deref()
+                .or(addon.workshop_title.as_deref()),
+            l4a_protocol::AddonNamePreference::WorkshopTitle
+            | l4a_protocol::AddonNamePreference::FileName => addon
+                .workshop_title
+                .as_deref()
+                .or(addon.addon_title.as_deref()),
+        };
+        let base_title =
+            preferred_meta_title.unwrap_or_else(|| strip_leading_bracket_prefixes(&addon.title));
+        let target_vpk = build_target_vpk_name(addon.workshop_id, group_prefix, base_title, rules);
         let conflict = plan_rename(config, &addon, &target_vpk, &mut seen_targets)
             .err()
             .map(|error| error.to_string());
@@ -191,6 +203,21 @@ pub fn preview_batch_rename(
     }
 
     Ok(items)
+}
+
+fn strip_leading_bracket_prefixes(raw: &str) -> &str {
+    let mut rest = raw.trim();
+    while let Some(after_open) = rest.strip_prefix('[') {
+        if let Some((_, tail)) = after_open.split_once(']') {
+            let trimmed_tail = tail.trim();
+            if !trimmed_tail.is_empty() {
+                rest = trimmed_tail;
+                continue;
+            }
+        }
+        break;
+    }
+    rest
 }
 
 struct RenamePlan<'a> {
@@ -421,7 +448,7 @@ pub fn move_addons(
             updated.has_dummy_bypass = has_dummy;
             changes.verify()?;
             require_free(&sibling)?;
-            db.upsert_addon(&updated)?;
+            db.update_addon_file_state(&updated)?;
             Ok(updated)
         })?;
         moved.push(updated);
@@ -616,7 +643,7 @@ fn publish_addon_path(
         if let Some(sibling) = sibling {
             require_free(sibling)?;
         }
-        db.upsert_addon(addon)
+        db.update_addon_file_state(addon)
     })
 }
 

@@ -1,6 +1,18 @@
-use super::*;
-use l4a_protocol::{AddonOperationOutcome, TaskRecord};
+use super::{EventSink, L4aEngine, NullEventSink};
+use crate::config::AppPaths;
+use crate::db::LocalDb;
+use crate::error::CoreError;
+use l4a_protocol::{
+    AddonDirType, AddonId, AddonOperationOutcome, AddonSummary, AppConfig, BundleRecord, CoreEvent,
+    GroupId, LoadoutProfile, ProfileId, TaskKind, TaskRecord, TaskStatus, UserGroup, WorkshopId,
+};
 use l4a_steam::MockSteamBridge;
+use l4a_vpk::{inspect_dummy_vpk, DummyInspection};
+use l4a_workshop::{
+    DownloadProgress, DownloadRequest, DownloadResult, ProgressSink, WorkshopError,
+};
+use std::fs;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::{mpsc, oneshot};
@@ -212,8 +224,13 @@ async fn workshop_update_preserves_customization_and_links_and_rolls_back_on_err
     assert_eq!(meta.original_size, Some(file_size));
     assert_eq!(meta.original_time_updated, new_snapshot.time_updated);
     let snapshot = engine.snapshot().unwrap();
+    let expected_bundle = BundleRecord {
+        maps: updated.maps.clone(),
+        cover_image: updated.cover_image.clone(),
+        ..bundle
+    };
     assert_eq!(snapshot.addons, vec![updated]);
-    assert_eq!(snapshot.bundles, vec![bundle]);
+    assert_eq!(snapshot.bundles, vec![expected_bundle]);
     assert_eq!(snapshot.user_groups, vec![group]);
     assert_eq!(snapshot.profiles, vec![profile]);
     assert_eq!(
