@@ -181,18 +181,38 @@ fn parse_part_number(raw: &str) -> Option<u32> {
         return Some(s.parse::<u32>().unwrap_or(10_000).min(10_000));
     }
     match s.as_str() {
-        "i" | "one" | "一" => Some(1),
-        "ii" | "two" | "二" => Some(2),
-        "iii" | "three" | "三" => Some(3),
-        "iv" | "four" | "四" => Some(4),
-        "v" | "five" | "五" => Some(5),
-        "vi" | "six" | "六" => Some(6),
-        "vii" | "seven" | "七" => Some(7),
-        "viii" | "eight" | "八" => Some(8),
-        "ix" | "nine" | "九" => Some(9),
-        "x" | "ten" | "十" => Some(10),
-        _ => None,
+        "one" | "一" => Some(1),
+        "two" | "二" => Some(2),
+        "three" | "三" => Some(3),
+        "four" | "四" => Some(4),
+        "five" | "五" => Some(5),
+        "six" | "六" => Some(6),
+        "seven" | "七" => Some(7),
+        "eight" | "八" => Some(8),
+        "nine" | "九" => Some(9),
+        "ten" | "十" => Some(10),
+        _ => parse_roman_part_number(&s),
     }
+}
+
+fn parse_roman_part_number(raw: &str) -> Option<u32> {
+    let mut total = 0i64;
+    let mut largest_right = 0;
+    for digit in raw.bytes().rev() {
+        let value = match digit {
+            b'i' => 1,
+            b'v' => 5,
+            b'x' => 10,
+            _ => return None,
+        };
+        if value < largest_right {
+            total -= value;
+        } else {
+            total += value;
+            largest_right = value;
+        }
+    }
+    (total > 0).then_some(total.min(10_000) as u32)
 }
 
 pub(super) fn extract_explicit_release_key(raw: &str) -> Option<String> {

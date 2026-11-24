@@ -181,11 +181,23 @@ export function formatBundleMemberLabel(
   }
 
   if (preference !== 'file_name') {
-    const altTitle =
+    const alternateTitle = (member: AddonSummary) =>
       preference === 'addon_title'
-        ? cleanMetadataTitle(addon.workshopTitle)
-        : cleanMetadataTitle(addon.addonTitle);
-    if (altTitle && altTitle.toLowerCase() !== key) {
+        ? cleanMetadataTitle(member.workshopTitle)
+        : (cleanMetadataTitle(member.addonTitle) ??
+          cleanMetadataTitle(member.addonInfo.addontitle));
+    const altTitle = alternateTitle(addon);
+    const altKey = altTitle?.toLowerCase();
+    if (
+      altTitle &&
+      altKey !== key &&
+      !siblings.some(
+        (member) =>
+          member.id !== addon.id &&
+          (alternateTitle(member)?.toLowerCase() === altKey ||
+            formatAddonDisplayName(member, preference).trim().toLowerCase() === altKey),
+      )
+    ) {
       return altTitle;
     }
   }

@@ -6,6 +6,7 @@ use l4a_protocol::{
 };
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 impl L4aEngine {
@@ -63,7 +64,9 @@ impl L4aEngine {
 
             while self.hydration_pending.swap(false, Ordering::SeqCst) {
                 let resolver = self.resolver.read().unwrap().clone();
-                if resolver.providers().is_empty() {
+                // 即使只是读取元数据，初始化 Steamworks 也会影响 VAC 游戏启动。
+                let background_resolver = resolver.without_steamworks_sdk();
+                if background_resolver.providers().is_empty() {
                     break;
                 }
 
@@ -97,25 +100,23 @@ impl L4aEngine {
                 }
 
                 let missing_ids: Vec<WorkshopId> = missing.into_iter().collect();
-                let mut pass_hydrated = 0usize;
-
                 for chunk in missing_ids.chunks(HYDRATE_BATCH_SIZE) {
-                    let Ok((outcomes, _warnings)) = resolver.fetch_items(chunk).await else {
+                    let fetched = background_resolver.fetch_items(chunk).await;
+                    let workspace = self.lock_workspace()?;
+                    if !Arc::ptr_eq(&resolver, &self.resolver.read().unwrap()) {
+                        self.hydration_pending.store(true, Ordering::SeqCst);
+                        break;
+                    }
+
+                    let Ok((outcomes, _warnings)) = fetched else {
                         record_unresolved(chunk);
                         continue;
                     };
 
-                    let mut resolved_ids = HashSet::with_capacity(outcomes.len());
-                    for outcome in &outcomes {
-                        let wid = match outcome {
-                            WorkshopFetchOutcome::Found { item } => item.workshop_id,
-                            WorkshopFetchOutcome::Removed { workshop_id, .. }
-                            | WorkshopFetchOutcome::PrivateOrUnavailable { workshop_id, .. } => {
-                                *workshop_id
-                            }
-                        };
-                        resolved_ids.insert(wid);
-                    }
+                    let resolved_ids: HashSet<_> = outcomes
+                        .iter()
+                        .map(WorkshopFetchOutcome::workshop_id)
+                        .collect();
                     if !resolved_ids.is_empty() {
                         let mut backoff = self.hydration_backoff.lock().unwrap();
                         for wid in &resolved_ids {
@@ -129,81 +130,54 @@ impl L4aEngine {
                         .collect();
                     record_unresolved(&unresolved);
 
-                    if outcomes.is_empty() {
-                        continue;
-                    }
-
                     let mut chunk_changed = false;
-                    {
-                        let _workspace = self.lock_workspace()?;
-                        for outcome in outcomes {
-                            match outcome {
-                                WorkshopFetchOutcome::Found { item } => {
-                                    if self.db.has_workshop_snapshot(item.workshop_id)? {
-                                        continue;
-                                    }
-                                    if item.file_type == WorkshopFileType::Collection {
-                                        self.db.mark_workshop_status(
-                                            item.workshop_id,
-                                            WorkshopItemStatus::PrivateOrUnavailable,
-                                            item.source,
-                                        )?;
-                                    } else {
-                                        let replace_deps =
-                                            source_provides_dependencies(item.source)
-                                                || !item.dependencies.is_empty();
-                                        self.db.upsert_workshop_snapshot(&item, replace_deps)?;
-                                        pass_hydrated += 1;
-                                    }
-                                    chunk_changed = true;
-                                }
-                                WorkshopFetchOutcome::Removed {
-                                    workshop_id,
-                                    source,
-                                    ..
-                                } => {
-                                    if self.db.has_workshop_snapshot(workshop_id)? {
-                                        continue;
-                                    }
-                                    self.db.mark_workshop_status(
-                                        workshop_id,
-                                        WorkshopItemStatus::Removed,
-                                        source,
-                                    )?;
-                                    chunk_changed = true;
-                                }
-                                WorkshopFetchOutcome::PrivateOrUnavailable {
-                                    workshop_id,
-                                    source,
-                                    ..
-                                } => {
-                                    if self.db.has_workshop_snapshot(workshop_id)? {
-                                        continue;
-                                    }
+                    for outcome in outcomes {
+                        let workshop_id = outcome.workshop_id();
+                        if self.db.has_workshop_snapshot(workshop_id)? {
+                            continue;
+                        }
+                        match outcome {
+                            WorkshopFetchOutcome::Found { item } => {
+                                if item.file_type == WorkshopFileType::Collection {
                                     self.db.mark_workshop_status(
                                         workshop_id,
                                         WorkshopItemStatus::PrivateOrUnavailable,
-                                        source,
+                                        item.source,
                                     )?;
-                                    chunk_changed = true;
+                                } else {
+                                    let replace_deps = source_provides_dependencies(item.source)
+                                        || !item.dependencies.is_empty();
+                                    self.db.upsert_workshop_snapshot(&item, replace_deps)?;
+                                    total_hydrated += 1;
                                 }
                             }
+                            WorkshopFetchOutcome::Removed { source, .. } => {
+                                self.db.mark_workshop_status(
+                                    workshop_id,
+                                    WorkshopItemStatus::Removed,
+                                    source,
+                                )?;
+                            }
+                            WorkshopFetchOutcome::PrivateOrUnavailable { source, .. } => {
+                                self.db.mark_workshop_status(
+                                    workshop_id,
+                                    WorkshopItemStatus::PrivateOrUnavailable,
+                                    source,
+                                )?;
+                            }
                         }
-                        if chunk_changed {
-                            self.refresh_bundles_logged();
-                        }
+                        chunk_changed = true;
                     }
+                    if chunk_changed {
+                        self.refresh_bundles_logged();
+                    }
+                    drop(workspace);
 
                     if chunk_changed {
                         self.events.emit(CoreEvent::SnapshotUpdated {
                             external_change: false,
                         });
                     }
-                }
-
-                total_hydrated += pass_hydrated;
-                if pass_hydrated == 0 {
-                    break;
                 }
             }
 

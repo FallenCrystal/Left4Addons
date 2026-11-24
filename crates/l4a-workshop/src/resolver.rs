@@ -37,6 +37,16 @@ impl WorkshopResolver {
         &self.providers
     }
 
+    pub fn without_steamworks_sdk(&self) -> Self {
+        let providers = self
+            .providers
+            .iter()
+            .filter(|provider| provider.source_kind() != MetadataSource::SteamworksSdk)
+            .cloned()
+            .collect();
+        Self::new(providers, self.policy.clone())
+    }
+
     pub async fn fetch_items(
         &self,
         ids: &[WorkshopId],
@@ -174,10 +184,10 @@ impl WorkshopResolver {
             }
             match provider.fetch_collection(collection_id).await {
                 Ok(mut record) => {
-                    if let Some(ref url) = record.preview_url {
-                        let normalized = upgrade_steam_cdn_https(url);
-                        record.preview_url = (!normalized.is_empty()).then_some(normalized);
-                    }
+                    record.preview_url = record
+                        .preview_url
+                        .as_deref()
+                        .and_then(normalize_workshop_url);
                     for item in &mut record.items {
                         normalize_item_urls(item);
                     }
@@ -321,59 +331,20 @@ fn merge_item_fields(existing: &mut WorkshopItemRecord, incoming: WorkshopItemRe
     }
 }
 
-/// 将官方 Steam / Valve CDN 的旧版 `http://` 链接自动升级为 `https://`，
-/// 使早期工坊条目返回 `http://cloud-3.steamusercontent.com/...` 等封面/直链时在默认 `https_only` 模式下仍能正常拉取，
-/// 同时不放行任何非官方任意 HTTP 主机。
-pub fn upgrade_steam_cdn_https(raw: &str) -> String {
+/// 清理工坊链接，保留显式协议供请求端按镜像和 HTTPS 设置处理。
+pub fn normalize_workshop_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if let Some(rest) = trimmed.strip_prefix("//") {
-        return format!("https://{rest}");
+    if trimmed.starts_with("//") {
+        Some(format!("https:{trimmed}"))
+    } else {
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
-    let Ok(mut parsed) = url::Url::parse(trimmed) else {
-        return trimmed.to_string();
-    };
-    if parsed.scheme() == "http" && parsed.port().is_none() {
-        let is_steam_cdn = parsed.host_str().is_some_and(|host| {
-            let h = host.to_ascii_lowercase();
-            h == "steamusercontent.com"
-                || h.ends_with(".steamusercontent.com")
-                || h == "steamstatic.com"
-                || h.ends_with(".steamstatic.com")
-                || h == "media.steampowered.com"
-                || ((h == "cloud.steampowered.com"
-                    || (h.starts_with("cloud-") && h.ends_with(".steampowered.com")))
-                    && parsed.path().starts_with("/ugc/"))
-                || (h.ends_with(".akamaihd.net")
-                    && matches!(
-                        h.strip_suffix(".akamaihd.net"),
-                        Some("steamuserimages" | "steamcdn")
-                            | Some(_)
-                                if h.starts_with("steamuserimages-")
-                                    || h.starts_with("steamcdn-")
-                                    || h == "steamuserimages.akamaihd.net"
-                                    || h == "steamcdn.akamaihd.net"
-                    ))
-        });
-        if is_steam_cdn && parsed.set_scheme("https").is_ok() {
-            return parsed.into();
-        }
-    }
-    trimmed.to_string()
 }
 
-pub(crate) fn normalize_item_urls(item: &mut WorkshopItemRecord) {
-    if let Some(ref url) = item.preview_url {
-        let normalized = upgrade_steam_cdn_https(url);
-        item.preview_url = (!normalized.is_empty()).then_some(normalized);
-    }
+fn normalize_item_urls(item: &mut WorkshopItemRecord) {
+    item.preview_url = item.preview_url.as_deref().and_then(normalize_workshop_url);
     for preview in &mut item.previews {
-        if let Some(ref url) = preview.url {
-            let normalized = upgrade_steam_cdn_https(url);
-            preview.url = (!normalized.is_empty()).then_some(normalized);
-        }
+        preview.url = preview.url.as_deref().and_then(normalize_workshop_url);
     }
-    if let Some(ref url) = item.file_url {
-        let normalized = upgrade_steam_cdn_https(url);
-        item.file_url = (!normalized.is_empty()).then_some(normalized);
-    }
+    item.file_url = item.file_url.as_deref().and_then(normalize_workshop_url);
 }

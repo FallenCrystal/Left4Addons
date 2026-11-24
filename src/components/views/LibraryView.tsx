@@ -12,8 +12,10 @@ import { Button, EmptyState } from '../m3/primitives';
 import { BundleDetailSheet } from './library/BundleDetailSheet';
 import {
   buildLibraryDisplayItems,
+  canCollapseCampaignBundle,
   computeAvailableCategories,
   computeLibraryCounts,
+  getInstalledBundleMembers,
   type ExternalAddonFilter,
   type LibraryScope,
   type LibrarySort,
@@ -153,12 +155,8 @@ export function LibraryView({
 
   const hasCollapsibleBundles = useMemo(
     () =>
-      bundles.some(
-        (b) =>
-          b.memberAddonIds.reduce((n, id) => {
-            const addon = addonsById.get(id);
-            return addon?.installState === 'installed' ? n + 1 : n;
-          }, 0) >= 2,
+      bundles.some((bundle) =>
+        canCollapseCampaignBundle(getInstalledBundleMembers(bundle, addonsById)),
       ),
     [bundles, addonsById],
   );

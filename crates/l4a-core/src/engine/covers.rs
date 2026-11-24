@@ -1,7 +1,8 @@
 use super::L4aEngine;
+use crate::db::repo::normalize_valid_remote_cover_url;
 use crate::error::CoreError;
 use crate::file_changes::same_file;
-use l4a_workshop::{upgrade_steam_cdn_https, WorkshopError};
+use l4a_workshop::WorkshopError;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Read, Write};
@@ -63,20 +64,13 @@ impl L4aEngine {
             ("gif", "image/gif"),
         ];
 
-        let normalized = upgrade_steam_cdn_https(url);
-        let url = url::Url::parse(&normalized)
-            .ok()
-            .filter(|url| {
-                matches!(url.scheme(), "http" | "https")
-                    && url.username().is_empty()
-                    && url.password().is_none()
-            })
+        let url = normalize_valid_remote_cover_url(url)
             .ok_or_else(|| CoreError::InvalidInput("无效的封面图片地址".into()))?;
         self.mirror
-            .validate_url(url.as_str())
+            .validate_url(&url)
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
 
-        let url_hash = hex::encode(&Sha256::digest(url.as_str().as_bytes())[..16]);
+        let url_hash = hex::encode(&Sha256::digest(url.as_bytes())[..16]);
         let mut stale_cached: Option<(&'static str, Vec<u8>)> = None;
         for &(ext, cached_mime) in CACHED_COVER_FORMATS {
             let cache_path = self
@@ -103,9 +97,9 @@ impl L4aEngine {
 
         let (client, _) = self
             .mirror
-            .build_client_for(url.as_str(), Some(Duration::from_secs(15)))
+            .build_client_for(&url, Some(Duration::from_secs(15)))
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
-        let (request, _) = self.mirror.prepare_get(&client, url.as_str());
+        let (request, _) = self.mirror.prepare_get(&client, &url);
         let mut response = match request.send().await {
             Ok(resp) => match resp.error_for_status() {
                 Ok(ok_resp) => ok_resp,

@@ -189,8 +189,8 @@ pub fn is_remote_image_url(raw: &str) -> bool {
 }
 
 pub fn normalize_valid_remote_cover_url(raw: &str) -> Option<String> {
-    let upgraded = l4a_workshop::upgrade_steam_cdn_https(raw);
-    let parsed = url::Url::parse(&upgraded).ok()?;
+    let normalized = l4a_workshop::normalize_workshop_url(raw)?;
+    let parsed = url::Url::parse(&normalized).ok()?;
     if matches!(parsed.scheme(), "http" | "https")
         && parsed.host_str().is_some()
         && parsed.username().is_empty()

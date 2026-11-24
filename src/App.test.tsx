@@ -110,6 +110,94 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     ).toBeTruthy();
   });
 
+  it.each(['grid', 'list'])('limits the %s bundle switch to visible manual parts', async (layout) => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    const bundle = snapshot.bundles[0];
+    const [chapter, assets] = snapshot.addons;
+    chapter.primaryDir = 'workshop';
+    assets.primaryDir = 'workshop';
+    const [visiblePart, hiddenPart] = [
+      { ...assets, id: 'hash:visible', title: 'Local chapters', enabled: true },
+      { ...assets, id: 'hash:hidden', title: 'Local textures', enabled: false },
+    ].map((part) => ({
+      ...part,
+      primaryDir: 'loading' as const,
+      workshopId: undefined,
+      workshopTitle: undefined,
+      addonTitle: part.title,
+    }));
+    bundle.memberAddonIds.push(visiblePart.id, hiddenPart.id);
+    snapshot.addons = [chapter, assets, visiblePart, hiddenPart];
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'toggle_addons' ? { items: [] } : snapshot,
+    );
+    render(<App />);
+    await screen.findByText(bundle.name);
+    if (layout === 'list') {
+      fireEvent.click(screen.getByRole('button', { name: 'List' }));
+    }
+
+    const scope = screen.getByRole('group', { name: 'Scope' });
+    expect(screen.getByRole('switch', { name: bundle.name }).getAttribute('aria-checked')).toBe(
+      'false',
+    );
+    fireEvent.click(within(scope).getByRole('button', { name: /^Workshop/ }));
+    expect(screen.getByText(bundle.name)).toBeTruthy();
+    expect(screen.queryByRole('switch', { name: bundle.name })).toBeNull();
+    fireEvent.click(screen.getByText(bundle.name));
+    const inspector = screen.getByRole('dialog', { name: bundle.name });
+    expect(within(inspector).getByRole('switch', { name: 'Disabled' })).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    fireEvent.click(within(scope).getByRole('button', { name: /^All/ }));
+    fireEvent.change(screen.getByPlaceholderText('Title, author, ID, filename'), {
+      target: { value: visiblePart.title },
+    });
+    const bundleSwitch = screen.getByRole('switch', { name: bundle.name });
+    expect(bundleSwitch.getAttribute('aria-checked')).toBe('true');
+    await act(async () => {
+      fireEvent.click(bundleSwitch);
+    });
+    expect(invokeMock).toHaveBeenCalledWith('toggle_addons', {
+      addonIds: [visiblePart.id],
+      enabled: false,
+      allowWorkshopDir: false,
+    });
+  });
+
+  it('keeps non-campaign manual and locked dependency bundle members visible', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    const members = snapshot.addons.slice(3, 7);
+    snapshot.addons = members;
+    snapshot.bundles = [
+      {
+        id: 'manual',
+        name: 'Manual bundle',
+        kind: 'manual',
+        locked: false,
+        memberAddonIds: members.slice(0, 2).map((member) => member.id),
+        maps: [],
+      },
+      {
+        id: 'legacy',
+        name: 'Legacy bundle',
+        kind: 'dependency_graph',
+        locked: true,
+        memberAddonIds: members.slice(2).map((member) => member.id),
+        maps: [],
+      },
+    ];
+    invokeMock.mockResolvedValue(snapshot);
+    render(<App />);
+
+    for (const member of members) {
+      expect(await screen.findByRole('button', { name: member.title })).toBeTruthy();
+    }
+    expect(screen.queryByRole('button', { name: 'Group Parts' })).toBeNull();
+  });
+
   it('filters by M3 category dropdown, switches component naming preference, hides Maps 0, and copies raw map code without map prefix', async () => {
     const writeTextMock = vi.fn().mockResolvedValue(undefined);
     Object.assign(navigator, { clipboard: { writeText: writeTextMock } });

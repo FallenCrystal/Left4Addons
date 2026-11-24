@@ -337,7 +337,7 @@ pub fn rebuild_auto_bundles(db: &LocalDb) -> Result<Vec<BundleRecord>, CoreError
             };
             if cand.is_boilerplate_title
                 || cand.is_standalone_fix_only_title
-                || cand.has_file_fix_marker_outside(title_key)
+                || cand.has_standalone_fix_marker_outside(title_key)
             {
                 continue;
             }
@@ -376,7 +376,7 @@ pub fn rebuild_auto_bundles(db: &LocalDb) -> Result<Vec<BundleRecord>, CoreError
                 }
                 if cand.identical_group_title_key.as_deref() == Some(tex_root_key.as_str())
                     && !cand.is_standalone_fix_only_title
-                    && !cand.has_file_fix_marker_outside(&tex_root_key)
+                    && !cand.has_standalone_fix_marker_outside(&tex_root_key)
                 {
                     combined_for_tex.push(*cand);
                 }

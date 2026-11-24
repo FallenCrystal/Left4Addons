@@ -158,6 +158,29 @@ describe('format utilities', () => {
     expect(stripLeadingBracketPrefixes('[2814104912] [Campaigns] Chernobyl')).toBe('Chernobyl');
   });
 
+  it('uses filenames when both metadata titles collide across bundle members', () => {
+    const parts = ['north', 'south'].map((name) =>
+      makeSampleAddon({
+        id: `hash:${name}`,
+        title: 'City Escape Campaign',
+        workshopTitle: 'City Escape Campaign',
+        addonTitle: 'City Escape',
+        currentFileName: `${name}.vpk`,
+      }),
+    );
+    expect(parts.map((part) => formatBundleMemberLabel(part, parts))).toEqual([
+      'City Escape Campaign · north',
+      'City Escape Campaign · south',
+    ]);
+    expect(parts.map((part) => formatBundleMemberLabel(part, parts, 'addon_title'))).toEqual([
+      'City Escape · north',
+      'City Escape · south',
+    ]);
+
+    parts[1].addonTitle = 'City Escape Part 2';
+    expect(formatBundleMemberLabel(parts[1], parts)).toBe('City Escape Part 2');
+  });
+
   it.each([
     ['underscore', '[2814104912] [Campaigns] Chernobyl_Chapter One (v2)_.vpk'],
     ['space', '[2814104912] [Campaigns] Chernobyl Chapter One (v2).vpk'],

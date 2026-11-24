@@ -84,9 +84,10 @@ pub(super) fn group_release_signature(members: &[&BundleCandidate]) -> String {
 }
 
 fn cluster_internally_valid(members: &[&BundleCandidate], prefer_file: bool) -> bool {
-    if !group_authors_consistent(members) {
-        return false;
-    }
+    group_authors_consistent(members) && group_releases_consistent(members, prefer_file)
+}
+
+pub(super) fn group_releases_consistent(members: &[&BundleCandidate], prefer_file: bool) -> bool {
     for i in 0..members.len() {
         for j in (i + 1)..members.len() {
             let a = members[i];
@@ -193,7 +194,7 @@ fn wildcard_proposals_conflict(
     false
 }
 
-type WildcardScore = (bool, bool, bool, bool, bool);
+type WildcardScore = (bool, bool, bool, bool, bool, bool);
 
 fn wildcard_bucket_score(
     w: &BundleCandidate,
@@ -210,6 +211,11 @@ fn wildcard_bucket_score(
             .iter()
             .any(|ex| ex.author_name_key.as_deref() == Some(na))
     });
+    let same_release = w.effective_release_key(prefer_file).is_some_and(|release| {
+        bucket
+            .iter()
+            .any(|ex| ex.effective_release_key(prefer_file) == Some(release))
+    });
     let same_version = w.version_key.as_deref().is_some_and(|ver| {
         bucket
             .iter()
@@ -224,19 +230,20 @@ fn wildcard_bucket_score(
     (
         same_steam,
         same_author_name,
+        same_release,
         same_version,
         no_role_rank_collision,
         complementary_maps,
     )
 }
 
-/// 在单一正交维度上同时、非变更地切分候选簇，完全不依赖 `AddonId` 排序决策归属。
-fn partition_dimension<'a, F>(
+fn split_dimension<'a, F>(
     candidates: Vec<&'a BundleCandidate>,
-    prefer_file: bool,
-    check_zero_rank: bool,
     key_fn: F,
-) -> Vec<Vec<&'a BundleCandidate>>
+) -> (
+    BTreeMap<&'a str, Vec<&'a BundleCandidate>>,
+    Vec<&'a BundleCandidate>,
+)
 where
     F: Fn(&'a BundleCandidate) -> Option<&'a str>,
 {
@@ -249,7 +256,17 @@ where
             wildcards.push(cand);
         }
     }
-    if concrete_map.is_empty() {
+    (concrete_map, wildcards)
+}
+
+/// 同时评估缺少分组键的候选项，归属由已有成员决定。
+fn assign_wildcards<'a>(
+    base_buckets: Vec<Vec<&'a BundleCandidate>>,
+    wildcards: Vec<&'a BundleCandidate>,
+    prefer_file: bool,
+    check_zero_rank: bool,
+) -> Vec<Vec<&'a BundleCandidate>> {
+    if base_buckets.is_empty() {
         return if wildcards.is_empty() {
             Vec::new()
         } else {
@@ -257,7 +274,6 @@ where
         };
     }
 
-    let base_buckets: Vec<Vec<&'a BundleCandidate>> = concrete_map.into_values().collect();
     let mut proposals: Vec<Vec<(&'a BundleCandidate, WildcardScore)>> =
         vec![Vec::new(); base_buckets.len()];
     let mut residual: Vec<&'a BundleCandidate> = Vec::new();
@@ -338,45 +354,69 @@ where
     out
 }
 
+fn partition_dimension<'a, F>(
+    candidates: Vec<&'a BundleCandidate>,
+    prefer_file: bool,
+    check_zero_rank: bool,
+    key_fn: F,
+) -> Vec<Vec<&'a BundleCandidate>>
+where
+    F: Fn(&'a BundleCandidate) -> Option<&'a str>,
+{
+    let (concrete, wildcards) = split_dimension(candidates, key_fn);
+    assign_wildcards(
+        concrete.into_values().collect(),
+        wildcards,
+        prefer_file,
+        check_zero_rank,
+    )
+}
+
+fn partition_by_release(
+    candidates: Vec<&BundleCandidate>,
+    prefer_file: bool,
+) -> Vec<Vec<&BundleCandidate>> {
+    partition_dimension(candidates, prefer_file, false, |c| {
+        c.title_release_key.as_deref()
+    })
+    .into_iter()
+    .flat_map(|cluster| {
+        partition_dimension(cluster, prefer_file, false, |c| {
+            c.file_release_key.as_deref()
+        })
+    })
+    .flat_map(|cluster| {
+        partition_dimension(cluster, prefer_file, false, |c| {
+            c.effective_release_key(prefer_file)
+        })
+    })
+    .collect()
+}
+
 pub(super) fn partition_by_author_and_release(
     candidates: Vec<&BundleCandidate>,
     prefer_file: bool,
 ) -> Vec<Vec<&BundleCandidate>> {
-    // 1. 按 Steam 创作者 ID 正交切分
-    let after_steam = partition_dimension(candidates, prefer_file, false, |c| {
-        c.steam_creator_id.as_deref()
-    });
-
-    // 2. 对不含 Steam 创作者 ID 的簇按本地作者名正交切分（含 Steam ID 的簇已在第 1 步校验过名称一致性与无冲突）
-    let mut after_author = Vec::new();
-    for cl in after_steam {
-        if cl.iter().any(|c| c.steam_creator_id.is_some()) {
-            after_author.push(cl);
-        } else {
-            after_author.extend(partition_dimension(cl, prefer_file, false, |c| {
-                c.author_name_key.as_deref()
-            }));
-        }
-    }
-
-    // 3. 按标题发布版、文件名发布版与生效发布版依次正交切分
-    let mut after_title_rel = Vec::new();
-    for cl in after_author {
-        after_title_rel.extend(partition_dimension(cl, prefer_file, false, |c| {
-            c.title_release_key.as_deref()
-        }));
-    }
-    let mut after_file_rel = Vec::new();
-    for cl in after_title_rel {
-        after_file_rel.extend(partition_dimension(cl, prefer_file, false, |c| {
-            c.file_release_key.as_deref()
-        }));
-    }
+    // 先拆分同一 Steam 创作者的各个发布版，再评估缺少 Steam ID 的本地分包归属。
+    let (creators, local_parts) = split_dimension(candidates, |c| c.steam_creator_id.as_deref());
+    let steam_releases = creators
+        .into_values()
+        .flat_map(|cluster| partition_by_release(cluster, prefer_file))
+        .collect();
     let mut out = Vec::new();
-    for cl in after_file_rel {
-        out.extend(partition_dimension(cl, prefer_file, false, |c| {
-            c.effective_release_key(prefer_file)
-        }));
+    for cluster in assign_wildcards(steam_releases, local_parts, prefer_file, false) {
+        if cluster.iter().any(|c| c.steam_creator_id.is_some()) {
+            out.push(cluster);
+        } else {
+            let authors = partition_dimension(cluster, prefer_file, false, |c| {
+                c.author_name_key.as_deref()
+            });
+            out.extend(
+                authors
+                    .into_iter()
+                    .flat_map(|members| partition_by_release(members, prefer_file)),
+            );
+        }
     }
     out
 }

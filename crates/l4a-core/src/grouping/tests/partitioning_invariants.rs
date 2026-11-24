@@ -4,6 +4,53 @@ use crate::grouping::rebuild_auto_bundles;
 use l4a_protocol::AddonId;
 
 #[test]
+fn assigns_local_parts_to_a_matching_workshop_release() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (wid, title) in [
+        (601, "City Escape v1 Part 1"),
+        (602, "City Escape v2 Part 1"),
+    ] {
+        db.upsert_addon(&make_addon(
+            &format!("ws:{wid}"),
+            Some(wid),
+            &format!("{wid}.vpk"),
+            Some(title),
+            Some("Mapper"),
+            &["Campaign"],
+            &["ce_first"],
+        ))
+        .unwrap();
+        db.upsert_workshop_snapshot(
+            &make_ws_snapshot(wid, title, "76561198000000001", &[], &[]),
+            true,
+        )
+        .unwrap();
+    }
+    for (id, file, title) in [
+        ("hash:v1", "archive.vpk", "City Escape v1 Part 2"),
+        ("hash:ambiguous", "misc.vpk", "City Escape Part 3"),
+    ] {
+        db.upsert_addon(&make_addon(
+            id,
+            None,
+            file,
+            Some(title),
+            Some("Mapper"),
+            &[],
+            &[],
+        ))
+        .unwrap();
+    }
+
+    let bundles = rebuild_auto_bundles(&db).unwrap();
+    assert_eq!(bundles.len(), 1);
+    assert_eq!(
+        bundles[0].member_addon_ids,
+        vec![AddonId("ws:601".into()), AddonId("hash:v1".into())]
+    );
+}
+
+#[test]
 fn enforces_author_compatibility_with_single_steam_id_and_disjoint_bundle_membership() {
     let db = LocalDb::open_in_memory().unwrap();
 

@@ -64,10 +64,12 @@ function BundleListRow({
 }: BundleListRowProps) {
   const { t } = useTranslation();
   const summary = summarizeBundle(allMembers);
+  const visibleSummary = summarizeBundle(visibleMembers);
   const visibleIds = visibleMembers.map((m) => m.id);
   const selected = visibleIds.length > 0 && visibleIds.every((id) => validSelectedIds.has(id));
-  const loadingIds = summary.loading.map((m) => m.id);
-  const muted = summary.installed.length > 0 && summary.enabledInstalled.length === 0;
+  const loadingIds = visibleSummary.loading.map((m) => m.id);
+  const muted = visibleSummary.installed.length > 0 && visibleSummary.enabledInstalled.length === 0;
+  const firstPath = visibleSummary.firstPath;
 
   return (
     <div
@@ -118,16 +120,16 @@ function BundleListRow({
               <CloudOff size={11} />
             </span>
           )}
-          {loadingIds.length > 0 && !summary.allLoadingEnabled && (
+          {loadingIds.length > 0 && !visibleSummary.allLoadingEnabled && (
             <span
               className="md-pill"
-              data-tone={summary.noneLoadingEnabled ? 'surface' : 'tertiary'}
+              data-tone={visibleSummary.noneLoadingEnabled ? 'surface' : 'tertiary'}
             >
-              {summary.noneLoadingEnabled
+              {visibleSummary.noneLoadingEnabled
                 ? t('common.disabled')
                 : t('organize.statusPartial', {
-                    enabled: summary.enabledLoading.length,
-                    total: summary.loading.length,
+                    enabled: visibleSummary.enabledLoading.length,
+                    total: loadingIds.length,
                   })}
             </span>
           )}
@@ -148,20 +150,20 @@ function BundleListRow({
         </div>
       </button>
       <div className="l4a-list-trailing">
-        {summary.primaryDir && (
+        {visibleSummary.primaryDir && (
           <span className="md-pill" data-tone="surface">
-            {summary.primaryDir === 'loading'
+            {visibleSummary.primaryDir === 'loading'
               ? t('library.loadingDir')
               : t('library.workshopDir')}
           </span>
         )}
-        {summary.firstPath && (
+        {firstPath && (
           <IconButton
             size="sm"
             label={t('common.openInExplorer')}
             onClick={(e) => {
               e.stopPropagation();
-              onOpenInFileManager(summary.firstPath!);
+              onOpenInFileManager(firstPath);
             }}
           >
             <FolderOpen size={15} />
@@ -170,7 +172,7 @@ function BundleListRow({
         {loadingIds.length > 0 && (
           <Switch
             compact
-            checked={summary.allLoadingEnabled}
+            checked={visibleSummary.allLoadingEnabled}
             disabled={busy}
             label={bundle.name}
             onChange={(next) => onBatchToggle(loadingIds, next)}

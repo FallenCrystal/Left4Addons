@@ -13,4 +13,4 @@ pub use providers::{
     CatalogBackendProvider, PlaceholderWebScraper, SteamBridgeProvider, SteamWebApiProvider,
     WebScraperPlaceholderProvider, WorkshopWebScraper,
 };
-pub use resolver::{upgrade_steam_cdn_https, SourceRoutingPolicy, WorkshopResolver};
+pub use resolver::{normalize_workshop_url, SourceRoutingPolicy, WorkshopResolver};

@@ -70,12 +70,12 @@ function BundleGridCard({
 }: BundleGridCardProps) {
   const { t } = useTranslation();
   const summary = summarizeBundle(allMembers);
+  const visibleSummary = summarizeBundle(visibleMembers);
   const visibleIds = visibleMembers.map((m) => m.id);
   const selected = visibleIds.length > 0 && visibleIds.every((id) => validSelectedIds.has(id));
-  const loadingIds = summary.loading.map((m) => m.id);
-  const muted = summary.installed.length > 0 && summary.enabledInstalled.length === 0;
-  const switchChecked =
-    loadingIds.length > 0 ? summary.allLoadingEnabled : summary.enabledInstalled.length > 0;
+  const loadingIds = visibleSummary.loading.map((m) => m.id);
+  const muted = visibleSummary.installed.length > 0 && visibleSummary.enabledInstalled.length === 0;
+  const firstPath = visibleSummary.firstPath;
 
   const handleOpenOrSelect = () => {
     if (batchMode) onToggleSelectMany(visibleIds);
@@ -168,38 +168,38 @@ function BundleGridCard({
 
         <div className="l4a-addon-card-footer">
           <div className="l4a-row-wrap" style={{ gap: 6 }}>
-            {summary.primaryDir && (
+            {visibleSummary.primaryDir && (
               <span className="md-pill" data-tone="surface">
-                {summary.primaryDir === 'loading' ? <Folder size={11} /> : <Store size={11} />}
-                {summary.primaryDir === 'loading'
+                {visibleSummary.primaryDir === 'loading' ? <Folder size={11} /> : <Store size={11} />}
+                {visibleSummary.primaryDir === 'loading'
                   ? t('library.loadingDir')
                   : t('library.workshopDir')}
               </span>
             )}
-            {loadingIds.length > 0 && !summary.allLoadingEnabled && (
+            {loadingIds.length > 0 && !visibleSummary.allLoadingEnabled && (
               <span
                 className="md-pill"
-                data-tone={summary.noneLoadingEnabled ? 'surface' : 'tertiary'}
+                data-tone={visibleSummary.noneLoadingEnabled ? 'surface' : 'tertiary'}
               >
-                {summary.noneLoadingEnabled
+                {visibleSummary.noneLoadingEnabled
                   ? t('common.disabled')
                   : t('organize.statusPartial', {
-                      enabled: summary.enabledLoading.length,
-                      total: summary.loading.length,
+                      enabled: visibleSummary.enabledLoading.length,
+                      total: loadingIds.length,
                     })}
               </span>
             )}
           </div>
 
-          {summary.installed.length > 0 && (
+          {(firstPath || loadingIds.length > 0) && (
             <div className="l4a-row-wrap" style={{ gap: 6, flexWrap: 'nowrap' }}>
-              {summary.firstPath && (
+              {firstPath && (
                 <IconButton
                   size="sm"
                   label={t('common.openInExplorer')}
                   onClick={(e) => {
                     e.stopPropagation();
-                    onOpenInFileManager(summary.firstPath!);
+                    onOpenInFileManager(firstPath);
                   }}
                 >
                   <FolderOpen size={15} />
@@ -208,7 +208,7 @@ function BundleGridCard({
               {loadingIds.length > 0 && (
                 <Switch
                   compact
-                  checked={switchChecked}
+                  checked={visibleSummary.allLoadingEnabled}
                   disabled={busy}
                   label={bundle.name}
                   onChange={(next) => onBatchToggle(loadingIds, next)}

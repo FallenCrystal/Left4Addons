@@ -5,9 +5,10 @@ use super::parsing::{
 };
 use super::partition::{
     authors_compatible, explicit_releases_compatible, group_authors_consistent,
+    group_releases_consistent,
 };
 use regex::Regex;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub(super) fn is_valid_campaign_dependency_edge(u: &BundleCandidate, v: &BundleCandidate) -> bool {
@@ -92,7 +93,7 @@ pub(super) fn is_valid_campaign_group(members: &[&BundleCandidate]) -> bool {
     if !members.iter().any(|m| m.has_campaign_signal) {
         return false;
     }
-    group_authors_consistent(members)
+    group_authors_consistent(members) && group_releases_consistent(members, false)
 }
 
 pub(super) fn metadata_titles_compatible(members: &[&BundleCandidate]) -> bool {
@@ -133,8 +134,20 @@ pub(super) fn has_conflicting_versions(members: &[&BundleCandidate]) -> bool {
 }
 
 pub(super) fn has_complementary_map_split(members: &[&BundleCandidate]) -> bool {
-    members.iter().any(|m| !m.addon.maps.is_empty())
-        && (members.iter().any(|m| m.addon.maps.is_empty()) || !all_map_sets_identical(members))
+    let mut seen = HashSet::new();
+    for member in members {
+        let codes: HashSet<_> = member
+            .addon
+            .maps
+            .iter()
+            .map(|map| map.code.to_ascii_lowercase())
+            .collect();
+        if !seen.is_disjoint(&codes) {
+            return false;
+        }
+        seen.extend(codes);
+    }
+    members.len() >= 2 && !seen.is_empty()
 }
 
 /// 校验本地附件/工坊同名战役包是否确实属于同一套战役的分包（避免两个碰巧同名的独立地图误合并）。
@@ -196,20 +209,6 @@ pub(super) fn identical_title_group_corroborated(members: &[&BundleCandidate]) -
     same_desc || same_tagline || same_url || shared_file_prefix
 }
 
-fn all_map_sets_identical(members: &[&BundleCandidate]) -> bool {
-    let sets: Vec<BTreeSet<String>> = members
-        .iter()
-        .map(|m| {
-            m.addon
-                .maps
-                .iter()
-                .map(|entry| entry.code.to_ascii_lowercase())
-                .collect()
-        })
-        .collect();
-    sets.windows(2).all(|w| !w[0].is_empty() && w[0] == w[1])
-}
-
 pub(super) fn sort_bundle_candidates(members: &mut [&BundleCandidate]) {
     members.sort_by(|a, b| {
         a.sort_rank()
@@ -242,17 +241,22 @@ pub(super) fn derive_bundle_name(members: &[&BundleCandidate]) -> String {
                 let key = normalize_comparison_text(disp);
                 let entry = root_counts.entry(key).or_insert_with(|| (0, disp.clone()));
                 entry.0 += 1;
-                if disp.len() < entry.1.len()
-                    && root_key_len_valid(&normalize_comparison_text(disp))
-                {
+                if (disp.len(), disp.as_str()) < (entry.1.len(), entry.1.as_str()) {
                     entry.1 = disp.clone();
                 }
             }
         }
-        if let Some((_, best_disp)) = root_counts
-            .into_values()
-            .filter(|(cnt, _)| *cnt >= 2)
-            .max_by_key(|(cnt, disp)| (*cnt, std::cmp::Reverse(disp.len())))
+        if let Some((_, (_, best_disp))) = root_counts
+            .into_iter()
+            .filter(|(_, (count, _))| *count >= 2)
+            .min_by(
+                |(key_a, (count_a, display_a)), (key_b, (count_b, display_b))| {
+                    count_b
+                        .cmp(count_a)
+                        .then_with(|| display_a.len().cmp(&display_b.len()))
+                        .then_with(|| key_a.cmp(key_b))
+                },
+            )
         {
             return best_disp;
         }

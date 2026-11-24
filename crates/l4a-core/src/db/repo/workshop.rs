@@ -78,8 +78,7 @@ impl LocalDb {
         let file_url = item
             .file_url
             .as_deref()
-            .map(l4a_workshop::upgrade_steam_cdn_https)
-            .filter(|s| !s.is_empty());
+            .and_then(l4a_workshop::normalize_workshop_url);
 
         tx.execute(
             r#"

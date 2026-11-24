@@ -305,11 +305,12 @@ impl BundleCandidate {
         if !self.has_any_fix_marker {
             return false;
         }
-        if contains_fix_marker(shared_root_key) {
-            return false;
-        }
+        let root_has_fix_marker = contains_fix_marker(shared_root_key);
         for raw in &self.all_titles_lower {
             let norm = normalize_comparison_text(raw);
+            if root_has_fix_marker && !norm.contains(shared_root_key) {
+                continue;
+            }
             let remainder = norm.replace(shared_root_key, " ");
             if contains_fix_marker(&remainder) {
                 return true;

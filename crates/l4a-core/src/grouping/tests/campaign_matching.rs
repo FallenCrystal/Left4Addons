@@ -151,6 +151,158 @@ fn excludes_yama_missing_texture_fix_and_survivor_expression_dependencies() {
 }
 
 #[test]
+fn shared_dependency_cannot_bridge_campaign_releases() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (wid, title, maps, dependencies) in [
+        (301, "City Escape v1", &["ce_first"][..], &[303][..]),
+        (
+            302,
+            "City Escape v2",
+            &["ce_first", "ce_second"][..],
+            &[303][..],
+        ),
+        (303, "City Escape Textures", &[][..], &[][..]),
+    ] {
+        let mut addon = make_addon(
+            &format!("ws:{wid}"),
+            Some(wid),
+            &format!("{wid}.vpk"),
+            Some(title),
+            Some("Mapper"),
+            &[],
+            maps,
+        );
+        addon.version = None;
+        db.upsert_addon(&addon).unwrap();
+        db.upsert_workshop_snapshot(
+            &make_ws_snapshot(wid, title, "76561198000000001", &[], dependencies),
+            true,
+        )
+        .unwrap();
+    }
+
+    assert!(rebuild_auto_bundles(&db).unwrap().is_empty());
+}
+
+#[test]
+fn workshop_fix_title_excludes_a_vpk_with_copied_campaign_metadata() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (wid, workshop_title, maps) in [
+        (401, "City Escape", &["ce_first"][..]),
+        (402, "City Escape", &[][..]),
+        (403, "City Escape Missing Textures Fix", &[][..]),
+    ] {
+        db.upsert_addon(&make_addon(
+            &format!("ws:{wid}"),
+            Some(wid),
+            &format!("{wid}.vpk"),
+            Some("City Escape"),
+            Some("Mapper"),
+            &[],
+            maps,
+        ))
+        .unwrap();
+        db.upsert_workshop_snapshot(
+            &make_ws_snapshot(wid, workshop_title, "76561198000000001", &[], &[]),
+            true,
+        )
+        .unwrap();
+    }
+
+    let bundles = rebuild_auto_bundles(&db).unwrap();
+    assert_eq!(bundles.len(), 1);
+    assert_eq!(
+        bundles[0].member_addon_ids,
+        vec![AddonId("ws:401".into()), AddonId("ws:402".into())]
+    );
+}
+
+#[test]
+fn only_disjoint_map_splits_can_override_same_title_version_conflicts() {
+    for (second_maps, expected_bundles) in
+        [(&["CE_FIRST", "ce_second"][..], 0), (&["ce_second"][..], 1)]
+    {
+        let db = LocalDb::open_in_memory().unwrap();
+        for (file, version, maps) in [
+            ("archive.vpk", Some("1.0"), &["ce_first"][..]),
+            ("bonus.vpk", Some("2.0"), second_maps),
+            ("content.vpk", None, &[][..]),
+        ] {
+            let mut addon = make_addon(
+                file,
+                None,
+                file,
+                Some("City Escape"),
+                Some("Mapper"),
+                &[],
+                maps,
+            );
+            addon.version = version.map(str::to_string);
+            db.upsert_addon(&addon).unwrap();
+        }
+
+        let bundles = rebuild_auto_bundles(&db).unwrap();
+        assert_eq!(bundles.len(), expected_bundles);
+    }
+}
+
+#[test]
+fn orders_roman_parts_beyond_ten() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (id, title, maps) in [
+        ("hash:a", "City Escape Part XII", &["ce_twelfth"][..]),
+        ("hash:b", "City Escape (Part XIV)", &[][..]),
+        ("hash:c", "City Escape Part XI", &["ce_eleventh"][..]),
+    ] {
+        db.upsert_addon(&make_addon(
+            id,
+            None,
+            &format!("{}.vpk", &id[5..]),
+            Some(title),
+            Some("Mapper"),
+            &[],
+            maps,
+        ))
+        .unwrap();
+    }
+
+    let bundles = rebuild_auto_bundles(&db).unwrap();
+    assert_eq!(bundles.len(), 1);
+    assert_eq!(
+        bundles[0].member_addon_ids,
+        ["hash:c", "hash:a", "hash:b"].map(|id| AddonId(id.into()))
+    );
+}
+
+#[test]
+fn equal_length_shared_titles_choose_a_stable_bundle_name() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (wid, maps) in [(501, &["alpha_first"][..]), (502, &[][..])] {
+        db.upsert_addon(&make_addon(
+            &format!("ws:{wid}"),
+            Some(wid),
+            &format!("{wid}.vpk"),
+            Some("Alpha Town"),
+            Some("Mapper"),
+            &[],
+            maps,
+        ))
+        .unwrap();
+        db.upsert_workshop_snapshot(
+            &make_ws_snapshot(wid, "Bravo Town", "76561198000000001", &[], &[]),
+            true,
+        )
+        .unwrap();
+    }
+
+    for _ in 0..16 {
+        let bundles = rebuild_auto_bundles(&db).unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].name, "Alpha Town");
+    }
+}
+
+#[test]
 fn groups_local_attachment_campaign_parts_and_ignores_sdk_boilerplate_templates() {
     let db = LocalDb::open_in_memory().unwrap();
 

@@ -84,6 +84,27 @@ export function resolveLibraryMetadataTitle(
   );
 }
 
+export function getInstalledBundleMembers(
+  bundle: BundleRecord,
+  addonsById: ReadonlyMap<string, AddonSummary>,
+): AddonSummary[] {
+  return bundle.memberAddonIds
+    .map((id) => addonsById.get(id))
+    .filter((addon): addon is AddonSummary => addon?.installState === 'installed');
+}
+
+export function canCollapseCampaignBundle(installedMembers: readonly AddonSummary[]): boolean {
+  return (
+    installedMembers.length >= 2 &&
+    installedMembers.some(
+      (member) =>
+        member.maps.length > 0 ||
+        member.categories.includes('Campaign') ||
+        member.categories.includes('Map'),
+    )
+  );
+}
+
 export function summarizeBundle(allMembers: AddonSummary[]): BundleSummaryInfo {
   const installed = allMembers.filter((m) => m.installState === 'installed');
   const loading = installed.filter((m) => m.primaryDir === 'loading');
@@ -271,13 +292,10 @@ export function buildLibraryDisplayItems({
 
   if (collapseBundles && !externalFilter) {
     for (const bundle of bundles) {
-      const unclaimedMembers = bundle.memberAddonIds
-        .map((id) => addonsById.get(id))
-        .filter(
-          (a): a is AddonSummary =>
-            a !== undefined && a.installState === 'installed' && !claimedAddonIds.has(a.id),
-        );
-      if (unclaimedMembers.length < 2) continue;
+      const unclaimedMembers = getInstalledBundleMembers(bundle, addonsById).filter(
+        (addon) => !claimedAddonIds.has(addon.id),
+      );
+      if (!canCollapseCampaignBundle(unclaimedMembers)) continue;
 
       const scopeMembers = unclaimedMembers.filter(matchesScope);
       if (scopeMembers.length < 2) continue;

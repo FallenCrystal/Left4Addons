@@ -108,22 +108,15 @@ impl MirrorRouter {
     }
 
     pub fn resolve(&self, url: &str) -> ResolvedRequest {
-        if self.rules.is_empty() {
-            return ResolvedRequest {
-                url: url.to_string(),
-                original_host: None,
-                headers: HashMap::new(),
-                insecure_tls: false,
-            };
-        }
+        let direct = |url: String| ResolvedRequest {
+            url,
+            original_host: None,
+            headers: HashMap::new(),
+            insecure_tls: false,
+        };
 
         let Ok(mut parsed_url) = url::Url::parse(url) else {
-            return ResolvedRequest {
-                url: url.to_string(),
-                original_host: None,
-                headers: HashMap::new(),
-                insecure_tls: false,
-            };
+            return direct(url.to_string());
         };
 
         let Some(host) = parsed_url
@@ -133,22 +126,24 @@ impl MirrorRouter {
                 None => hostname.to_string(),
             })
         else {
-            return ResolvedRequest {
-                url: url.to_string(),
-                original_host: None,
-                headers: HashMap::new(),
-                insecure_tls: false,
-            };
+            return direct(url.to_string());
         };
 
+        let upgrade_cdn = is_legacy_steam_cdn_url(&parsed_url);
+        let https_only = self.https_only.load(Ordering::Relaxed);
         for compiled in &self.rules {
             let Some(captures) = compiled.regex.captures(&host) else {
                 continue;
             };
             let target = replace_captures(&compiled.raw.target, &captures);
-            if set_target_host(&mut parsed_url, &target) {
+            let mut routed_url = parsed_url.clone();
+            // 允许 HTTP 时镜像沿用原始协议。仅 HTTPS 模式先升级，再应用镜像端口。
+            if upgrade_cdn && https_only {
+                let _ = routed_url.set_scheme("https");
+            }
+            if set_target_host(&mut routed_url, &target) {
                 return ResolvedRequest {
-                    url: parsed_url.to_string(),
+                    url: routed_url.into(),
                     original_host: compiled.raw.keep_host.then_some(host),
                     headers: compiled.raw.headers.clone().unwrap_or_default(),
                     insecure_tls: compiled.raw.insecure_tls,
@@ -156,11 +151,10 @@ impl MirrorRouter {
             }
         }
 
-        ResolvedRequest {
-            url: url.to_string(),
-            original_host: None,
-            headers: HashMap::new(),
-            insecure_tls: false,
+        if upgrade_cdn && parsed_url.set_scheme("https").is_ok() {
+            direct(parsed_url.into())
+        } else {
+            direct(url.to_string())
         }
     }
 
@@ -224,6 +218,26 @@ impl MirrorRouter {
         let req = apply_resolved_headers(client.post(&resolved.url), &resolved);
         (req, resolved)
     }
+}
+
+fn is_legacy_steam_cdn_url(url: &url::Url) -> bool {
+    url.scheme() == "http"
+        && url.port().is_none()
+        && url.host_str().is_some_and(|host| {
+            host == "steamusercontent.com"
+                || host.ends_with(".steamusercontent.com")
+                || host == "steamstatic.com"
+                || host.ends_with(".steamstatic.com")
+                || host == "media.steampowered.com"
+                || ((host == "cloud.steampowered.com"
+                    || (host.starts_with("cloud-") && host.ends_with(".steampowered.com")))
+                    && url.path().starts_with("/ugc/"))
+                || host.strip_suffix(".akamaihd.net").is_some_and(|prefix| {
+                    matches!(prefix, "steamuserimages" | "steamcdn")
+                        || prefix.starts_with("steamuserimages-")
+                        || prefix.starts_with("steamcdn-")
+                })
+        })
 }
 
 fn apply_resolved_headers(mut req: RequestBuilder, resolved: &ResolvedRequest) -> RequestBuilder {
@@ -460,5 +474,42 @@ mod tests {
             router.resolve("https://cdn.example.com/b.vpk").url,
             "https://proxy.local:80/b.vpk"
         );
+    }
+
+    #[test]
+    fn routes_legacy_steam_cdn_links_according_to_mirror_and_https_policy() {
+        let mut rule = base_rule("mirror.local:8080");
+        rule.rules = Some("cloud.steampowered.com".to_string());
+        rule.keep_host = true;
+        let router = MirrorRouter::from_rules(vec![rule]);
+        let url = "http://cloud.steampowered.com/ugc/123/cover.jpg";
+
+        let direct = MirrorRouter::empty();
+        direct.set_https_only(true);
+        assert_eq!(
+            direct.validate_url(url).unwrap().url,
+            "https://cloud.steampowered.com/ugc/123/cover.jpg"
+        );
+        let mirrored = router.validate_url(url).unwrap();
+        assert_eq!(mirrored.url, "http://mirror.local:8080/ugc/123/cover.jpg");
+        assert_eq!(
+            mirrored.original_host.as_deref(),
+            Some("cloud.steampowered.com")
+        );
+
+        router.set_https_only(true);
+        assert_eq!(
+            router.validate_url(url).unwrap().url,
+            "https://mirror.local:8080/ugc/123/cover.jpg"
+        );
+        for other in [
+            "http://evil-steamuserimages.akamaihd.net/cover.jpg",
+            "http://cloud.steampowered.com/other/cover.jpg",
+        ] {
+            assert!(matches!(
+                router.validate_url(other),
+                Err(MirrorError::HttpsRequired)
+            ));
+        }
     }
 }
