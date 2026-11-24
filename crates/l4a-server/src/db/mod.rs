@@ -4,7 +4,7 @@ mod schema;
 mod search_query;
 mod upstream_apply;
 
-pub(crate) use search_query::{RankedLocalItem, RankedLocalSearch};
+pub(crate) use search_query::RankedCatalogMatch;
 
 use chrono::{DateTime, Utc};
 use l4a_protocol::{WorkshopId, WorkshopItemRecord, WorkshopItemStatus};
@@ -50,10 +50,18 @@ pub struct StoredItemMeta {
     pub is_listed: Option<bool>,
 }
 
+impl StoredItemMeta {
+    pub(crate) fn is_in_public_catalog(&self) -> bool {
+        self.catalog_indexed && self.is_listed == Some(true)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogIndexPolicy {
     /// 仅写入或刷新按 ID 穿透缓存，不将未收录条目暴露到公开工坊首页与搜索。
     CacheOnly,
+    /// Search can warm the by-ID cache while indexed metadata remains owned by catalog sync.
+    RefreshUnindexedCache,
     /// 仅在本地尚无任何记录时以 `CacheOnly` 写入，避免非英文搜索预热覆盖英文主记录。
     InsertOnlyCache,
     /// 将公开条目纳入目录索引，供公开工坊首页与检索展示。

@@ -56,7 +56,7 @@ flowchart TD
 ### 4.2 混合融合、单飞短缓存与暖缓存策略
 - **本地强命中提升 & 本地兜底**：Steam CM 负责全量语义检索与官方排序；本地 SQLite FTS5 补充中文拼音（如 `guangzhou` → `广州增城`）、去空格/驼峰复合词（如 `EarlyDays` / `DayBreak`）、作者名检索、`AdminOverride` 覆写与离线/超时降级（`X-L4A-Search-Mode: local-fallback`）。
 - **单飞并发合并与 60 秒内存缓存**：相同的 `SteamSearchRequest` 共享同一个在途 CM 请求并在内存中缓存 `cache_ttl_secs`（默认 60 秒，上限 512 项），避免连续翻页或重复搜索放大上游延迟。
-- **覆写、隐私隔离与异步 `CacheOnly` 暖缓存**：合并阶段严格过滤 `listed == false`、`consumer_appid != app_id` 及本地已知私密/受限条目，并叠加 `AdminOverride` 与本地 `creator_name`。搜索命中的公开条目以 `CatalogIndexPolicy::CacheOnly` 异步写入本地缓存（非英文检索仅缓存本地尚未收录的新 ID，不覆盖英文规范标题），既加速后续按 ID 获取直链，又不污染公开首页目录。
+- **覆写、隐私隔离与异步暖缓存**。合并阶段过滤未列出、消费 App ID 不符和本地已知受限的 Steam 条目，并叠加 `AdminOverride` 与本地 `creator_name`。Steam 确认的私密、下架和未列出状态按版本与观测时间写入 SQLite，供后续本地搜索使用。可选暖缓存异步保存公开条目，英文搜索可刷新穿透缓存，非英文搜索仅写入新的 ID。已收录的公开目录由同步维护。
 
 ## 5. 管理控制台 (`GET /admin/`) 与安全边界
 

@@ -27,7 +27,7 @@ impl ServerRepo {
         conn: &Connection,
         workshop_id: WorkshopId,
     ) -> anyhow::Result<Option<StoredItemMeta>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT file_type, status, title, description, creator_steam_id,
                     creator_name, preview_url, previews_json, file_url, file_size,
                     time_created, time_updated, tags_json, collection_children_json,
@@ -98,7 +98,7 @@ impl ServerRepo {
         conn: &Connection,
         parent_id: WorkshopId,
     ) -> anyhow::Result<Vec<WorkshopDependency>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT edge.dep_workshop_id,
                     CASE WHEN dep.status = 'private_or_unavailable' THEN NULL ELSE edge.dep_title END,
                     edge.required

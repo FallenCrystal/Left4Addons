@@ -36,6 +36,8 @@
 - **本地能力增强与隔离保护**：本地 SQLite FTS5 索引（中英文分词、驼峰/忽略空格复合词、中文标题拼音、`AdminOverride` 人工覆写与直链、下架墓碑）会与 Steam CM 结果智能去重融合；仅通过按需搜索暖缓存 (`CacheOnly`) 的条目不会污染公开首页，本地已知的私密 (`private_or_unavailable`) 与未列出 (`is_listed = 0`) 条目绝不会从公开搜索泄露。
 - **精确 ID / 链接查询**：传入 Steam Workshop 链接或 6 位以上纯数字 ID 时，若本地未收录且未在本地标记为受限/覆写，会自动通过 `GetDetails` 穿透补全公开条目。
 
+常规混合检索在去重后计算总数和分页。普通查询的 Steam 命中数超过 2400 时，整次查询使用 Steam 的排序、分页和总数，仍会应用本地覆写及可见性过滤。Steam 超时或失败时仍可回退到本地目录。
+
 > `GET /api/v1/admin/items/search` 保持**纯本地 SQLite 缓存检索**，供管理员检视已缓存条目与墓碑，不触发上游 Steam CM 请求。
 
 ### `GET /api/v1/collections/{collection_id}?refresh=false`

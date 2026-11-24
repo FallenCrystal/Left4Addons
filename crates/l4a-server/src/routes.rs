@@ -290,12 +290,15 @@ async fn search_items(
 ) -> Result<(HeaderMap, Json<SearchResponse>), (StatusCode, Json<Value>)> {
     let q = SearchQuery::from(params);
     let accept_language = headers
-        .get(ACCEPT_LANGUAGE)
-        .and_then(|value| value.to_str().ok());
+        .get_all(ACCEPT_LANGUAGE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
     let output = state
         .server
         .search
-        .search(&q, accept_language)
+        .search(&q, Some(&accept_language))
         .await
         .map_err(internal_err)?;
     let mut resp_headers = HeaderMap::new();

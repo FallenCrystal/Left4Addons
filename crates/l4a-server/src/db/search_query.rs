@@ -1,7 +1,6 @@
 use super::{parse_workshop_id_col, serialize_json_enum, ServerRepo};
 use crate::search::{self, MatchRank, ParsedQuery};
-use chrono::{DateTime, Utc};
-use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopId, WorkshopItemRecord};
+use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopId};
 use rusqlite::{params, Connection, Row, Rows};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -14,25 +13,21 @@ const SEARCH_ITEM_FILTERS: &str = "
 
 const SEARCH_ORDER_COLUMNS: &str = "
     w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
-    COALESCE(w.time_updated, 0), COALESCE(w.time_created, 0)";
+    COALESCE(w.time_updated, 0), COALESCE(w.time_created, 0),
+    w.status = 'active', w.is_admin_override";
 const SEARCH_FTS_SOURCE: &str = "
     FROM workshop_items_fts JOIN workshop_items w ON w.workshop_id = workshop_items_fts.rowid";
 
-#[derive(Debug, Clone)]
-pub(crate) struct RankedLocalItem {
-    pub record: WorkshopItemRecord,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RankedCatalogMatch {
+    pub id: WorkshopId,
     pub rank: Option<MatchRank>,
+    pub is_active: bool,
     pub is_admin_override: bool,
-    pub last_verified_at: DateTime<Utc>,
+    pub sort_value: i64,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RankedLocalSearch {
-    pub total: u64,
-    pub items: Vec<RankedLocalItem>,
-}
-
-type RankedIdPage = (u64, Vec<(WorkshopId, Option<MatchRank>)>);
+type RankedMatchPage = (u64, Vec<RankedCatalogMatch>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSearchTarget {
@@ -56,6 +51,22 @@ struct SearchFilters {
     status: Option<String>,
     public_only: bool,
     file_type: Option<String>,
+}
+
+impl SearchFilters {
+    fn new(query: &SearchQuery, public_only: bool) -> Self {
+        Self {
+            tag: query
+                .tag
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_ascii_lowercase),
+            status: query.status.map(|status| serialize_json_enum(&status)),
+            public_only,
+            file_type: query.file_type.map(|ft| serialize_json_enum(&ft)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -107,6 +118,26 @@ impl SearchSort {
             }
         })
     }
+
+    fn ranked_match(
+        self,
+        row: &Row<'_>,
+        id: WorkshopId,
+        rank: Option<MatchRank>,
+    ) -> rusqlite::Result<RankedCatalogMatch> {
+        Ok(RankedCatalogMatch {
+            id,
+            rank,
+            is_active: row.get(5)?,
+            is_admin_override: row.get(6)?,
+            sort_value: match self {
+                Self::Subscriptions | Self::Relevance => row.get(2)?,
+                Self::Updated => row.get(3)?,
+                Self::Newest => row.get(4)?,
+                _ => 0,
+            },
+        })
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -118,22 +149,10 @@ enum PageEntry {
     Relevance(MatchRank, Reverse<i64>, Reverse<i64>, WorkshopId),
 }
 
-impl PageEntry {
-    fn id(self) -> WorkshopId {
-        match self {
-            Self::TimeDescending(Reverse((_, id)))
-            | Self::TimeAscending(_, id)
-            | Self::Title(_, id)
-            | Self::Subscriptions(_, id)
-            | Self::Relevance(_, _, _, id) => id,
-        }
-    }
-}
-
 #[derive(PartialEq, Eq)]
 struct RankedEntry {
     entry: PageEntry,
-    rank: Option<MatchRank>,
+    matched: RankedCatalogMatch,
 }
 
 impl Ord for RankedEntry {
@@ -157,11 +176,11 @@ struct SearchPage {
 }
 
 impl SearchPage {
-    fn new(sort: SearchSort, page_size: u32, offset: u64) -> Self {
+    fn new(sort: SearchSort, page_size: Option<u32>, offset: u64) -> Self {
         Self {
             sort,
             offset,
-            limit: offset + u64::from(page_size),
+            limit: page_size.map_or(u64::MAX, |size| offset + u64::from(size)),
             total: 0,
             best: BinaryHeap::new(),
         }
@@ -178,7 +197,7 @@ impl SearchPage {
                 self.total += 1;
                 let entry = RankedEntry {
                     entry: self.sort.entry(row, id, rank)?,
-                    rank: Some(rank),
+                    matched: self.sort.ranked_match(row, id, Some(rank))?,
                 };
                 // Count every validated match and keep only the best entries through this page.
                 if (self.best.len() as u64) < self.limit {
@@ -193,16 +212,16 @@ impl SearchPage {
         Ok(())
     }
 
-    fn finish(mut self) -> RankedIdPage {
+    fn finish(mut self) -> RankedMatchPage {
         let offset = usize::try_from(self.offset).unwrap_or(usize::MAX);
         let page_len = self.best.len().saturating_sub(offset);
         // The requested page is at the end of the retained entries in sort order.
-        let mut pairs: Vec<_> = std::iter::from_fn(|| self.best.pop())
+        let mut matches: Vec<_> = std::iter::from_fn(|| self.best.pop())
             .take(page_len)
-            .map(|ranked| (ranked.entry.id(), ranked.rank))
+            .map(|ranked| ranked.matched)
             .collect();
-        pairs.reverse();
-        (self.total, pairs)
+        matches.reverse();
+        (self.total, matches)
     }
 }
 
@@ -211,103 +230,77 @@ impl ServerRepo {
         let page = query.page.max(1);
         let page_size = query.page_size.clamp(1, 100);
         let offset = u64::from(page - 1) * u64::from(page_size);
-        let ranked = self.search_ranked(query, public_only, offset, page_size)?;
-        Ok(SearchResponse {
-            items: ranked.items.into_iter().map(|item| item.record).collect(),
-            total: ranked.total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
+        self.with_read_snapshot(|conn| {
+            let (total, matches) =
+                Self::ranked_matches(conn, query, public_only, offset, Some(page_size))?;
+            let mut items = Vec::with_capacity(matches.len());
+            for matched in matches {
+                if let Some(meta) = Self::get_item_with_conn(conn, matched.id)? {
+                    items.push(meta.record);
+                }
+            }
+            Ok(SearchResponse {
+                items,
+                total,
+                page,
+                page_size,
+                source: MetadataSource::CatalogServer,
+            })
         })
     }
 
-    pub(crate) fn search_ranked(
+    /// Return compact matches for the hybrid merge, which loads full local records after paging.
+    pub(crate) fn catalog_search_matches(
         &self,
+        query: &SearchQuery,
+    ) -> anyhow::Result<Vec<RankedCatalogMatch>> {
+        self.with_read_snapshot(|conn| {
+            let (_, matches) = Self::ranked_matches(conn, query, true, 0, None)?;
+            Ok(matches)
+        })
+    }
+
+    fn ranked_matches(
+        conn: &Connection,
         query: &SearchQuery,
         public_only: bool,
         offset: u64,
-        limit: u32,
-    ) -> anyhow::Result<RankedLocalSearch> {
-        let limit = limit.clamp(1, 500);
-        let filters = SearchFilters {
-            tag: query
-                .tag
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_ascii_lowercase),
-            status: query.status.map(|status| serialize_json_enum(&status)),
-            public_only,
-            file_type: query.file_type.map(|ft| serialize_json_enum(&ft)),
-        };
+        limit: Option<u32>,
+    ) -> anyhow::Result<RankedMatchPage> {
+        let filters = SearchFilters::new(query, public_only);
         let sort = SearchSort::from_name(query.sort.as_deref());
         let target = LocalSearchTarget::from_name(query.search_target.as_deref());
         let parsed = query.query.as_deref().and_then(search::parse_query);
 
-        self.with_read_snapshot(|conn| {
-            let (total, page_entries) = match &parsed {
-                None => Self::browse_items(conn, &filters, sort, limit, offset)?,
-                Some(parsed) => {
-                    if let Some(id) = parsed
-                        .exact_workshop_id
-                        .filter(|_| parsed.numeric_prefix.is_none())
-                    {
-                        Self::search_exact_id(conn, &filters, id, offset)?
-                    } else {
-                        let mut selection = SearchPage::new(sort, limit, offset);
-                        if parsed.terms.is_empty() {
-                            Self::search_symbol_only(
-                                conn,
-                                parsed,
-                                &filters,
-                                target,
-                                &mut selection,
-                            )?;
-                        } else {
-                            Self::search_indexed(conn, parsed, &filters, target, &mut selection)?;
-                        }
-                        selection.finish()
-                    }
-                }
-            };
+        let Some(parsed) = parsed else {
+            return Self::browse_items(conn, &filters, sort, limit, offset);
+        };
+        if let Some(id) = parsed
+            .exact_workshop_id
+            .filter(|_| parsed.numeric_prefix.is_none())
+        {
+            return Self::search_exact_id(conn, &filters, sort, id, offset);
+        }
 
-            let mut items = Vec::with_capacity(page_entries.len());
-            for (id, rank) in page_entries {
-                if let Some(meta) = Self::get_item_with_conn(conn, id)? {
-                    items.push(RankedLocalItem {
-                        record: meta.record,
-                        rank,
-                        is_admin_override: meta.is_admin_override,
-                        last_verified_at: meta.last_verified_at,
-                    });
-                }
-            }
-
-            Ok(RankedLocalSearch { total, items })
-        })
+        let mut selection = SearchPage::new(sort, limit, offset);
+        if parsed.terms.is_empty() {
+            Self::search_symbol_only(conn, &parsed, &filters, target, &mut selection)?;
+        } else {
+            Self::search_indexed(conn, &parsed, &filters, target, &mut selection)?;
+        }
+        Ok(selection.finish())
     }
 
     fn browse_items(
         conn: &Connection,
         filters: &SearchFilters,
         sort: SearchSort,
-        page_size: u32,
+        page_size: Option<u32>,
         offset: u64,
-    ) -> anyhow::Result<RankedIdPage> {
-        let total: u64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"),
-            params![
-                filters.tag,
-                filters.status,
-                filters.public_only,
-                filters.file_type
-            ],
-            |r| r.get(0),
-        )?;
-
+    ) -> anyhow::Result<RankedMatchPage> {
         let order_by = sort.browse_order();
         let sql = format!(
-            "SELECT w.workshop_id FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}
+            "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}
              ORDER BY {order_by} LIMIT ?5 OFFSET ?6"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -317,46 +310,63 @@ impl ServerRepo {
                 filters.status,
                 filters.public_only,
                 filters.file_type,
-                page_size,
+                page_size.map_or(-1, i64::from),
                 offset
             ],
-            |row| Ok((parse_workshop_id_col(0, row.get(0)?)?, None)),
+            |row| sort.ranked_match(row, parse_workshop_id_col(0, row.get(0)?)?, None),
         )?;
-        Ok((total, rows.collect::<Result<Vec<_>, _>>()?))
+        let matches = rows.collect::<Result<Vec<_>, _>>()?;
+        let total = if page_size.is_some() {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM workshop_items w WHERE {SEARCH_ITEM_FILTERS}"),
+                params![
+                    filters.tag,
+                    filters.status,
+                    filters.public_only,
+                    filters.file_type
+                ],
+                |r| r.get(0),
+            )?
+        } else {
+            matches.len() as u64
+        };
+        Ok((total, matches))
     }
 
     fn search_exact_id(
         conn: &Connection,
         filters: &SearchFilters,
+        sort: SearchSort,
         id: u64,
         offset: u64,
-    ) -> anyhow::Result<RankedIdPage> {
+    ) -> anyhow::Result<RankedMatchPage> {
         let Ok(id) = i64::try_from(id) else {
             return Ok((0, Vec::new()));
         };
-        let matched = conn
-            .prepare_cached(&format!(
-                "SELECT 1 FROM workshop_items w WHERE w.workshop_id = ?5 AND {SEARCH_ITEM_FILTERS}"
-            ))?
-            .exists(params![
-                filters.tag,
-                filters.status,
-                filters.public_only,
-                filters.file_type,
-                id
-            ])?;
-        let ids = if matched && offset == 0 {
-            vec![(
-                WorkshopId(id as u64),
-                Some(MatchRank {
-                    tier: 0,
-                    sub_rank: 0,
-                }),
-            )]
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w
+             WHERE w.workshop_id = ?5 AND {SEARCH_ITEM_FILTERS}"
+        ))?;
+        let mut rows = stmt.query(params![
+            filters.tag,
+            filters.status,
+            filters.public_only,
+            filters.file_type,
+            id
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok((0, Vec::new()));
+        };
+        let matches = if offset == 0 {
+            let rank = MatchRank {
+                tier: 0,
+                sub_rank: 0,
+            };
+            vec![sort.ranked_match(row, WorkshopId(id as u64), Some(rank))?]
         } else {
             Vec::new()
         };
-        Ok((u64::from(matched), ids))
+        Ok((1, matches))
     }
 
     fn search_indexed(
@@ -409,7 +419,7 @@ impl ServerRepo {
                 };
                 page.collect(rows, |row, id| {
                     let title = row.get_ref(1)?.as_str()?;
-                    let creator = row.get_ref(5)?.as_str_or_null()?;
+                    let creator = row.get_ref(7)?.as_str_or_null()?;
                     Ok(match target {
                         LocalSearchTarget::TitleOnly => {
                             search::score_title_only_candidate(parsed, id.as_u64(), title)
@@ -439,7 +449,7 @@ impl ServerRepo {
                     desc_query
                 ])?;
                 page.collect(rows, |row, _| {
-                    let description = row.get_ref(5)?.as_str_or_null()?;
+                    let description = row.get_ref(7)?.as_str_or_null()?;
                     Ok(description.and_then(|desc| search::score_desc_candidate(parsed, desc)))
                 })?;
             }
@@ -503,7 +513,7 @@ impl ServerRepo {
                 filters.file_type
             ])?;
             page.collect(rows, |row, _| {
-                let description = row.get_ref(5)?.as_str()?;
+                let description = row.get_ref(7)?.as_str()?;
                 let cleaned = search::strip_bbcode_and_urls(description);
                 let matches = search::fold_text(&cleaned).contains(&parsed.raw_folded);
                 Ok(matches.then_some(MatchRank {

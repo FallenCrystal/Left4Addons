@@ -44,5 +44,5 @@ default_language = "english"
 steam_timeout_ms = 4500
 # 实时 Steam 检索页在内存中的短缓存 TTL（秒，0 表示禁用缓存）
 cache_ttl_secs = 60
-# 将实时检索到的公开条目按 CacheOnly 异步写入本地缓存（不污染公开首页目录）
+# 将实时检索到的公开条目异步写入按 ID 查询缓存
 cache_steam_results = true

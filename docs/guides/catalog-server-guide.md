@@ -67,7 +67,7 @@ cache_steam_results = true
 - `default_language`：当请求既未传 `?lang=` 也未携带有效的 `Accept-Language` 时使用的 Steam 语言（如 `english`、`schinese`、`tchinese`）。
 - `steam_timeout_ms`：单次混合检索等待 Steam CM 的超时预算（毫秒，范围 `500..=15000`）。
 - `cache_ttl_secs`：Steam 搜索结果页在内存中的短缓存 TTL（秒，范围 `0..=3600`；`0` 表示禁用）。
-- `cache_steam_results`：是否将搜索命中的公开条目以 `CacheOnly` 策略异步预热到本地缓存，加快后续 `GET /items/{id}` 与下载解析。
+- `cache_steam_results` 控制公开条目的异步暖缓存，加快后续 `GET /items/{id}` 与下载解析。写入 Steam 确认的可见性限制始终生效。
 
 ---
 

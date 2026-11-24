@@ -1,5 +1,5 @@
-use crate::config::CatalogConfigStore;
-use crate::db::{CatalogIndexPolicy, RankedLocalItem, RankedLocalSearch, ServerRepo};
+use crate::config::{CatalogConfigStore, SyncSection};
+use crate::db::{CatalogIndexPolicy, RankedCatalogMatch, ServerRepo};
 use crate::search::{self, MatchRank, ParsedQuery};
 use crate::sync::with_catalog_source;
 use crate::upstream::{
@@ -9,27 +9,21 @@ use crate::upstream::{
     QUERY_TYPE_RANKED_BY_TEXT_SEARCH, QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
     QUERY_TYPE_RANKED_BY_TREND, QUERY_TYPE_RANKED_BY_VOTE,
 };
-use chrono::{DateTime, Utc};
+use futures_util::future::join_all;
 use l4a_protocol::{
     MetadataSource, SearchQuery, SearchResponse, WorkshopFetchOutcome, WorkshopFileType,
     WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, Mutex};
-use tokio::task::JoinSet;
+use tokio::sync::{broadcast, Mutex, OnceCell};
 
 const MAX_SEARCH_CACHE_ENTRIES: usize = 512;
-const LOCAL_WINDOW_LIMIT: u32 = 100;
-const OVERLAY_BATCH_SIZE: usize = 100;
-const MAX_FULL_STEAM_DEDUP_ITEMS: u64 = 240;
-const MAX_FULL_STEAM_DEDUP_PAGES: u32 = 12;
-const MAX_DETERMINISTIC_MERGE_ITEMS: u64 = 300;
-const MAX_DETERMINISTIC_MERGE_PAGES: u32 = 12;
-const MAX_FULL_LOCAL_PRELOAD: u64 = 500;
-const MAX_DETERMINISTIC_LOCAL_PRELOAD: u64 = 2000;
+const MAX_STEAM_MERGE_PAGES: u64 = 24;
+const STEAM_SCAN_PAGE_SIZE: u32 = 100;
+const MAX_STEAM_MERGE_ITEMS: u64 = MAX_STEAM_MERGE_PAGES * STEAM_SCAN_PAGE_SIZE as u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchExecutionMode {
@@ -54,9 +48,13 @@ pub struct HybridSearchOutput {
     pub mode: SearchExecutionMode,
 }
 
-#[derive(Clone)]
+struct SharedSteamPage {
+    raw: WorkshopQueryPage,
+    restrictions_saved: OnceCell<()>,
+}
+
 struct CachedSteamPage {
-    page: WorkshopQueryPage,
+    page: Arc<SharedSteamPage>,
     cached_at: Instant,
 }
 
@@ -85,42 +83,126 @@ struct SteamSortPlan {
 struct SteamFetchCtx {
     app_id: u32,
     cache_ttl: Duration,
-    steam_timeout: Duration,
     deadline: Instant,
     cache_steam_results: bool,
 }
 
-enum MergeOutcome {
-    Ready(SearchResponse),
-    SteamUnavailable(anyhow::Error),
+#[derive(Debug, Clone, thiserror::Error)]
+enum SteamSearchError {
+    #[error("{0}")]
+    Unavailable(String),
+    #[error("保存 Steam 可见性失败: {0}")]
+    Visibility(String),
 }
 
-struct FullSteamCorpus {
-    steam_p1: WorkshopQueryPage,
-    all_overlaid: Vec<WorkshopItemRecord>,
-    raw_steam_ids: HashSet<WorkshopId>,
-    suppressed_steam_ids: HashSet<WorkshopId>,
-    contradicted: HashMap<WorkshopId, DateTime<Utc>>,
+enum SteamResults {
+    Complete(Vec<Arc<SharedSteamPage>>),
+    NativePage {
+        page: Arc<SharedSteamPage>,
+        total: u64,
+    },
 }
 
-struct LocalTailCursor<'a> {
-    query: &'a SearchQuery,
-    in_memory: &'a [WorkshopItemRecord],
-    raw_local_loaded: u64,
-    local_total: u64,
-    contradicted: &'a HashMap<WorkshopId, DateTime<Utc>>,
-    excluded_ids: &'a HashSet<WorkshopId>,
-    to_skip: usize,
-    page_size: usize,
+enum ExactLookup {
+    Local,
+    Steam(Option<Box<WorkshopObservation>>),
+    Unavailable,
 }
+
+#[derive(Clone, Copy)]
+struct Pagination {
+    page: u32,
+    size: u32,
+    offset: usize,
+}
+
+impl Pagination {
+    fn new(query: &SearchQuery) -> Self {
+        let page = query.page.max(1);
+        let size = query.page_size.clamp(1, 100);
+        let offset = usize::try_from(u64::from(page - 1) * u64::from(size)).unwrap_or(usize::MAX);
+        Self { page, size, offset }
+    }
+
+    fn output(
+        self,
+        items: Vec<WorkshopItemRecord>,
+        total: u64,
+        mode: SearchExecutionMode,
+    ) -> HybridSearchOutput {
+        HybridSearchOutput {
+            response: SearchResponse {
+                items: items.into_iter().map(with_catalog_source).collect(),
+                total,
+                page: self.page,
+                page_size: self.size,
+                source: MetadataSource::CatalogServer,
+            },
+            mode,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SearchHit<'a> {
+    Catalog(RankedCatalogMatch),
+    Steam(&'a WorkshopItemRecord),
+}
+
+impl SearchHit<'_> {
+    fn id(self) -> WorkshopId {
+        match self {
+            Self::Catalog(matched) => matched.id,
+            Self::Steam(item) => item.workshop_id,
+        }
+    }
+
+    fn should_promote(self, steam_best_tier: Option<u8>) -> bool {
+        let Self::Catalog(matched) = self else {
+            // An exact ID fetched separately from Steam participates as a tier-zero match.
+            return true;
+        };
+        matched.is_active
+            && matched.rank.is_some_and(|rank| {
+                rank.tier == 0
+                    || (matched.is_admin_override && rank.tier <= 3)
+                    || (rank.tier <= 5 && steam_best_tier.is_none_or(|best| rank.tier < best))
+            })
+    }
+
+    fn sort_key(self, sort: DeterministicSort) -> (Reverse<i128>, u64) {
+        let sort_value = match (self, sort) {
+            (Self::Catalog(matched), DeterministicSort::Subscriptions) => {
+                i128::from(matched.sort_value as u64)
+            }
+            (Self::Catalog(matched), _) => i128::from(matched.sort_value),
+            (Self::Steam(item), DeterministicSort::Subscriptions) => {
+                i128::from(item.subscriptions.unwrap_or(0))
+            }
+            (Self::Steam(item), DeterministicSort::Updated) => {
+                i128::from(item.time_updated.unwrap_or(0))
+            }
+            (Self::Steam(item), DeterministicSort::Newest) => {
+                i128::from(item.time_created.unwrap_or(0))
+            }
+        };
+        let id = self.id().as_u64();
+        let tie_breaker = match sort {
+            DeterministicSort::Subscriptions => id,
+            DeterministicSort::Updated | DeterministicSort::Newest => u64::MAX - id,
+        };
+        (Reverse(sort_value), tie_breaker)
+    }
+}
+
+type SharedPageResult = Result<Arc<SharedSteamPage>, SteamSearchError>;
 
 pub struct HybridSearchService {
     config_store: Arc<CatalogConfigStore>,
     repo: Arc<ServerRepo>,
     upstream: Arc<dyn WorkshopUpstream>,
     cache: Mutex<HashMap<SteamSearchRequest, CachedSteamPage>>,
-    inflight:
-        Mutex<HashMap<SteamSearchRequest, broadcast::Receiver<Result<WorkshopQueryPage, String>>>>,
+    inflight: Mutex<HashMap<SteamSearchRequest, broadcast::Receiver<SharedPageResult>>>,
 }
 
 impl HybridSearchService {
@@ -146,440 +228,209 @@ impl HybridSearchService {
         tokio::task::spawn_blocking(move || op(&repo)).await?
     }
 
-    async fn fetch_local_range(
-        &self,
-        query: &SearchQuery,
-        offset: u64,
-        limit: u32,
-    ) -> anyhow::Result<RankedLocalSearch> {
-        let q = query.clone();
-        self.db_call(move |r| r.search_ranked(&q, true, offset, limit))
-            .await
-    }
-
     pub async fn search(
         self: &Arc<Self>,
         query: &SearchQuery,
         accept_language: Option<&str>,
     ) -> anyhow::Result<HybridSearchOutput> {
-        let page = query.page.max(1);
-        let page_size = query.page_size.clamp(1, 100);
-        let offset = u64::from(page - 1) * u64::from(page_size);
-
+        let pagination = Pagination::new(query);
         let cfg = self.config_store.get();
-        let search_cfg = cfg.search.clone();
-        let app_id = cfg.steam.app_id;
-        let item_ttl_secs = cfg.sync.item_ttl_secs;
-        let enable_read_through = cfg.sync.enable_read_through;
+        let search_cfg = &cfg.search;
 
         let parsed = query.query.as_deref().and_then(search::parse_query);
         let is_pure_url = parsed
             .as_ref()
             .is_some_and(|p| p.exact_workshop_id.is_some() && p.numeric_prefix.is_none());
-
-        let mut effective_query = query.clone();
-        if !is_pure_url && effective_query.file_type.is_none() {
-            effective_query.file_type = Some(WorkshopFileType::Item);
+        let mut query = query.clone();
+        if !is_pure_url && query.file_type.is_none() {
+            query.file_type = Some(WorkshopFileType::Item);
         }
 
-        if !search_cfg.enable_hybrid_search || should_use_local_only(&effective_query) {
+        if !search_cfg.enable_hybrid_search || should_use_local_only(&query) {
             return self
-                .run_local_only(&effective_query, SearchExecutionMode::LocalOnly)
+                .run_local_only(&query, SearchExecutionMode::LocalOnly)
                 .await;
         }
 
-        let steam_timeout = Duration::from_millis(search_cfg.steam_timeout_ms);
-        let deadline = Instant::now() + steam_timeout;
-        let cache_ttl = Duration::from_secs(search_cfg.cache_ttl_secs);
+        let ctx = SteamFetchCtx {
+            app_id: cfg.steam.app_id,
+            cache_ttl: Duration::from_secs(search_cfg.cache_ttl_secs),
+            deadline: Instant::now() + Duration::from_millis(search_cfg.steam_timeout_ms),
+            cache_steam_results: search_cfg.cache_steam_results,
+        };
 
-        // Handle direct Steam Workshop URL or 6+ digit Workshop ID lookup.
-        let mut exact_steam_item: Option<WorkshopItemRecord> = None;
-        if let Some(wid) = parsed.as_ref().and_then(|p| p.exact_workshop_id) {
-            let is_long_numeric = parsed
-                .as_ref()
-                .and_then(|p| p.numeric_prefix.as_deref())
-                .is_some_and(|p| p.len() >= 6);
-
-            if is_pure_url || is_long_numeric {
-                let wid_typed = WorkshopId(wid);
-                let q_clone = effective_query.clone();
-                let local_check = self.db_call(move |r| r.search(&q_clone, true)).await?;
-                let found_in_local = if is_pure_url {
-                    local_check.total > 0
-                } else {
-                    local_check
-                        .items
-                        .iter()
-                        .any(|item| item.workshop_id == wid_typed)
-                };
-
-                if is_pure_url && found_in_local {
-                    return Ok(HybridSearchOutput {
-                        response: normalize_response(local_check),
-                        mode: SearchExecutionMode::LocalOnly,
-                    });
+        let mut exact_observation = None;
+        if let Some(wid) = parsed
+            .as_ref()
+            .filter(|p| {
+                p.numeric_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| prefix.len() >= 6)
+            })
+            .and_then(|p| p.exact_workshop_id)
+        {
+            match self.lookup_exact(WorkshopId(wid), ctx, &cfg.sync).await? {
+                ExactLookup::Local if is_pure_url => {
+                    return self
+                        .run_local_only(&query, SearchExecutionMode::LocalOnly)
+                        .await;
                 }
-
-                if !found_in_local {
-                    if !enable_read_through {
-                        if is_pure_url {
-                            return Ok(HybridSearchOutput {
-                                response: normalize_response(local_check),
-                                mode: SearchExecutionMode::LocalOnly,
-                            });
-                        }
-                    } else {
-                        let stored = self.db_call(move |r| r.get_item(wid_typed)).await?;
-                        let negative = self.repo.negative_status(wid_typed, item_ttl_secs);
-                        let blocked_by_local = stored.as_ref().is_some_and(|meta| {
-                            meta.is_admin_override
-                                || meta.record.status == WorkshopItemStatus::PrivateOrUnavailable
-                                || meta.is_listed == Some(false)
-                        }) || matches!(
-                            negative,
-                            Some(
-                                WorkshopItemStatus::PrivateOrUnavailable
-                                    | WorkshopItemStatus::Removed
-                            )
-                        );
-
-                        if !blocked_by_local {
-                            let exact_res = match remaining_timeout(deadline) {
-                                Ok(budget) => tokio::time::timeout(
-                                    budget,
-                                    self.upstream.fetch_details(&[wid_typed]),
-                                )
-                                .await
-                                .map_err(|_| anyhow::anyhow!("精确 ID Steam CM 检索超时"))
-                                .and_then(|res| res),
-                                Err(err) => Err(err),
-                            };
-                            match exact_res {
-                                Ok(observations) => {
-                                    if search_cfg.cache_steam_results {
-                                        let warm: Vec<_> = observations
-                                            .iter()
-                                            .filter(|obs| is_public_active_for_app(obs, app_id))
-                                            .cloned()
-                                            .collect();
-                                        self.spawn_cache_warming(warm, 0);
-                                    }
-                                    if let Some(obs) = observations
-                                        .into_iter()
-                                        .find(|o| o.outcome.workshop_id() == wid_typed)
-                                    {
-                                        if is_public_active_for_app(&obs, app_id) {
-                                            if let WorkshopFetchOutcome::Found { item } =
-                                                obs.outcome
-                                            {
-                                                if matches_filters(&item, &effective_query, true) {
-                                                    exact_steam_item = Some(item);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if is_pure_url {
-                                        let (total, items) = match exact_steam_item {
-                                            Some(item) => (
-                                                1,
-                                                if offset == 0 {
-                                                    vec![with_catalog_source(item)]
-                                                } else {
-                                                    Vec::new()
-                                                },
-                                            ),
-                                            None => (0, Vec::new()),
-                                        };
-                                        return Ok(HybridSearchOutput {
-                                            response: SearchResponse {
-                                                items,
-                                                total,
-                                                page,
-                                                page_size,
-                                                source: MetadataSource::CatalogServer,
-                                            },
-                                            mode: SearchExecutionMode::Hybrid,
-                                        });
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::warn!(workshop_id = %wid_typed, error = %err, "精确 ID Steam CM 检索失败");
-                                    if is_pure_url {
-                                        return Ok(HybridSearchOutput {
-                                            response: normalize_response(local_check),
-                                            mode: SearchExecutionMode::LocalFallback,
-                                        });
-                                    }
-                                }
-                            }
-                        } else if is_pure_url {
-                            return Ok(HybridSearchOutput {
-                                response: normalize_response(local_check),
-                                mode: SearchExecutionMode::LocalOnly,
-                            });
-                        }
-                    }
+                ExactLookup::Unavailable if is_pure_url => {
+                    return self
+                        .run_local_only(&query, SearchExecutionMode::LocalFallback)
+                        .await;
                 }
+                ExactLookup::Steam(observation) if is_pure_url => {
+                    let items = self
+                        .apply_local_overlay(&query, ctx.app_id, observation.as_deref(), false)
+                        .await?;
+                    let total = items.len() as u64;
+                    let items = items.into_iter().skip(pagination.offset).collect();
+                    return Ok(pagination.output(items, total, SearchExecutionMode::Hybrid));
+                }
+                ExactLookup::Steam(observation) => exact_observation = observation,
+                ExactLookup::Local | ExactLookup::Unavailable => {}
             }
         }
 
-        let trimmed_q = effective_query
+        let search_text = query
             .query
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(ToString::to_string);
-        let sort_plan = resolve_sort_plan(effective_query.sort.as_deref(), trimmed_q.is_some());
-        let language = resolve_steam_language(
-            effective_query.language.as_deref(),
-            accept_language,
-            &search_cfg.default_language,
-        );
-        let search_target = parsed_steam_target(effective_query.search_target.as_deref());
-        let file_type = match effective_query.file_type {
-            Some(WorkshopFileType::Collection) => MATCHING_FILE_TYPE_COLLECTIONS,
-            _ => MATCHING_FILE_TYPE_ITEMS,
-        };
-        let required_tags = effective_query
+            .map(str::to_owned);
+        let sort_plan = resolve_sort_plan(query.sort.as_deref(), search_text.is_some());
+        let search_target = parsed_steam_target(query.search_target.as_deref());
+        let required_tags = query
             .tag
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|t| vec![t.to_string()])
+            .map(|tag| vec![tag.to_owned()])
             .unwrap_or_default();
-
-        let base_request = SteamSearchRequest {
+        let request = SteamSearchRequest {
             query_type: sort_plan.query_type,
-            file_type,
-            page,
-            num_per_page: page_size,
-            search_text: trimmed_q.clone(),
+            file_type: match query.file_type {
+                Some(WorkshopFileType::Collection) => MATCHING_FILE_TYPE_COLLECTIONS,
+                _ => MATCHING_FILE_TYPE_ITEMS,
+            },
+            page: pagination.page,
+            num_per_page: pagination.size,
+            search_text_target: search_text.as_ref().and(search_target),
+            search_text,
             required_tags,
-            language,
+            language: resolve_steam_language(
+                query.language.as_deref(),
+                accept_language,
+                &search_cfg.default_language,
+            ),
             days: sort_plan.days,
-            search_text_target: trimmed_q.as_ref().and(search_target),
-        };
-        let fetch_ctx = SteamFetchCtx {
-            app_id,
-            cache_ttl,
-            steam_timeout,
-            deadline,
-            cache_steam_results: search_cfg.cache_steam_results,
         };
 
-        let local_limit = match sort_plan.merge {
-            MergeStrategy::Deterministic(_) => (offset + u64::from(page_size))
-                .clamp(u64::from(LOCAL_WINDOW_LIMIT), MAX_DETERMINISTIC_MERGE_ITEMS)
-                as u32,
-            _ => LOCAL_WINDOW_LIMIT,
-        };
-        let local_fut = self.fetch_local_range(&effective_query, 0, local_limit);
-        let steam_fut = self.fetch_steam_page_cached(&base_request, fetch_ctx);
-        let (local_res, steam_res) = tokio::join!(local_fut, steam_fut);
-        let mut local_window = local_res?;
-        let mut raw_local_loaded = local_window.items.len() as u64;
-
-        let exact_id = exact_steam_item.as_ref().map(|item| item.workshop_id);
-        if let Some(exact_item) = exact_steam_item {
-            inject_exact_item_into_local(&mut local_window, exact_item);
-        }
-
-        let initial_steam_page = match steam_res {
-            Ok(p) => p,
-            Err(err) => {
+        let steam = self.fetch_steam_results(&request, ctx).await;
+        let exact = self
+            .apply_local_overlay(&query, ctx.app_id, exact_observation.as_deref(), false)
+            .await?
+            .pop();
+        match steam {
+            Err(SteamSearchError::Unavailable(err)) => {
                 tracing::warn!(error = %err, "Steam CM 混合检索失败，回退至本地索引");
-                return self
-                    .fallback_to_local(
-                        &effective_query,
-                        &local_window,
-                        raw_local_loaded,
-                        exact_id,
-                        page,
-                        page_size,
-                        offset,
-                        SearchExecutionMode::LocalFallback,
-                    )
-                    .await;
-            }
-        };
-
-        // If Steam returned no matches at all, fall back to exact local catalog pagination.
-        if initial_steam_page.total == 0 && initial_steam_page.outcomes.is_empty() {
-            return self
-                .fallback_to_local(
-                    &effective_query,
-                    &local_window,
-                    raw_local_loaded,
-                    exact_id,
-                    page,
-                    page_size,
-                    offset,
-                    SearchExecutionMode::Hybrid,
-                )
-                .await;
-        }
-
-        let steam_total_raw = initial_steam_page
-            .total
-            .max(initial_steam_page.outcomes.len() as u64);
-        let steam_pages_total = steam_total_raw.div_ceil(u64::from(page_size)).max(1) as u32;
-        let can_full_dedup = local_window.total > 0
-            && steam_total_raw <= MAX_FULL_STEAM_DEDUP_ITEMS
-            && steam_pages_total <= MAX_FULL_STEAM_DEDUP_PAGES;
-
-        let end = offset + u64::from(page_size);
-        if can_full_dedup {
-            let max_preload = match sort_plan.merge {
-                MergeStrategy::Deterministic(_) => end
-                    .max(u64::from(LOCAL_WINDOW_LIMIT))
-                    .min(MAX_DETERMINISTIC_LOCAL_PRELOAD)
-                    .min(local_window.total),
-                _ => MAX_FULL_LOCAL_PRELOAD.min(local_window.total),
-            };
-            if raw_local_loaded < max_preload {
-                let extra = self
-                    .fetch_local_range(
-                        &effective_query,
-                        raw_local_loaded,
-                        (max_preload - raw_local_loaded) as u32,
-                    )
-                    .await?;
-                let fetched_len = extra.items.len() as u64;
-                extend_local_window(&mut local_window, extra.items, exact_id);
-                raw_local_loaded = raw_local_loaded.saturating_add(fetched_len);
-            }
-        }
-
-        let outcome = if can_full_dedup {
-            match self
-                .build_full_steam_corpus(
-                    &effective_query,
-                    app_id,
-                    page,
-                    steam_pages_total,
-                    &base_request,
-                    &initial_steam_page,
-                    fetch_ctx,
-                )
-                .await?
-            {
-                Ok(corpus) => match sort_plan.merge {
-                    MergeStrategy::Relevance => {
-                        self.merge_relevance_full(
-                            &effective_query,
-                            parsed.as_ref(),
-                            search_target,
-                            page,
-                            page_size,
-                            offset,
-                            &local_window,
-                            raw_local_loaded,
-                            exact_id,
-                            &corpus,
-                        )
-                        .await?
-                    }
-                    MergeStrategy::SteamOrder => {
-                        self.merge_steam_order_full(
-                            &effective_query,
-                            page,
-                            page_size,
-                            offset,
-                            &local_window,
-                            raw_local_loaded,
-                            exact_id,
-                            &corpus,
-                        )
-                        .await?
-                    }
-                    MergeStrategy::Deterministic(det_sort) => {
-                        self.merge_deterministic_full(
-                            &effective_query,
-                            det_sort,
-                            page,
-                            page_size,
-                            offset,
-                            &local_window,
-                            raw_local_loaded,
-                            exact_id,
-                            &corpus,
-                        )
-                        .await?
-                    }
-                },
-                Err(err) => MergeOutcome::SteamUnavailable(err),
-            }
-        } else {
-            match sort_plan.merge {
-                MergeStrategy::Relevance => {
-                    self.merge_relevance_windowed(
-                        &effective_query,
-                        parsed.as_ref(),
-                        search_target,
-                        page,
-                        page_size,
-                        offset,
-                        &base_request,
-                        initial_steam_page,
-                        &local_window,
-                        raw_local_loaded,
-                        exact_id,
-                        fetch_ctx,
-                    )
-                    .await?
-                }
-                MergeStrategy::SteamOrder => MergeOutcome::Ready(
-                    self.merge_steam_order_windowed(
-                        &effective_query,
-                        app_id,
-                        page,
-                        page_size,
-                        offset,
-                        initial_steam_page,
-                        &local_window,
-                        raw_local_loaded,
-                        exact_id,
-                    )
-                    .await?,
-                ),
-                MergeStrategy::Deterministic(det_sort) => {
-                    self.merge_deterministic_windowed(
-                        &effective_query,
-                        det_sort,
-                        page,
-                        page_size,
-                        offset,
-                        &base_request,
-                        initial_steam_page,
-                        &local_window,
-                        raw_local_loaded,
-                        exact_id,
-                        fetch_ctx,
-                    )
-                    .await?
-                }
-            }
-        };
-
-        match outcome {
-            MergeOutcome::Ready(response) => Ok(HybridSearchOutput {
-                response,
-                mode: SearchExecutionMode::Hybrid,
-            }),
-            MergeOutcome::SteamUnavailable(err) => {
-                tracing::warn!(error = %err, "Steam CM 多页检索失败，回退至本地索引");
-                self.fallback_to_local(
-                    &effective_query,
-                    &local_window,
-                    raw_local_loaded,
-                    exact_id,
-                    page,
-                    page_size,
-                    offset,
+                self.local_with_exact(
+                    &query,
+                    pagination,
+                    exact.as_ref(),
                     SearchExecutionMode::LocalFallback,
                 )
                 .await
+            }
+            Err(err @ SteamSearchError::Visibility(_)) => Err(err.into()),
+            Ok(SteamResults::Complete(pages)) if !pages.is_empty() => {
+                let first_page_len = pages[0].raw.outcomes.len().min(pagination.size as usize);
+                let observations: Vec<_> = pages
+                    .iter()
+                    .flat_map(|page| page.raw.outcomes.iter())
+                    .collect();
+                let steam_items = self
+                    .apply_local_overlay(&query, ctx.app_id, observations.iter().copied(), true)
+                    .await?;
+                let local = self.catalog_matches(&query).await?;
+                let hits = merge_matches(
+                    &local,
+                    &steam_items,
+                    &observations,
+                    first_page_len,
+                    exact.as_ref(),
+                    sort_plan.merge,
+                    parsed.as_ref(),
+                    search_target,
+                );
+                self.finish_hits(pagination, hits, SearchExecutionMode::Hybrid)
+                    .await
+            }
+            Ok(SteamResults::NativePage { page, total }) if exact.is_none() => {
+                let mut items = self
+                    .apply_local_overlay(&query, ctx.app_id, page.raw.outcomes.iter(), true)
+                    .await?;
+                let mut seen = HashSet::new();
+                items.retain(|item| seen.insert(item.workshop_id));
+                Ok(pagination.output(items, total, SearchExecutionMode::Hybrid))
+            }
+            Ok(_) => {
+                self.local_with_exact(
+                    &query,
+                    pagination,
+                    exact.as_ref(),
+                    SearchExecutionMode::Hybrid,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn lookup_exact(
+        &self,
+        wid: WorkshopId,
+        ctx: SteamFetchCtx,
+        sync: &SyncSection,
+    ) -> anyhow::Result<ExactLookup> {
+        if !sync.enable_read_through {
+            return Ok(ExactLookup::Local);
+        }
+        let stored = self.db_call(move |r| r.get_item(wid)).await?;
+        if stored.as_ref().is_some_and(|meta| {
+            meta.is_in_public_catalog()
+                || meta.is_admin_override
+                || meta.record.status == WorkshopItemStatus::PrivateOrUnavailable
+                || meta.is_listed == Some(false)
+        }) || matches!(
+            self.repo.negative_status(wid, sync.item_ttl_secs),
+            Some(WorkshopItemStatus::PrivateOrUnavailable | WorkshopItemStatus::Removed)
+        ) {
+            return Ok(ExactLookup::Local);
+        }
+
+        let result = match remaining_timeout(ctx.deadline) {
+            Ok(budget) => tokio::time::timeout(budget, self.upstream.fetch_details(&[wid]))
+                .await
+                .map_err(|_| anyhow::anyhow!("精确 ID Steam CM 检索超时"))
+                .and_then(|res| res),
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(mut observations) => {
+                observations.retain(|obs| obs.outcome.workshop_id() == wid);
+                self.persist_confirmed_restrictions(&observations, ctx.app_id)
+                    .await?;
+                if ctx.cache_steam_results {
+                    self.warm_public_results(&observations, ctx.app_id, 0);
+                }
+                Ok(ExactLookup::Steam(
+                    observations.into_iter().next().map(Box::new),
+                ))
+            }
+            Err(err) => {
+                tracing::warn!(workshop_id = %wid, error = %err, "精确 ID Steam CM 检索失败");
+                Ok(ExactLookup::Unavailable)
             }
         }
     }
@@ -589,994 +440,149 @@ impl HybridSearchService {
         query: &SearchQuery,
         mode: SearchExecutionMode,
     ) -> anyhow::Result<HybridSearchOutput> {
-        let q = query.clone();
-        let resp = self.db_call(move |r| r.search(&q, true)).await?;
+        let query = query.clone();
+        let resp = self.db_call(move |r| r.search(&query, true)).await?;
         Ok(HybridSearchOutput {
             response: normalize_response(resp),
             mode,
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn fallback_to_local(
+    async fn local_with_exact(
         &self,
         query: &SearchQuery,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        page: u32,
-        page_size: u32,
-        offset: u64,
+        pagination: Pagination,
+        exact: Option<&WorkshopItemRecord>,
         mode: SearchExecutionMode,
     ) -> anyhow::Result<HybridSearchOutput> {
-        let end = offset + u64::from(page_size);
-        let covers_page = (local_window.items.len() as u64) >= end
-            || raw_local_loaded >= local_window.total
-            || (local_window.items.len() as u64) >= local_window.total;
-        if covers_page {
-            return Ok(HybridSearchOutput {
-                response: slice_local_window(local_window, page, page_size, offset),
-                mode,
-            });
-        }
-        if exact_id.is_none() {
+        let Some(exact) = exact else {
             return self.run_local_only(query, mode).await;
-        }
-        let fetched = self
-            .fetch_local_range(query, offset.saturating_sub(1), page_size)
-            .await?;
-        let items: Vec<WorkshopItemRecord> = fetched
-            .items
-            .into_iter()
-            .filter(|item| exact_id != Some(item.record.workshop_id))
-            .take(page_size as usize)
-            .map(|item| with_catalog_source(item.record))
+        };
+        let local = self.catalog_matches(query).await?;
+        let hits = std::iter::once(SearchHit::Steam(exact))
+            .chain(
+                local
+                    .into_iter()
+                    .filter(|matched| matched.id != exact.workshop_id)
+                    .map(SearchHit::Catalog),
+            )
             .collect();
-        Ok(HybridSearchOutput {
-            response: SearchResponse {
-                items,
-                total: local_window.total,
-                page,
-                page_size,
-                source: MetadataSource::CatalogServer,
-            },
-            mode,
-        })
+        self.finish_hits(pagination, hits, mode).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn build_full_steam_corpus(
-        self: &Arc<Self>,
+    async fn catalog_matches(
+        &self,
         query: &SearchQuery,
-        app_id: u32,
-        current_page: u32,
-        steam_pages_total: u32,
-        base_request: &SteamSearchRequest,
-        initial_steam_page: &WorkshopQueryPage,
-        fetch_ctx: SteamFetchCtx,
-    ) -> anyhow::Result<Result<FullSteamCorpus, anyhow::Error>> {
-        let missing_pages: Vec<u32> = (1..=steam_pages_total)
-            .filter(|&p| p != current_page)
-            .collect();
-        let mut pages = match self
-            .fetch_steam_pages_concurrent(base_request, missing_pages, fetch_ctx)
+    ) -> anyhow::Result<Vec<RankedCatalogMatch>> {
+        let query = query.clone();
+        self.db_call(move |r| r.catalog_search_matches(&query))
             .await
-        {
-            Ok(map) => map,
-            Err(err) => return Ok(Err(err)),
-        };
-        pages.insert(current_page, initial_steam_page.clone());
-
-        let mut raw_steam_ids = HashSet::new();
-        let mut contradicted = HashMap::new();
-        let mut all_overlaid = Vec::new();
-        let mut seen_overlaid = HashSet::new();
-        for p in 1..=steam_pages_total {
-            if let Some(raw_page) = pages.get(&p) {
-                record_steam_page_metadata(raw_page, app_id, &mut raw_steam_ids, &mut contradicted);
-                let overlaid = self
-                    .apply_local_overlay(query, app_id, &raw_page.outcomes, true)
-                    .await?;
-                for item in overlaid {
-                    if seen_overlaid.insert(item.workshop_id) {
-                        all_overlaid.push(item);
-                    }
-                }
-            }
-        }
-        let suppressed_steam_ids: HashSet<WorkshopId> =
-            raw_steam_ids.difference(&seen_overlaid).copied().collect();
-        let steam_p1 = pages
-            .remove(&1)
-            .unwrap_or_else(|| initial_steam_page.clone());
-        Ok(Ok(FullSteamCorpus {
-            steam_p1,
-            all_overlaid,
-            raw_steam_ids,
-            suppressed_steam_ids,
-            contradicted,
-        }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_relevance_full(
+    async fn finish_hits(
         &self,
-        query: &SearchQuery,
-        parsed: Option<&ParsedQuery>,
-        search_target: Option<SteamSearchTarget>,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        corpus: &FullSteamCorpus,
-    ) -> anyhow::Result<MergeOutcome> {
-        let steam_p1_items = self
-            .apply_local_overlay(
-                query,
-                self.config_store.get().steam.app_id,
-                &corpus.steam_p1.outcomes,
-                true,
-            )
-            .await?;
-        let steam_p1_ids: HashSet<WorkshopId> =
-            steam_p1_items.iter().map(|i| i.workshop_id).collect();
-        let steam_p1_best_tier = parsed.and_then(|pq| {
-            steam_p1_items
-                .iter()
-                .take(5)
-                .filter_map(|item| score_for_target(pq, search_target, item))
-                .map(|rank| rank.tier)
-                .min()
-        });
-
-        let (promoted_local, supplemental_local, promoted_ids, contradicted_dropped) =
-            partition_local_items(
-                &local_window.items,
-                &corpus.contradicted,
-                &corpus.suppressed_steam_ids,
-                &steam_p1_ids,
-                steam_p1_best_tier,
-            );
-
-        let deduped_steam: Vec<WorkshopItemRecord> = corpus
-            .all_overlaid
-            .iter()
-            .filter(|item| !promoted_ids.contains(&item.workshop_id))
-            .cloned()
+        pagination: Pagination,
+        hits: Vec<SearchHit<'_>>,
+        mode: SearchExecutionMode,
+    ) -> anyhow::Result<HybridSearchOutput> {
+        let total = hits.len() as u64;
+        let page: Vec<_> = hits
+            .into_iter()
+            .skip(pagination.offset)
+            .take(pagination.size as usize)
             .collect();
-
-        let k = promoted_local.len() as u64;
-        let steam_len = deduped_steam.len() as u64;
-        let end = offset + u64::from(page_size);
-
-        let mut page_items = Vec::with_capacity(page_size as usize);
-        let mut emitted_ids = HashSet::new();
-
-        if offset < k {
-            let start_idx = offset as usize;
-            let end_idx = end.min(k) as usize;
-            for item in &promoted_local[start_idx..end_idx] {
-                if emitted_ids.insert(item.workshop_id) {
-                    page_items.push(item.clone());
-                }
-            }
-        }
-
-        if end > k && page_items.len() < page_size as usize {
-            let s_start = offset.saturating_sub(k).min(steam_len) as usize;
-            let s_end = end.saturating_sub(k).min(steam_len) as usize;
-            for item in &deduped_steam[s_start..s_end] {
-                if emitted_ids.insert(item.workshop_id) {
-                    page_items.push(item.clone());
-                    if page_items.len() >= page_size as usize {
-                        break;
-                    }
-                }
-            }
-        }
-
-        let mut excluded_for_tail = corpus.raw_steam_ids.clone();
-        excluded_for_tail.extend(&promoted_ids);
-        excluded_for_tail.extend(&emitted_ids);
-        if let Some(eid) = exact_id {
-            excluded_for_tail.insert(eid);
-        }
-
-        if page_items.len() < page_size as usize {
-            let supp_skip = offset.saturating_sub(k.saturating_add(steam_len)) as usize;
-            self.append_local_tail(
-                LocalTailCursor {
-                    query,
-                    in_memory: &supplemental_local,
-                    raw_local_loaded,
-                    local_total: local_window.total,
-                    contradicted: &corpus.contradicted,
-                    excluded_ids: &excluded_for_tail,
-                    to_skip: supp_skip,
-                    page_size: page_size as usize,
-                },
-                &mut emitted_ids,
-                &mut page_items,
-            )
-            .await?;
-        }
-
-        let overlap_supp = supplemental_local
+        let ids: Vec<_> = page
             .iter()
-            .filter(|item| corpus.raw_steam_ids.contains(&item.workshop_id))
-            .count() as u64;
-        let effective_local_total = local_window.total.saturating_sub(contradicted_dropped);
-        let total = effective_local_total
-            .saturating_add(steam_len)
-            .saturating_sub(overlap_supp);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
-
-        Ok(MergeOutcome::Ready(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_steam_order_full(
-        &self,
-        query: &SearchQuery,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        corpus: &FullSteamCorpus,
-    ) -> anyhow::Result<MergeOutcome> {
-        let mut contradicted_dropped = 0u64;
-        let mut visible_local = Vec::new();
-        for local in &local_window.items {
-            if is_local_contradicted(local, &corpus.contradicted)
-                || corpus
-                    .suppressed_steam_ids
-                    .contains(&local.record.workshop_id)
-            {
-                contradicted_dropped += 1;
-            } else {
-                visible_local.push(local.record.clone());
-            }
-        }
-
-        let steam_len = corpus.all_overlaid.len() as u64;
-        let end = offset + u64::from(page_size);
-        let mut page_items = Vec::with_capacity(page_size as usize);
-        let mut emitted_ids = HashSet::new();
-
-        if offset < steam_len {
-            let s_start = offset as usize;
-            let s_end = end.min(steam_len) as usize;
-            for item in &corpus.all_overlaid[s_start..s_end] {
-                if emitted_ids.insert(item.workshop_id) {
-                    page_items.push(item.clone());
-                }
-            }
-        }
-
-        let mut excluded_for_tail = corpus.raw_steam_ids.clone();
-        excluded_for_tail.extend(&emitted_ids);
-        if let Some(eid) = exact_id {
-            excluded_for_tail.insert(eid);
-        }
-        if page_items.len() < page_size as usize {
-            let supp_skip = offset.saturating_sub(steam_len) as usize;
-            self.append_local_tail(
-                LocalTailCursor {
-                    query,
-                    in_memory: &visible_local,
-                    raw_local_loaded,
-                    local_total: local_window.total,
-                    contradicted: &corpus.contradicted,
-                    excluded_ids: &excluded_for_tail,
-                    to_skip: supp_skip,
-                    page_size: page_size as usize,
-                },
-                &mut emitted_ids,
-                &mut page_items,
-            )
-            .await?;
-        }
-
-        let overlap = visible_local
-            .iter()
-            .filter(|item| corpus.raw_steam_ids.contains(&item.workshop_id))
-            .count() as u64;
-        let total = local_window
-            .total
-            .saturating_sub(contradicted_dropped)
-            .saturating_add(steam_len)
-            .saturating_sub(overlap);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
-
-        Ok(MergeOutcome::Ready(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_deterministic_full(
-        &self,
-        query: &SearchQuery,
-        det_sort: DeterministicSort,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        corpus: &FullSteamCorpus,
-    ) -> anyhow::Result<MergeOutcome> {
-        let mut merged: HashMap<WorkshopId, WorkshopItemRecord> = HashMap::new();
-        let mut contradicted_dropped = 0u64;
-        let mut overlap = 0u64;
-        for local in &local_window.items {
-            if is_local_contradicted(local, &corpus.contradicted)
-                || corpus
-                    .suppressed_steam_ids
-                    .contains(&local.record.workshop_id)
-            {
-                contradicted_dropped += 1;
-                continue;
-            }
-            if corpus.raw_steam_ids.contains(&local.record.workshop_id) {
-                overlap += 1;
-            }
-            merged.insert(local.record.workshop_id, local.record.clone());
-        }
-        for item in &corpus.all_overlaid {
-            merged.insert(item.workshop_id, item.clone());
-        }
-
-        let mut all_items: Vec<WorkshopItemRecord> = merged.into_values().collect();
-        sort_deterministic(&mut all_items, det_sort);
-
-        let start = (offset as usize).min(all_items.len());
-        let end = (start + page_size as usize).min(all_items.len());
-        let mut page_items = all_items[start..end].to_vec();
-        let mut emitted_ids: HashSet<WorkshopId> =
-            page_items.iter().map(|i| i.workshop_id).collect();
-
-        if page_items.len() < page_size as usize && raw_local_loaded < local_window.total {
-            let mut excluded = corpus.raw_steam_ids.clone();
-            excluded.extend(&emitted_ids);
-            for item in &all_items {
-                excluded.insert(item.workshop_id);
-            }
-            if let Some(eid) = exact_id {
-                excluded.insert(eid);
-            }
-            let supp_skip = offset.saturating_sub(all_items.len() as u64) as usize;
-            self.append_local_tail(
-                LocalTailCursor {
-                    query,
-                    in_memory: &[],
-                    raw_local_loaded,
-                    local_total: local_window.total,
-                    contradicted: &corpus.contradicted,
-                    excluded_ids: &excluded,
-                    to_skip: supp_skip,
-                    page_size: page_size as usize,
-                },
-                &mut emitted_ids,
-                &mut page_items,
-            )
-            .await?;
-        }
-
-        let total = local_window
-            .total
-            .saturating_sub(contradicted_dropped)
-            .saturating_add(corpus.all_overlaid.len() as u64)
-            .saturating_sub(overlap);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
-
-        Ok(MergeOutcome::Ready(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_relevance_windowed(
-        self: &Arc<Self>,
-        query: &SearchQuery,
-        parsed: Option<&ParsedQuery>,
-        search_target: Option<SteamSearchTarget>,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        base_request: &SteamSearchRequest,
-        initial_steam_page: WorkshopQueryPage,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        fetch_ctx: SteamFetchCtx,
-    ) -> anyhow::Result<MergeOutcome> {
-        let mut steam_pages: HashMap<u32, WorkshopQueryPage> = HashMap::new();
-        steam_pages.insert(page, initial_steam_page.clone());
-
-        let steam_total = initial_steam_page
-            .total
-            .max(initial_steam_page.outcomes.len() as u64);
-
-        // Ensure page 1 is present if local matches exist on page > 1.
-        if page > 1 && !local_window.items.is_empty() {
-            let mut p1_req = base_request.clone();
-            p1_req.page = 1;
-            match self.fetch_steam_page_cached(&p1_req, fetch_ctx).await {
-                Ok(p1) => {
-                    steam_pages.insert(1, p1);
-                }
-                Err(err) => return Ok(MergeOutcome::SteamUnavailable(err)),
-            }
-        }
-
-        let steam_p1 = steam_pages
-            .get(&1)
-            .cloned()
-            .unwrap_or_else(|| initial_steam_page.clone());
-
-        let mut seen_steam_ids = HashSet::new();
-        let mut contradicted = HashMap::new();
-        record_steam_page_metadata(
-            &initial_steam_page,
-            fetch_ctx.app_id,
-            &mut seen_steam_ids,
-            &mut contradicted,
-        );
-        if page > 1 {
-            record_steam_page_metadata(
-                &steam_p1,
-                fetch_ctx.app_id,
-                &mut seen_steam_ids,
-                &mut contradicted,
-            );
-        }
-
-        let mut overlaid_pages: HashMap<u32, Vec<WorkshopItemRecord>> = HashMap::new();
-        let steam_p1_items = self
-            .apply_local_overlay(query, fetch_ctx.app_id, &steam_p1.outcomes, true)
-            .await?;
-        let mut suppressed_steam_ids = collect_suppressed_ids(&steam_p1.outcomes, &steam_p1_items);
-        overlaid_pages.insert(1, steam_p1_items.clone());
-
-        if page > 1 {
-            let init_overlaid = self
-                .apply_local_overlay(query, fetch_ctx.app_id, &initial_steam_page.outcomes, true)
-                .await?;
-            suppressed_steam_ids.extend(collect_suppressed_ids(
-                &initial_steam_page.outcomes,
-                &init_overlaid,
-            ));
-            overlaid_pages.insert(page, init_overlaid);
-        }
-
-        let steam_p1_ids: HashSet<WorkshopId> =
-            steam_p1_items.iter().map(|i| i.workshop_id).collect();
-        let steam_p1_best_tier = parsed.and_then(|pq| {
-            steam_p1_items
-                .iter()
-                .take(5)
-                .filter_map(|item| score_for_target(pq, search_target, item))
-                .map(|rank| rank.tier)
-                .min()
-        });
-
-        let (promoted_local, supplemental_local, promoted_ids, mut contradicted_dropped) =
-            partition_local_items(
-                &local_window.items,
-                &contradicted,
-                &suppressed_steam_ids,
-                &steam_p1_ids,
-                steam_p1_best_tier,
-            );
-
-        let k = promoted_local.len() as u64;
-        let steam_total = steam_total.max(steam_p1.total);
-        let end = offset + u64::from(page_size);
-
-        let ps_u64 = u64::from(page_size);
-        let steam_start = offset.saturating_sub(k);
-        let steam_end = end.saturating_sub(k).min(steam_total);
-
-        let prev_contra_len = contradicted.len();
-        let prev_suppressed_len = suppressed_steam_ids.len();
-        if end > k && steam_start < steam_end {
-            let first_sp = (steam_start / ps_u64 + 1) as u32;
-            let last_sp = ((steam_end - 1) / ps_u64 + 1) as u32;
-            let missing_slice_pages: Vec<u32> = (first_sp..=last_sp)
-                .filter(|sp| !steam_pages.contains_key(sp))
-                .collect();
-            if !missing_slice_pages.is_empty() {
-                match self
-                    .fetch_steam_pages_concurrent(base_request, missing_slice_pages, fetch_ctx)
-                    .await
-                {
-                    Ok(fetched) => {
-                        for (sp, raw_page) in fetched {
-                            record_steam_page_metadata(
-                                &raw_page,
-                                fetch_ctx.app_id,
-                                &mut seen_steam_ids,
-                                &mut contradicted,
-                            );
-                            let overlaid = self
-                                .apply_local_overlay(
-                                    query,
-                                    fetch_ctx.app_id,
-                                    &raw_page.outcomes,
-                                    true,
-                                )
-                                .await?;
-                            suppressed_steam_ids
-                                .extend(collect_suppressed_ids(&raw_page.outcomes, &overlaid));
-                            overlaid_pages.insert(sp, overlaid);
-                            steam_pages.insert(sp, raw_page);
-                        }
-                    }
-                    Err(err) => return Ok(MergeOutcome::SteamUnavailable(err)),
-                }
-            }
-        }
-
-        // Recompute local partitions if later Steam slice pages introduced contradictions/suppressions.
-        let (promoted_local, supplemental_local, promoted_ids) = if contradicted.len()
-            > prev_contra_len
-            || suppressed_steam_ids.len() > prev_suppressed_len
-        {
-            let (p, s, pids, dropped) = partition_local_items(
-                &local_window.items,
-                &contradicted,
-                &suppressed_steam_ids,
-                &steam_p1_ids,
-                steam_p1_best_tier,
-            );
-            contradicted_dropped = dropped;
-            (p, s, pids)
-        } else {
-            (promoted_local, supplemental_local, promoted_ids)
-        };
-        let k = promoted_local.len() as u64;
-
-        let mut page_items = Vec::with_capacity(page_size as usize);
-        let mut emitted_ids = HashSet::new();
-
-        if offset < k {
-            let start_idx = offset as usize;
-            let end_idx = end.min(k) as usize;
-            for item in &promoted_local[start_idx..end_idx] {
-                if emitted_ids.insert(item.workshop_id) {
-                    page_items.push(item.clone());
-                }
-            }
-        }
-
-        let steam_start = offset.saturating_sub(k);
-        let steam_end = end.saturating_sub(k).min(steam_total);
-        if end > k && steam_start < steam_end {
-            let first_sp = (steam_start / ps_u64 + 1) as u32;
-            let last_sp = ((steam_end - 1) / ps_u64 + 1) as u32;
-            for sp in first_sp..=last_sp {
-                let overlaid = if let Some(cached_overlaid) = overlaid_pages.get(&sp) {
-                    cached_overlaid.as_slice()
-                } else {
-                    &[]
-                };
-                let page_base = u64::from(sp - 1) * ps_u64;
-                let take_from = steam_start.saturating_sub(page_base) as usize;
-                let take_to = (steam_end.saturating_sub(page_base) as usize).min(overlaid.len());
-                if take_from < take_to {
-                    for item in &overlaid[take_from..take_to] {
-                        if !promoted_ids.contains(&item.workshop_id)
-                            && emitted_ids.insert(item.workshop_id)
-                        {
-                            page_items.push(item.clone());
-                            if page_items.len() >= page_size as usize {
-                                break;
-                            }
-                        }
-                    }
-                }
-                if page_items.len() >= page_size as usize {
-                    break;
-                }
-            }
-        }
-
-        let mut excluded_for_tail = seen_steam_ids.clone();
-        excluded_for_tail.extend(&promoted_ids);
-        excluded_for_tail.extend(&emitted_ids);
-        if let Some(eid) = exact_id {
-            excluded_for_tail.insert(eid);
-        }
-
-        if page_items.len() < page_size as usize {
-            let supp_skip = offset.saturating_sub(k.saturating_add(steam_total)) as usize;
-            self.append_local_tail(
-                LocalTailCursor {
-                    query,
-                    in_memory: &supplemental_local,
-                    raw_local_loaded,
-                    local_total: local_window.total,
-                    contradicted: &contradicted,
-                    excluded_ids: &excluded_for_tail,
-                    to_skip: supp_skip,
-                    page_size: page_size as usize,
-                },
-                &mut emitted_ids,
-                &mut page_items,
-            )
-            .await?;
-        }
-
-        let overlap = local_window
-            .items
-            .iter()
-            .filter(|l| {
-                !is_local_contradicted(l, &contradicted)
-                    && seen_steam_ids.contains(&l.record.workshop_id)
+            .filter_map(|hit| match hit {
+                SearchHit::Catalog(matched) => Some(matched.id),
+                SearchHit::Steam(_) => None,
             })
-            .count() as u64;
-        let total = local_window
-            .total
-            .saturating_sub(contradicted_dropped)
-            .saturating_add(steam_total)
-            .saturating_sub(overlap);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
-
-        Ok(MergeOutcome::Ready(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        }))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_steam_order_windowed(
-        &self,
-        query: &SearchQuery,
-        app_id: u32,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        initial_steam_page: WorkshopQueryPage,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-    ) -> anyhow::Result<SearchResponse> {
-        let mut seen_steam_ids = HashSet::new();
-        let mut contradicted = HashMap::new();
-        record_steam_page_metadata(
-            &initial_steam_page,
-            app_id,
-            &mut seen_steam_ids,
-            &mut contradicted,
-        );
-
-        let steam_total = initial_steam_page
-            .total
-            .max(initial_steam_page.outcomes.len() as u64);
-        let page_items = self
-            .apply_local_overlay(query, app_id, &initial_steam_page.outcomes, true)
-            .await?;
-        let suppressed_steam_ids =
-            collect_suppressed_ids(&initial_steam_page.outcomes, &page_items);
-        let mut page_items = page_items;
-        let mut emitted_ids: HashSet<WorkshopId> =
-            page_items.iter().map(|i| i.workshop_id).collect();
-
-        let mut visible_local = Vec::new();
-        let mut contradicted_dropped = 0u64;
-        for local in &local_window.items {
-            if is_local_contradicted(local, &contradicted)
-                || suppressed_steam_ids.contains(&local.record.workshop_id)
-            {
-                contradicted_dropped += 1;
-            } else {
-                visible_local.push(local.record.clone());
-            }
-        }
-
-        let mut excluded_for_tail = seen_steam_ids.clone();
-        excluded_for_tail.extend(&emitted_ids);
-        if let Some(eid) = exact_id {
-            excluded_for_tail.insert(eid);
-        }
-
-        if page_items.len() < page_size as usize {
-            let supp_skip = offset.saturating_sub(steam_total) as usize;
-            self.append_local_tail(
-                LocalTailCursor {
-                    query,
-                    in_memory: &visible_local,
-                    raw_local_loaded,
-                    local_total: local_window.total,
-                    contradicted: &contradicted,
-                    excluded_ids: &excluded_for_tail,
-                    to_skip: supp_skip,
-                    page_size: page_size as usize,
-                },
-                &mut emitted_ids,
-                &mut page_items,
-            )
-            .await?;
-        }
-
-        let overlap = visible_local
-            .iter()
-            .filter(|i| seen_steam_ids.contains(&i.workshop_id))
-            .count() as u64;
-        let total = local_window
-            .total
-            .saturating_sub(contradicted_dropped)
-            .saturating_add(steam_total)
-            .saturating_sub(overlap);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
-
-        Ok(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn merge_deterministic_windowed(
-        self: &Arc<Self>,
-        query: &SearchQuery,
-        det_sort: DeterministicSort,
-        page: u32,
-        page_size: u32,
-        offset: u64,
-        base_request: &SteamSearchRequest,
-        initial_steam_page: WorkshopQueryPage,
-        local_window: &RankedLocalSearch,
-        raw_local_loaded: u64,
-        exact_id: Option<WorkshopId>,
-        fetch_ctx: SteamFetchCtx,
-    ) -> anyhow::Result<MergeOutcome> {
-        let steam_total = initial_steam_page
-            .total
-            .max(initial_steam_page.outcomes.len() as u64);
-        let end = offset + u64::from(page_size);
-
-        let mut seen_steam_ids = HashSet::new();
-        let mut contradicted = HashMap::new();
-
-        let (page_items, contradicted_dropped, overlap) = if page <= MAX_DETERMINISTIC_MERGE_PAGES
-            && end <= MAX_DETERMINISTIC_MERGE_ITEMS
-        {
-            let extra_pages: Vec<u32> = (1..page).collect();
-            let mut steam_pages = if extra_pages.is_empty() {
-                HashMap::new()
-            } else {
-                match self
-                    .fetch_steam_pages_concurrent(base_request, extra_pages, fetch_ctx)
-                    .await
-                {
-                    Ok(map) => map,
-                    Err(err) => return Ok(MergeOutcome::SteamUnavailable(err)),
-                }
-            };
-            steam_pages.insert(page, initial_steam_page);
-
-            let mut overlaid_pages = Vec::new();
-            let mut suppressed_steam_ids = HashSet::new();
-            for sp in 1..=page {
-                if let Some(raw) = steam_pages.get(&sp) {
-                    record_steam_page_metadata(
-                        raw,
-                        fetch_ctx.app_id,
-                        &mut seen_steam_ids,
-                        &mut contradicted,
-                    );
-                    let overlaid = self
-                        .apply_local_overlay(query, fetch_ctx.app_id, &raw.outcomes, true)
-                        .await?;
-                    suppressed_steam_ids.extend(collect_suppressed_ids(&raw.outcomes, &overlaid));
-                    overlaid_pages.extend(overlaid);
-                }
-            }
-
-            let mut merged: HashMap<WorkshopId, WorkshopItemRecord> = HashMap::new();
-            let mut dropped = 0u64;
-            let mut ov = 0u64;
-            for local in &local_window.items {
-                if is_local_contradicted(local, &contradicted)
-                    || suppressed_steam_ids.contains(&local.record.workshop_id)
-                {
-                    dropped += 1;
-                    continue;
-                }
-                if seen_steam_ids.contains(&local.record.workshop_id) {
-                    ov += 1;
-                }
-                merged.insert(local.record.workshop_id, local.record.clone());
-            }
-
-            for item in overlaid_pages {
-                merged.insert(item.workshop_id, item);
-            }
-
-            let mut all_items: Vec<WorkshopItemRecord> = merged.into_values().collect();
-            sort_deterministic(&mut all_items, det_sort);
-            let start = (offset as usize).min(all_items.len());
-            let slice_end = (start + page_size as usize).min(all_items.len());
-            (all_items[start..slice_end].to_vec(), dropped, ov)
-        } else {
-            record_steam_page_metadata(
-                &initial_steam_page,
-                fetch_ctx.app_id,
-                &mut seen_steam_ids,
-                &mut contradicted,
+            .collect();
+        let mut local = HashMap::new();
+        if !ids.is_empty() {
+            let (stored, _) = self.db_call(move |r| r.get_batch(&ids)).await?;
+            // A sync can change listing status between ranking and loading the page.
+            local.extend(
+                stored
+                    .into_iter()
+                    .filter(|meta| meta.is_in_public_catalog())
+                    .map(|meta| (meta.record.workshop_id, meta.record)),
             );
-            let mut items = self
-                .apply_local_overlay(query, fetch_ctx.app_id, &initial_steam_page.outcomes, true)
-                .await?;
-            let suppressed_steam_ids = collect_suppressed_ids(&initial_steam_page.outcomes, &items);
-            let mut emitted: HashSet<WorkshopId> = items.iter().map(|i| i.workshop_id).collect();
-            let mut visible_local = Vec::new();
-            let mut dropped = 0u64;
-            let mut ov = 0u64;
-            for local in &local_window.items {
-                if is_local_contradicted(local, &contradicted)
-                    || suppressed_steam_ids.contains(&local.record.workshop_id)
-                {
-                    dropped += 1;
-                    continue;
-                }
-                if seen_steam_ids.contains(&local.record.workshop_id) {
-                    ov += 1;
-                }
-                visible_local.push(local.record.clone());
-            }
-            let mut excluded = seen_steam_ids.clone();
-            excluded.extend(&emitted);
-            if let Some(eid) = exact_id {
-                excluded.insert(eid);
-            }
-            if items.len() < page_size as usize {
-                let supp_skip = offset.saturating_sub(steam_total) as usize;
-                self.append_local_tail(
-                    LocalTailCursor {
-                        query,
-                        in_memory: &visible_local,
-                        raw_local_loaded,
-                        local_total: local_window.total,
-                        contradicted: &contradicted,
-                        excluded_ids: &excluded,
-                        to_skip: supp_skip,
-                        page_size: page_size as usize,
-                    },
-                    &mut emitted,
-                    &mut items,
-                )
-                .await?;
-            }
-            (items, dropped, ov)
-        };
+        }
+        let items = page
+            .into_iter()
+            .filter_map(|hit| match hit {
+                SearchHit::Catalog(matched) => local.remove(&matched.id),
+                SearchHit::Steam(item) => Some(item.clone()),
+            })
+            .collect();
+        Ok(pagination.output(items, total, mode))
+    }
 
-        let total = local_window
-            .total
-            .saturating_sub(contradicted_dropped)
-            .saturating_add(steam_total)
-            .saturating_sub(overlap);
-        let total = if page_items.is_empty() {
-            total
-        } else {
-            total.max(offset + page_items.len() as u64)
-        };
+    async fn fetch_steam_results(
+        self: &Arc<Self>,
+        request: &SteamSearchRequest,
+        ctx: SteamFetchCtx,
+    ) -> Result<SteamResults, SteamSearchError> {
+        let mut scan_request = request.clone();
+        scan_request.page = 1;
+        let first = self.fetch_steam_page_cached(&scan_request, ctx).await?;
+        let total = steam_total(&first.raw);
+        // For very broad searches, keep native Steam paging for the entire query.
+        // An exact union would require scanning every upstream page before returning any page.
+        if total > MAX_STEAM_MERGE_ITEMS {
+            let page = if request.page == 1 {
+                first
+            } else {
+                self.fetch_steam_page_cached(request, ctx).await?
+            };
+            return Ok(SteamResults::NativePage { page, total });
+        }
 
-        Ok(MergeOutcome::Ready(SearchResponse {
-            items: page_items.into_iter().map(with_catalog_source).collect(),
-            total,
-            page,
-            page_size,
-            source: MetadataSource::CatalogServer,
+        if total.div_ceil(u64::from(request.num_per_page)) > MAX_STEAM_MERGE_PAGES {
+            scan_request.num_per_page = STEAM_SCAN_PAGE_SIZE;
+        }
+        let num_pages = total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
+        let pages = join_all((1..=num_pages).map(|page| {
+            let mut req = scan_request.clone();
+            req.page = page;
+            let first = &first;
+            async move {
+                if page == 1 && req.num_per_page == request.num_per_page {
+                    return Ok(first.clone());
+                }
+                self.fetch_steam_page_cached(&req, ctx).await
+            }
         }))
+        .await;
+        // Wait for all fetched restrictions to be saved before allowing a local fallback.
+        if let Some(err) = pages.iter().find_map(|page| match page {
+            Err(err @ SteamSearchError::Visibility(_)) => Some(err),
+            _ => None,
+        }) {
+            return Err(err.clone());
+        }
+        let mut pages = pages.into_iter().collect::<Result<Vec<_>, _>>()?;
+        if scan_request.num_per_page != request.num_per_page
+            && pages
+                .first()
+                .is_some_and(|page| steam_total(&page.raw) == 0)
+        {
+            return Err(SteamSearchError::Unavailable(
+                "Steam CM 检索结果在重新分页时发生变化".to_owned(),
+            ));
+        }
+        if pages.iter().all(|page| page.raw.outcomes.is_empty()) {
+            pages.clear();
+        }
+        Ok(SteamResults::Complete(pages))
     }
 
-    async fn append_local_tail(
-        &self,
-        mut cursor: LocalTailCursor<'_>,
-        emitted_ids: &mut HashSet<WorkshopId>,
-        out: &mut Vec<WorkshopItemRecord>,
-    ) -> anyhow::Result<()> {
-        for item in cursor.in_memory {
-            let wid = item.workshop_id;
-            if cursor.excluded_ids.contains(&wid) || emitted_ids.contains(&wid) {
-                continue;
-            }
-            if cursor.to_skip > 0 {
-                cursor.to_skip -= 1;
-                continue;
-            }
-            emitted_ids.insert(wid);
-            out.push(item.clone());
-            if out.len() >= cursor.page_size {
-                return Ok(());
-            }
-        }
-
-        let mut db_offset = cursor.raw_local_loaded;
-        while out.len() < cursor.page_size && db_offset < cursor.local_total {
-            let needed = cursor.page_size - out.len();
-            let batch_limit = (cursor.to_skip + needed + 32).clamp(32, 200) as u32;
-            let batch = self
-                .fetch_local_range(cursor.query, db_offset, batch_limit)
-                .await?;
-            if batch.items.is_empty() {
-                break;
-            }
-            db_offset = db_offset.saturating_add(batch.items.len() as u64);
-            for local in batch.items {
-                if is_local_contradicted(&local, cursor.contradicted) {
-                    continue;
-                }
-                let wid = local.record.workshop_id;
-                if cursor.excluded_ids.contains(&wid) || emitted_ids.contains(&wid) {
-                    continue;
-                }
-                if cursor.to_skip > 0 {
-                    cursor.to_skip -= 1;
-                    continue;
-                }
-                emitted_ids.insert(wid);
-                out.push(local.record);
-                if out.len() >= cursor.page_size {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn apply_local_overlay(
+    async fn apply_local_overlay<'a>(
         &self,
         query: &SearchQuery,
         app_id: u32,
-        observations: &[WorkshopObservation],
+        observations: impl IntoIterator<Item = &'a WorkshopObservation>,
         steam_enforced_tags: bool,
     ) -> anyhow::Result<Vec<WorkshopItemRecord>> {
         let mut candidates = Vec::new();
@@ -1596,14 +602,11 @@ impl HybridSearchService {
             return Ok(Vec::new());
         }
 
-        let mut meta_map = HashMap::new();
-        for chunk in ids.chunks(OVERLAY_BATCH_SIZE) {
-            let chunk_ids = chunk.to_vec();
-            let (stored, _) = self.db_call(move |r| r.get_batch(&chunk_ids)).await?;
-            for meta in stored {
-                meta_map.insert(meta.record.workshop_id, meta);
-            }
-        }
+        let (stored, _) = self.db_call(move |r| r.get_batch(&ids)).await?;
+        let meta_map: HashMap<_, _> = stored
+            .into_iter()
+            .map(|meta| (meta.record.workshop_id, meta))
+            .collect();
 
         let mut out = Vec::with_capacity(candidates.len());
         for mut item in candidates {
@@ -1642,113 +645,94 @@ impl HybridSearchService {
         Ok(out)
     }
 
-    async fn fetch_steam_pages_concurrent(
-        self: &Arc<Self>,
-        base_request: &SteamSearchRequest,
-        pages: Vec<u32>,
-        ctx: SteamFetchCtx,
-    ) -> anyhow::Result<HashMap<u32, WorkshopQueryPage>> {
-        let unique_pages: BTreeSet<u32> = pages.into_iter().collect();
-        if unique_pages.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut join_set = JoinSet::new();
-        for p in unique_pages {
-            let svc = Arc::clone(self);
-            let mut req = base_request.clone();
-            req.page = p;
-            join_set.spawn(async move {
-                let res = svc.fetch_steam_page_cached(&req, ctx).await;
-                (p, res)
-            });
-        }
-        let mut out = HashMap::new();
-        while let Some(joined) = join_set.join_next().await {
-            match joined {
-                Ok((p, Ok(page))) => {
-                    out.insert(p, page);
-                }
-                Ok((_, Err(err))) => {
-                    join_set.abort_all();
-                    return Err(err);
-                }
-                Err(join_err) => {
-                    join_set.abort_all();
-                    return Err(anyhow::anyhow!("Steam CM 并发检索任务失败: {join_err}"));
-                }
-            }
-        }
-        Ok(out)
-    }
-
     async fn fetch_steam_page_cached(
         self: &Arc<Self>,
         request: &SteamSearchRequest,
         ctx: SteamFetchCtx,
-    ) -> anyhow::Result<WorkshopQueryPage> {
+    ) -> SharedPageResult {
         if !ctx.cache_ttl.is_zero() {
-            let mut cache = self.cache.lock().await;
-            if let Some(entry) = cache.get(request) {
-                if entry.cached_at.elapsed() < ctx.cache_ttl {
-                    return Ok(entry.page.clone());
+            let cached = {
+                let mut cache = self.cache.lock().await;
+                match cache.get(request) {
+                    Some(entry) if entry.cached_at.elapsed() < ctx.cache_ttl => {
+                        Some(entry.page.clone())
+                    }
+                    _ => {
+                        cache.remove(request);
+                        None
+                    }
                 }
-                cache.remove(request);
+            };
+            if let Some(page) = cached {
+                self.save_page_restrictions(&page, ctx.app_id).await?;
+                return Ok(page);
             }
         }
 
-        let wait_budget = remaining_timeout(ctx.deadline)?;
+        let mut map = self.inflight.lock().await;
+        let wait_budget = remaining_timeout(ctx.deadline)
+            .map_err(|err| SteamSearchError::Unavailable(err.to_string()))?;
+        let mut rx = if let Some(existing) = map.get(request).filter(|rx| !rx.is_closed()) {
+            existing.resubscribe()
+        } else {
+            let (tx, rx) = broadcast::channel(1);
+            map.insert(request.clone(), rx.resubscribe());
+            let svc = Arc::clone(self);
+            let req = request.clone();
+            tokio::spawn(async move {
+                let result = tokio::time::timeout(wait_budget, svc.upstream.search_files(&req))
+                    .await
+                    .map_err(|_| SteamSearchError::Unavailable("Steam CM 实时搜索超时".to_owned()))
+                    .and_then(|res| {
+                        res.map_err(|err| SteamSearchError::Unavailable(err.to_string()))
+                    })
+                    .map(|raw| {
+                        Arc::new(SharedSteamPage {
+                            raw,
+                            restrictions_saved: OnceCell::new(),
+                        })
+                    });
 
-        let mut rx = {
-            let mut map = self.inflight.lock().await;
-            if let Some(existing) = map.get(request).filter(|rx| !rx.is_closed()) {
-                existing.resubscribe()
-            } else {
-                let (tx, rx) = broadcast::channel(1);
-                map.insert(request.clone(), rx.resubscribe());
-                let svc = Arc::clone(self);
-                let req = request.clone();
-                tokio::spawn(async move {
-                    let result =
-                        tokio::time::timeout(ctx.steam_timeout, svc.upstream.search_files(&req))
-                            .await
-                            .map_err(|_| "Steam CM 实时搜索超时".to_string())
-                            .and_then(|res| res.map_err(|err| err.to_string()));
-
-                    if let Ok(ref page) = result {
-                        if !ctx.cache_ttl.is_zero() {
-                            svc.insert_cached_page(req.clone(), page.clone(), ctx.cache_ttl)
-                                .await;
-                        }
-                        if ctx.cache_steam_results {
-                            let warm: Vec<_> = page
-                                .outcomes
-                                .iter()
-                                .filter(|obs| is_public_active_for_app(obs, ctx.app_id))
-                                .cloned()
-                                .collect();
-                            svc.spawn_cache_warming(warm, req.language);
-                        }
+                if let Ok(page) = &result {
+                    if !ctx.cache_ttl.is_zero() {
+                        svc.insert_cached_page(req.clone(), page.clone(), ctx.cache_ttl)
+                            .await;
                     }
-
+                }
+                {
                     let mut map = svc.inflight.lock().await;
                     map.remove(&req);
-                    let _ = tx.send(result);
-                });
-                rx
-            }
+                    let _ = tx.send(result.clone());
+                }
+                // Save restrictions even if the original HTTP request has gone away.
+                if let Ok(page) = result {
+                    match svc.save_page_restrictions(&page, ctx.app_id).await {
+                        Ok(()) if ctx.cache_steam_results => {
+                            svc.warm_public_results(&page.raw.outcomes, ctx.app_id, req.language);
+                        }
+                        Ok(()) => {}
+                        Err(err) => tracing::error!(error = %err, "保存搜索结果的可见性失败"),
+                    }
+                }
+            });
+            rx
         };
+        drop(map);
 
-        let result = tokio::time::timeout(wait_budget, rx.recv())
+        let page = tokio::time::timeout(wait_budget, rx.recv())
             .await
-            .map_err(|_| anyhow::anyhow!("Steam CM 实时搜索等待超时"))?
-            .map_err(|err| anyhow::anyhow!("Steam CM 搜索并发通道异常: {err}"))?;
-        result.map_err(anyhow::Error::msg)
+            .map_err(|_| SteamSearchError::Unavailable("Steam CM 实时搜索等待超时".to_owned()))?
+            .map_err(|err| {
+                SteamSearchError::Unavailable(format!("Steam CM 搜索并发通道异常: {err}"))
+            })??;
+        self.save_page_restrictions(&page, ctx.app_id).await?;
+        Ok(page)
     }
 
     async fn insert_cached_page(
         &self,
         request: SteamSearchRequest,
-        page: WorkshopQueryPage,
+        page: Arc<SharedSteamPage>,
         cache_ttl: Duration,
     ) {
         let mut cache = self.cache.lock().await;
@@ -1771,21 +755,75 @@ impl HybridSearchService {
         );
     }
 
-    fn spawn_cache_warming(&self, observations: Vec<WorkshopObservation>, language: i32) {
+    async fn save_page_restrictions(
+        &self,
+        page: &SharedSteamPage,
+        app_id: u32,
+    ) -> Result<(), SteamSearchError> {
+        page.restrictions_saved
+            .get_or_try_init(|| self.persist_confirmed_restrictions(&page.raw.outcomes, app_id))
+            .await
+            .map_err(|err| SteamSearchError::Visibility(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn persist_confirmed_restrictions(
+        &self,
+        observations: &[WorkshopObservation],
+        app_id: u32,
+    ) -> anyhow::Result<()> {
+        let restricted: Vec<_> = observations
+            .iter()
+            .filter(|obs| {
+                obs.consumer_appid.is_none_or(|id| id == app_id)
+                    && match &obs.outcome {
+                        WorkshopFetchOutcome::Found { item } => {
+                            item.status == WorkshopItemStatus::PrivateOrUnavailable
+                                || (item.status == WorkshopItemStatus::Active && !obs.listed)
+                        }
+                        WorkshopFetchOutcome::PrivateOrUnavailable { .. }
+                        | WorkshopFetchOutcome::Removed { .. } => true,
+                    }
+            })
+            .cloned()
+            .collect();
+        if !restricted.is_empty() {
+            self.db_call(move |repo| {
+                repo.apply_upstream_outcomes_with_policy(
+                    &restricted,
+                    CatalogIndexPolicy::CacheOnly,
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn warm_public_results(
+        &self,
+        observations: &[WorkshopObservation],
+        app_id: u32,
+        language: i32,
+    ) {
+        let observations: Vec<_> = observations
+            .iter()
+            .filter(|obs| is_public_active_for_app(obs, app_id))
+            .cloned()
+            .collect();
         if observations.is_empty() {
             return;
         }
         let repo = Arc::clone(&self.repo);
         let policy = if language == 0 {
-            CatalogIndexPolicy::CacheOnly
+            CatalogIndexPolicy::RefreshUnindexedCache
         } else {
             CatalogIndexPolicy::InsertOnlyCache
         };
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                repo.apply_upstream_outcomes_with_policy(&observations, policy)
-            })
-            .await;
+        tokio::task::spawn_blocking(move || {
+            if let Err(err) = repo.apply_upstream_outcomes_with_policy(&observations, policy) {
+                tracing::warn!(error = %err, "Steam 检索暖缓存写入失败");
+            }
         });
     }
 }
@@ -1793,119 +831,89 @@ impl HybridSearchService {
 fn remaining_timeout(deadline: Instant) -> anyhow::Result<Duration> {
     let now = Instant::now();
     if now >= deadline {
-        anyhow::bail!("Steam CM 检索预算耗尽");
+        anyhow::bail!("Steam CM 请求超出检索超时预算");
     }
-    Ok(deadline.saturating_duration_since(now))
+    Ok(deadline - now)
 }
 
-fn record_steam_page_metadata(
-    page: &WorkshopQueryPage,
-    app_id: u32,
-    raw_steam_ids: &mut HashSet<WorkshopId>,
-    contradicted: &mut HashMap<WorkshopId, DateTime<Utc>>,
-) {
-    for obs in &page.outcomes {
-        let wid = obs.outcome.workshop_id();
-        raw_steam_ids.insert(wid);
-        if !is_public_active_for_app(obs, app_id) {
-            let obs_at = obs.observed_at();
-            contradicted
-                .entry(wid)
-                .and_modify(|prev| {
-                    if obs_at > *prev {
-                        *prev = obs_at;
-                    }
-                })
-                .or_insert(obs_at);
-        }
-    }
+fn steam_total(page: &WorkshopQueryPage) -> u64 {
+    page.total.max(page.outcomes.len() as u64)
 }
 
-fn is_local_contradicted(
-    local: &RankedLocalItem,
-    contradicted: &HashMap<WorkshopId, DateTime<Utc>>,
-) -> bool {
-    !local.is_admin_override
-        && contradicted
-            .get(&local.record.workshop_id)
-            .is_some_and(|&obs_at| obs_at >= local.last_verified_at)
-}
-
-fn collect_suppressed_ids(
-    raw: &[WorkshopObservation],
-    overlaid: &[WorkshopItemRecord],
-) -> HashSet<WorkshopId> {
-    let overlaid_ids: HashSet<WorkshopId> = overlaid.iter().map(|i| i.workshop_id).collect();
-    raw.iter()
+#[allow(clippy::too_many_arguments)]
+fn merge_matches<'a>(
+    local: &[RankedCatalogMatch],
+    steam: &'a [WorkshopItemRecord],
+    observations: &[&WorkshopObservation],
+    first_page_len: usize,
+    exact: Option<&'a WorkshopItemRecord>,
+    strategy: MergeStrategy,
+    parsed: Option<&ParsedQuery>,
+    target: Option<SteamSearchTarget>,
+) -> Vec<SearchHit<'a>> {
+    let mut steam_ids = HashSet::new();
+    let steam: Vec<_> = steam
+        .iter()
+        .filter(|item| steam_ids.insert(item.workshop_id))
+        .collect();
+    // A cached Steam hit can be suppressed by a newer local tombstone. Keep that ID out of the local tail as well.
+    let suppressed: HashSet<_> = observations
+        .iter()
         .map(|obs| obs.outcome.workshop_id())
-        .filter(|wid| !overlaid_ids.contains(wid))
-        .collect()
-}
+        .filter(|id| !steam_ids.contains(id))
+        .collect();
 
-fn partition_local_items(
-    local_items: &[RankedLocalItem],
-    contradicted: &HashMap<WorkshopId, DateTime<Utc>>,
-    suppressed_steam_ids: &HashSet<WorkshopId>,
-    steam_p1_ids: &HashSet<WorkshopId>,
-    steam_p1_best_tier: Option<u8>,
-) -> (
-    Vec<WorkshopItemRecord>,
-    Vec<WorkshopItemRecord>,
-    HashSet<WorkshopId>,
-    u64,
-) {
-    let mut promoted_local = Vec::new();
-    let mut supplemental_local = Vec::new();
-    let mut promoted_ids = HashSet::new();
-    let mut contradicted_dropped = 0u64;
+    let local = exact.into_iter().map(SearchHit::Steam).chain(
+        local
+            .iter()
+            .filter(|matched| {
+                !suppressed.contains(&matched.id)
+                    && exact.is_none_or(|item| item.workshop_id != matched.id)
+            })
+            .copied()
+            .map(SearchHit::Catalog),
+    );
 
-    for local_item in local_items {
-        let wid = local_item.record.workshop_id;
-        if is_local_contradicted(local_item, contradicted) || suppressed_steam_ids.contains(&wid) {
-            contradicted_dropped += 1;
-            continue;
-        }
-        if steam_p1_ids.contains(&wid) {
-            continue;
-        }
-        let promote = local_item.record.status == WorkshopItemStatus::Active
-            && match local_item.rank {
-                Some(rank) if rank.tier == 0 => true,
-                Some(rank) if local_item.is_admin_override && rank.tier <= 3 => true,
-                Some(rank)
-                    if rank.tier <= 5 && steam_p1_best_tier.is_none_or(|best| rank.tier < best) =>
-                {
-                    true
-                }
-                _ => false,
-            };
-        if promote {
-            promoted_ids.insert(wid);
-            promoted_local.push(local_item.record.clone());
-        } else {
-            supplemental_local.push(local_item.record.clone());
-        }
+    let mut hits = if strategy == MergeStrategy::Relevance {
+        let first_page_ids: HashSet<_> = observations[..first_page_len]
+            .iter()
+            .map(|obs| obs.outcome.workshop_id())
+            .collect();
+        let steam_best_tier = parsed.and_then(|parsed| {
+            steam
+                .iter()
+                .filter(|item| first_page_ids.contains(&item.workshop_id))
+                .take(5)
+                .filter_map(|item| score_for_target(parsed, target, item))
+                .map(|rank| rank.tier)
+                .min()
+        });
+        let (mut promoted, tail): (Vec<_>, Vec<_>) = local.partition(|hit| {
+            !first_page_ids.contains(&hit.id()) && hit.should_promote(steam_best_tier)
+        });
+        let promoted_ids: HashSet<_> = promoted.iter().map(|hit| hit.id()).collect();
+        promoted.extend(
+            steam
+                .into_iter()
+                .filter(|item| !promoted_ids.contains(&item.workshop_id))
+                .map(SearchHit::Steam),
+        );
+        promoted.extend(
+            tail.into_iter()
+                .filter(|hit| !steam_ids.contains(&hit.id())),
+        );
+        promoted
+    } else {
+        steam
+            .into_iter()
+            .map(SearchHit::Steam)
+            .chain(local.filter(|hit| !steam_ids.contains(&hit.id())))
+            .collect()
+    };
+    if let MergeStrategy::Deterministic(sort) = strategy {
+        hits.sort_unstable_by_key(|hit| hit.sort_key(sort));
     }
-
-    (
-        promoted_local,
-        supplemental_local,
-        promoted_ids,
-        contradicted_dropped,
-    )
-}
-
-fn extend_local_window(
-    window: &mut RankedLocalSearch,
-    extra: Vec<RankedLocalItem>,
-    exact_id: Option<WorkshopId>,
-) {
-    for item in extra {
-        if exact_id == Some(item.record.workshop_id) {
-            continue;
-        }
-        window.items.push(item);
-    }
+    hits
 }
 
 fn normalize_response(mut resp: SearchResponse) -> SearchResponse {
@@ -2033,72 +1041,6 @@ fn score_for_target(
             &item.title,
             item.creator_name.as_deref(),
         ),
-    }
-}
-
-fn inject_exact_item_into_local(local_window: &mut RankedLocalSearch, exact: WorkshopItemRecord) {
-    let wid = exact.workshop_id;
-    let last_verified_at = exact.fetched_at;
-    let exact_entry = RankedLocalItem {
-        record: exact,
-        rank: Some(MatchRank {
-            tier: 0,
-            sub_rank: 0,
-        }),
-        is_admin_override: false,
-        last_verified_at,
-    };
-    if let Some(pos) = local_window
-        .items
-        .iter()
-        .position(|item| item.record.workshop_id == wid)
-    {
-        local_window.items.remove(pos);
-        local_window.items.insert(0, exact_entry);
-    } else {
-        local_window.items.insert(0, exact_entry);
-        local_window.total = local_window.total.saturating_add(1);
-    }
-}
-
-fn slice_local_window(
-    local_window: &RankedLocalSearch,
-    page: u32,
-    page_size: u32,
-    offset: u64,
-) -> SearchResponse {
-    let start = (offset as usize).min(local_window.items.len());
-    let end = (start + page_size as usize).min(local_window.items.len());
-    let items = local_window.items[start..end]
-        .iter()
-        .map(|item| with_catalog_source(item.record.clone()))
-        .collect();
-    SearchResponse {
-        items,
-        total: local_window.total,
-        page,
-        page_size,
-        source: MetadataSource::CatalogServer,
-    }
-}
-
-fn sort_deterministic(items: &mut [WorkshopItemRecord], sort: DeterministicSort) {
-    match sort {
-        DeterministicSort::Subscriptions => {
-            items.sort_by_key(|item| (Reverse(item.subscriptions.unwrap_or(0)), item.workshop_id))
-        }
-        DeterministicSort::Updated => items.sort_by_key(|item| {
-            (
-                Reverse(item.time_updated.unwrap_or(0)),
-                Reverse(item.workshop_id),
-            )
-        }),
-        DeterministicSort::Newest => items.sort_by_key(|item| {
-            (
-                Reverse(item.time_created.unwrap_or(0)),
-                Reverse(item.workshop_id),
-            )
-        }),
     }
 }
 
@@ -2238,6 +1180,7 @@ pub fn parse_steam_language_tag(raw: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     #[test]
     fn resolves_steam_language_from_query_accept_header_and_default() {

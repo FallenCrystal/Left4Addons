@@ -90,7 +90,11 @@ impl ServerRepo {
                 let wid = observation.outcome.workshop_id();
                 let observed_at = observation.observed_at();
                 let existing = Self::get_item_tx(&tx, wid)?;
-                if index_policy == CatalogIndexPolicy::InsertOnlyCache && existing.is_some() {
+                if existing.as_ref().is_some_and(|prev| {
+                    index_policy == CatalogIndexPolicy::InsertOnlyCache
+                        || (index_policy == CatalogIndexPolicy::RefreshUnindexedCache
+                            && prev.catalog_indexed)
+                }) {
                     summary.skipped_stale += 1;
                     continue;
                 }
