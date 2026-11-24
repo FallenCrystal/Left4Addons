@@ -67,6 +67,10 @@ pub struct AddonSummary {
     pub workshop_id: Option<WorkshopId>,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addon_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workshop_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -84,6 +88,8 @@ pub struct AddonSummary {
     pub files_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_cover_image: Option<String>,
     #[serde(default)]
     pub categories: Vec<String>,
     #[serde(default)]
@@ -439,6 +445,15 @@ pub enum GameUpdateDummyPolicy {
     AutoKeepLocalRegenerateDummy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AddonNamePreference {
+    #[default]
+    WorkshopTitle,
+    AddonTitle,
+    FileName,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -464,6 +479,10 @@ pub struct AppConfig {
     pub catalog_server_url: Option<String>,
     #[serde(default = "default_provider_order")]
     pub source_order: Vec<String>,
+    #[serde(default)]
+    pub addon_name_preference: AddonNamePreference,
+    #[serde(default = "default_true_flag")]
+    pub collapse_campaign_bundles: bool,
     #[serde(default)]
     pub rename_rules: RenameRuleConfig,
 }
@@ -499,6 +518,8 @@ impl Default for AppConfig {
             https_only: true,
             catalog_server_url: None,
             source_order: default_provider_order(),
+            addon_name_preference: AddonNamePreference::default(),
+            collapse_campaign_bundles: true,
             rename_rules: RenameRuleConfig::default(),
         }
     }

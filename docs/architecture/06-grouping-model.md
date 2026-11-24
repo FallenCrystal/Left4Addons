@@ -11,7 +11,7 @@ v1 同时存在 `auto-group`、`workshop-import`、`manual` 与 `MasterCollectio
 
 | 层次 | 实体 | 关系基数 | 职责与保护机制 |
 | --- | --- | --- | --- |
-| 第 1 层：多包整合 | `BundleRecord` | 1 对多（聚合地图与封面） | 把 `Part 1/2` 或主包+依赖分包聚合成逻辑包；支持 **`locked` 锁定保护**（锁定组与 `Manual` 组绝不被自动重建破坏） |
+| 第 1 层：多包整合 | `BundleRecord` | 1 对多（聚合地图与封面） | 面向**战役分包**（`Part 1/2`、主包+材质/模型分包、本地附件同元数据多包）聚合成逻辑包并在组件库主页默认折叠展示；自动过滤独立材质修复/汉化补丁与人物模型/表情等非战役依赖，支持 **`locked` 锁定保护**（锁定组与 `Manual` 组绝不被自动重建破坏） |
 | 第 2 层：上游合集 | `TrackedCollectionRecord` | 引用 WorkshopID | 专门跟踪 Steam 合集订阅与上游增删 Diff，不强行独占本地模组分类 |
 | 第 3 层：自定义分组 | `UserGroup` | **多对多** (`user_group_addons`) | 玩家自由分类与打标，一个模组可同时属于「战役」「高画质」「周五开黑」等多个组 |
 | 第 4 层：启用预设 | `LoadoutProfile` | 多对多 (`profile_addons`) | 一键切换整套启用方案，仅操作 `loading/` 托管目录并汇报跳过的纯工坊条目 |

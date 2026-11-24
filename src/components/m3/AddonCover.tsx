@@ -110,40 +110,60 @@ const TONAL_PAIR_VARS = [
 
 export function AddonCover({
   src,
+  fallbackSrc,
   title,
   category,
   compact = false,
 }: {
   src?: string;
+  fallbackSrc?: string;
   title: string;
   category?: string;
   compact?: boolean;
 }) {
-  const [failedSrc, setFailedSrc] = useState<string | null>(null);
-  const [loadedCache, setLoadedCache] = useState<{ key: string; url: string | null } | null>(null);
+  const [failedCandidates, setFailedCandidates] = useState<string[]>([]);
+  const [resolvedCacheUrls, setResolvedCacheUrls] = useState<Record<string, string>>({});
 
-  const shouldLoadCache = Boolean(src && isTauriRuntime() && isLocalCacheKey(src));
-  const cachedImmediate = shouldLoadCache && src ? cacheUrlMap.get(src) : undefined;
+  const markFailed = (candidate: string) => {
+    setFailedCandidates((prev) => (prev.includes(candidate) ? prev : [...prev, candidate]));
+  };
+
+  const candidates = [src, fallbackSrc].filter(
+    (v, idx, arr): v is string =>
+      Boolean(v) &&
+      arr.indexOf(v) === idx &&
+      Boolean(resolveDirectUrl(v) || (isTauriRuntime() && isLocalCacheKey(v))),
+  );
+  const activeSrc = candidates.find((candidate) => !failedCandidates.includes(candidate));
+
+  const directUrl = resolveDirectUrl(activeSrc);
+  const shouldLoadCache = Boolean(
+    activeSrc && !directUrl && isTauriRuntime() && isLocalCacheKey(activeSrc),
+  );
+  const cachedImmediate = shouldLoadCache && activeSrc ? cacheUrlMap.get(activeSrc) : undefined;
+  const cachedStateUrl = shouldLoadCache && activeSrc ? resolvedCacheUrls[activeSrc] : undefined;
 
   useEffect(() => {
-    if (!shouldLoadCache || !src || cachedImmediate) return;
+    if (!shouldLoadCache || !activeSrc || cachedImmediate || cachedStateUrl) return;
     let active = true;
-    void loadCachedImageUrl(src).then((url) => {
-      if (active) setLoadedCache({ key: src, url });
+    void loadCachedImageUrl(activeSrc).then((url) => {
+      if (!active) return;
+      if (!url) {
+        markFailed(activeSrc);
+      } else {
+        setResolvedCacheUrls((prev) =>
+          prev[activeSrc] === url ? prev : { ...prev, [activeSrc]: url },
+        );
+      }
     });
     return () => {
       active = false;
     };
-  }, [shouldLoadCache, src, cachedImmediate]);
+  }, [shouldLoadCache, activeSrc, cachedImmediate, cachedStateUrl]);
 
-  const resolvedUrl =
-    resolveDirectUrl(src) ??
-    cachedImmediate ??
-    (loadedCache?.key === src ? loadedCache?.url : undefined);
+  const resolvedUrl = directUrl ?? cachedImmediate ?? cachedStateUrl;
 
-  const canLoadImg = Boolean(resolvedUrl && failedSrc !== resolvedUrl);
-
-  if (canLoadImg && resolvedUrl) {
+  if (activeSrc && resolvedUrl) {
     return (
       <img
         src={resolvedUrl}
@@ -151,7 +171,7 @@ export function AddonCover({
         className="l4a-cover-img"
         loading="lazy"
         draggable={false}
-        onError={() => setFailedSrc(resolvedUrl)}
+        onError={() => markFailed(activeSrc)}
       />
     );
   }

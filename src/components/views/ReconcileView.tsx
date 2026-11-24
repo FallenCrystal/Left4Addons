@@ -23,7 +23,7 @@ import type {
   ReconcileIssue,
   ReconcileIssueKind,
 } from '../../api/ipc';
-import { formatTimestamp, getFileBaseName } from '../../utils/format';
+import { formatAddonDisplayName, formatTimestamp, getFileBaseName } from '../../utils/format';
 import { Button, Checkbox, Dialog, EmptyState, FilterChip, IconButton } from '../m3/primitives';
 
 export interface ReconcileViewProps {
@@ -357,7 +357,11 @@ export function ReconcileView({
 
             {visibleIssues.map((issue) => {
               const addon = issue.addonId ? addonsById.get(issue.addonId) : undefined;
-              const title = addon?.title ?? (issue.workshopId ? `#${issue.workshopId}` : issue.id);
+              const title = addon
+                ? formatAddonDisplayName(addon, config.addonNamePreference)
+                : issue.workshopId
+                  ? `#${issue.workshopId}`
+                  : issue.id;
               const tone = issueTone(issue.kind);
               const selected = selectedIds.has(issue.id);
               const helpExpanded = expandedHelpIds.has(issue.id);

@@ -1,22 +1,30 @@
 mod support;
 
-use axum::{routing::get, Json, Router};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
 use chrono::Utc;
 use l4a_core::db::LocalDb;
 use l4a_core::{AppPaths, CoreError, EventSink, L4aEngine, NullEventSink};
+use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
-    AddonDirType, AddonId, AddonOperationOutcome, AppConfig, CoreEvent, DesktopError,
-    DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState, IssueId, LoadoutProfile,
-    MetadataSource, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileIssueKind,
-    RenameRuleConfig, SearchQuery, SearchResponse, UserGroup, WorkshopCollectionRecord,
-    WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
+    AddonDirType, AddonId, AddonOperationOutcome, AppConfig, BatchItemsRequest, BatchItemsResponse,
+    CoreEvent, DesktopError, DesktopErrorCode, GameUpdateDummyPolicy, GroupId, InstallState,
+    IssueId, LoadoutProfile, MetadataSource, ProfileId, ReconcileAction, ReconcileBatchItem,
+    ReconcileIssueKind, RenameRuleConfig, SearchQuery, SearchResponse, UserGroup,
+    WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemRecord,
+    WorkshopItemStatus,
 };
 use l4a_steam::{MockSteamBridge, SubscribedItemInfo};
-use l4a_workshop::WorkshopError;
+use l4a_workshop::{
+    SourceRoutingPolicy, SteamBridgeProvider, SteamWebApiProvider, WorkshopError, WorkshopResolver,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 
 use support::{create_test_vpk, item_record, make_engine, make_engine_with_events, RecordedEvents};
 
@@ -546,6 +554,22 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
         None,
         b"w1",
     );
+    create_test_vpk(
+        &loading_dir.join("s1.vpk"),
+        "Zoey Model Part 1",
+        "AuthorS",
+        false,
+        None,
+        b"s1",
+    );
+    create_test_vpk(
+        &loading_dir.join("s2.vpk"),
+        "Zoey Model Part 2",
+        "AuthorS",
+        false,
+        None,
+        b"s2",
+    );
 
     let bridge = Arc::new(MockSteamBridge::new(true));
     let col_id = WorkshopId::new(55555).unwrap();
@@ -594,7 +618,16 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
         .id
         .clone();
 
-    // Auto bundle aggregates Yama Part 1 + Part 2 and combines their maps!
+    // scan() automatically builds the campaign bundle for Yama (clean name "Yama", ordered parts)
+    // and ignores non-campaign Zoey Model Part 1/2!
+    assert_eq!(snap.bundles.len(), 1);
+    assert_eq!(snap.bundles[0].name, "Yama");
+    assert_eq!(
+        snap.bundles[0].member_addon_ids,
+        vec![p1_id.clone(), p2_id.clone()]
+    );
+    assert_eq!(snap.bundles[0].maps.len(), 2);
+
     let bundles = engine.rebuild_bundles().unwrap();
     assert_eq!(bundles.len(), 1);
     assert_eq!(bundles[0].maps.len(), 2);
@@ -665,14 +698,16 @@ async fn grouping_bundles_locked_collections_and_profiles_work_cleanly() {
     let apply_report = engine
         .apply_profile(&ProfileId("prof_clean".into()))
         .unwrap();
-    assert_eq!(apply_report.disabled_count, 1);
-    assert_eq!(apply_report.batch.items[0].addon_id, w1_id);
-    assert_eq!(
-        apply_report.batch.items[0].outcome,
-        AddonOperationOutcome::Applied
-    );
+    assert_eq!(apply_report.disabled_count, 3);
+    assert!(apply_report
+        .batch
+        .items
+        .iter()
+        .any(|i| i.addon_id == w1_id && i.outcome == AddonOperationOutcome::Applied));
     assert_eq!(apply_report.batch.refresh_error, None);
     assert!(loading_dir.join("w1.vpk.disabled").exists());
+    assert!(loading_dir.join("s1.vpk.disabled").exists());
+    assert!(loading_dir.join("s2.vpk.disabled").exists());
     assert!(loading_dir.join("p1.vpk").exists());
 }
 
@@ -1929,4 +1964,787 @@ async fn subscribed_workshop_ids_come_from_the_steam_bridge() {
         engine.subscribed_workshop_ids().await,
         Err(CoreError::Workshop(WorkshopError::Unsupported(_)))
     ));
+}
+
+#[test]
+fn deleting_part_clears_stale_auto_bundle_and_config_roundtrips_preferences() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    create_test_vpk(
+        &loading.join("sakura_1.vpk"),
+        "樱花战役",
+        "Mapper",
+        true,
+        None,
+        b"part-1",
+    );
+    create_test_vpk(
+        &loading.join("sakura_2.vpk"),
+        "樱花战役",
+        "Mapper",
+        false,
+        None,
+        b"part-2",
+    );
+
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        addon_name_preference: l4a_protocol::AddonNamePreference::FileName,
+        collapse_campaign_bundles: false,
+        ..Default::default()
+    };
+    let engine = make_engine(dir.path(), cfg, Arc::new(MockSteamBridge::new(false)));
+    let snap = engine.scan().unwrap();
+    assert_eq!(snap.bundles.len(), 1);
+    assert_eq!(snap.bundles[0].member_addon_ids.len(), 2);
+
+    // Deleting one part immediately drops the 1-member auto-bundle without needing a manual rescan.
+    let first_id = snap.addons[0].id.clone();
+    engine.delete_addons(&[first_id], true, true).unwrap();
+    let after_delete = engine.snapshot().unwrap();
+    assert_eq!(after_delete.addons.len(), 1);
+    assert!(after_delete.bundles.is_empty());
+
+    // Saving config writes valid TOML with scalar preferences preserved across Engine restarts.
+    let updated_cfg = AppConfig {
+        addon_name_preference: l4a_protocol::AddonNamePreference::FileName,
+        collapse_campaign_bundles: false,
+        ..engine.config()
+    };
+    engine.save_config(updated_cfg).unwrap();
+    drop(engine);
+
+    let reopened =
+        L4aEngine::open_default(dir.path().join("runtime"), Arc::new(NullEventSink)).unwrap();
+    assert_eq!(
+        reopened.config().addon_name_preference,
+        l4a_protocol::AddonNamePreference::FileName
+    );
+    assert!(!reopened.config().collapse_campaign_bundles);
+}
+
+async fn serve_workshop_fixture(app: Router) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn serve_catalog_items(items: Arc<Mutex<Vec<WorkshopItemRecord>>>) -> String {
+    serve_workshop_fixture(Router::new().route(
+        "/api/v1/items/batch",
+        post(move |Json(batch): Json<BatchItemsRequest>| async move {
+            Json(BatchItemsResponse {
+                items: items
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| batch.ids.contains(&item.workshop_id))
+                    .cloned()
+                    .collect(),
+                missing_ids: Vec::new(),
+            })
+        }),
+    ))
+    .await
+}
+
+#[tokio::test]
+async fn hydration_uses_web_api_without_sdk_and_legacy_urls_work_through_http_mirror() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    let fixture = dir.path().join("fixture.vpk");
+    create_test_vpk(&fixture, "Remote Mod", "Mapper", false, None, b"remote");
+    create_test_vpk(
+        &loading.join("909901.vpk"),
+        "Local Mod",
+        "Mapper",
+        false,
+        None,
+        b"local",
+    );
+
+    let cover = "http://cloud-3.steamusercontent.com/ugc/909901/cover.jpg";
+    let file = "http://cloud-3.steamusercontent.com/ugc/909902/mod.vpk";
+    let body = std::fs::read(&fixture).unwrap();
+    let app = Router::new()
+        .route(
+            "/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+            post(move || async move {
+                Json(serde_json::json!({"response": {"publishedfiledetails": [
+                    {"publishedfileid": "909901", "result": 1, "title": "Web API Mod", "preview_url": cover, "file_url": file},
+                    {"publishedfileid": "909902", "result": 1, "title": "Remote Mod", "file_url": file}
+                ]}}))
+            }),
+        )
+        .route(
+            "/ugc/909901/cover.jpg",
+            get(|| async { ([("content-type", "image/jpeg")], vec![0xff, 0xd8, 0xff]) }),
+        )
+        .route("/ugc/909902/mod.vpk", get(move || async move { body }));
+    let base_url = serve_workshop_fixture(app).await;
+    let mirror = Arc::new(MirrorRouter::from_rules(vec![serde_json::from_value(
+        serde_json::json!({
+            "rules": "cloud-3.steamusercontent.com",
+            "target": base_url.strip_prefix("http://").unwrap(),
+        }),
+    )
+    .unwrap()]));
+
+    let bridge = Arc::new(MockSteamBridge::new(true));
+    let mut steam_item = item_record(909901, "SDK Mod", 1_710_000_000, vec![]);
+    steam_item.file_url = Some(file.into());
+    bridge.insert_item(steam_item);
+    let resolver = Arc::new(WorkshopResolver::new(
+        vec![
+            Arc::new(SteamBridgeProvider::new(bridge.clone())),
+            Arc::new(SteamWebApiProvider::with_base_url(base_url, mirror.clone())),
+        ],
+        SourceRoutingPolicy::default(),
+    ));
+    let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
+    let engine = L4aEngine::with_dependencies(
+        paths,
+        Arc::new(LocalDb::open_in_memory().unwrap()),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            max_download_retries: 0,
+            ..Default::default()
+        },
+        mirror,
+        bridge,
+        resolver,
+        Arc::new(NullEventSink),
+    )
+    .unwrap();
+    engine.scan().unwrap();
+
+    let wid = WorkshopId(909901);
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 1);
+    let snapshot = engine.db().get_workshop_snapshot(wid).unwrap().unwrap();
+    assert_eq!(snapshot.source, MetadataSource::SteamWebApi);
+    assert_eq!(snapshot.file_url.as_deref(), Some(file));
+    let cover_url = engine.snapshot().unwrap().addons[0]
+        .cover_image
+        .clone()
+        .unwrap();
+    assert_eq!(cover_url, cover);
+    assert_eq!(
+        engine.fetch_workshop_cover(&cover_url).await.unwrap(),
+        ("image/jpeg".into(), vec![0xff, 0xd8, 0xff])
+    );
+    let downloaded = engine
+        .download_workshop_item(WorkshopId(909902))
+        .await
+        .unwrap();
+    assert_eq!(downloaded.install_state, InstallState::Installed);
+    assert_eq!(
+        engine.fetch_workshop_item(wid).await.unwrap().title,
+        "SDK Mod"
+    );
+}
+
+#[tokio::test]
+async fn hydration_retries_web_api_item_timeouts_after_backoff() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    let wid = WorkshopId(909905);
+    create_test_vpk(
+        &loading.join(format!("{wid}.vpk")),
+        "Local Mod",
+        "Mapper",
+        false,
+        None,
+        b"local",
+    );
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let base_url = serve_workshop_fixture(Router::new().route(
+        "/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        post({
+            let requests = requests.clone();
+            move || async move {
+                let details = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    serde_json::json!({"publishedfileid": wid.to_string(), "result": 16})
+                } else {
+                    serde_json::json!({
+                        "publishedfileid": wid.to_string(),
+                        "result": 1,
+                        "title": "Workshop Mod"
+                    })
+                };
+                Json(serde_json::json!({"response": {"publishedfiledetails": [details]}}))
+            }
+        }),
+    ))
+    .await;
+    let mirror = Arc::new(MirrorRouter::empty());
+    let resolver = Arc::new(WorkshopResolver::new(
+        vec![Arc::new(SteamWebApiProvider::with_base_url(
+            base_url,
+            mirror.clone(),
+        ))],
+        SourceRoutingPolicy::default(),
+    ));
+    let engine = L4aEngine::with_dependencies(
+        AppPaths::from_runtime_dir(dir.path().join("runtime")),
+        Arc::new(LocalDb::open_in_memory().unwrap()),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            ..Default::default()
+        },
+        mirror,
+        Arc::new(MockSteamBridge::new(false)),
+        resolver,
+        Arc::new(NullEventSink),
+    )
+    .unwrap();
+    engine.scan().unwrap();
+
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    assert!(engine.db().get_workshop_snapshot(wid).unwrap().is_none());
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    engine.expire_hydration_backoff_for_test();
+    engine.scan().unwrap();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 1);
+    let addon = engine.db().get_addon_by_workshop_id(wid).unwrap().unwrap();
+    assert_eq!(addon.remote_status, WorkshopItemStatus::Active);
+    assert_eq!(addon.workshop_title.as_deref(), Some("Workshop Mod"));
+}
+
+#[tokio::test]
+async fn hydration_discards_stale_tombstones_and_backoff_after_catalog_change() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    for (wid, title) in [(909903, "First Mod"), (909904, "Second Mod")] {
+        create_test_vpk(
+            &loading.join(format!("{wid}.vpk")),
+            title,
+            "Mapper",
+            false,
+            None,
+            b"local",
+        );
+    }
+
+    let old_request = Arc::new(Notify::new());
+    let release_old = Arc::new(Notify::new());
+    let old_url = serve_workshop_fixture(Router::new().route(
+        "/api/v1/items/batch",
+        post({
+            let old_request = old_request.clone();
+            let release_old = release_old.clone();
+            move || async move {
+                old_request.notify_one();
+                release_old.notified().await;
+                let mut removed = item_record(909903, "Old Catalog", 1_710_000_000, vec![]);
+                removed.status = WorkshopItemStatus::Removed;
+                Json(BatchItemsResponse {
+                    items: vec![removed],
+                    missing_ids: vec![WorkshopId(909904)],
+                })
+            }
+        }),
+    ))
+    .await;
+    let new_url = serve_catalog_items(Arc::new(Mutex::new(vec![
+        item_record(909903, "First From New Catalog", 1_720_000_000, vec![]),
+        item_record(909904, "Second From New Catalog", 1_720_000_000, vec![]),
+    ])))
+    .await;
+    let config = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        https_only: false,
+        catalog_server_url: Some(old_url),
+        source_order: vec!["catalog-server".into()],
+        ..Default::default()
+    };
+    let engine = Arc::new(make_engine(
+        dir.path(),
+        config.clone(),
+        Arc::new(MockSteamBridge::new(false)),
+    ));
+    engine.save_config(config).unwrap();
+    engine.scan().unwrap();
+
+    let hydration = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.hydrate_missing_workshop_metadata().await.unwrap() }
+    });
+    tokio::time::timeout(Duration::from_secs(5), old_request.notified())
+        .await
+        .unwrap();
+    engine
+        .save_config(AppConfig {
+            catalog_server_url: Some(new_url),
+            ..engine.config()
+        })
+        .unwrap();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    release_old.notify_one();
+    assert_eq!(hydration.await.unwrap(), 2);
+    let snapshots = engine.db().list_workshop_snapshots().unwrap();
+    assert_eq!(
+        snapshots[&WorkshopId(909903)].status,
+        WorkshopItemStatus::Active
+    );
+    assert_eq!(
+        snapshots[&WorkshopId(909903)].title,
+        "First From New Catalog"
+    );
+    assert_eq!(
+        snapshots[&WorkshopId(909904)].title,
+        "Second From New Catalog"
+    );
+}
+
+#[tokio::test]
+async fn hydrates_missing_workshop_metadata_prefers_workshop_cover_and_caches_remote_image() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+
+    // Create two campaign parts in loading_dir with Workshop IDs in filename, plus a Steam-style sidecar JPG.
+    create_test_vpk(
+        &loading.join("[910001] yama_main.vpk"),
+        "Yama",
+        "Mapper",
+        true,
+        Some("l4d_yama_1"),
+        b"yama-part-1",
+    );
+    create_test_vpk(
+        &loading.join("[910002] yama_assets.vpk"),
+        "Yama Assets",
+        "Mapper",
+        false,
+        None,
+        b"yama-part-2",
+    );
+    // Minimal JPEG magic header + EOI so image::guess_format detects JPEG for the sidecar.
+    let minimal_jpeg = vec![
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ];
+    std::fs::write(workshop.join("910001.jpg"), &minimal_jpeg).unwrap();
+
+    let mut main_item = item_record(
+        910001,
+        "Yama Campaign Remastered",
+        1_710_000_000,
+        vec![910002],
+    );
+    // Preserve the source URL so mirror routing can choose the connection protocol.
+    main_item.preview_url =
+        Some("http://cloud-3.steamusercontent.com/ugc/910001/preview.jpg".into());
+    let asset_item = item_record(910002, "Yama Assets Pack", 1_710_000_000, vec![]);
+    let catalog_url = serve_catalog_items(Arc::new(Mutex::new(vec![main_item, asset_item]))).await;
+
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        workshop_dir: workshop.to_string_lossy().into_owned(),
+        https_only: false,
+        catalog_server_url: Some(catalog_url),
+        source_order: vec!["catalog-server".into()],
+        ..Default::default()
+    };
+    let engine = make_engine(
+        dir.path(),
+        cfg.clone(),
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.save_config(cfg).unwrap();
+    let initial = engine.scan().unwrap();
+    let before = initial
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(910001)))
+        .unwrap();
+    assert_eq!(before.title, "Yama");
+    assert_eq!(before.workshop_title, None);
+    assert!(before
+        .local_cover_image
+        .as_deref()
+        .is_some_and(|name| name.ends_with("_sidecar.jpg")));
+    assert_eq!(before.cover_image, before.local_cover_image);
+
+    let hydrated = engine.hydrate_missing_workshop_metadata().await.unwrap();
+    assert_eq!(hydrated, 2);
+    // Second pass is a no-op once snapshots are hydrated.
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+
+    let after_snap = engine.snapshot().unwrap();
+    let after = after_snap
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(910001)))
+        .unwrap();
+    assert_eq!(
+        after.workshop_title.as_deref(),
+        Some("Yama Campaign Remastered")
+    );
+    assert_eq!(after.addon_title.as_deref(), Some("Yama"));
+    assert_eq!(after.title, "Yama Campaign Remastered");
+    assert_eq!(
+        after.cover_image.as_deref(),
+        Some("http://cloud-3.steamusercontent.com/ugc/910001/preview.jpg")
+    );
+    assert_eq!(after.local_cover_image, before.local_cover_image);
+    assert_eq!(after_snap.bundles.len(), 1);
+    assert_eq!(
+        after_snap.bundles[0].kind,
+        l4a_protocol::BundleKind::DependencyGraph
+    );
+
+    // Batch rename honors WorkshopTitle (default) vs AddonTitle preference.
+    let rules = engine.config().rename_rules;
+    let preview_ws = engine
+        .preview_rename(&rules, std::slice::from_ref(&after.id))
+        .unwrap();
+    assert_eq!(
+        preview_ws[0].target_file_name,
+        "[910001] Yama Campaign Remastered.vpk"
+    );
+    engine
+        .save_config(AppConfig {
+            addon_name_preference: l4a_protocol::AddonNamePreference::AddonTitle,
+            ..engine.config()
+        })
+        .unwrap();
+    let preview_addon = engine
+        .preview_rename(&rules, std::slice::from_ref(&after.id))
+        .unwrap();
+    assert_eq!(preview_addon[0].target_file_name, "[910001] Yama.vpk");
+
+    // Remote cover fetching persists valid images to disk cache, while HTML error pages disguised as image/jpeg are never cached.
+    let hits = Arc::new(AtomicUsize::new(0));
+    let poison_hits = Arc::new(AtomicUsize::new(0));
+    let hits_route = hits.clone();
+    let poison_route = poison_hits.clone();
+    let jpeg_payload = minimal_jpeg.clone();
+    let app = Router::new()
+        .route(
+            "/ws-cover.jpg",
+            get(move || {
+                let hits_route = hits_route.clone();
+                let body = jpeg_payload.clone();
+                async move {
+                    hits_route.fetch_add(1, Ordering::SeqCst);
+                    ([("content-type", "image/jpeg")], body)
+                }
+            }),
+        )
+        .route(
+            "/captive-portal.jpg",
+            get(move || {
+                let poison_route = poison_route.clone();
+                async move {
+                    poison_route.fetch_add(1, Ordering::SeqCst);
+                    (
+                        [("content-type", "image/jpeg")],
+                        b"<html>Gateway Error</html>".to_vec(),
+                    )
+                }
+            }),
+        );
+    let cover_server_url = serve_workshop_fixture(app).await;
+    let cover_url = format!("{cover_server_url}/ws-cover.jpg");
+    let first_fetch = engine.fetch_workshop_cover(&cover_url).await.unwrap();
+    let second_fetch = engine.fetch_workshop_cover(&cover_url).await.unwrap();
+    assert_eq!(first_fetch.0, "image/jpeg");
+    assert_eq!(first_fetch, second_fetch);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let poison_url = format!("{cover_server_url}/captive-portal.jpg");
+    let _ = engine.fetch_workshop_cover(&poison_url).await.unwrap();
+    let _ = engine.fetch_workshop_cover(&poison_url).await.unwrap();
+    // Must re-fetch because non-image HTML payload was not written to ws_cover_* disk cache.
+    assert_eq!(poison_hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn scan_refreshes_legacy_sidecar_cover_without_changing_the_vpk() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+    create_test_vpk(
+        &loading.join("920001.vpk"),
+        "Outpost",
+        "Mapper",
+        false,
+        None,
+        b"vpk",
+    );
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            workshop_dir: workshop.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let jpeg = |pixel: [u8; 3]| {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&pixel, 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        bytes
+    };
+    let original = jpeg([255, 0, 0]);
+    let sidecar = workshop.join("920001.jpg");
+    std::fs::write(&sidecar, &original).unwrap();
+
+    let mut addon = engine.scan().unwrap().addons.pop().unwrap();
+    let vpk_hash = addon.content_hash.as_deref().unwrap();
+    let legacy_key = format!("{}_sidecar.jpg", &vpk_hash[..16]);
+    let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
+    std::fs::write(paths.image_cache_dir.join(&legacy_key), original).unwrap();
+    addon.cover_image = Some(legacy_key.clone());
+    addon.local_cover_image = Some(legacy_key.clone());
+    engine.db().upsert_addon(&addon).unwrap();
+
+    let replacement = jpeg([0, 0, 255]);
+    std::fs::write(&sidecar, &replacement).unwrap();
+    let refreshed = engine.scan().unwrap().addons.pop().unwrap();
+    let new_key = refreshed.local_cover_image.as_deref().unwrap();
+    assert_eq!(refreshed.content_hash, addon.content_hash);
+    assert_ne!(new_key, legacy_key);
+    assert_eq!(refreshed.cover_image.as_deref(), Some(new_key));
+    assert_eq!(engine.read_cached_image(new_key).unwrap(), replacement);
+    assert_eq!(
+        engine.scan().unwrap().addons[0]
+            .local_cover_image
+            .as_deref(),
+        Some(new_key)
+    );
+}
+
+#[tokio::test]
+async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::SystemTime;
+
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+
+    // 1. VPK scanned BEFORE Steam writes workshop/<wid>.jpg picks up the sidecar on an unchanged rescan.
+    create_test_vpk(
+        &loading.join("[920001] outpost.vpk"),
+        "Outpost",
+        "Mapper",
+        false,
+        None,
+        b"outpost-vpk",
+    );
+    create_test_vpk(
+        &loading.join("[920002] transient.vpk"),
+        "Transient",
+        "Mapper",
+        false,
+        None,
+        b"transient-vpk",
+    );
+
+    let catalog_items = Arc::new(Mutex::new(Vec::new()));
+    let catalog_url = serve_catalog_items(catalog_items.clone()).await;
+    let cfg = AppConfig {
+        loading_dir: loading.to_string_lossy().into_owned(),
+        workshop_dir: workshop.to_string_lossy().into_owned(),
+        https_only: false,
+        catalog_server_url: Some(catalog_url),
+        source_order: vec!["catalog-server".into()],
+        ..Default::default()
+    };
+    let engine = make_engine(
+        dir.path(),
+        cfg.clone(),
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.save_config(cfg).unwrap();
+
+    let snap1 = engine.scan().unwrap();
+    let a1 = snap1
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1.local_cover_image, None);
+
+    let minimal_jpeg = vec![
+        0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xd9,
+    ];
+    std::fs::write(workshop.join("920001.jpg"), &minimal_jpeg).unwrap();
+
+    // Rescan without modifying outpost.vpk: must discover 920001.jpg sidecar!
+    let snap2 = engine.scan().unwrap();
+    let a1_after_sidecar = snap2
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    let sidecar_key = a1_after_sidecar
+        .local_cover_image
+        .clone()
+        .expect("sidecar discovered on unchanged scan");
+    assert!(sidecar_key.ends_with("_sidecar.jpg"));
+
+    // 2. Transient missing provider outcome backs off briefly, then retries once backoff expires.
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    let mut item_920002 = item_record(920002, "Transient Hydrated", 1_720_000_000, vec![]);
+    item_920002.tags = vec![];
+    catalog_items.lock().unwrap().push(item_920002);
+    // Still inside backoff window -> skipped
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    // Backoff expires -> retried and hydrated!
+    engine.expire_hydration_backoff_for_test();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 1);
+
+    // 3. Non-ASCII invalid relative cover URL (where byte 7/8 fall inside multi-byte UTF-8 chars) never panics
+    // and falls back to local_cover_image; also Workshop Sync snapshot is not overwritten by hydration.
+    let mut item_920001 = item_record(920001, "Outpost Synced", 1_720_000_500, vec![]);
+    item_920001.preview_url = Some("封面图片路径/preview.jpg".into());
+    item_920001.tags = vec!["Weapons".into()];
+    engine
+        .db()
+        .upsert_workshop_snapshot(&item_920001, true)
+        .unwrap();
+
+    // Even if the provider has an older title, hydration keeps the synced snapshot.
+    let stale_item = item_record(920001, "Stale Hydration Title", 1_700_000_000, vec![]);
+    catalog_items.lock().unwrap().push(stale_item);
+    engine.expire_hydration_backoff_for_test();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+
+    let snap3 = engine.snapshot().unwrap();
+    let a1_utf8 = snap3
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1_utf8.workshop_title.as_deref(), Some("Outpost Synced"));
+    assert_eq!(a1_utf8.cover_image.as_deref(), Some(sidecar_key.as_str()));
+    assert_eq!(a1_utf8.categories, vec!["Weapon".to_string()]);
+
+    // 4. Unchanged scan + toggle must NOT persist Workshop-derived "Weapon" into local categories_json.
+    let _ = engine.scan().unwrap();
+    engine
+        .toggle_addons(std::slice::from_ref(&a1_utf8.id), false, false)
+        .unwrap();
+    item_920001.tags = vec!["Survivors".into()];
+    engine
+        .db()
+        .upsert_workshop_snapshot(&item_920001, true)
+        .unwrap();
+    let snap4 = engine.snapshot().unwrap();
+    let a1_retagged = snap4
+        .addons
+        .iter()
+        .find(|a| a.workshop_id == Some(WorkshopId(920001)))
+        .unwrap();
+    assert_eq!(a1_retagged.categories, vec!["Survivor".to_string()]);
+
+    // 5. Expired cached Workshop covers revalidate with origin, and fall back to stale bytes when upstream is 503.
+    let minimal_png: Vec<u8> = vec![
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00,
+    ];
+    let version_two = Arc::new(AtomicBool::new(false));
+    let fail_upstream = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(AtomicUsize::new(0));
+    let v2_route = version_two.clone();
+    let fail_route = fail_upstream.clone();
+    let hits_route = hits.clone();
+    let jpg_body = minimal_jpeg.clone();
+    let png_body = minimal_png.clone();
+    let app = Router::new().route(
+        "/rotating.img",
+        get(move || {
+            let v2 = v2_route.load(Ordering::SeqCst);
+            let fail = fail_route.load(Ordering::SeqCst);
+            let hits_route = hits_route.clone();
+            let jpg = jpg_body.clone();
+            let png = png_body.clone();
+            async move {
+                hits_route.fetch_add(1, Ordering::SeqCst);
+                if fail {
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [("content-type", "text/plain")],
+                        b"upstream down".to_vec(),
+                    );
+                }
+                if v2 {
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "image/png")],
+                        png,
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "image/jpeg")],
+                        jpg,
+                    )
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let rotating_url = format!("http://{addr}/rotating.img");
+    let (mime1, bytes1) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime1, "image/jpeg");
+    assert_eq!(bytes1, minimal_jpeg);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    let expire_cache = |cache_dir: &std::path::Path| {
+        let expired_time = SystemTime::now() - Duration::from_secs(90_000);
+        for entry in std::fs::read_dir(cache_dir).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("ws_cover_") {
+                let f = std::fs::File::options()
+                    .write(true)
+                    .open(entry.path())
+                    .unwrap();
+                f.set_modified(expired_time).unwrap();
+            }
+        }
+    };
+
+    // Expire cache + switch origin to v2 PNG -> revalidates and updates cached format!
+    let cache_dir = AppPaths::from_runtime_dir(dir.path().join("runtime")).image_cache_dir;
+    expire_cache(&cache_dir);
+    version_two.store(true, Ordering::SeqCst);
+    let (mime2, bytes2) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime2, "image/png");
+    assert_eq!(bytes2, minimal_png);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // Expire cache again + origin returns 503 -> falls back to stale cached PNG!
+    expire_cache(&cache_dir);
+    fail_upstream.store(true, Ordering::SeqCst);
+    let (mime3, bytes3) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime3, "image/png");
+    assert_eq!(bytes3, minimal_png);
+    assert_eq!(hits.load(Ordering::SeqCst), 3);
 }

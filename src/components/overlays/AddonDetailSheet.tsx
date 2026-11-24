@@ -18,18 +18,26 @@ import {
   Store,
   Trash2,
 } from 'lucide-react';
-import type { AddonSummary, BundleRecord, UserGroup } from '../../api/ipc';
+import type {
+  AddonNamePreference,
+  AddonSummary,
+  BundleRecord,
+  UserGroup,
+} from '../../api/ipc';
 import {
   buildSteamProtocolUrl,
   buildWorkshopUrl,
+  formatAddonDisplayName,
   formatBytes,
   formatTimestamp,
+  resolveAddonMetadataTitle,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
 import { Button, FilterChip, IconButton, SideSheet, Switch, Tabs } from '../m3/primitives';
 
 export interface AddonDetailSheetProps {
   addon: AddonSummary | null;
+  namePreference?: AddonNamePreference;
   bundles: BundleRecord[];
   userGroups: UserGroup[];
   busy: boolean;
@@ -57,6 +65,7 @@ function isZeroContentFlag(key: string, value: string): boolean {
 
 export function AddonDetailSheet({
   addon,
+  namePreference = 'workshop_title',
   bundles,
   userGroups,
   busy,
@@ -98,6 +107,15 @@ export function AddonDetailSheet({
 
   if (!addon) return null;
 
+  const displayName = formatAddonDisplayName(addon, namePreference);
+  const metadataTitle = resolveAddonMetadataTitle(
+    addon,
+    namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
+  );
+  const workshopTitle = addon.workshopTitle?.trim();
+  const addonInfoTitle = addon.addonTitle?.trim();
+  const hasMaps = addon.maps.length > 0;
+  const activeTab: 'info' | 'maps' = hasMaps ? tab : 'info';
   const memberBundles = bundles.filter((b) => b.memberAddonIds.includes(addon.id));
   const memberGroups = userGroups.filter((g) => g.addonIds.includes(addon.id));
   const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
@@ -111,7 +129,7 @@ export function AddonDetailSheet({
   return (
     <SideSheet
       open={Boolean(addon)}
-      title={addon.title}
+      title={displayName}
       onClose={onClose}
       headerTrailing={
         installed ? (
@@ -155,7 +173,7 @@ export function AddonDetailSheet({
               size="sm"
               disabled={busy}
               icon={<Download size={15} />}
-              onClick={() => onDownload(addon.workshopId!, addon.title)}
+              onClick={() => onDownload(addon.workshopId!, metadataTitle)}
             >
               {t('common.download')}
             </Button>
@@ -166,7 +184,7 @@ export function AddonDetailSheet({
               size="sm"
               disabled={busy}
               icon={<ArrowUpCircle size={15} />}
-              onClick={() => onUpdate(addon.workshopId!, addon.title)}
+              onClick={() => onUpdate(addon.workshopId!, metadataTitle)}
             >
               {t('common.update')}
             </Button>
@@ -184,24 +202,26 @@ export function AddonDetailSheet({
         </>
       }
     >
-      <Tabs
-        compact
-        idPrefix={tabsId}
-        value={tab}
-        onChange={setTab}
-        tabs={[
-          { value: 'info', label: t('detail.info') },
-          { value: 'maps', label: t('detail.maps'), count: addon.maps.length },
-        ]}
-      />
+      {hasMaps && (
+        <Tabs
+          compact
+          idPrefix={tabsId}
+          value={activeTab}
+          onChange={setTab}
+          tabs={[
+            { value: 'info', label: t('detail.info') },
+            { value: 'maps', label: t('detail.maps'), count: addon.maps.length },
+          ]}
+        />
+      )}
 
       <div
         className="md-sheet-body"
-        role="tabpanel"
-        id={`${tabsId}-panel-${tab}`}
-        aria-labelledby={`${tabsId}-tab-${tab}`}
+        role={hasMaps ? 'tabpanel' : undefined}
+        id={hasMaps ? `${tabsId}-panel-${activeTab}` : undefined}
+        aria-labelledby={hasMaps ? `${tabsId}-tab-${activeTab}` : undefined}
       >
-        {tab === 'info' ? (
+        {activeTab === 'info' ? (
           <>
             <div
               className="l4a-addon-cover-wrap"
@@ -209,7 +229,8 @@ export function AddonDetailSheet({
             >
               <AddonCover
                 src={addon.coverImage}
-                title={addon.title}
+                fallbackSrc={addon.localCoverImage}
+                title={displayName}
                 category={addon.categories[0]}
               />
               <div className="l4a-cover-overlay-top">
@@ -325,6 +346,18 @@ export function AddonDetailSheet({
                 <span className="l4a-kv-label">{t('detail.filesCount')}</span>
                 <span className="l4a-kv-value">{addon.filesCount}</span>
               </div>
+              {workshopTitle && workshopTitle !== displayName && (
+                <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
+                  <span className="l4a-kv-label">{t('detail.workshopTitle')}</span>
+                  <span className="l4a-kv-value selectable">{workshopTitle}</span>
+                </div>
+              )}
+              {addonInfoTitle && addonInfoTitle !== displayName && addonInfoTitle !== workshopTitle && (
+                <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
+                  <span className="l4a-kv-label">{t('detail.addonTitle')}</span>
+                  <span className="l4a-kv-value selectable">{addonInfoTitle}</span>
+                </div>
+              )}
               <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                 <span className="l4a-kv-label">{t('detail.fileName')}</span>
                 <span className="l4a-kv-value md-mono selectable">
@@ -549,9 +582,11 @@ export function AddonDetailSheet({
                   variant="tonal"
                   size="sm"
                   icon={<Copy size={13} />}
-                  onClick={() => onCopy(`map ${m.code}`)}
+                  title={t('detail.copyMapCode')}
+                  aria-label={`${t('detail.copyMapCode')} ${m.code}`}
+                  onClick={() => onCopy(m.code)}
                 >
-                  {t('detail.copyMapCmd', { code: m.code })}
+                  {t('common.copy')}
                 </Button>
               </div>
             ))}

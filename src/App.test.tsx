@@ -78,18 +78,203 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(await screen.findByText('Manual Addons Directory (addons)')).toBeTruthy();
   });
 
-  it('shows explorer action and clickable AddonInfo URL in detail sheet', async () => {
+  it('collapses campaign bundles in Library and drills down into member AddonInfo URLs', async () => {
     render(<App />);
+    // Chernobyl Assets Pack is collapsed under the Chernobyl: Chapter One campaign bundle card by default
     const trigger = await screen.findByRole('button', { name: 'Chernobyl: Chapter One' });
+    expect(screen.queryByRole('button', { name: 'Chernobyl Assets Pack' })).toBeNull();
     fireEvent.click(trigger);
 
-    const sheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
-    expect(within(sheet).getByRole('button', { name: 'Show in Explorer' })).toBeTruthy();
+    const bundleSheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
+    expect(within(bundleSheet).getByRole('tab', { name: /Members/ })).toBeTruthy();
+    expect(within(bundleSheet).getByRole('tab', { name: /Maps/ })).toBeTruthy();
+
+    // Drill down from bundle member #1 into the full AddonDetailSheet
+    fireEvent.click(within(bundleSheet).getByText('Chernobyl Assets Pack'));
+    const assetSheet = await screen.findByRole('dialog', { name: 'Chernobyl Assets Pack' });
+    // Non-map asset pack must NOT render a "Maps 0" tab
+    expect(within(assetSheet).queryByRole('tab', { name: /Maps/ })).toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Toggle Group Parts off to expand individual parts in Library, then open Chapter One detail sheet
+    fireEvent.click(screen.getByRole('button', { name: 'Group Parts' }));
+    expect(await screen.findByRole('button', { name: 'Chernobyl Assets Pack' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Chernobyl: Chapter One' }));
+
+    const detailSheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
+    expect(within(detailSheet).getByRole('button', { name: 'Show in Explorer' })).toBeTruthy();
     expect(
-      within(sheet).getByRole('button', {
+      within(detailSheet).getByRole('button', {
         name: 'https://steamcommunity.com/sharedfiles/filedetails/?id=2814104912',
       }),
     ).toBeTruthy();
+  });
+
+  it.each(['grid', 'list'])('limits the %s bundle switch to visible manual parts', async (layout) => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    const bundle = snapshot.bundles[0];
+    const [chapter, assets] = snapshot.addons;
+    chapter.primaryDir = 'workshop';
+    assets.primaryDir = 'workshop';
+    const [visiblePart, hiddenPart] = [
+      { ...assets, id: 'hash:visible', title: 'Local chapters', enabled: true },
+      { ...assets, id: 'hash:hidden', title: 'Local textures', enabled: false },
+    ].map((part) => ({
+      ...part,
+      primaryDir: 'loading' as const,
+      workshopId: undefined,
+      workshopTitle: undefined,
+      addonTitle: part.title,
+    }));
+    bundle.memberAddonIds.push(visiblePart.id, hiddenPart.id);
+    snapshot.addons = [chapter, assets, visiblePart, hiddenPart];
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === 'toggle_addons' ? { items: [] } : snapshot,
+    );
+    render(<App />);
+    await screen.findByText(bundle.name);
+    if (layout === 'list') {
+      fireEvent.click(screen.getByRole('button', { name: 'List' }));
+    }
+
+    const scope = screen.getByRole('group', { name: 'Scope' });
+    expect(screen.getByRole('switch', { name: bundle.name }).getAttribute('aria-checked')).toBe(
+      'false',
+    );
+    fireEvent.click(within(scope).getByRole('button', { name: /^Workshop/ }));
+    expect(screen.getByText(bundle.name)).toBeTruthy();
+    expect(screen.queryByRole('switch', { name: bundle.name })).toBeNull();
+    fireEvent.click(screen.getByText(bundle.name));
+    const inspector = screen.getByRole('dialog', { name: bundle.name });
+    expect(within(inspector).getByRole('switch', { name: 'Disabled' })).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    fireEvent.click(within(scope).getByRole('button', { name: /^All/ }));
+    fireEvent.change(screen.getByPlaceholderText('Title, author, ID, filename'), {
+      target: { value: visiblePart.title },
+    });
+    const bundleSwitch = screen.getByRole('switch', { name: bundle.name });
+    expect(bundleSwitch.getAttribute('aria-checked')).toBe('true');
+    await act(async () => {
+      fireEvent.click(bundleSwitch);
+    });
+    expect(invokeMock).toHaveBeenCalledWith('toggle_addons', {
+      addonIds: [visiblePart.id],
+      enabled: false,
+      allowWorkshopDir: false,
+    });
+  });
+
+  it('keeps non-campaign manual and locked dependency bundle members visible', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    const members = snapshot.addons.slice(3, 7);
+    snapshot.addons = members;
+    snapshot.bundles = [
+      {
+        id: 'manual',
+        name: 'Manual bundle',
+        kind: 'manual',
+        locked: false,
+        memberAddonIds: members.slice(0, 2).map((member) => member.id),
+        maps: [],
+      },
+      {
+        id: 'legacy',
+        name: 'Legacy bundle',
+        kind: 'dependency_graph',
+        locked: true,
+        memberAddonIds: members.slice(2).map((member) => member.id),
+        maps: [],
+      },
+    ];
+    invokeMock.mockResolvedValue(snapshot);
+    render(<App />);
+
+    for (const member of members) {
+      expect(await screen.findByRole('button', { name: member.title })).toBeTruthy();
+    }
+    expect(screen.queryByRole('button', { name: 'Group Parts' })).toBeNull();
+  });
+
+  it('filters by M3 category dropdown, switches component naming preference, hides Maps 0, and copies raw map code without map prefix', async () => {
+    const writeTextMock = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText: writeTextMock } });
+
+    render(<App />);
+    await screen.findByText('Yama Campaign Remastered');
+
+    // Category filter is an M3 Select combobox instead of a sprawling chip bar
+    const categorySelect = screen.getByRole('combobox', { name: 'Category' });
+    expect(categorySelect.textContent).toContain('All categories');
+    fireEvent.click(categorySelect);
+    const categoryMenu = screen.getByRole('listbox', { name: 'Category' });
+    fireEvent.click(within(categoryMenu).getByRole('option', { name: /Weapon/ }));
+    expect(screen.getByText('Tactical M4A1 SOPMOD')).toBeTruthy();
+    expect(screen.queryByText('Yama Campaign Remastered')).toBeNull();
+
+    // Weapon addon has 0 maps -> right-side sheet must NOT show "Maps 0" tab
+    fireEvent.click(screen.getByRole('button', { name: 'Tactical M4A1 SOPMOD' }));
+    const weaponSheet = await screen.findByRole('dialog', { name: 'Tactical M4A1 SOPMOD' });
+    expect(within(weaponSheet).queryByRole('tab')).toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Selecting Map category keeps multi-part Chernobyl bundle collapsed as 2 parts (even though Part 2 is Textures/Models)
+    fireEvent.click(categorySelect);
+    fireEvent.click(
+      within(screen.getByRole('listbox', { name: 'Category' })).getByRole('option', {
+        name: /Map/,
+      }),
+    );
+    expect(screen.getByRole('button', { name: 'Chernobyl: Chapter One' })).toBeTruthy();
+    expect(screen.getByText('2 parts')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Chernobyl Assets Pack' })).toBeNull();
+
+    // Reset category back to All categories
+    fireEvent.click(categorySelect);
+    fireEvent.click(
+      within(screen.getByRole('listbox', { name: 'Category' })).getByRole('option', {
+        name: /All categories/,
+      }),
+    );
+
+    // Campaign addon with maps copies raw map ID without "map " prefix
+    fireEvent.click(await screen.findByRole('button', { name: 'Yama Campaign Remastered' }));
+    const yamaSheet = await screen.findByRole('dialog', { name: 'Yama Campaign Remastered' });
+    fireEvent.click(within(yamaSheet).getByRole('tab', { name: /Maps/ }));
+    const copyMapBtn = within(yamaSheet).getByRole('button', { name: 'Copy map ID l4d_yama_1' });
+    expect(copyMapBtn.textContent).not.toContain('map l4d_yama_1');
+    fireEvent.click(copyMapBtn);
+    await waitFor(() => {
+      expect(writeTextMock).toHaveBeenCalledWith('l4d_yama_1');
+    });
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Switch Component Name preference to Addon Info, then Filename in Settings -> Appearance
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+    let nameGroup = screen.getByRole('group', { name: 'Component Name' });
+    expect(
+      within(nameGroup)
+        .getByRole('button', { name: 'Workshop' })
+        .getAttribute('aria-pressed'),
+    ).toBe('true');
+    fireEvent.click(within(nameGroup).getByRole('button', { name: 'Addon Info' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    expect(await screen.findByRole('button', { name: 'Yama' })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Appearance' }));
+    nameGroup = screen.getByRole('group', { name: 'Component Name' });
+    fireEvent.click(within(nameGroup).getByRole('button', { name: 'Filename' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    expect(await screen.findByText('[3011942811] Yama_Campaign_Remastered')).toBeTruthy();
+    expect(screen.getByText('local_custom_soundboard')).toBeTruthy();
   });
 
   it('supports batch reconcile, help guide dialog, and inline organize inspector', async () => {
@@ -156,32 +341,90 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     });
   });
 
-  it('loads desktop remote covers through the app protocol', async () => {
+  it('loads desktop remote covers through the app protocol and falls back to localCoverImage on error', async () => {
     setTauriMode(true);
     const snapshot = await previewEngine.getDashboardSnapshot();
     const coverUrl = 'http://catalog.example.com/cover.jpg?size=64&v=2';
-    snapshot.addons[0].coverImage = coverUrl;
-    invokeMock.mockResolvedValue(snapshot);
+    snapshot.addons[2].coverImage = coverUrl;
+    snapshot.addons[2].localCoverImage = 'abcd1234_cover.jpg';
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'read_cached_image') return [0xff, 0xd8, 0xff];
+      return snapshot;
+    });
     render(<App />);
 
-    const img = await screen.findByAltText(snapshot.addons[0].title);
+    const img = await screen.findByAltText(snapshot.addons[2].title);
     const src = new URL(img.getAttribute('src')!);
     expect(src.protocol).toBe('l4a-cover:');
     expect(src.searchParams.get('url')).toBe(coverUrl);
+
+    // When the remote Workshop cover fails (e.g. offline), AddonCover falls back to the cached local VPK cover
+    fireEvent.error(img);
+    await waitFor(() => {
+      const fallbackImg = screen.getByAltText(snapshot.addons[2].title);
+      expect(fallbackImg.getAttribute('src')).toMatch(/^blob:/);
+    });
+    expect(invokeMock).toHaveBeenCalledWith('read_cached_image', {
+      cacheKey: 'abcd1234_cover.jpg',
+    });
   });
 
-  it('excludes hidden filtered-out addons from batch actions', async () => {
+  it('settles on placeholder without IPC ping-pong when both primary and fallback cache keys are missing', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.addons[2].coverImage = 'missing_primary.jpg';
+    snapshot.addons[2].localCoverImage = 'missing_fallback.jpg';
+    let cacheReads = 0;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'read_cached_image') {
+        cacheReads += 1;
+        throw new Error('not found');
+      }
+      return snapshot;
+    });
     render(<App />);
-    await screen.findByText('Chernobyl: Chapter One');
+    await screen.findByText(snapshot.addons[2].title);
 
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Chernobyl: Chapter One' }));
+    await waitFor(() => {
+      expect(cacheReads).toBe(2);
+    });
+    // Allow microtasks/effects to flush and ensure no infinite re-request loop occurs
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(cacheReads).toBe(2);
+    expect(screen.queryByAltText(snapshot.addons[2].title)).toBeNull();
+  });
+
+  it('excludes hidden filtered-out addons and non-matching bundle siblings from batch actions', async () => {
+    render(<App />);
+    await screen.findByText('Yama Campaign Remastered');
+
+    // Selecting standalone addon selects 1 item; selecting 2-part collapsed bundle adds 2 items
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Yama Campaign Remastered' }));
     expect(screen.getByText('1 selected')).toBeTruthy();
 
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Chernobyl: Chapter One' }));
+    expect(screen.getByText('3 selected')).toBeTruthy();
+
+    // Searching for one bundle member's exact Workshop ID keeps the bundle card visible,
+    // but excludes the non-matching sibling (Chernobyl Assets Pack) from batch actions!
     const searchInput = screen.getByPlaceholderText('Title, author, ID, filename');
+    fireEvent.change(searchInput, { target: { value: '2814104912' } });
+    expect(screen.getByRole('button', { name: 'Chernobyl: Chapter One' })).toBeTruthy();
+    expect(screen.getByText('1 selected')).toBeTruthy();
+    expect(screen.getByText('2 hidden')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+    const deleteDialog = await screen.findByRole('dialog', { name: 'Delete Addons' });
+    expect(within(deleteDialog).getByText('Chernobyl: Chapter One')).toBeTruthy();
+    expect(within(deleteDialog).queryByText('Chernobyl Assets Pack')).toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
     fireEvent.change(searchInput, { target: { value: 'zzzz-no-match' } });
 
     expect(screen.getByText('0 selected')).toBeTruthy();
-    expect(screen.getByText('1 hidden')).toBeTruthy();
+    expect(screen.getByText('3 hidden')).toBeTruthy();
     const deleteBtn = screen.getByRole('button', { name: 'Delete' }) as HTMLButtonElement;
     expect(deleteBtn.disabled).toBe(true);
   });
@@ -276,6 +519,58 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     const reportDialog = await screen.findByRole('dialog', { name: 'Batch Result' });
     expect(within(reportDialog).getByText('Manual recovery required')).toBeTruthy();
     expect(within(reportDialog).getByText(/Disk busy/)).toBeTruthy();
+  });
+
+  it('keeps refreshed Workshop metadata and saved preferences when a refresh overlaps a save', async () => {
+    setTauriMode(true);
+    const initial = await previewEngine.getDashboardSnapshot();
+    const savedConfig = { ...initial.config, collapseCampaignBundles: false };
+    const refreshedTitle = 'Hydrated Chernobyl Assets';
+    const refreshed: DashboardSnapshot = {
+      ...initial,
+      addons: initial.addons.map((addon) =>
+        addon.title === 'Chernobyl Assets Pack'
+          ? { ...addon, title: refreshedTitle, workshopTitle: refreshedTitle }
+          : addon,
+      ),
+    };
+    let initialRead = false;
+    let finishRefresh!: (snapshot: DashboardSnapshot) => void;
+    let finishSave!: (config: DashboardSnapshot['config']) => void;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'get_dashboard_snapshot') {
+        if (!initialRead) {
+          initialRead = true;
+          return initial;
+        }
+        return new Promise<DashboardSnapshot>((resolve) => {
+          finishRefresh = resolve;
+        });
+      }
+      if (command === 'save_config') {
+        return new Promise<DashboardSnapshot['config']>((resolve) => {
+          finishSave = resolve;
+        });
+      }
+      return initial;
+    });
+
+    await act(async () => {
+      render(<App />);
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Group Parts' }));
+    await waitFor(() => expect(eventHandler).not.toBeNull());
+    act(() => eventHandler?.({ payload: { type: 'snapshot_updated', externalChange: false } }));
+    expect(finishRefresh).toBeTypeOf('function');
+
+    await act(async () => finishSave(savedConfig));
+    expect(await screen.findByRole('button', { name: 'Chernobyl Assets Pack' })).toBeTruthy();
+    await act(async () => finishRefresh(refreshed));
+
+    expect(await screen.findByRole('button', { name: refreshedTitle })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Group Parts' }).getAttribute('aria-pressed')).toBe(
+      'false',
+    );
   });
 
   it('uses custom M3 select menu and M3 tooltip attributes instead of native browser popups', async () => {

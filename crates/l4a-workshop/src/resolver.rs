@@ -37,6 +37,16 @@ impl WorkshopResolver {
         &self.providers
     }
 
+    pub fn without_steamworks_sdk(&self) -> Self {
+        let providers = self
+            .providers
+            .iter()
+            .filter(|provider| provider.source_kind() != MetadataSource::SteamworksSdk)
+            .cloned()
+            .collect();
+        Self::new(providers, self.policy.clone())
+    }
+
     pub async fn fetch_items(
         &self,
         ids: &[WorkshopId],
@@ -150,7 +160,16 @@ impl WorkshopResolver {
             }
         }
 
-        let ordered = ids.iter().filter_map(|id| results.remove(id)).collect();
+        let ordered = ids
+            .iter()
+            .filter_map(|id| {
+                let mut outcome = results.remove(id)?;
+                if let WorkshopFetchOutcome::Found { item } = &mut outcome {
+                    normalize_item_urls(item);
+                }
+                Some(outcome)
+            })
+            .collect();
         Ok((ordered, warnings))
     }
 
@@ -164,7 +183,16 @@ impl WorkshopResolver {
                 continue;
             }
             match provider.fetch_collection(collection_id).await {
-                Ok(record) => return Ok((record, warnings)),
+                Ok(mut record) => {
+                    record.preview_url = record
+                        .preview_url
+                        .as_deref()
+                        .and_then(normalize_workshop_url);
+                    for item in &mut record.items {
+                        normalize_item_urls(item);
+                    }
+                    return Ok((record, warnings));
+                }
                 Err(WorkshopError::ScraperNotImplemented(_)) => continue,
                 Err(err) => warnings.push(format!("{}: {err}", provider.name())),
             }
@@ -185,7 +213,12 @@ impl WorkshopResolver {
                 continue;
             }
             match provider.search(query).await {
-                Ok(resp) => return Ok((resp, warnings)),
+                Ok(mut resp) => {
+                    for item in &mut resp.items {
+                        normalize_item_urls(item);
+                    }
+                    return Ok((resp, warnings));
+                }
                 Err(WorkshopError::ScraperNotImplemented(_)) => continue,
                 Err(err) => warnings.push(format!("{}: {err}", provider.name())),
             }
@@ -296,4 +329,22 @@ fn merge_item_fields(existing: &mut WorkshopItemRecord, incoming: WorkshopItemRe
     if existing.collection_children.is_empty() && !incoming.collection_children.is_empty() {
         existing.collection_children = incoming.collection_children;
     }
+}
+
+/// 清理工坊链接，保留显式协议供请求端按镜像和 HTTPS 设置处理。
+pub fn normalize_workshop_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("//") {
+        Some(format!("https:{trimmed}"))
+    } else {
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+}
+
+fn normalize_item_urls(item: &mut WorkshopItemRecord) {
+    item.preview_url = item.preview_url.as_deref().and_then(normalize_workshop_url);
+    for preview in &mut item.previews {
+        preview.url = preview.url.as_deref().and_then(normalize_workshop_url);
+    }
+    item.file_url = item.file_url.as_deref().and_then(normalize_workshop_url);
 }

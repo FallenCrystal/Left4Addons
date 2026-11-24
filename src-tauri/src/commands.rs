@@ -24,7 +24,9 @@ pub async fn get_dashboard_snapshot(
 pub async fn scan_workspace(
     state: State<'_, TauriState>,
 ) -> Result<DashboardSnapshot, DesktopError> {
-    state.engine.scan().map_err(Into::into)
+    let snapshot = state.engine.scan()?;
+    crate::spawn_workshop_hydration(&state.engine);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -215,7 +217,9 @@ pub async fn save_config(
     config: AppConfig,
     state: State<'_, TauriState>,
 ) -> Result<AppConfig, DesktopError> {
-    state.engine.save_config(config).map_err(Into::into)
+    let saved = state.engine.save_config(config)?;
+    crate::spawn_workshop_hydration(&state.engine);
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -443,11 +447,12 @@ pub async fn track_collection(
     auto_sync: bool,
     state: State<'_, TauriState>,
 ) -> Result<TrackedCollectionRecord, DesktopError> {
-    state
+    let record = state
         .engine
         .track_collection(collection_id, auto_sync)
-        .await
-        .map_err(Into::into)
+        .await?;
+    crate::spawn_workshop_hydration(&state.engine);
+    Ok(record)
 }
 
 #[tauri::command]
