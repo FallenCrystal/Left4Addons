@@ -21,14 +21,14 @@ pub(super) fn is_valid_campaign_dependency_edge(u: &BundleCandidate, v: &BundleC
     let Some(shared_root) = shared_campaign_root_key(u, v) else {
         return false;
     };
-    !u.has_standalone_fix_marker_outside(&shared_root)
-        && !v.has_standalone_fix_marker_outside(&shared_root)
+    !u.has_standalone_fix_marker_outside(shared_root)
+        && !v.has_standalone_fix_marker_outside(shared_root)
 }
 
-fn shared_campaign_root_key(u: &BundleCandidate, v: &BundleCandidate) -> Option<String> {
+fn shared_campaign_root_key<'a>(u: &'a BundleCandidate, v: &'a BundleCandidate) -> Option<&'a str> {
     for uk in &u.metadata_root_keys {
         if root_key_len_valid(uk) && v.metadata_root_keys.iter().any(|vk| vk == uk) {
-            return Some(uk.clone());
+            return Some(uk);
         }
     }
     // 支持如 `Chernobyl: Chapter One` 与 `Chernobyl Assets Pack` 这类共享战役前缀的分包关联
@@ -52,24 +52,24 @@ fn shared_campaign_root_key(u: &BundleCandidate, v: &BundleCandidate) -> Option<
             .or(v.file_clean_root_key.as_deref());
         if let (Some(uf), Some(vf)) = (u_file, v_file) {
             if uf == vf && root_key_len_valid(uf) && !is_generic_file_stem(uf) {
-                return Some(uf.to_string());
+                return Some(uf);
             }
         }
     }
     None
 }
 
-fn shared_part_prefix_key(a: &str, b: &str) -> Option<String> {
+fn shared_part_prefix_key<'a>(a: &'a str, b: &'a str) -> Option<&'a str> {
     let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     if !root_key_len_valid(shorter) {
         return None;
     }
     let rest = longer.strip_prefix(shorter)?.trim();
     if rest.is_empty() {
-        return Some(shorter.to_string());
+        return Some(shorter);
     }
     let trimmed_rest = rest.trim_start_matches([':', '-', '_', '/', '|', '(', '[', ' ']);
-    is_recognized_subpackage_qualifier(trimmed_rest).then(|| shorter.to_string())
+    is_recognized_subpackage_qualifier(trimmed_rest).then_some(shorter)
 }
 
 fn is_recognized_subpackage_qualifier(s: &str) -> bool {
@@ -105,10 +105,18 @@ pub(super) fn metadata_titles_compatible(members: &[&BundleCandidate]) -> bool {
     if titled.len() <= 1 {
         return true;
     }
-    let first = titled[0];
-    titled[1..]
+    // 每条依赖边可能匹配不同的标题。整组有标题的成员需要共享同一个词根。
+    titled
         .iter()
-        .all(|other| shared_campaign_root_key(first, other).is_some())
+        .flat_map(|m| &m.metadata_root_keys)
+        .any(|root| {
+            titled.iter().all(|member| {
+                member
+                    .metadata_root_keys
+                    .iter()
+                    .any(|key| shared_part_prefix_key(root, key) == Some(root.as_str()))
+            })
+        })
 }
 
 /// 若同组有元数据标题的成员中，仅部分成员含有「修复/补丁/汉化」标记而其他成员没有，判定为独立补丁混入并拒绝。

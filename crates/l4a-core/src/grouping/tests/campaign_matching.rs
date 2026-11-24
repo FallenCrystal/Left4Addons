@@ -185,6 +185,82 @@ fn shared_dependency_cannot_bridge_campaign_releases() {
 }
 
 #[test]
+fn shared_dependency_cannot_bridge_different_campaigns() {
+    let db = LocalDb::open_in_memory().unwrap();
+    for (wid, addon_title, workshop_title, maps, dependencies) in [
+        (
+            401,
+            "Harbor Run Part 1",
+            "Harbor Run Part 1",
+            &["harbor1"][..],
+            &[403, 404][..],
+        ),
+        (
+            402,
+            "Forest Run Part 3",
+            "Forest Run Part 3",
+            &["forest1"][..],
+            &[403, 405][..],
+        ),
+        (
+            403,
+            "Harbor Run Assets",
+            "Forest Run Assets",
+            &[][..],
+            &[][..],
+        ),
+        (
+            404,
+            "Harbor Run Part 2",
+            "Harbor Run Part 2",
+            &[][..],
+            &[][..],
+        ),
+        (
+            405,
+            "Forest Run Part 4",
+            "Forest Run Part 4",
+            &[][..],
+            &[][..],
+        ),
+    ] {
+        db.upsert_addon(&make_addon(
+            &format!("ws:{wid}"),
+            Some(wid),
+            &format!("{wid}.vpk"),
+            Some(addon_title),
+            Some("Mapper"),
+            &[],
+            maps,
+        ))
+        .unwrap();
+        db.upsert_workshop_snapshot(
+            &make_ws_snapshot(wid, workshop_title, "76561198000000001", &[], dependencies),
+            true,
+        )
+        .unwrap();
+    }
+
+    let bundles = rebuild_auto_bundles(&db).unwrap();
+    let harbor = bundles
+        .iter()
+        .find(|bundle| bundle.name == "Harbor Run")
+        .unwrap();
+    let forest = bundles
+        .iter()
+        .find(|bundle| bundle.name == "Forest Run")
+        .unwrap();
+    for (bundle, parts) in [
+        (harbor, ["ws:401", "ws:404"]),
+        (forest, ["ws:402", "ws:405"]),
+    ] {
+        for part in parts {
+            assert!(bundle.member_addon_ids.contains(&AddonId(part.into())));
+        }
+    }
+}
+
+#[test]
 fn workshop_fix_title_excludes_a_vpk_with_copied_campaign_metadata() {
     let db = LocalDb::open_in_memory().unwrap();
     for (wid, workshop_title, maps) in [

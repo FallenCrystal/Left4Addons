@@ -2150,6 +2150,78 @@ async fn hydration_uses_web_api_without_sdk_and_legacy_urls_work_through_http_mi
 }
 
 #[tokio::test]
+async fn hydration_retries_web_api_item_timeouts_after_backoff() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    let wid = WorkshopId(909905);
+    create_test_vpk(
+        &loading.join(format!("{wid}.vpk")),
+        "Local Mod",
+        "Mapper",
+        false,
+        None,
+        b"local",
+    );
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let base_url = serve_workshop_fixture(Router::new().route(
+        "/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
+        post({
+            let requests = requests.clone();
+            move || async move {
+                let details = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                    serde_json::json!({"publishedfileid": wid.to_string(), "result": 16})
+                } else {
+                    serde_json::json!({
+                        "publishedfileid": wid.to_string(),
+                        "result": 1,
+                        "title": "Workshop Mod"
+                    })
+                };
+                Json(serde_json::json!({"response": {"publishedfiledetails": [details]}}))
+            }
+        }),
+    ))
+    .await;
+    let mirror = Arc::new(MirrorRouter::empty());
+    let resolver = Arc::new(WorkshopResolver::new(
+        vec![Arc::new(SteamWebApiProvider::with_base_url(
+            base_url,
+            mirror.clone(),
+        ))],
+        SourceRoutingPolicy::default(),
+    ));
+    let engine = L4aEngine::with_dependencies(
+        AppPaths::from_runtime_dir(dir.path().join("runtime")),
+        Arc::new(LocalDb::open_in_memory().unwrap()),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            ..Default::default()
+        },
+        mirror,
+        Arc::new(MockSteamBridge::new(false)),
+        resolver,
+        Arc::new(NullEventSink),
+    )
+    .unwrap();
+    engine.scan().unwrap();
+
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    assert!(engine.db().get_workshop_snapshot(wid).unwrap().is_none());
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 0);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    engine.expire_hydration_backoff_for_test();
+    engine.scan().unwrap();
+    assert_eq!(engine.hydrate_missing_workshop_metadata().await.unwrap(), 1);
+    let addon = engine.db().get_addon_by_workshop_id(wid).unwrap().unwrap();
+    assert_eq!(addon.remote_status, WorkshopItemStatus::Active);
+    assert_eq!(addon.workshop_title.as_deref(), Some("Workshop Mod"));
+}
+
+#[tokio::test]
 async fn hydration_discards_stale_tombstones_and_backoff_after_catalog_change() {
     let dir = tempdir().unwrap();
     let loading = dir.path().join("addons");
@@ -2399,6 +2471,66 @@ async fn hydrates_missing_workshop_metadata_prefers_workshop_cover_and_caches_re
     let _ = engine.fetch_workshop_cover(&poison_url).await.unwrap();
     // Must re-fetch because non-image HTML payload was not written to ws_cover_* disk cache.
     assert_eq!(poison_hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn scan_refreshes_legacy_sidecar_cover_without_changing_the_vpk() {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    let workshop = loading.join("workshop");
+    std::fs::create_dir_all(&workshop).unwrap();
+    create_test_vpk(
+        &loading.join("920001.vpk"),
+        "Outpost",
+        "Mapper",
+        false,
+        None,
+        b"vpk",
+    );
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            workshop_dir: workshop.to_string_lossy().into_owned(),
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let jpeg = |pixel: [u8; 3]| {
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut bytes)
+            .encode(&pixel, 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        bytes
+    };
+    let original = jpeg([255, 0, 0]);
+    let sidecar = workshop.join("920001.jpg");
+    std::fs::write(&sidecar, &original).unwrap();
+
+    let mut addon = engine.scan().unwrap().addons.pop().unwrap();
+    let vpk_hash = addon.content_hash.as_deref().unwrap();
+    let legacy_key = format!("{}_sidecar.jpg", &vpk_hash[..16]);
+    let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
+    std::fs::write(paths.image_cache_dir.join(&legacy_key), original).unwrap();
+    addon.cover_image = Some(legacy_key.clone());
+    addon.local_cover_image = Some(legacy_key.clone());
+    engine.db().upsert_addon(&addon).unwrap();
+
+    let replacement = jpeg([0, 0, 255]);
+    std::fs::write(&sidecar, &replacement).unwrap();
+    let refreshed = engine.scan().unwrap().addons.pop().unwrap();
+    let new_key = refreshed.local_cover_image.as_deref().unwrap();
+    assert_eq!(refreshed.content_hash, addon.content_hash);
+    assert_ne!(new_key, legacy_key);
+    assert_eq!(refreshed.cover_image.as_deref(), Some(new_key));
+    assert_eq!(engine.read_cached_image(new_key).unwrap(), replacement);
+    assert_eq!(
+        engine.scan().unwrap().addons[0]
+            .local_cover_image
+            .as_deref(),
+        Some(new_key)
+    );
 }
 
 #[tokio::test]

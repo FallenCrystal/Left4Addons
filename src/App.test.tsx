@@ -521,6 +521,58 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(within(reportDialog).getByText(/Disk busy/)).toBeTruthy();
   });
 
+  it('keeps refreshed Workshop metadata and saved preferences when a refresh overlaps a save', async () => {
+    setTauriMode(true);
+    const initial = await previewEngine.getDashboardSnapshot();
+    const savedConfig = { ...initial.config, collapseCampaignBundles: false };
+    const refreshedTitle = 'Hydrated Chernobyl Assets';
+    const refreshed: DashboardSnapshot = {
+      ...initial,
+      addons: initial.addons.map((addon) =>
+        addon.title === 'Chernobyl Assets Pack'
+          ? { ...addon, title: refreshedTitle, workshopTitle: refreshedTitle }
+          : addon,
+      ),
+    };
+    let initialRead = false;
+    let finishRefresh!: (snapshot: DashboardSnapshot) => void;
+    let finishSave!: (config: DashboardSnapshot['config']) => void;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === 'get_dashboard_snapshot') {
+        if (!initialRead) {
+          initialRead = true;
+          return initial;
+        }
+        return new Promise<DashboardSnapshot>((resolve) => {
+          finishRefresh = resolve;
+        });
+      }
+      if (command === 'save_config') {
+        return new Promise<DashboardSnapshot['config']>((resolve) => {
+          finishSave = resolve;
+        });
+      }
+      return initial;
+    });
+
+    await act(async () => {
+      render(<App />);
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Group Parts' }));
+    await waitFor(() => expect(eventHandler).not.toBeNull());
+    act(() => eventHandler?.({ payload: { type: 'snapshot_updated', externalChange: false } }));
+    expect(finishRefresh).toBeTypeOf('function');
+
+    await act(async () => finishSave(savedConfig));
+    expect(await screen.findByRole('button', { name: 'Chernobyl Assets Pack' })).toBeTruthy();
+    await act(async () => finishRefresh(refreshed));
+
+    expect(await screen.findByRole('button', { name: refreshedTitle })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Group Parts' }).getAttribute('aria-pressed')).toBe(
+      'false',
+    );
+  });
+
   it('uses custom M3 select menu and M3 tooltip attributes instead of native browser popups', async () => {
     const { container } = render(<App />);
     await screen.findByText('Chernobyl: Chapter One');

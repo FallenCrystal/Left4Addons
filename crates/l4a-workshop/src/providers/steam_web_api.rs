@@ -220,18 +220,8 @@ impl WorkshopProvider for SteamWebApiProvider {
                         observed_at: now,
                         reason: Some("Steam Web API result=15 (AccessDenied)".into()),
                     }),
-                    Some(other) => outcomes.push(WorkshopFetchOutcome::PrivateOrUnavailable {
-                        workshop_id: wid,
-                        source: MetadataSource::SteamWebApi,
-                        observed_at: now,
-                        reason: Some(format!("Steam Web API result={other}")),
-                    }),
-                    None => outcomes.push(WorkshopFetchOutcome::PrivateOrUnavailable {
-                        workshop_id: wid,
-                        source: MetadataSource::SteamWebApi,
-                        observed_at: now,
-                        reason: Some("Steam Web API 响应缺少 result 字段".into()),
-                    }),
+                    // 超时或缺少状态的条目由其他数据源补查，或留待下次重试。
+                    _ => {}
                 }
             }
         }

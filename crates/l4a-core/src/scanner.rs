@@ -7,6 +7,7 @@ use l4a_protocol::{
     WorkshopId,
 };
 use l4a_vpk::{extract_addon_metadata, inspect_dummy_vpk, DummyInspection};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -260,23 +261,23 @@ pub(crate) fn scan_and_commit<T>(
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
             next.categories = merge_categories(stored_cats, &next.addon_info, &next.maps, &[]);
-            if next.local_cover_image.is_none() {
-                let stem_raw = strip_suffix_ascii_case(&vpk_name, ".disabled").unwrap_or(&vpk_name);
-                let file_stem = strip_suffix_ascii_case(stem_raw, ".vpk").unwrap_or(stem_raw);
-                if let Some(ref hash) = next.content_hash {
-                    if let Some(sidecar) = cache_sidecar_jpg(
-                        &path,
-                        file_stem,
-                        next.workshop_id,
-                        workshop_dir,
-                        image_cache_dir,
-                        hash,
-                    ) {
-                        if next.cover_image.is_none() {
-                            next.cover_image = Some(sidecar.clone());
-                        }
-                        next.local_cover_image = Some(sidecar);
+            if next
+                .local_cover_image
+                .as_deref()
+                .is_none_or(is_sidecar_cover)
+            {
+                let file_stem = strip_suffix_ascii_case(&vpk_name, ".vpk").unwrap_or(&vpk_name);
+                if let Some(sidecar) = cache_sidecar_jpg(
+                    &path,
+                    file_stem,
+                    next.workshop_id,
+                    workshop_dir,
+                    image_cache_dir,
+                ) {
+                    if next.cover_image == next.local_cover_image {
+                        next.cover_image = Some(sidecar.clone());
                     }
+                    next.local_cover_image = Some(sidecar);
                 }
             }
             if next.workshop_title.is_none() && next.addon_title.is_none() {
@@ -543,7 +544,6 @@ fn build_addon_summary(
                 workshop_id,
                 workshop_dir,
                 image_cache_dir,
-                &meta.content_hash,
             )
         })
         .or_else(|| {
@@ -585,13 +585,17 @@ fn build_addon_summary(
     }
 }
 
+fn is_sidecar_cover(key: &str) -> bool {
+    key.rsplit_once('.')
+        .is_some_and(|(stem, _)| stem.ends_with("_sidecar"))
+}
+
 fn cache_sidecar_jpg(
     vpk_path: &Path,
     file_stem: &str,
     workshop_id: Option<WorkshopId>,
     workshop_dir: &Path,
     image_cache_dir: &Path,
-    content_hash: &str,
 ) -> Option<String> {
     const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
     let mut candidates = Vec::with_capacity(2);
@@ -603,7 +607,6 @@ fn cache_sidecar_jpg(
             candidates.push(workshop_dir.join(format!("{wid}.jpg")));
         }
     }
-    let hash_prefix = &content_hash[..content_hash.len().min(16)];
     for candidate in candidates {
         let Ok(meta) = fs::symlink_metadata(&candidate) else {
             continue;
@@ -623,7 +626,8 @@ fn cache_sidecar_jpg(
             image::ImageFormat::Jpeg => "jpg",
             _ => continue,
         };
-        let cache_name = format!("{hash_prefix}_sidecar.{ext}");
+        let digest = Sha256::digest(&bytes);
+        let cache_name = format!("{}_sidecar.{ext}", hex::encode(&digest[..16]));
         let dest = image_cache_dir.join(&cache_name);
         if fs::symlink_metadata(&dest).is_ok_and(|m| m.is_file() && m.len() > 0) {
             return Some(cache_name);

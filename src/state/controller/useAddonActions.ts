@@ -21,6 +21,7 @@ export interface UseAddonActionsParams {
   snapshotRef: RefObject<DashboardSnapshot | null>;
   tRef: RefObject<TranslateFn>;
   commitSnapshot: (seq: number, next: DashboardSnapshot) => boolean;
+  commitSavedConfig: (config: AppConfig) => void;
   nextSnapshotSeq: () => number;
   notify: NotifyFn;
   refresh: () => Promise<boolean>;
@@ -38,6 +39,7 @@ export function useAddonActions({
   snapshotRef,
   tRef,
   commitSnapshot,
+  commitSavedConfig,
   nextSnapshotSeq,
   notify,
   refresh,
@@ -113,11 +115,7 @@ export function useAddonActions({
         !prevConfig || prevConfig.disableSteamworksSdk !== config.disableSteamworksSdk;
 
       try {
-        const saved = await client.saveConfig(config);
-        const cfgSeq = nextSnapshotSeq();
-        if (snapshotRef.current) {
-          commitSnapshot(cfgSeq, { ...snapshotRef.current, config: saved });
-        }
+        commitSavedConfig(await client.saveConfig(config));
         if (sdkFlagChanged) {
           setSteamCaps(null);
         }
@@ -154,6 +152,7 @@ export function useAddonActions({
     },
     [
       client,
+      commitSavedConfig,
       commitSnapshot,
       nextSnapshotSeq,
       notify,

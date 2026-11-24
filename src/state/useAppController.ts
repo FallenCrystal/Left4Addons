@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as ipc from '../api/ipc';
-import type { DashboardSnapshot, SteamCapabilities, SyncReport } from '../api/ipc';
+import type { AppConfig, DashboardSnapshot, SteamCapabilities, SyncReport } from '../api/ipc';
 import type { BatchDialogPayload, NotifyOptions, SnackbarItem } from './controller/types';
 import { getClient } from './controller/types';
 import { useAddonActions } from './controller/useAddonActions';
@@ -37,6 +37,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   const snackIdRef = useRef(0);
   const snapshotSeqRef = useRef(0);
   const lastCommittedSeqRef = useRef(0);
+  const lastSavedConfigSeqRef = useRef(0);
   const refreshInFlightRef = useRef(false);
   const refreshQueuedRef = useRef(false);
   const snapshotRef = useRef<DashboardSnapshot | null>(null);
@@ -52,10 +53,6 @@ export function useAppController(onOpenReconcile?: () => void) {
   }, [onOpenReconcile]);
 
   useEffect(() => {
-    snapshotRef.current = snapshot;
-  }, [snapshot]);
-
-  useEffect(() => {
     return () => {
       if (snackTimerRef.current !== null) {
         window.clearTimeout(snackTimerRef.current);
@@ -63,22 +60,45 @@ export function useAppController(onOpenReconcile?: () => void) {
     };
   }, []);
 
-  const commitSnapshot = useCallback((seq: number, next: DashboardSnapshot): boolean => {
-    if (seq < lastCommittedSeqRef.current) {
-      return false;
-    }
-    lastCommittedSeqRef.current = seq;
+  const publishSnapshot = useCallback((next: DashboardSnapshot) => {
     snapshotRef.current = next;
     setSnapshot(next);
     setSnapshotVersion((v) => v + 1);
     setInitError(null);
-    return true;
   }, []);
+
+  const commitSnapshot = useCallback(
+    (seq: number, next: DashboardSnapshot): boolean => {
+      if (seq < lastCommittedSeqRef.current) {
+        return false;
+      }
+      lastCommittedSeqRef.current = seq;
+      const current = snapshotRef.current;
+      // A refresh started before a config save can still contain fresh addon data.
+      publishSnapshot(
+        current && seq < lastSavedConfigSeqRef.current
+          ? { ...next, config: current.config }
+          : next,
+      );
+      return true;
+    },
+    [publishSnapshot],
+  );
 
   const nextSnapshotSeq = useCallback(() => {
     snapshotSeqRef.current += 1;
     return snapshotSeqRef.current;
   }, []);
+
+  const commitSavedConfig = useCallback(
+    (config: AppConfig) => {
+      const current = snapshotRef.current;
+      if (!current) return;
+      lastSavedConfigSeqRef.current = nextSnapshotSeq();
+      publishSnapshot({ ...current, config });
+    },
+    [nextSnapshotSeq, publishSnapshot],
+  );
 
   const notify = useCallback((message: string, options?: NotifyOptions) => {
     if (snackTimerRef.current !== null) {
@@ -207,6 +227,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     snapshotRef,
     tRef,
     commitSnapshot,
+    commitSavedConfig,
     nextSnapshotSeq,
     notify,
     refresh,

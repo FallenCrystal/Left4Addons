@@ -108,7 +108,10 @@ pub fn rebuild_auto_bundles(db: &LocalDb) -> Result<Vec<BundleRecord>, CoreError
             .filter(|id| !assigned.contains(*id))
             .filter_map(|id| candidates_by_id.get(id))
             .collect();
-        if !is_valid_campaign_group(&members) {
+        if !is_valid_campaign_group(&members)
+            || !metadata_titles_compatible(&members)
+            || has_conflicting_duplicate_parts(&members, false)
+        {
             continue;
         }
         sort_bundle_candidates(&mut members);
