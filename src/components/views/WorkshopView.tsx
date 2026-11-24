@@ -94,7 +94,9 @@ export function WorkshopView({
   onInvalidId,
   onNotify,
 }: WorkshopViewProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const searchLanguage = i18n.language?.trim() || undefined;
+  const [trackedLanguage, setTrackedLanguage] = useState(searchLanguage);
   const [draftQuery, setDraftQuery] = useState('');
   const [searchParams, setSearchParams] = useState<{
     query: string;
@@ -109,6 +111,13 @@ export function WorkshopView({
     page: 1,
     retryNonce: 0,
   });
+
+  if (trackedLanguage !== searchLanguage) {
+    setTrackedLanguage(searchLanguage);
+    if (searchParams.page !== 1) {
+      setSearchParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+    }
+  }
   const [directInput, setDirectInput] = useState('');
   const [directBusy, setDirectBusy] = useState(false);
   const [searchResult, setSearchResult] = useState<{
@@ -120,7 +129,7 @@ export function WorkshopView({
   const [missingSubs, setMissingSubs] = useState<string[] | null>(null);
 
   const searchSeqRef = useRef(0);
-  const reqKey = JSON.stringify(searchParams);
+  const reqKey = JSON.stringify({ ...searchParams, language: searchLanguage });
 
   const localByWorkshopId = useMemo(() => {
     const map = new Map<string, AddonSummary>();
@@ -146,6 +155,7 @@ export function WorkshopView({
       sort: searchParams.sort === 'relevance' ? undefined : searchParams.sort,
       page: searchParams.page,
       pageSize: 24,
+      language: searchLanguage,
     })
       .then((res) => {
         if (!active || seq !== searchSeqRef.current) return;
@@ -167,7 +177,7 @@ export function WorkshopView({
     return () => {
       active = false;
     };
-  }, [searchParams, reqKey, onSearch]);
+  }, [searchParams, reqKey, searchLanguage, onSearch]);
 
   const loading = searchResult?.reqKey !== reqKey;
   const response = searchResult?.response ?? null;

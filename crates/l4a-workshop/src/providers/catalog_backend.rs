@@ -177,6 +177,27 @@ impl WorkshopProvider for CatalogBackendProvider {
                 params.push(("sort", sort.clone()));
             }
         }
+        if let Some(ref lang) = query.language {
+            let trimmed = lang.trim();
+            if !trimmed.is_empty() {
+                params.push(("lang", trimmed.to_string()));
+            }
+        }
+        if let Some(ref target) = query.search_target {
+            let trimmed = target.trim();
+            if !trimmed.is_empty() {
+                params.push(("searchTarget", trimmed.to_string()));
+            }
+        }
+        if let Some(file_type) = query.file_type {
+            let ft_str = serde_json::to_string(&file_type)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            if !ft_str.is_empty() {
+                params.push(("fileType", ft_str));
+            }
+        }
 
         let (req, _) = self.mirror.prepare_get(&client, &url);
         let resp = req

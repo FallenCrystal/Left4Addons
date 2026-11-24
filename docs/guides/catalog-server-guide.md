@@ -52,7 +52,22 @@ incremental_pages_per_tick = 2
 enable_backfill = false
 backfill_interval_secs = 15
 backfill_batch_size = 50
+
+[search]
+enable_hybrid_search = true
+default_language = "english"
+steam_timeout_ms = 4500
+cache_ttl_secs = 60
+cache_steam_results = true
 ```
+
+`[search]` 配置项控制公开搜索接口 `GET /api/v1/items/search` 的混合检索行为：
+
+- `enable_hybrid_search`：开启后将 Steam CM 实时检索与本地 FTS5 索引混合（支持按请求语言调整结果，并在 Steam 超时或不可达时自动回退至本地索引）。
+- `default_language`：当请求既未传 `?lang=` 也未携带有效的 `Accept-Language` 时使用的 Steam 语言（如 `english`、`schinese`、`tchinese`）。
+- `steam_timeout_ms`：单次混合检索等待 Steam CM 的超时预算（毫秒，范围 `500..=15000`）。
+- `cache_ttl_secs`：Steam 搜索结果页在内存中的短缓存 TTL（秒，范围 `0..=3600`；`0` 表示禁用）。
+- `cache_steam_results`：是否将搜索命中的公开条目以 `CacheOnly` 策略异步预热到本地缓存，加快后续 `GET /items/{id}` 与下载解析。
 
 ---
 

@@ -171,6 +171,12 @@ pub struct SearchQuery {
     pub page: u32,
     #[serde(default = "default_page_size")]
     pub page_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<WorkshopFileType>,
 }
 
 fn default_page() -> u32 {

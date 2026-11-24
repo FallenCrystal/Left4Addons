@@ -466,6 +466,42 @@ pub fn score_primary_candidate(
     None
 }
 
+pub fn score_title_only_candidate(
+    query: &ParsedQuery,
+    workshop_id: u64,
+    title: &str,
+) -> Option<MatchRank> {
+    if query.exact_workshop_id == Some(workshop_id) {
+        return Some(MatchRank {
+            tier: 0,
+            sub_rank: 0,
+        });
+    }
+
+    if query.terms.is_empty() {
+        return None;
+    }
+
+    let title_folded = fold_text(title);
+    if title_folded == query.raw_folded {
+        return Some(MatchRank {
+            tier: 0,
+            sub_rank: 1,
+        });
+    }
+
+    let title_tokens = tokenize_with_aliases(title);
+    if query.contains_required_literals(&title_folded) {
+        if let Some(rank) = score_title_direct(query, &title_folded, &title_tokens)
+            .or_else(|| score_title_pinyin(query, title, &title_tokens))
+        {
+            return Some(rank);
+        }
+    }
+
+    None
+}
+
 pub fn score_desc_candidate(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
     let cleaned = strip_bbcode_and_urls(description);
     if !query.literal_substrings.is_empty()

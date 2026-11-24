@@ -17,8 +17,11 @@ use l4a_server::{
     config::{CatalogConfig, CatalogConfigStore},
     db::ServerRepo,
     upstream::{
-        MockWorkshopUpstream, WorkshopObservation, WorkshopQueryPage, MATCHING_FILE_TYPE_ITEMS,
+        MockWorkshopUpstream, SteamSearchRequest, SteamSearchTarget, WorkshopObservation,
+        WorkshopQueryPage, MATCHING_FILE_TYPE_COLLECTIONS, MATCHING_FILE_TYPE_ITEMS,
         QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE, QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+        QUERY_TYPE_RANKED_BY_TEXT_SEARCH, QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+        QUERY_TYPE_RANKED_BY_TREND, QUERY_TYPE_RANKED_BY_VOTE,
     },
     ServerState,
 };
@@ -1629,6 +1632,7 @@ async fn public_search_keeps_indexed_items_past_ttl_and_excludes_read_through_an
                 ),
             },
             listed: false,
+            consumer_appid: None,
         },
     );
 
@@ -1794,6 +1798,7 @@ async fn listing_recheck_hides_restricted_metadata_without_incremental_sync() {
                 ),
             },
             listed: false,
+            consumer_appid: None,
         },
     );
     let _workers = state.sync.spawn_background_workers().drop_guard();
@@ -1913,6 +1918,7 @@ async fn backfill_counts_membership_only_promotions_with_its_cursor() {
                     ),
                 },
                 listed: id != 9303,
+                consumer_appid: None,
             },
         );
     }
@@ -2088,4 +2094,1462 @@ async fn batch_keeps_successful_chunks_and_falls_back_only_for_failed_ids() {
         Some("https://example.test/cached.vpk")
     );
     assert_eq!(batch.missing_ids, vec![WorkshopId(102)]);
+}
+
+async fn search_with_mode(
+    app: &axum::Router,
+    uri: &str,
+    headers: Vec<(&str, &str)>,
+) -> (StatusCode, Option<String>, SearchResponse) {
+    let (status, resp_headers, bytes) = raw_request(app, "GET", uri, headers, None).await;
+    let mode = resp_headers
+        .get("x-l4a-search-mode")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+    (status, mode, body)
+}
+
+fn steam_req(
+    query_type: u32,
+    file_type: u32,
+    page: u32,
+    num_per_page: u32,
+    search_text: Option<&str>,
+    tag: Option<&str>,
+    language: i32,
+) -> SteamSearchRequest {
+    SteamSearchRequest {
+        query_type,
+        file_type,
+        page,
+        num_per_page,
+        search_text: search_text.map(str::to_string),
+        required_tags: tag.map(|t| vec![t.to_string()]).unwrap_or_default(),
+        language,
+        days: (query_type == QUERY_TYPE_RANKED_BY_TREND).then_some(7),
+        search_text_target: None,
+    }
+}
+
+#[tokio::test]
+async fn hybrid_search_replicates_steam_relevance_promotes_local_pinyin_and_paginates_cleanly() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    // Local DB has description noise for "Early Days", a Chinese map for pinyin, and a camelCase map.
+    let mut noise = sample_item(
+        3832010631,
+        "L4D2 - Custom Campaigns: Extended Subtitles",
+        100,
+        None,
+    );
+    noise.description = Some("Supported: Prague • Early Days • Hell Ride".into());
+    noise.subscriptions = Some(84);
+    state.repo.upsert_item(&noise, false, true).unwrap();
+
+    let mut gz = sample_item(2396847377, "广州增城 （Zengcheng）Lv8.06", 200, None);
+    gz.creator_name = Some("长远的梦".into());
+    gz.subscriptions = Some(1_577_877);
+    state.repo.upsert_item(&gz, false, true).unwrap();
+
+    let mut day_break = sample_item(2750097524, "Day Break v2", 300, None);
+    day_break.subscriptions = Some(36_450);
+    state.repo.upsert_item(&day_break, false, true).unwrap();
+
+    // Steam returns Early Days PART 1..6 across two pages of size 4.
+    let early_part = |id: u64, title: &str, subs: u64| {
+        let mut item = sample_item(
+            id,
+            title,
+            500,
+            Some(&format!("https://cdn.steamusercontent.com/ugc/{id}.vpk")),
+        );
+        item.subscriptions = Some(subs);
+        WorkshopObservation::from(WorkshopFetchOutcome::Found { item })
+    };
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            4,
+            Some("Early Days"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 6,
+            next_cursor: None,
+            outcomes: vec![
+                early_part(3560883926, "Early Days PART 1/6", 46_600),
+                early_part(3561257025, "Early Days PART 6/6", 45_852),
+                early_part(3560889923, "Early Days PART 5/6", 45_852),
+                early_part(3560888138, "Early Days PART 4/6", 45_874),
+            ],
+        },
+    );
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            2,
+            4,
+            Some("Early Days"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 6,
+            next_cursor: None,
+            outcomes: vec![
+                early_part(3560886975, "Early Days PART 3/6", 45_909),
+                early_part(3560886114, "Early Days PART 2/6", 45_927),
+            ],
+        },
+    );
+
+    // For pinyin "guangzhou", Steam only has weak description hits while local has 广州增城 (tier 4).
+    let weak_steam = |id: u64, title: &str| {
+        let mut item = sample_item(id, title, 400, None);
+        item.description = Some("Map set near guangzhou".into());
+        WorkshopObservation::from(WorkshopFetchOutcome::Found { item })
+    };
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            2,
+            Some("guangzhou"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 3,
+            next_cursor: None,
+            outcomes: vec![
+                weak_steam(7001, "Weak Map A"),
+                weak_steam(7002, "Weak Map B"),
+            ],
+        },
+    );
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            2,
+            2,
+            Some("guangzhou"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 3,
+            next_cursor: None,
+            outcomes: vec![weak_steam(7003, "Weak Map C")],
+        },
+    );
+
+    let app = build_router(state);
+
+    // 1. Steam Early Days ordering preserved; local description noise stays behind Steam pages.
+    let (status, mode, p1) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days&page=1&pageSize=4",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(p1.total, 7);
+    assert_eq!(
+        p1.items.iter().map(|i| i.workshop_id.0).collect::<Vec<_>>(),
+        vec![3560883926, 3561257025, 3560889923, 3560888138]
+    );
+
+    let (status, mode, p2) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days&page=2&pageSize=4",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(
+        p2.items.iter().map(|i| i.workshop_id.0).collect::<Vec<_>>(),
+        vec![3560886975, 3560886114, 3832010631]
+    );
+
+    // 2. Pinyin local strong hit promotes ahead of weak Steam hits, straddling pages cleanly.
+    let (_, mode, gz_p1) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=guangzhou&page=1&pageSize=2",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(gz_p1.total, 4);
+    assert_eq!(
+        gz_p1
+            .items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![2396847377, 7001]
+    );
+
+    let (_, mode, gz_p2) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=guangzhou&page=2&pageSize=2",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(
+        gz_p2
+            .items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![7002, 7003]
+    );
+
+    // 3. Spaceless compound query where Steam returns empty delegates to local matches.
+    let (_, mode, db_res) = search_with_mode(&app, "/api/v1/items/search?q=DayBreak", vec![]).await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(db_res.total, 1);
+    assert_eq!(db_res.items[0].workshop_id, WorkshopId(2750097524));
+}
+
+#[tokio::test]
+async fn hybrid_search_propagates_language_target_filetype_sorts_and_local_only_modes() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    let mut local_popular = sample_item(9501, "Local Top Map", 1000, None);
+    local_popular.subscriptions = Some(100_000);
+    local_popular.time_created = Some(500);
+    state.repo.upsert_item(&local_popular, false, true).unwrap();
+
+    let mut local_mid = sample_item(9502, "Alpha Local Map", 3000, None);
+    local_mid.subscriptions = Some(20_000);
+    local_mid.time_created = Some(3000);
+    state.repo.upsert_item(&local_mid, false, true).unwrap();
+
+    let mut local_removed = sample_item(9503, "Removed Local Map", 500, None);
+    local_removed.status = WorkshopItemStatus::Removed;
+    local_removed.time_created = Some(400);
+    state.repo.upsert_item(&local_removed, false, true).unwrap();
+
+    let mut steam_high = sample_item(9601, "Steam Popular Map", 2000, None);
+    steam_high.subscriptions = Some(50_000);
+    steam_high.time_created = Some(2000);
+    let mut steam_low = sample_item(9602, "Steam Newer Map", 4000, None);
+    steam_low.subscriptions = Some(10_000);
+    steam_low.time_created = Some(4000);
+
+    for sort_qt in [
+        QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+        QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE,
+        QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+    ] {
+        upstream.insert_search_page(
+            steam_req(sort_qt, MATCHING_FILE_TYPE_ITEMS, 1, 10, None, None, 0),
+            WorkshopQueryPage {
+                total: 2,
+                next_cursor: None,
+                outcomes: vec![
+                    WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                        item: steam_high.clone(),
+                    }),
+                    WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                        item: steam_low.clone(),
+                    }),
+                ],
+            },
+        );
+    }
+
+    let app = build_router(state);
+
+    // Language mapping: ?lang=zh-CN -> 6, ?lang=en -> 0, Accept-Language: zh-TW -> 7
+    let _ = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days&lang=zh-CN",
+        vec![],
+    )
+    .await;
+    let _ = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days&lang=en",
+        vec![("Accept-Language", "zh-CN,zh;q=0.9")],
+    )
+    .await;
+    let _ = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days",
+        vec![("Accept-Language", "en-US;q=0.4, zh-TW;q=0.9")],
+    )
+    .await;
+    let _ = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Early%20Days&searchTarget=title&fileType=collection&sort=trend",
+        vec![],
+    )
+    .await;
+
+    let recorded = upstream.recorded_searches();
+    assert_eq!(recorded[0].language, 6);
+    assert_eq!(recorded[1].language, 0);
+    assert_eq!(recorded[2].language, 7);
+    assert_eq!(recorded[3].query_type, QUERY_TYPE_RANKED_BY_TREND);
+    assert_eq!(recorded[3].days, Some(7));
+    assert_eq!(recorded[3].file_type, MATCHING_FILE_TYPE_COLLECTIONS);
+    assert_eq!(
+        recorded[3].search_text_target,
+        Some(SteamSearchTarget::Title)
+    );
+
+    // Deterministic merge sorts across Steam + local items
+    let (_, mode, subs) = search_with_mode(
+        &app,
+        "/api/v1/items/search?sort=subscriptions&pageSize=10",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(
+        subs.items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9501, 9601, 9502, 9602, 9503]
+    );
+
+    let (_, _, upd) = search_with_mode(
+        &app,
+        "/api/v1/items/search?sort=updated&pageSize=10",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        upd.items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9602, 9502, 9601, 9501, 9503]
+    );
+
+    let (_, _, newest) =
+        search_with_mode(&app, "/api/v1/items/search?sort=newest&pageSize=10", vec![]).await;
+    assert_eq!(
+        newest
+            .items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9602, 9502, 9601, 9501, 9503]
+    );
+
+    // Local-only modes do not call upstream search_files
+    let count_before = upstream.recorded_searches().len();
+    for uri in [
+        "/api/v1/items/search?sort=title",
+        "/api/v1/items/search?sort=updated_asc",
+        "/api/v1/items/search?status=removed",
+    ] {
+        let (status, mode, _) = search_with_mode(&app, uri, vec![]).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert_eq!(mode.as_deref(), Some("local"), "{uri}");
+    }
+    let (status, bytes) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/items/search?q=Local",
+        vec![("X-Admin-Token", "test-admin-password")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let admin_res: SearchResponse = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(admin_res.total, 3);
+    assert_eq!(upstream.recorded_searches().len(), count_before);
+}
+
+#[tokio::test]
+async fn hybrid_search_respects_admin_overrides_privacy_creator_enrichment_and_cache_warming() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    let now = Utc::now();
+
+    // 5101: Admin override
+    let override_item = sample_item(5101, "Steam Title 5101", 100, None);
+    state.repo.upsert_item(&override_item, false, true).unwrap();
+    state
+        .repo
+        .apply_admin_override(
+            WorkshopId(5101),
+            "admin",
+            l4a_protocol::AdminItemOverrideRequest {
+                status: WorkshopItemStatus::Active,
+                title: Some("Overridden Title 5101".into()),
+                description: None,
+                file_url: Some("https://mirror.example.com/5101.vpk".into()),
+                preview_url: None,
+                dependencies: None,
+                reason: Some("Manual fix".into()),
+            },
+        )
+        .unwrap();
+
+    // 5102: Locally tombstoned PrivateOrUnavailable (fresher than Steam mock observation)
+    let mut priv_seed = sample_item(5102, "Was Public 5102", 100, None);
+    priv_seed.fetched_at = now;
+    state.repo.upsert_item(&priv_seed, false, true).unwrap();
+    state
+        .repo
+        .apply_upstream_outcomes(&[WorkshopObservation {
+            outcome: WorkshopFetchOutcome::PrivateOrUnavailable {
+                workshop_id: WorkshopId(5102),
+                source: MetadataSource::SteamKit,
+                observed_at: now + chrono::Duration::seconds(60),
+                reason: None,
+            },
+            listed: false,
+            consumer_appid: None,
+        }])
+        .unwrap();
+
+    // 5103: Locally unlisted (is_listed = false)
+    let mut unlisted_seed = sample_item(5103, "Unlisted 5103", 100, None);
+    unlisted_seed.fetched_at = now + chrono::Duration::seconds(60);
+    state
+        .repo
+        .apply_upstream_outcomes(&[WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found {
+                item: unlisted_seed,
+            },
+            listed: false,
+            consumer_appid: None,
+        }])
+        .unwrap();
+
+    // 5105: Locally cached creator_name
+    let mut known_creator = sample_item(5105, "Creator Enrich 5105", 100, None);
+    known_creator.creator_name = Some("KnownMapper".into());
+    state.repo.upsert_item(&known_creator, false, true).unwrap();
+
+    // 5107: Canonical English item already indexed locally
+    let canonical = sample_item(5107, "Canonical English Map", 100, None);
+    state.repo.upsert_item(&canonical, false, true).unwrap();
+
+    let mut s5101 = sample_item(5101, "Steam Title 5101", 200, None);
+    s5101.fetched_at = now;
+    let mut s5102 = sample_item(5102, "Leaked Private 5102", 200, None);
+    s5102.fetched_at = now;
+    let mut s5103 = sample_item(5103, "Leaked Unlisted 5103", 200, None);
+    s5103.fetched_at = now;
+    let mut s5104 = sample_item(5104, "Wrong App 5104", 200, None);
+    s5104.fetched_at = now;
+    let mut s5105 = sample_item(5105, "Creator Enrich 5105", 200, None);
+    s5105.creator_name = None;
+    s5105.fetched_at = now + chrono::Duration::seconds(10);
+    let mut s5106 = sample_item(
+        5106,
+        "中文新图 5106",
+        200,
+        Some("https://cdn.steamusercontent.com/ugc/5106.vpk"),
+    );
+    s5106.fetched_at = now + chrono::Duration::seconds(10);
+    let mut s5107 = sample_item(5107, "中文译名地图", 200, None);
+    s5107.fetched_at = now + chrono::Duration::seconds(10);
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("Test"),
+            None,
+            6,
+        ),
+        WorkshopQueryPage {
+            total: 7,
+            next_cursor: None,
+            outcomes: vec![
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5101 }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5102 }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5103 }),
+                WorkshopObservation {
+                    outcome: WorkshopFetchOutcome::Found { item: s5104 },
+                    listed: true,
+                    consumer_appid: Some(4000),
+                },
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5105 }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5106 }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s5107 }),
+            ],
+        },
+    );
+
+    let app = build_router(state.clone());
+    let (status, mode, res) =
+        search_with_mode(&app, "/api/v1/items/search?q=Test&lang=zh-CN", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+
+    let ids: Vec<u64> = res.items.iter().map(|i| i.workshop_id.0).collect();
+    assert_eq!(ids, vec![5101, 5105, 5106, 5107]);
+    assert_eq!(res.items[0].title, "Overridden Title 5101");
+    assert_eq!(res.items[0].source, MetadataSource::AdminOverride);
+    assert_eq!(res.items[1].creator_name.as_deref(), Some("KnownMapper"));
+    assert_eq!(res.items[3].title, "中文译名地图");
+
+    // Wait briefly for async CacheOnly warming of 5106
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while state.repo.get_item(WorkshopId(5106)).unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Subsequent GET /items/5106 hits SQLite cache even when upstream fails
+    upstream.set_fail_fetches(true);
+    let (status, bytes) = json_request(&app, "GET", "/api/v1/items/5106", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let cached_5106: WorkshopItemRecord = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        cached_5106.file_url.as_deref(),
+        Some("https://cdn.steamusercontent.com/ugc/5106.vpk")
+    );
+
+    // 5106 was CacheOnly-warmed so it does NOT leak onto empty public browse; 5107 kept its canonical English title!
+    let (_, _, browse) = search_with_mode(&app, "/api/v1/items/search", vec![]).await;
+    let browse_ids: Vec<u64> = browse.items.iter().map(|i| i.workshop_id.0).collect();
+    assert!(!browse_ids.contains(&5106));
+    assert_eq!(
+        state
+            .repo
+            .get_item(WorkshopId(5107))
+            .unwrap()
+            .unwrap()
+            .record
+            .title,
+        "Canonical English Map"
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_direct_url_long_id_fallback_timeout_and_cache_dedup() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.steam_timeout_ms = 500)
+        .unwrap();
+
+    let local_fallback_item = sample_item(6200, "Local Survival Map", 100, None);
+    state
+        .repo
+        .upsert_item(&local_fallback_item, false, true)
+        .unwrap();
+
+    let s6101 = sample_item(
+        6101,
+        "Direct URL Map",
+        200,
+        Some("https://cdn.steamusercontent.com/ugc/6101.vpk"),
+    );
+    upstream.insert_item(s6101);
+    upstream.insert_outcome(
+        WorkshopId(6102),
+        WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found {
+                item: sample_item(6102, "Wrong App Map", 200, None),
+            },
+            listed: true,
+            consumer_appid: Some(4000),
+        },
+    );
+    state
+        .repo
+        .apply_upstream_outcomes(&[WorkshopObservation {
+            outcome: WorkshopFetchOutcome::PrivateOrUnavailable {
+                workshop_id: WorkshopId(6103),
+                source: MetadataSource::SteamKit,
+                observed_at: Utc::now(),
+                reason: None,
+            },
+            listed: false,
+            consumer_appid: None,
+        }])
+        .unwrap();
+    let s610400 = sample_item(610400, "Long Numeric Match", 300, None);
+    upstream.insert_item(s610400);
+
+    let s_local_text = sample_item(6201, "Steam Survival Match", 400, None);
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("Survival"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: s_local_text,
+            })],
+        },
+    );
+
+    let app = build_router(state);
+
+    // 1. Direct URL lookup via fetch_details
+    let (_, mode, url_res) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D6101",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(url_res.total, 1);
+    assert_eq!(url_res.items[0].workshop_id, WorkshopId(6101));
+
+    // Wrong consumer_appid and locally blocked PrivateOrUnavailable return 0 items
+    let (_, _, wrong_app) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D6102",
+        vec![],
+    )
+    .await;
+    assert_eq!(wrong_app.total, 0);
+
+    let (_, _, blocked_priv) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D6103",
+        vec![],
+    )
+    .await;
+    assert_eq!(blocked_priv.total, 0);
+    assert_eq!(upstream.fetch_count(WorkshopId(6103)), 0);
+
+    // 2. 6+ digit ID lookup prepends tier-0 exact hit
+    let (_, mode, num_res) = search_with_mode(&app, "/api/v1/items/search?q=610400", vec![]).await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(num_res.total, 1);
+    assert_eq!(num_res.items[0].workshop_id, WorkshopId(610400));
+
+    // 3. Repeated identical search hits in-memory cache (1 Steam RPC)
+    let before = upstream.recorded_searches().len();
+    let (_, mode1, r1) = search_with_mode(&app, "/api/v1/items/search?q=Survival", vec![]).await;
+    let (_, mode2, r2) = search_with_mode(&app, "/api/v1/items/search?q=Survival", vec![]).await;
+    assert_eq!(mode1.as_deref(), Some("hybrid"));
+    assert_eq!(mode2.as_deref(), Some("hybrid"));
+    assert_eq!(r1.items.len(), 2);
+    assert_eq!(r2.items.len(), 2);
+    assert_eq!(upstream.recorded_searches().len() - before, 1);
+
+    // 4. Steam search failure falls back gracefully to local catalog
+    upstream.set_fail_searches(true);
+    let (status, mode, fb) = search_with_mode(&app, "/api/v1/items/search?q=Local", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("local-fallback"));
+    assert_eq!(fb.total, 1);
+    assert_eq!(fb.items[0].workshop_id, WorkshopId(6200));
+
+    // 5. Steam search timeout falls back gracefully to local catalog
+    upstream.set_fail_searches(false);
+    upstream.set_search_delay(Some(std::time::Duration::from_millis(800)));
+    let (status, mode, to_fb) =
+        search_with_mode(&app, "/api/v1/items/search?q=Local", vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("local-fallback"));
+    assert_eq!(to_fb.total, 1);
+    assert_eq!(to_fb.items[0].workshop_id, WorkshopId(6200));
+}
+
+#[tokio::test]
+async fn catalog_backend_provider_search_forwards_language_target_and_file_type() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let mut col = sample_item(7701, "Coop Collection", 300, None);
+    col.file_type = WorkshopFileType::Collection;
+    col.collection_children = vec![WorkshopId(7702)];
+    upstream.insert_search_page(
+        SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_COLLECTIONS,
+            page: 1,
+            num_per_page: 24,
+            search_text: Some("Coop".into()),
+            required_tags: vec!["Campaigns".into()],
+            language: 6,
+            days: None,
+            search_text_target: Some(SteamSearchTarget::Title),
+        },
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: col,
+            })],
+        },
+    );
+
+    let state = ServerState::in_memory_with_upstream("admin-key-123", upstream.clone()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(state);
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let provider =
+        CatalogBackendProvider::new(format!("http://{addr}"), Arc::new(MirrorRouter::empty()));
+    let resp = provider
+        .search(&l4a_protocol::SearchQuery {
+            query: Some("Coop".into()),
+            tag: Some("Campaigns".into()),
+            status: None,
+            sort: None,
+            page: 1,
+            page_size: 24,
+            language: Some("zh-CN".into()),
+            search_target: Some("title".into()),
+            file_type: Some(WorkshopFileType::Collection),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(resp.total, 1);
+    assert_eq!(resp.items[0].workshop_id, WorkshopId(7701));
+    assert_eq!(resp.items[0].file_type, WorkshopFileType::Collection);
+    let recorded = upstream.recorded_searches();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].language, 6);
+    assert_eq!(recorded[0].file_type, MATCHING_FILE_TYPE_COLLECTIONS);
+    assert_eq!(
+        recorded[0].search_text_target,
+        Some(SteamSearchTarget::Title)
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_suppresses_cached_steam_hit_after_newer_restriction_or_removal() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_steam_results = false)
+        .unwrap();
+
+    let t0 = Utc::now();
+    let mut s9101 = sample_item(
+        9101,
+        "Restricted Later 9101",
+        500,
+        Some("https://cdn.steamusercontent.com/ugc/9101.vpk"),
+    );
+    s9101.fetched_at = t0;
+    let mut s9102 = sample_item(
+        9102,
+        "Removed Later 9102",
+        500,
+        Some("https://cdn.steamusercontent.com/ugc/9102.vpk"),
+    );
+    s9102.fetched_at = t0;
+    state.repo.upsert_item(&s9102, false, true).unwrap();
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("Later"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: vec![
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s9101 }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: s9102 }),
+            ],
+        },
+    );
+
+    let app = build_router(state.clone());
+    let (_, mode1, first) = search_with_mode(&app, "/api/v1/items/search?q=Later", vec![]).await;
+    assert_eq!(mode1.as_deref(), Some("hybrid"));
+    assert_eq!(first.items.len(), 2);
+
+    // 9101 becomes negative-cached PrivateOrUnavailable without a SQLite row; 9102 becomes Removed in SQLite.
+    let t1 = t0 + chrono::Duration::seconds(30);
+    state
+        .repo
+        .apply_upstream_outcomes(&[
+            WorkshopObservation {
+                outcome: WorkshopFetchOutcome::PrivateOrUnavailable {
+                    workshop_id: WorkshopId(9101),
+                    source: MetadataSource::SteamKit,
+                    observed_at: t1,
+                    reason: None,
+                },
+                listed: false,
+                consumer_appid: None,
+            },
+            WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Removed {
+                    workshop_id: WorkshopId(9102),
+                    source: MetadataSource::SteamKit,
+                    observed_at: t1,
+                    reason: None,
+                },
+                listed: true,
+                consumer_appid: None,
+            },
+        ])
+        .unwrap();
+
+    // Cached Steam page must now suppress both items.
+    let (_, mode2, second) = search_with_mode(&app, "/api/v1/items/search?q=Later", vec![]).await;
+    assert_eq!(mode2.as_deref(), Some("hybrid"));
+    assert!(second.items.is_empty());
+    assert_eq!(upstream.recorded_searches().len(), 1);
+}
+
+#[tokio::test]
+async fn hybrid_search_keeps_deterministic_sort_order_beyond_page_three() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    let mut local = sample_item(9200, "Local Top Sub", 100, None);
+    local.subscriptions = Some(90_000);
+    state.repo.upsert_item(&local, false, true).unwrap();
+
+    for (idx, (id, subs)) in [
+        (9201, 80_000),
+        (9202, 70_000),
+        (9203, 60_000),
+        (9204, 50_000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut item = sample_item(id, &format!("Steam Item {id}"), 200, None);
+        item.subscriptions = Some(subs);
+        upstream.insert_search_page(
+            steam_req(
+                QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+                MATCHING_FILE_TYPE_ITEMS,
+                (idx + 1) as u32,
+                1,
+                None,
+                None,
+                0,
+            ),
+            WorkshopQueryPage {
+                total: 4,
+                next_cursor: None,
+                outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                    item,
+                })],
+            },
+        );
+    }
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+            MATCHING_FILE_TYPE_ITEMS,
+            5,
+            1,
+            None,
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 4,
+            next_cursor: None,
+            outcomes: Vec::new(),
+        },
+    );
+
+    let app = build_router(state);
+    let mut collected = Vec::new();
+    for page in 1..=5u32 {
+        let (_, mode, resp) = search_with_mode(
+            &app,
+            &format!("/api/v1/items/search?sort=subscriptions&page={page}&pageSize=1"),
+            vec![],
+        )
+        .await;
+        assert_eq!(mode.as_deref(), Some("hybrid"));
+        assert_eq!(resp.total, 5);
+        assert_eq!(resp.items.len(), 1);
+        collected.push(resp.items[0].workshop_id.0);
+    }
+    assert_eq!(collected, vec![9200, 9201, 9202, 9203, 9204]);
+}
+
+#[tokio::test]
+async fn hybrid_search_deduplicates_across_steam_pages_for_totals_and_tail() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    for (id, title) in [(9301, "Alpha One"), (9302, "Beta Two")] {
+        let mut item = sample_item(id, title, 100, None);
+        item.description = Some("Overlap keyword".into());
+        state.repo.upsert_item(&item, false, true).unwrap();
+    }
+
+    let make_steam = |id: u64, title: &str| {
+        let mut item = sample_item(id, title, 200, None);
+        item.description = Some("Overlap keyword".into());
+        WorkshopObservation::from(WorkshopFetchOutcome::Found { item })
+    };
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_VOTE,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            1,
+            Some("Overlap"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: vec![make_steam(9301, "Alpha One")],
+        },
+    );
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_VOTE,
+            MATCHING_FILE_TYPE_ITEMS,
+            2,
+            1,
+            Some("Overlap"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: vec![make_steam(9302, "Beta Two")],
+        },
+    );
+
+    let app = build_router(state);
+    let (_, _, p1) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Overlap&sort=toprated&page=1&pageSize=1",
+        vec![],
+    )
+    .await;
+    let (_, _, p2) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Overlap&sort=toprated&page=2&pageSize=1",
+        vec![],
+    )
+    .await;
+    let (_, _, p3) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Overlap&sort=toprated&page=3&pageSize=1",
+        vec![],
+    )
+    .await;
+
+    assert_eq!(p1.total, 2);
+    assert_eq!(p2.total, 2);
+    assert_eq!(p3.total, 2);
+    assert_eq!(
+        p1.items.iter().map(|i| i.workshop_id.0).collect::<Vec<_>>(),
+        vec![9301]
+    );
+    assert_eq!(
+        p2.items.iter().map(|i| i.workshop_id.0).collect::<Vec<_>>(),
+        vec![9302]
+    );
+    assert!(p3.items.is_empty());
+}
+
+#[tokio::test]
+async fn hybrid_search_reaches_local_matches_beyond_first_100() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    for idx in 0..125u64 {
+        let mut item = sample_item(
+            80_000 + idx,
+            &format!("Other Campaign {idx}"),
+            1_700_000_000 + idx as i64,
+            None,
+        );
+        item.description = Some("DeepReach supplemental".into());
+        item.subscriptions = Some(1_000 - idx);
+        state.repo.upsert_item(&item, false, true).unwrap();
+    }
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            24,
+            Some("DeepReach"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: vec![
+                WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                    item: sample_item(89_001, "DeepReach Steam One", 2_000, None),
+                }),
+                WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                    item: sample_item(89_002, "DeepReach Steam Two", 2_000, None),
+                }),
+            ],
+        },
+    );
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            6,
+            24,
+            Some("DeepReach"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: Vec::new(),
+        },
+    );
+
+    let app = build_router(state);
+    let (_, mode1, p1) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=DeepReach&page=1&pageSize=24",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode1.as_deref(), Some("hybrid"));
+    assert_eq!(p1.total, 127);
+    assert_eq!(p1.items.len(), 24);
+
+    let (_, mode6, p6) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=DeepReach&page=6&pageSize=24",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode6.as_deref(), Some("hybrid"));
+    assert_eq!(p6.total, 127);
+    assert_eq!(p6.items.len(), 7);
+}
+
+#[tokio::test]
+async fn hybrid_search_drops_stale_local_copy_when_steam_reports_unlisted() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    let mut stale_local = sample_item(9401, "Became Unlisted", 100, None);
+    stale_local.subscriptions = Some(50_000);
+    state.repo.upsert_item(&stale_local, false, true).unwrap();
+
+    let mut steam_unlisted = sample_item(9401, "Became Unlisted", 200, None);
+    steam_unlisted.subscriptions = Some(50_000);
+    steam_unlisted.fetched_at = Utc::now() + chrono::Duration::seconds(30);
+    let mut steam_public = sample_item(9402, "Public Remaining", 200, None);
+    steam_public.subscriptions = Some(10_000);
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            None,
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: vec![
+                WorkshopObservation {
+                    outcome: WorkshopFetchOutcome::Found {
+                        item: steam_unlisted,
+                    },
+                    listed: false,
+                    consumer_appid: Some(550),
+                },
+                WorkshopObservation::from(WorkshopFetchOutcome::Found { item: steam_public }),
+            ],
+        },
+    );
+
+    let app = build_router(state);
+    let (_, mode, resp) =
+        search_with_mode(&app, "/api/v1/items/search?sort=subscriptions", vec![]).await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(resp.total, 1);
+    assert_eq!(
+        resp.items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9402]
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_shares_single_timeout_budget_across_multi_page_fetches() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.steam_timeout_ms = 500)
+        .unwrap();
+
+    let mut local = sample_item(9450, "Budget Local Item", 100, None);
+    local.subscriptions = Some(500);
+    state.repo.upsert_item(&local, false, true).unwrap();
+
+    for p in 1..=3u32 {
+        let mut item = sample_item(9450 + u64::from(p), &format!("Steam P{p}"), 200, None);
+        item.subscriptions = Some(10_000 - u64::from(p) * 100);
+        upstream.insert_search_page(
+            steam_req(
+                QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+                MATCHING_FILE_TYPE_ITEMS,
+                p,
+                1,
+                None,
+                None,
+                0,
+            ),
+            WorkshopQueryPage {
+                total: 3,
+                next_cursor: None,
+                outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                    item,
+                })],
+            },
+        );
+    }
+
+    upstream.set_search_delay(Some(std::time::Duration::from_millis(320)));
+    let app = build_router(state);
+    let started = std::time::Instant::now();
+    let (status, mode, resp) = search_with_mode(
+        &app,
+        "/api/v1/items/search?sort=subscriptions&page=3&pageSize=1",
+        vec![],
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("local-fallback"));
+    assert!(
+        elapsed < std::time::Duration::from_millis(750),
+        "expected shared timeout budget around 500ms, took {elapsed:?}"
+    );
+    assert_eq!(resp.total, 1);
+}
+
+#[tokio::test]
+async fn hybrid_search_falls_back_when_required_steam_page_fails() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    state
+        .repo
+        .upsert_item(
+            &sample_item(9471, "MultiPage Fallback A", 200, None),
+            false,
+            true,
+        )
+        .unwrap();
+    state
+        .repo
+        .upsert_item(
+            &sample_item(9472, "MultiPage Fallback B", 100, None),
+            false,
+            true,
+        )
+        .unwrap();
+
+    // Insert only page 2 with large total and fail page 1 explicitly so windowed relevance falls back.
+    upstream.fail_search_request(steam_req(
+        QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+        MATCHING_FILE_TYPE_ITEMS,
+        1,
+        1,
+        Some("MultiPage"),
+        None,
+        0,
+    ));
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            2,
+            1,
+            Some("MultiPage"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 100,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: sample_item(9480, "Steam Page Two Only", 300, None),
+            })],
+        },
+    );
+
+    let app = build_router(state);
+    let (status, mode, resp) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=MultiPage&page=2&pageSize=1",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mode.as_deref(), Some("local-fallback"));
+    assert_eq!(resp.total, 2);
+    assert!(resp.items.iter().all(|i| i.workshop_id != WorkshopId(9480)));
+}
+
+#[tokio::test]
+async fn hybrid_search_keeps_steam_hits_with_localized_tag_display_names() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    let mut item = sample_item(9491, "Localized Tag Campaign", 200, None);
+    item.tags = vec!["战役".into()];
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("Campaign"),
+            Some("Campaigns"),
+            6,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item,
+            })],
+        },
+    );
+
+    let app = build_router(state);
+    let (_, mode, resp) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Campaign&tag=Campaigns&lang=zh-CN",
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    assert_eq!(resp.total, 1);
+    assert_eq!(resp.items[0].workshop_id, WorkshopId(9491));
+}
+
+#[tokio::test]
+async fn hybrid_search_respects_enable_read_through_switch_for_exact_lookups() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.sync.enable_read_through = false)
+        .unwrap();
+
+    upstream.insert_item(sample_item(6501, "Blocked Read Through URL", 300, None));
+    upstream.insert_item(sample_item(
+        650100,
+        "Blocked Read Through Numeric",
+        300,
+        None,
+    ));
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("TextAllowed"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: sample_item(6502, "TextAllowed Steam Item", 300, None),
+            })],
+        },
+    );
+
+    let app = build_router(state.clone());
+    let (_, url_mode, url_resp) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D6501",
+        vec![],
+    )
+    .await;
+    assert_eq!(url_mode.as_deref(), Some("local"));
+    assert_eq!(url_resp.total, 0);
+    assert_eq!(upstream.fetch_count(WorkshopId(6501)), 0);
+    assert!(state.repo.get_item(WorkshopId(6501)).unwrap().is_none());
+
+    let (_, _, num_resp) = search_with_mode(&app, "/api/v1/items/search?q=650100", vec![]).await;
+    assert_eq!(num_resp.total, 0);
+    assert_eq!(upstream.fetch_count(WorkshopId(650100)), 0);
+
+    let (_, text_mode, text_resp) =
+        search_with_mode(&app, "/api/v1/items/search?q=TextAllowed", vec![]).await;
+    assert_eq!(text_mode.as_deref(), Some("hybrid"));
+    assert_eq!(text_resp.total, 1);
+    assert_eq!(text_resp.items[0].workshop_id, WorkshopId(6502));
+}
+
+#[tokio::test]
+async fn hybrid_search_omitting_file_type_excludes_indexed_collections() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_ttl_secs = 0)
+        .unwrap();
+
+    let mut col = sample_item(9701, "Coop Collection Mega", 300, None);
+    col.file_type = WorkshopFileType::Collection;
+    state.repo.upsert_item(&col, false, true).unwrap();
+    state
+        .repo
+        .upsert_item(&sample_item(9702, "Coop Item Map", 200, None), false, true)
+        .unwrap();
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("Coop"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: sample_item(9703, "Coop Steam Item", 400, None),
+            })],
+        },
+    );
+
+    let app = build_router(state);
+    let (_, mode, items_only) = search_with_mode(&app, "/api/v1/items/search?q=Coop", vec![]).await;
+    assert_eq!(mode.as_deref(), Some("hybrid"));
+    let hybrid_ids: Vec<u64> = items_only.items.iter().map(|i| i.workshop_id.0).collect();
+    assert!(!hybrid_ids.contains(&9701));
+    assert!(hybrid_ids.contains(&9702));
+    assert!(hybrid_ids.contains(&9703));
+
+    upstream.set_fail_searches(true);
+    let (_, fb_mode, fb) = search_with_mode(&app, "/api/v1/items/search?q=Coop", vec![]).await;
+    assert_eq!(fb_mode.as_deref(), Some("local-fallback"));
+    assert_eq!(
+        fb.items.iter().map(|i| i.workshop_id.0).collect::<Vec<_>>(),
+        vec![9702]
+    );
+
+    let (_, _, col_res) = search_with_mode(
+        &app,
+        "/api/v1/items/search?q=Coop&fileType=collection&sort=title",
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        col_res
+            .items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9701]
+    );
+}
+
+#[tokio::test]
+async fn hybrid_search_sets_vary_accept_language_while_preserving_cors() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    let app = build_router(state);
+
+    let (status, resp_headers, _) = raw_request(
+        &app,
+        "GET",
+        "/api/v1/items/search?q=VaryTest",
+        vec![("Origin", "https://example.test")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resp_headers
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    let vary_tokens: Vec<String> = resp_headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    assert!(
+        vary_tokens.iter().any(|t| t == "accept-language"),
+        "missing accept-language in Vary: {vary_tokens:?}"
+    );
+    assert!(
+        vary_tokens.iter().any(|t| t == "origin"),
+        "CORS vary token lost: {vary_tokens:?}"
+    );
 }

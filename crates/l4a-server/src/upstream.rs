@@ -31,11 +31,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
 use tokio::task::AbortHandle;
 
+pub const QUERY_TYPE_RANKED_BY_VOTE: u32 = 0;
 pub const QUERY_TYPE_RANKED_BY_PUBLICATION_DATE: u32 = 1;
+pub const QUERY_TYPE_RANKED_BY_TREND: u32 = 3;
+pub const QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS: u32 = 9;
+pub const QUERY_TYPE_RANKED_BY_TEXT_SEARCH: u32 = 12;
 pub const QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE: u32 = 21;
 pub const MATCHING_FILE_TYPE_ITEMS: u32 = 0;
 pub const MATCHING_FILE_TYPE_COLLECTIONS: u32 = 1;
 const WORKSHOP_FILE_TYPE_COLLECTION: u32 = 2;
+const PROTO_FIELD_SEARCH_TEXT_TARGET: u32 = 50;
 pub(crate) const DETAILS_BATCH_SIZE: usize = 100;
 const AUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -44,6 +49,7 @@ const AUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
 pub struct WorkshopObservation {
     pub outcome: WorkshopFetchOutcome,
     pub listed: bool,
+    pub consumer_appid: Option<u32>,
 }
 
 impl From<WorkshopFetchOutcome> for WorkshopObservation {
@@ -51,6 +57,7 @@ impl From<WorkshopFetchOutcome> for WorkshopObservation {
         Self {
             outcome,
             listed: true,
+            consumer_appid: None,
         }
     }
 }
@@ -63,6 +70,27 @@ impl WorkshopObservation {
             | WorkshopFetchOutcome::PrivateOrUnavailable { observed_at, .. } => *observed_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum SteamSearchTarget {
+    All = 0,
+    Title = 1,
+    Description = 2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SteamSearchRequest {
+    pub query_type: u32,
+    pub file_type: u32,
+    pub page: u32,
+    pub num_per_page: u32,
+    pub search_text: Option<String>,
+    pub required_tags: Vec<String>,
+    pub language: i32,
+    pub days: Option<u32>,
+    pub search_text_target: Option<SteamSearchTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +111,9 @@ pub trait WorkshopUpstream: Send + Sync {
         cursor: &str,
         num_per_page: u32,
     ) -> anyhow::Result<WorkshopQueryPage>;
+
+    async fn search_files(&self, request: &SteamSearchRequest)
+        -> anyhow::Result<WorkshopQueryPage>;
 
     async fn status(&self) -> CatalogSteamStatus;
 
@@ -623,7 +654,46 @@ fn map_detail(
     Some(WorkshopObservation {
         outcome,
         listed: d.visibility() == 0,
+        consumer_appid: d.consumer_appid,
     })
+}
+
+pub fn build_search_files_proto(
+    app_id: u32,
+    request: &SteamSearchRequest,
+) -> CPublishedFile_QueryFiles_Request {
+    let mut proto = CPublishedFile_QueryFiles_Request {
+        query_type: Some(request.query_type),
+        page: Some(request.page.max(1)),
+        numperpage: Some(request.num_per_page.clamp(1, 100)),
+        appid: Some(app_id),
+        // Never restrict creator_appid to 550: L4D2 Authoring Tools maps use creator_appid=563.
+        creator_appid: None,
+        requiredtags: request.required_tags.clone(),
+        match_all_tags: Some(true),
+        search_text: request.search_text.clone(),
+        filetype: Some(request.file_type),
+        days: request.days,
+        cache_max_age_seconds: Some(0),
+        language: Some(request.language),
+        return_vote_data: Some(true),
+        return_tags: Some(true),
+        return_previews: Some(true),
+        return_children: Some(true),
+        return_short_description: Some(false),
+        return_details: Some(true),
+        ..Default::default()
+    };
+    if let Some(target) = request
+        .search_text_target
+        .filter(|t| *t != SteamSearchTarget::All)
+    {
+        proto
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(PROTO_FIELD_SEARCH_TEXT_TARGET, target as u64);
+    }
+    proto
 }
 
 fn can_resolve_by_id(d: &PublishedFileDetails) -> bool {
@@ -666,11 +736,16 @@ fn details_to_record(
         .tags
         .iter()
         .filter_map(|t| {
-            t.display_name
+            t.tag
                 .as_deref()
-                .or(t.tag.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    t.display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
                 .map(ToString::to_string)
         })
         .collect();
@@ -877,6 +952,57 @@ impl WorkshopUpstream for SteamCmClient {
             outcomes.len() == resp.publishedfiledetails.len(),
             "Steam CM QueryFiles 包含未核验的条目"
         );
+        Ok(WorkshopQueryPage {
+            total: u64::from(resp.total.unwrap_or(0)),
+            next_cursor: resp.next_cursor.filter(|s| !s.trim().is_empty()),
+            outcomes,
+        })
+    }
+
+    async fn search_files(
+        &self,
+        request: &SteamSearchRequest,
+    ) -> anyhow::Result<WorkshopQueryPage> {
+        let _permit = self.inner.request_gate.acquire().await?;
+        let app_id = self.inner.config_store.get().steam.app_id;
+        let mut conn = self.inner.get_or_connect().await?;
+        self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        let mut observed_at = Utc::now();
+        let resp = match conn
+            .service_method(build_search_files_proto(app_id, request))
+            .await
+        {
+            Ok(r) => r,
+            Err(err) if should_retry_network(&err) => {
+                conn = self.inner.invalidate_and_reconnect().await?;
+                observed_at = Utc::now();
+                conn.service_method(build_search_files_proto(app_id, request))
+                    .await
+                    .map_err(|e| {
+                        self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
+                        anyhow::anyhow!("Steam CM search_files 重试失败: {e}")
+                    })?
+            }
+            Err(err) => {
+                self.inner.failed_requests.fetch_add(1, Ordering::Relaxed);
+                let mut m = self.inner.meta.write().await;
+                m.last_error = Some(err.to_string());
+                return Err(anyhow::anyhow!("Steam CM search_files 调用失败: {err}"));
+            }
+        };
+
+        let outcomes = self
+            .inner
+            .map_details(&conn, &resp.publishedfiledetails, observed_at)
+            .await;
+        if outcomes.len() < resp.publishedfiledetails.len() {
+            tracing::warn!(
+                returned = resp.publishedfiledetails.len(),
+                verified = outcomes.len(),
+                "Steam CM search_files 部分条目状态未核验"
+            );
+        }
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
             next_cursor: resp.next_cursor.filter(|s| !s.trim().is_empty()),
@@ -1108,8 +1234,13 @@ impl WorkshopUpstream for SteamCmClient {
 struct MockUpstreamState {
     outcomes: HashMap<WorkshopId, WorkshopObservation>,
     query_pages: HashMap<(u32, u32, String), WorkshopQueryPage>,
+    search_pages: HashMap<SteamSearchRequest, WorkshopQueryPage>,
+    recorded_searches: Vec<SteamSearchRequest>,
     fetch_counts: HashMap<WorkshopId, u64>,
     fail_fetches: bool,
+    fail_searches: bool,
+    failed_searches: HashSet<SteamSearchRequest>,
+    search_delay: Option<Duration>,
     failed_details: HashSet<WorkshopId>,
     mode: SteamAuthMode,
     account_name: Option<String>,
@@ -1156,8 +1287,28 @@ impl MockWorkshopUpstream {
             .insert((query_type, file_type, cursor.into()), page);
     }
 
+    pub fn insert_search_page(&self, req: SteamSearchRequest, page: WorkshopQueryPage) {
+        self.inner.lock().unwrap().search_pages.insert(req, page);
+    }
+
+    pub fn recorded_searches(&self) -> Vec<SteamSearchRequest> {
+        self.inner.lock().unwrap().recorded_searches.clone()
+    }
+
     pub fn set_fail_fetches(&self, fail: bool) {
         self.inner.lock().unwrap().fail_fetches = fail;
+    }
+
+    pub fn set_fail_searches(&self, fail: bool) {
+        self.inner.lock().unwrap().fail_searches = fail;
+    }
+
+    pub fn fail_search_request(&self, req: SteamSearchRequest) {
+        self.inner.lock().unwrap().failed_searches.insert(req);
+    }
+
+    pub fn set_search_delay(&self, delay: Option<Duration>) {
+        self.inner.lock().unwrap().search_delay = delay;
     }
 
     pub fn fail_details_containing(&self, wid: WorkshopId) {
@@ -1224,6 +1375,35 @@ impl WorkshopUpstream for MockWorkshopUpstream {
         Ok(guard
             .query_pages
             .get(&key)
+            .cloned()
+            .unwrap_or(WorkshopQueryPage {
+                total: 0,
+                next_cursor: None,
+                outcomes: Vec::new(),
+            }))
+    }
+
+    async fn search_files(
+        &self,
+        request: &SteamSearchRequest,
+    ) -> anyhow::Result<WorkshopQueryPage> {
+        let delay = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.total_requests += 1;
+            guard.recorded_searches.push(request.clone());
+            if guard.fail_fetches || guard.fail_searches || guard.failed_searches.contains(request)
+            {
+                anyhow::bail!("Simulated Steam CM search_files failure");
+            }
+            guard.search_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let guard = self.inner.lock().unwrap();
+        Ok(guard
+            .search_pages
+            .get(request)
             .cloned()
             .unwrap_or(WorkshopQueryPage {
                 total: 0,
@@ -1454,5 +1634,87 @@ mod tests {
             .set_qr_challenge(previous, "https://example.test/old")
             .await
             .is_err());
+    }
+
+    #[test]
+    fn build_search_files_proto_omits_creator_appid_and_serializes_target() {
+        use steam_vent_proto_common::protobuf::Message;
+
+        let req = SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_ITEMS,
+            page: 2,
+            num_per_page: 24,
+            search_text: Some("Early Days".to_string()),
+            required_tags: vec!["Campaigns".to_string()],
+            language: 6,
+            days: Some(7),
+            search_text_target: Some(SteamSearchTarget::Title),
+        };
+        let proto = build_search_files_proto(550, &req);
+        assert_eq!(proto.appid, Some(550));
+        assert!(proto.creator_appid.is_none());
+        assert_eq!(proto.query_type, Some(QUERY_TYPE_RANKED_BY_TEXT_SEARCH));
+        assert_eq!(proto.filetype, Some(MATCHING_FILE_TYPE_ITEMS));
+        assert_eq!(proto.page, Some(2));
+        assert_eq!(proto.numperpage, Some(24));
+        assert_eq!(proto.search_text.as_deref(), Some("Early Days"));
+        assert_eq!(proto.requiredtags, vec!["Campaigns".to_string()]);
+        assert_eq!(proto.language, Some(6));
+        assert_eq!(proto.days, Some(7));
+        assert_eq!(proto.return_short_description, Some(false));
+        assert_eq!(proto.return_details, Some(true));
+
+        let bytes = proto.write_to_bytes().unwrap();
+        let decoded = CPublishedFile_QueryFiles_Request::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            decoded
+                .special_fields
+                .unknown_fields()
+                .get(PROTO_FIELD_SEARCH_TEXT_TARGET)
+                .and_then(|v| match v {
+                    steam_vent_proto_common::protobuf::UnknownValueRef::Varint(val) => Some(val),
+                    _ => None,
+                }),
+            Some(SteamSearchTarget::Title as u64)
+        );
+
+        let default_target_proto = build_search_files_proto(
+            550,
+            &SteamSearchRequest {
+                search_text_target: Some(SteamSearchTarget::All),
+                ..req
+            },
+        );
+        assert!(default_target_proto
+            .special_fields
+            .unknown_fields()
+            .get(PROTO_FIELD_SEARCH_TEXT_TARGET)
+            .is_none());
+    }
+
+    #[test]
+    fn details_to_record_prefers_canonical_tags_over_localized_display_names() {
+        use steam_vent_proto_steam::steammessages_publishedfile_steamclient::published_file_details::Tag;
+
+        let details = PublishedFileDetails {
+            publishedfileid: Some(9001),
+            title: Some("Localized Map".into()),
+            tags: vec![
+                Tag {
+                    tag: Some("Campaigns".into()),
+                    display_name: Some("战役".into()),
+                    ..Default::default()
+                },
+                Tag {
+                    tag: Some("   ".into()),
+                    display_name: Some("Co-op".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let record = details_to_record(WorkshopId(9001), &details, None, Utc::now());
+        assert_eq!(record.tags, vec!["Campaigns", "Co-op"]);
     }
 }

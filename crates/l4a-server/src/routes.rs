@@ -6,8 +6,8 @@ use crate::ServerState;
 use axum::{
     extract::{Path, Query, Request, State},
     http::{
-        header::{CACHE_CONTROL, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
+        header::{ACCEPT_LANGUAGE, CACHE_CONTROL, SET_COOKIE, VARY},
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -20,8 +20,8 @@ use l4a_protocol::{
     AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogOverviewResponse, CatalogStats,
     CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, SearchQuery, SearchResponse,
     SetRefreshTokenRequest, StartCredentialsAuthRequest, SteamAuthFlowStatus,
-    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopId, WorkshopItemRecord,
-    WorkshopItemStatus,
+    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopFileType, WorkshopId,
+    WorkshopItemRecord, WorkshopItemStatus,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,9 +58,13 @@ impl RouteState {
 
 pub fn router(state: ServerState) -> Router {
     let state = RouteState { server: state };
+    let search_route = Router::new()
+        .route("/api/v1/items/search", get(search_items))
+        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(append_search_vary));
+
     let public_routes = Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/items/search", get(search_items))
         .route("/api/v1/items/batch", post(batch_items))
         .route("/api/v1/items/{workshop_id}", get(get_item))
         .route("/api/v1/collections/{collection_id}", get(get_collection))
@@ -127,10 +131,32 @@ pub fn router(state: ServerState) -> Router {
         ));
 
     Router::new()
+        .merge(search_route)
         .merge(public_routes)
         .merge(admin_routes)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+async fn append_search_vary(request: Request, next: Next) -> Response {
+    let should_vary = matches!(request.method(), &Method::GET | &Method::HEAD);
+    let mut response = next.run(request).await;
+    if !should_vary {
+        return response;
+    }
+    let has_accept_lang = response
+        .headers()
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|part| part.trim().eq_ignore_ascii_case("accept-language"));
+    if !has_accept_lang {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Accept-Language"));
+    }
+    response
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
@@ -233,6 +259,12 @@ struct SearchParams {
     sort: Option<String>,
     page: Option<u32>,
     page_size: Option<u32>,
+    #[serde(alias = "language")]
+    lang: Option<String>,
+    #[serde(alias = "search_target", alias = "search_text_target")]
+    search_target: Option<String>,
+    #[serde(alias = "filetype", alias = "file_type")]
+    file_type: Option<WorkshopFileType>,
 }
 
 impl From<SearchParams> for SearchQuery {
@@ -244,18 +276,34 @@ impl From<SearchParams> for SearchQuery {
             sort: params.sort,
             page: params.page.unwrap_or(1),
             page_size: params.page_size.unwrap_or(30),
+            language: params.lang,
+            search_target: params.search_target,
+            file_type: params.file_type,
         }
     }
 }
 
 async fn search_items(
     State(state): State<RouteState>,
+    headers: HeaderMap,
     Query(params): Query<SearchParams>,
-) -> ApiResult<SearchResponse> {
+) -> Result<(HeaderMap, Json<SearchResponse>), (StatusCode, Json<Value>)> {
     let q = SearchQuery::from(params);
-    let mut res = state.db(move |repo| repo.search(&q, true)).await?;
-    res.items = res.items.into_iter().map(with_catalog_source).collect();
-    Ok(Json(res))
+    let accept_language = headers
+        .get(ACCEPT_LANGUAGE)
+        .and_then(|value| value.to_str().ok());
+    let output = state
+        .server
+        .search
+        .search(&q, accept_language)
+        .await
+        .map_err(internal_err)?;
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        HeaderName::from_static("x-l4a-search-mode"),
+        HeaderValue::from_static(output.mode.as_header_value()),
+    );
+    Ok((resp_headers, Json(output.response)))
 }
 
 async fn admin_search_items(

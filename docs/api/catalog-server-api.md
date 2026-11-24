@@ -24,10 +24,19 @@
 ```
 响应：返回命中的 `items`（含已下架条目的墓碑状态）以及未能解析的 `missingIds`。
 
-### `GET /api/v1/items/search?q=&tag=&status=&sort=&page=1&pageSize=30`
-在本地 SQLite FTS5 缓存索引中按标题（支持中英文分词、驼峰/忽略空格复合匹配与中文标题拼音检索）、作者名、Workshop ID/链接、标签（大小写不敏感匹配）与状态 (`active` / `removed` / `private_or_unavailable`) 分页检索；仅当主字段无命中时自动回退至去除 BBCode 与链接后的简介检索，避免简介版权声明/致谢名单干扰结果。`sort` 支持 `relevance`、`updated`、`updated_asc`、`newest`、`subscriptions`、`title`。
+### `GET /api/v1/items/search?q=&tag=&status=&sort=&page=1&pageSize=30&lang=&searchTarget=&fileType=`
+公开检索接口默认启用 **SteamKit CM + 本地 SQLite FTS5 混合搜索**（可在 `catalog.toml` `[search]` 配置关闭）。响应头 `X-L4A-Search-Mode` 会标明本次执行模式：`hybrid`、`local` 或 `local-fallback`（Steam CM 超时或失败时的优雅降级）。
 
-公开搜索仅展示经目录同步（增量同步、全量回填）或管理员主动预热/覆写收录且已确认公开的条目，排除未列出、尚未核验可见性以及仅由客户端按 ID Read-Through 穿透缓存的条目；已收录条目不会因超过 `sync.item_ttl_secs` 而退出公开搜索，下载或按 ID 查询时仍会按 TTL 自动向 Steam CM 刷新最新直链。未列出的 Steam 条目与 Read-Through 缓存条目仍可按 ID 查询，此前已确认公开的墓碑和管理员锁定的公开覆写可以继续显示。
+- **混合检索与网页端一致性**：向 Steam CM `PublishedFile.QueryFiles` 发起检索时**不限制 `creator_appid`**（兼容《求生之路 2》Authoring Tools `563` 上传的绝大部分战役与地图），从而在服务端直接复刻创意工坊网页端的搜索相关性与 `file_url` / 依赖 / 画廊返回，无需爬取网页 HTML。
+- **多语言检索 (`lang` / `Accept-Language`)**：按 `lang` 查询参数 → HTTP `Accept-Language` 请求头（按 `q` 权重）→ 配置项 `search.default_language` 的优先级映射 Steam `ELanguage`（如 `en`/`english`→`0`、`zh-CN`/`schinese`→`6`、`zh-TW`/`tchinese`→`7`、`ja`→`10`、`ko`→`4`、`ru`→`8`），复刻 Steam 网页端随语言切换搜索结果的体验。
+- **扩展筛选与排序**：
+  - `searchTarget`：支持 `all`（默认，全字段）、`title`（仅标题）、`description`（仅简介）；
+  - `fileType`：支持 `item`（组件，默认）与 `collection`（合集）；
+  - `sort`：支持 `relevance`、`trend`、`toprated`、`subscriptions`（及 `totalprofiles` / `popular`）、`updated`、`newest`、`updated_asc`、`title`（后两项及 `removed` / `private_or_unavailable` 状态自动走本地索引 `local` 模式）。
+- **本地能力增强与隔离保护**：本地 SQLite FTS5 索引（中英文分词、驼峰/忽略空格复合词、中文标题拼音、`AdminOverride` 人工覆写与直链、下架墓碑）会与 Steam CM 结果智能去重融合；仅通过按需搜索暖缓存 (`CacheOnly`) 的条目不会污染公开首页，本地已知的私密 (`private_or_unavailable`) 与未列出 (`is_listed = 0`) 条目绝不会从公开搜索泄露。
+- **精确 ID / 链接查询**：传入 Steam Workshop 链接或 6 位以上纯数字 ID 时，若本地未收录且未在本地标记为受限/覆写，会自动通过 `GetDetails` 穿透补全公开条目。
+
+> `GET /api/v1/admin/items/search` 保持**纯本地 SQLite 缓存检索**，供管理员检视已缓存条目与墓碑，不触发上游 Steam CM 请求。
 
 ### `GET /api/v1/collections/{collection_id}?refresh=false`
 查询合集元数据及其子条目明细（若目标或子条目缺失会自动穿透拉取并补全 `items`；若目标 ID 非合集类型返回 `404`）。
