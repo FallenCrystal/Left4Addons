@@ -1,5 +1,11 @@
 use super::auth::AuthFlowSlot;
-use super::mapping::{build_search_files_proto, can_resolve_by_id, map_detail};
+use super::mapping::{
+    build_query_files_proto, build_search_files_proto, can_resolve_by_id, map_detail,
+};
+use super::wire::{
+    service_method_lossy, GET_DETAILS_RESPONSE_SCHEMA, GET_PLAYER_LINK_DETAILS_RESPONSE_SCHEMA,
+    QUERY_FILES_RESPONSE_SCHEMA,
+};
 use super::{
     SteamSearchRequest, WorkshopObservation, WorkshopQueryPage, WorkshopUpstream,
     DETAILS_BATCH_SIZE,
@@ -14,10 +20,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use steam_vent::{Connection, ConnectionTrait, NetworkError, ServerList};
+use steam_vent::{Connection, NetworkError, ServerList};
 use steam_vent_proto_steam::steammessages_player_steamclient::CPlayer_GetPlayerLinkDetails_Request;
 use steam_vent_proto_steam::steammessages_publishedfile_steamclient::{
-    CPublishedFile_GetDetails_Request, CPublishedFile_QueryFiles_Request, PublishedFileDetails,
+    CPublishedFile_GetDetails_Request, PublishedFileDetails,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -144,13 +150,14 @@ impl SteamCmClient {
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
         // Order overlapping requests by the start of the RPC, before any enrichment or database work.
         let mut observed_at = Utc::now();
-        let resp = match conn.service_method(make_req()).await {
+        let resp = match service_method_lossy(&conn, make_req(), GET_DETAILS_RESPONSE_SCHEMA).await
+        {
             Ok(resp) => resp,
             Err(err) if should_retry_network(&err) => {
                 let (_, reconnected) = self.inner.invalidate_and_reconnect(Some(conn_gen)).await?;
                 conn = reconnected;
                 observed_at = Utc::now();
-                conn.service_method(make_req())
+                service_method_lossy(&conn, make_req(), GET_DETAILS_RESPONSE_SCHEMA)
                     .await
                     .map_err(|err| anyhow::anyhow!("Steam CM GetDetails 重试失败: {err}"))?
             }
@@ -280,6 +287,13 @@ impl SteamCmInner {
         self.meta.write().await.last_error = Some(err_msg);
     }
 
+    async fn clear_last_error(&self) {
+        let mut meta = self.meta.write().await;
+        if meta.state == SteamConnectionState::Connected {
+            meta.last_error = None;
+        }
+    }
+
     async fn resolve_persona_names(&self, conn: &Connection, steam_ids: &[u64]) {
         if self.config_store.get().steam.mode != SteamAuthMode::Account || steam_ids.is_empty() {
             return;
@@ -302,7 +316,9 @@ impl SteamCmInner {
                 steamids: chunk.to_vec(),
                 ..Default::default()
             };
-            if let Ok(resp) = conn.service_method(req).await {
+            if let Ok(resp) =
+                service_method_lossy(conn, req, GET_PLAYER_LINK_DETAILS_RESPONSE_SCHEMA).await
+            {
                 let mut cache = self.persona_cache.write().await;
                 for acc in resp.accounts {
                     let sid = acc.public_data.steamid();
@@ -403,6 +419,9 @@ impl WorkshopUpstream for SteamCmClient {
                 last_error.unwrap_or_else(|| anyhow::anyhow!("Steam CM 未核验任何请求的条目"))
             );
         }
+        if !ids.is_empty() && last_error.is_none() {
+            self.inner.clear_last_error().await;
+        }
         Ok(all_outcomes)
     }
 
@@ -418,30 +437,12 @@ impl WorkshopUpstream for SteamCmClient {
         let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        let cursor_str = if cursor.trim().is_empty() {
-            "*".to_string()
-        } else {
-            cursor.trim().to_string()
-        };
-
-        let make_req = || CPublishedFile_QueryFiles_Request {
-            query_type: Some(query_type),
-            cursor: Some(cursor_str.clone()),
-            numperpage: Some(num_per_page.clamp(1, 100)),
-            appid: Some(app_id),
-            cache_max_age_seconds: Some(0),
-            filetype: Some(file_type),
-            return_vote_data: Some(true),
-            return_tags: Some(true),
-            return_previews: Some(true),
-            return_children: Some(true),
-            return_short_description: Some(true),
-            return_details: Some(true),
-            ..Default::default()
-        };
+        let make_req =
+            || build_query_files_proto(app_id, query_type, file_type, cursor, num_per_page);
 
         let mut observed_at = Utc::now();
-        let resp = match conn.service_method(make_req()).await {
+        let resp = match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA).await
+        {
             Ok(r) => r,
             Err(err) if should_retry_network(&err) => {
                 match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
@@ -452,7 +453,7 @@ impl WorkshopUpstream for SteamCmClient {
                     }
                 }
                 observed_at = Utc::now();
-                match conn.service_method(make_req()).await {
+                match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA).await {
                     Ok(r) => r,
                     Err(e) => {
                         let msg = format!("Steam CM QueryFiles 重试失败: {e}");
@@ -463,7 +464,7 @@ impl WorkshopUpstream for SteamCmClient {
             }
             Err(err) => {
                 let msg = format!("Steam CM QueryFiles 调用失败: {err}");
-                self.inner.record_request_failure(err.to_string()).await;
+                self.inner.record_request_failure(msg.clone()).await;
                 return Err(anyhow::anyhow!(msg));
             }
         };
@@ -476,6 +477,7 @@ impl WorkshopUpstream for SteamCmClient {
             outcomes.len() == resp.publishedfiledetails.len(),
             "Steam CM QueryFiles 包含未核验的条目"
         );
+        self.inner.clear_last_error().await;
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
             next_cursor: resp
@@ -496,9 +498,12 @@ impl WorkshopUpstream for SteamCmClient {
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
         let mut observed_at = Utc::now();
-        let resp = match conn
-            .service_method(build_search_files_proto(app_id, request))
-            .await
+        let resp = match service_method_lossy(
+            &conn,
+            build_search_files_proto(app_id, request),
+            QUERY_FILES_RESPONSE_SCHEMA,
+        )
+        .await
         {
             Ok(r) => r,
             Err(err) if should_retry_network(&err) => {
@@ -510,9 +515,12 @@ impl WorkshopUpstream for SteamCmClient {
                     }
                 }
                 observed_at = Utc::now();
-                match conn
-                    .service_method(build_search_files_proto(app_id, request))
-                    .await
+                match service_method_lossy(
+                    &conn,
+                    build_search_files_proto(app_id, request),
+                    QUERY_FILES_RESPONSE_SCHEMA,
+                )
+                .await
                 {
                     Ok(r) => r,
                     Err(e) => {
@@ -524,7 +532,7 @@ impl WorkshopUpstream for SteamCmClient {
             }
             Err(err) => {
                 let msg = format!("Steam CM search_files 调用失败: {err}");
-                self.inner.record_request_failure(err.to_string()).await;
+                self.inner.record_request_failure(msg.clone()).await;
                 return Err(anyhow::anyhow!(msg));
             }
         };
@@ -545,6 +553,7 @@ impl WorkshopUpstream for SteamCmClient {
                 "Steam CM search_files 部分条目状态未核验"
             );
         }
+        self.inner.clear_last_error().await;
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
             next_cursor: resp

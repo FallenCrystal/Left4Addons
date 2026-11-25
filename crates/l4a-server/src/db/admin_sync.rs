@@ -236,27 +236,58 @@ impl ServerRepo {
         Ok(())
     }
 
-    pub fn stats(&self) -> anyhow::Result<CatalogStats> {
+    pub fn total_items_count(&self) -> anyhow::Result<u64> {
         let conn = self.lock_reader()?;
-        let count = |sql: &str| -> anyhow::Result<u64> {
-            let n: i64 = conn.query_row(sql, [], |r| r.get(0))?;
-            Ok(n.max(0) as u64)
-        };
-        Ok(CatalogStats {
-            total_items: count("SELECT COUNT(*) FROM workshop_items")?,
-            active_items: count("SELECT COUNT(*) FROM workshop_items WHERE status = 'active'")?,
-            removed_items: count("SELECT COUNT(*) FROM workshop_items WHERE status = 'removed'")?,
-            private_items: count(
-                "SELECT COUNT(*) FROM workshop_items WHERE status = 'private_or_unavailable'",
-            )?,
-            collections_count: count(
-                "SELECT COUNT(*) FROM workshop_items WHERE file_type = 'collection'",
-            )?,
-            overridden_items: count(
-                "SELECT COUNT(*) FROM workshop_items WHERE is_admin_override = 1",
-            )?,
-            revisions_count: count("SELECT COUNT(*) FROM workshop_item_revisions")?,
-            audit_logs_count: count("SELECT COUNT(*) FROM audit_log")?,
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM workshop_items", [], |r| r.get(0))?;
+        Ok(n.max(0) as u64)
+    }
+
+    pub fn stats(&self) -> anyhow::Result<CatalogStats> {
+        self.with_read_snapshot(|conn| {
+            let (
+                total_items,
+                active_items,
+                removed_items,
+                private_items,
+                collections_count,
+                overridden_items,
+            ) = conn.query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'removed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'private_or_unavailable' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN file_type = 'collection' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN is_admin_override = 1 THEN 1 ELSE 0 END), 0)
+                 FROM workshop_items",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?.max(0) as u64,
+                        r.get::<_, i64>(1)?.max(0) as u64,
+                        r.get::<_, i64>(2)?.max(0) as u64,
+                        r.get::<_, i64>(3)?.max(0) as u64,
+                        r.get::<_, i64>(4)?.max(0) as u64,
+                        r.get::<_, i64>(5)?.max(0) as u64,
+                    ))
+                },
+            )?;
+            let revisions_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM workshop_item_revisions", [], |r| {
+                    r.get(0)
+                })?;
+            let audit_logs_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))?;
+            Ok(CatalogStats {
+                total_items,
+                active_items,
+                removed_items,
+                private_items,
+                collections_count,
+                overridden_items,
+                revisions_count: revisions_count.max(0) as u64,
+                audit_logs_count: audit_logs_count.max(0) as u64,
+            })
         })
     }
 }

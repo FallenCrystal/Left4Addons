@@ -1,5 +1,7 @@
 use crate::config::{CatalogConfigStore, SyncSection};
-use crate::db::{CatalogIndexPolicy, RankedCatalogMatch, ServerRepo};
+use crate::db::{
+    CatalogIndexPolicy, QueryAbortedError, QueryCancelToken, RankedCatalogMatch, ServerRepo,
+};
 use crate::search::{self, MatchRank, ParsedQuery};
 use crate::sync::with_catalog_source;
 use crate::upstream::{
@@ -10,7 +12,7 @@ use crate::upstream::{
     QUERY_TYPE_RANKED_BY_TREND, QUERY_TYPE_RANKED_BY_VOTE,
 };
 use chrono::Utc;
-use futures_util::future::join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use l4a_protocol::{
     MetadataSource, SearchQuery, SearchResponse, WorkshopFetchOutcome, WorkshopFileType,
     WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
@@ -19,14 +21,22 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, Mutex, OnceCell};
+use tokio::sync::{broadcast, mpsc, Mutex, OnceCell, Semaphore};
 
 const MAX_SEARCH_CACHE_ENTRIES: usize = 512;
-const MAX_INFLIGHT_SEARCHES: usize = 256;
-const MAX_WARM_QUEUE_BATCHES: usize = 64;
+const MAX_INFLIGHT_SEARCHES: usize = 64;
+const MAX_WARM_QUEUE_BATCHES: usize = 16;
+const WARM_WRITE_CHUNK_SIZE: usize = 25;
 const MAX_STEAM_MERGE_PAGES: u64 = 24;
 const STEAM_SCAN_PAGE_SIZE: u32 = 100;
 const MAX_STEAM_MERGE_ITEMS: u64 = MAX_STEAM_MERGE_PAGES * STEAM_SCAN_PAGE_SIZE as u64;
+const MAX_CONCURRENT_PAGES_PER_SEARCH: usize = 4;
+const MAX_CONCURRENT_LOCAL_SEARCHES: usize = 4;
+const LOCAL_SEARCH_QUEUE_WAIT: Duration = Duration::from_secs(2);
+const LOCAL_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_SUPPLEMENT_QUEUE_WAIT: Duration = Duration::from_millis(500);
+const LOCAL_SUPPLEMENT_TIMEOUT: Duration = Duration::from_secs(2);
+const ADMIN_SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchExecutionMode {
@@ -224,33 +234,65 @@ struct WarmBatch {
 
 #[derive(Default)]
 struct SearchCacheState {
+    next_inflight_id: u64,
     cache: HashMap<SteamSearchRequest, CachedSteamPage>,
-    inflight: HashMap<SteamSearchRequest, broadcast::Receiver<SharedPageResult>>,
-    inflight_exact: HashMap<WorkshopId, broadcast::Receiver<SharedExactResult>>,
+    inflight: HashMap<SteamSearchRequest, (u64, broadcast::Receiver<SharedPageResult>)>,
+    inflight_exact: HashMap<WorkshopId, (u64, broadcast::Receiver<SharedExactResult>)>,
+}
+
+impl SearchCacheState {
+    fn next_id(&mut self) -> u64 {
+        self.next_inflight_id = self.next_inflight_id.wrapping_add(1);
+        self.next_inflight_id
+    }
+
+    fn remove_inflight_if_matches(&mut self, key: &SteamSearchRequest, id: u64) {
+        if self
+            .inflight
+            .get(key)
+            .is_some_and(|(cur_id, _)| *cur_id == id)
+        {
+            self.inflight.remove(key);
+        }
+    }
+
+    fn remove_inflight_exact_if_matches(&mut self, key: &WorkshopId, id: u64) {
+        if self
+            .inflight_exact
+            .get(key)
+            .is_some_and(|(cur_id, _)| *cur_id == id)
+        {
+            self.inflight_exact.remove(key);
+        }
+    }
 }
 
 struct PageInflightGuard {
     state: Arc<Mutex<SearchCacheState>>,
-    key: Option<SteamSearchRequest>,
+    entry: Option<(SteamSearchRequest, u64)>,
 }
 
 impl PageInflightGuard {
+    fn id(&self) -> Option<u64> {
+        self.entry.as_ref().map(|(_, id)| *id)
+    }
+
     fn disarm(&mut self) {
-        self.key = None;
+        self.entry = None;
     }
 }
 
 impl Drop for PageInflightGuard {
     fn drop(&mut self) {
-        let Some(key) = self.key.take() else {
+        let Some((key, id)) = self.entry.take() else {
             return;
         };
         if let Ok(mut guard) = self.state.try_lock() {
-            guard.inflight.remove(&key);
+            guard.remove_inflight_if_matches(&key, id);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let state = Arc::clone(&self.state);
             handle.spawn(async move {
-                state.lock().await.inflight.remove(&key);
+                state.lock().await.remove_inflight_if_matches(&key, id);
             });
         }
     }
@@ -258,27 +300,57 @@ impl Drop for PageInflightGuard {
 
 struct ExactInflightGuard {
     state: Arc<Mutex<SearchCacheState>>,
-    key: Option<WorkshopId>,
+    entry: Option<(WorkshopId, u64)>,
 }
 
 impl ExactInflightGuard {
+    fn id(&self) -> Option<u64> {
+        self.entry.as_ref().map(|(_, id)| *id)
+    }
+
     fn disarm(&mut self) {
-        self.key = None;
+        self.entry = None;
     }
 }
 
 impl Drop for ExactInflightGuard {
     fn drop(&mut self) {
-        let Some(key) = self.key.take() else {
+        let Some((key, id)) = self.entry.take() else {
             return;
         };
         if let Ok(mut guard) = self.state.try_lock() {
-            guard.inflight_exact.remove(&key);
+            guard.remove_inflight_exact_if_matches(&key, id);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let state = Arc::clone(&self.state);
             handle.spawn(async move {
-                state.lock().await.inflight_exact.remove(&key);
+                state
+                    .lock()
+                    .await
+                    .remove_inflight_exact_if_matches(&key, id);
             });
+        }
+    }
+}
+
+struct CancelOnDrop {
+    token: QueryCancelToken,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn new(token: QueryCancelToken) -> Self {
+        Self { token, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.token.cancel();
         }
     }
 }
@@ -288,6 +360,13 @@ pub struct HybridSearchService {
     repo: Arc<ServerRepo>,
     upstream: Arc<dyn WorkshopUpstream>,
     cache_state: Arc<Mutex<SearchCacheState>>,
+    steam_rpc_gate: Arc<Semaphore>,
+    local_search_gate: Arc<Semaphore>,
+    local_search_queue_wait: Duration,
+    local_search_timeout: Duration,
+    local_supplement_queue_wait: Duration,
+    local_supplement_timeout: Duration,
+    admin_search_timeout: Duration,
     warm_tx: mpsc::Sender<WarmBatch>,
     warm_rx: StdMutex<Option<mpsc::Receiver<WarmBatch>>>,
 }
@@ -298,12 +377,22 @@ impl HybridSearchService {
         repo: Arc<ServerRepo>,
         upstream: Arc<dyn WorkshopUpstream>,
     ) -> Self {
+        let steam_concurrency = config_store.get().steam.request_concurrency.clamp(1, 16);
+        // Reserve at least one Steam CM slot for non-search reads/sync when concurrency > 1.
+        let search_steam_permits = steam_concurrency.saturating_sub(1).max(1);
         let (warm_tx, warm_rx) = mpsc::channel(MAX_WARM_QUEUE_BATCHES);
         Self {
             config_store,
             repo,
             upstream,
             cache_state: Arc::new(Mutex::new(SearchCacheState::default())),
+            steam_rpc_gate: Arc::new(Semaphore::new(search_steam_permits)),
+            local_search_gate: Arc::new(Semaphore::new(MAX_CONCURRENT_LOCAL_SEARCHES)),
+            local_search_queue_wait: LOCAL_SEARCH_QUEUE_WAIT,
+            local_search_timeout: LOCAL_SEARCH_TIMEOUT,
+            local_supplement_queue_wait: LOCAL_SUPPLEMENT_QUEUE_WAIT,
+            local_supplement_timeout: LOCAL_SUPPLEMENT_TIMEOUT,
+            admin_search_timeout: ADMIN_SEARCH_TIMEOUT,
             warm_tx,
             warm_rx: StdMutex::new(Some(warm_rx)),
         }
@@ -315,6 +404,55 @@ impl HybridSearchService {
     ) -> anyhow::Result<T> {
         let repo = self.repo.clone();
         tokio::task::spawn_blocking(move || op(&repo)).await?
+    }
+
+    async fn run_cancellable_local_search<T: Send + 'static>(
+        &self,
+        queue_wait: Duration,
+        exec_timeout: Duration,
+        op: impl FnOnce(&ServerRepo, &QueryCancelToken) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let permit = tokio::time::timeout(
+            queue_wait,
+            Arc::clone(&self.local_search_gate).acquire_owned(),
+        )
+        .await
+        .map_err(|_| anyhow::Error::new(QueryAbortedError::Busy))?
+        .map_err(|_| anyhow::Error::new(QueryAbortedError::Busy))?;
+
+        let cancel = QueryCancelToken::new();
+        let mut cancel_guard = CancelOnDrop::new(cancel.clone());
+        let repo = Arc::clone(&self.repo);
+        let cancel_for_blocking = cancel.clone();
+
+        // Hold `permit` inside the blocking closure so a timed-out or dropped HTTP request
+        // cannot admit a new scan before SQLite unwinds and returns its reader to the pool.
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            op(&repo, &cancel_for_blocking)
+        });
+
+        match tokio::time::timeout(exec_timeout, handle).await {
+            Ok(join_res) => {
+                cancel_guard.disarm();
+                join_res?
+            }
+            Err(_) => {
+                cancel.cancel();
+                cancel_guard.disarm();
+                Err(QueryAbortedError::Timeout.into())
+            }
+        }
+    }
+
+    pub async fn search_admin(&self, query: &SearchQuery) -> anyhow::Result<SearchResponse> {
+        let query = query.clone();
+        self.run_cancellable_local_search(
+            self.local_search_queue_wait,
+            self.admin_search_timeout,
+            move |repo, cancel| repo.search_cancellable(&query, false, cancel),
+        )
+        .await
     }
 
     pub async fn search(
@@ -464,7 +602,28 @@ impl HybridSearchService {
                 let steam_items = self
                     .apply_local_overlay(&query, ctx.app_id, observations.iter().copied(), true)
                     .await?;
-                let local = self.catalog_matches(&query).await?;
+                let local = match self
+                    .catalog_matches_with_budget(
+                        &query,
+                        self.local_supplement_queue_wait,
+                        self.local_supplement_timeout,
+                    )
+                    .await
+                {
+                    Ok(matches) => matches,
+                    Err(err)
+                        if err
+                            .chain()
+                            .any(|cause| cause.downcast_ref::<QueryAbortedError>().is_some()) =>
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "本地目录补充检索繁忙或超时，本次混合搜索降级为仅返回 Steam 实时结果"
+                        );
+                        Vec::new()
+                    }
+                    Err(err) => return Err(err),
+                };
                 let hits = merge_matches(
                     &local,
                     &steam_items,
@@ -571,7 +730,11 @@ impl HybridSearchService {
 
         let mut rx = {
             let mut state = self.cache_state.lock().await;
-            if let Some(existing) = state.inflight_exact.get(&wid).filter(|rx| !rx.is_closed()) {
+            if let Some((_, existing)) = state
+                .inflight_exact
+                .get(&wid)
+                .filter(|(_, rx)| !rx.is_closed())
+            {
                 existing.resubscribe()
             } else {
                 if state.inflight_exact.len() >= MAX_INFLIGHT_SEARCHES {
@@ -580,23 +743,29 @@ impl HybridSearchService {
                     ));
                 }
                 let (tx, rx) = broadcast::channel(1);
-                state.inflight_exact.insert(wid, rx.resubscribe());
+                let inflight_id = state.next_id();
+                state
+                    .inflight_exact
+                    .insert(wid, (inflight_id, rx.resubscribe()));
                 let svc = Arc::clone(self);
                 let cache_state = Arc::clone(&self.cache_state);
                 tokio::spawn(async move {
                     let mut guard = ExactInflightGuard {
                         state: cache_state,
-                        key: Some(wid),
+                        entry: Some((wid, inflight_id)),
                     };
-                    let fetch_result =
-                        tokio::time::timeout(ctx.steam_timeout, svc.upstream.fetch_details(&[wid]))
-                            .await
-                            .map_err(|_| {
-                                SteamSearchError::Unavailable("精确 ID Steam CM 检索超时".into())
-                            })
-                            .and_then(|res| {
-                                res.map_err(|err| SteamSearchError::Unavailable(err.to_string()))
-                            });
+                    let fetch_result = match tokio::time::timeout(
+                        ctx.steam_timeout,
+                        svc.execute_exact_rpc(wid, &tx, &mut guard),
+                    )
+                    .await
+                    {
+                        Ok(Some(res)) => res,
+                        Ok(None) => return,
+                        Err(_) => Err(SteamSearchError::Unavailable(
+                            "精确 ID Steam CM 检索超时".into(),
+                        )),
+                    };
 
                     let final_result: SharedExactResult = match fetch_result {
                         Ok(mut observations) => {
@@ -619,7 +788,7 @@ impl HybridSearchService {
 
                     {
                         let mut state = svc.cache_state.lock().await;
-                        state.inflight_exact.remove(&wid);
+                        state.remove_inflight_exact_if_matches(&wid, inflight_id);
                         guard.disarm();
                         let _ = tx.send(final_result);
                     }
@@ -636,13 +805,61 @@ impl HybridSearchService {
             })?
     }
 
+    async fn execute_exact_rpc(
+        &self,
+        wid: WorkshopId,
+        tx: &broadcast::Sender<SharedExactResult>,
+        guard: &mut ExactInflightGuard,
+    ) -> Option<Result<Vec<WorkshopObservation>, SteamSearchError>> {
+        if self.abort_exact_if_abandoned(wid, tx, guard).await {
+            return None;
+        }
+        let Ok(permit) = self.steam_rpc_gate.acquire().await else {
+            return Some(Err(SteamSearchError::Unavailable(
+                "Steam CM 并发闸门已关闭".to_owned(),
+            )));
+        };
+        if self.abort_exact_if_abandoned(wid, tx, guard).await {
+            return None;
+        }
+        let res = self.upstream.fetch_details(&[wid]).await;
+        drop(permit);
+        Some(res.map_err(|err| SteamSearchError::Unavailable(err.to_string())))
+    }
+
+    async fn abort_exact_if_abandoned(
+        &self,
+        wid: WorkshopId,
+        tx: &broadcast::Sender<SharedExactResult>,
+        guard: &mut ExactInflightGuard,
+    ) -> bool {
+        if tx.receiver_count() > 1 {
+            return false;
+        }
+        let mut state = self.cache_state.lock().await;
+        if tx.receiver_count() <= 1 {
+            if let Some(id) = guard.id() {
+                state.remove_inflight_exact_if_matches(&wid, id);
+            }
+            guard.disarm();
+            return true;
+        }
+        false
+    }
+
     async fn run_local_only(
         &self,
         query: &SearchQuery,
         mode: SearchExecutionMode,
     ) -> anyhow::Result<HybridSearchOutput> {
         let query = query.clone();
-        let resp = self.db_call(move |r| r.search(&query, true)).await?;
+        let resp = self
+            .run_cancellable_local_search(
+                self.local_search_queue_wait,
+                self.local_search_timeout,
+                move |r, cancel| r.search_cancellable(&query, true, cancel),
+            )
+            .await?;
         Ok(HybridSearchOutput {
             response: normalize_response(resp),
             mode,
@@ -660,7 +877,13 @@ impl HybridSearchService {
         let Some(exact) = exact else {
             return self.run_local_only(query, mode).await;
         };
-        let local = self.catalog_matches(query).await?;
+        let local = self
+            .catalog_matches_with_budget(
+                query,
+                self.local_search_queue_wait,
+                self.local_search_timeout,
+            )
+            .await?;
         let mut hits: Vec<_> = std::iter::once(SearchHit::Steam(exact))
             .chain(
                 local
@@ -675,13 +898,17 @@ impl HybridSearchService {
         self.finish_hits(query, pagination, hits, mode).await
     }
 
-    async fn catalog_matches(
+    async fn catalog_matches_with_budget(
         &self,
         query: &SearchQuery,
+        queue_wait: Duration,
+        exec_timeout: Duration,
     ) -> anyhow::Result<Vec<RankedCatalogMatch>> {
         let query = query.clone();
-        self.db_call(move |r| r.catalog_search_matches(&query))
-            .await
+        self.run_cancellable_local_search(queue_wait, exec_timeout, move |r, cancel| {
+            r.catalog_search_matches_cancellable(&query, cancel)
+        })
+        .await
     }
 
     async fn finish_hits(
@@ -749,67 +976,127 @@ impl HybridSearchService {
         if total > MAX_STEAM_MERGE_ITEMS || (force_native_paging && total > 0) {
             return self.resolve_native_page(request, first, total, ctx).await;
         }
+        if total == 0 {
+            return Ok(SteamResults::Complete(Vec::new()));
+        }
 
         if total.div_ceil(u64::from(request.num_per_page)) > MAX_STEAM_MERGE_PAGES {
             scan_request.num_per_page = STEAM_SCAN_PAGE_SIZE;
         }
-        let num_pages = total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
-        let pages = join_all((1..=num_pages).map(|page| {
-            let mut req = scan_request.clone();
-            req.page = page;
-            let first = &first;
-            async move {
-                if page == 1 && req.num_per_page == request.num_per_page {
-                    return Ok(first.clone());
-                }
-                self.fetch_steam_page_cached(&req, ctx).await
+
+        let mut pages = if scan_request.num_per_page == request.num_per_page {
+            let num_pages = total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
+            let mut pages = Vec::with_capacity(num_pages as usize);
+            pages.push(first);
+            if num_pages >= 2 {
+                pages.extend(
+                    self.fetch_steam_page_range(&scan_request, 2..=num_pages, ctx)
+                        .await?,
+                );
             }
-        }))
-        .await;
-        // Wait for all fetched restrictions to be saved before allowing a local fallback.
-        if let Some(err) = pages.iter().find_map(|page| match page {
-            Err(err @ SteamSearchError::Visibility(_)) => Some(err),
-            _ => None,
-        }) {
-            return Err(err.clone());
-        }
-        let mut pages = pages.into_iter().collect::<Result<Vec<_>, _>>()?;
-        if scan_request.num_per_page != request.num_per_page {
-            if let Some(repaged_first) = pages.first() {
-                let updated_total = steam_total(&repaged_first.raw);
-                if updated_total == 0 {
-                    return Err(SteamSearchError::Unavailable(
-                        "Steam CM 检索结果在重新分页时发生变化".to_owned(),
-                    ));
-                }
-                if updated_total > MAX_STEAM_MERGE_ITEMS {
-                    return self
-                        .resolve_native_page(request, first, updated_total, ctx)
-                        .await;
-                }
-                let updated_num_pages =
-                    updated_total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
-                if updated_num_pages > num_pages {
-                    let extra = join_all(((num_pages + 1)..=updated_num_pages).map(|page| {
-                        let mut req = scan_request.clone();
-                        req.page = page;
-                        async move { self.fetch_steam_page_cached(&req, ctx).await }
-                    }))
+            pages
+        } else {
+            let mut repaged_first_req = scan_request.clone();
+            repaged_first_req.page = 1;
+            let repaged_first = self
+                .fetch_steam_page_cached(&repaged_first_req, ctx)
+                .await?;
+            let updated_total = steam_total(&repaged_first.raw);
+            if updated_total == 0 {
+                return Err(SteamSearchError::Unavailable(
+                    "Steam CM 检索结果在重新分页时发生变化".to_owned(),
+                ));
+            }
+            if updated_total > MAX_STEAM_MERGE_ITEMS {
+                return self
+                    .resolve_native_page(request, first, updated_total, ctx)
                     .await;
-                    if let Some(err) = extra.iter().find_map(|page| match page {
-                        Err(err @ SteamSearchError::Visibility(_)) => Some(err),
-                        _ => None,
-                    }) {
-                        return Err(err.clone());
-                    }
-                    pages.extend(extra.into_iter().collect::<Result<Vec<_>, _>>()?);
-                }
             }
-        }
+            let updated_num_pages =
+                updated_total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
+            let mut pages = Vec::with_capacity(updated_num_pages as usize);
+            pages.push(repaged_first);
+            if updated_num_pages >= 2 {
+                pages.extend(
+                    self.fetch_steam_page_range(&scan_request, 2..=updated_num_pages, ctx)
+                        .await?,
+                );
+            }
+            pages
+        };
+
         if pages.iter().all(|page| page.raw.outcomes.is_empty()) {
             pages.clear();
         }
         Ok(SteamResults::Complete(pages))
+    }
+
+    async fn fetch_steam_page_range(
+        self: &Arc<Self>,
+        scan_request: &SteamSearchRequest,
+        mut pending: std::ops::RangeInclusive<u32>,
+        ctx: SteamFetchCtx,
+    ) -> Result<Vec<Arc<SharedSteamPage>>, SteamSearchError> {
+        let mut in_flight = FuturesUnordered::new();
+        let mut collected: Vec<(u32, Arc<SharedSteamPage>)> = Vec::new();
+        let mut first_unavailable: Option<SteamSearchError> = None;
+        let mut first_visibility: Option<SteamSearchError> = None;
+
+        let push_next = |pending: &mut std::ops::RangeInclusive<u32>,
+                         in_flight: &mut FuturesUnordered<_>| {
+            while in_flight.len() < MAX_CONCURRENT_PAGES_PER_SEARCH {
+                let Some(page) = pending.next() else {
+                    break;
+                };
+                let mut req = scan_request.clone();
+                req.page = page;
+                let svc = Arc::clone(self);
+                in_flight.push(async move {
+                    let res = svc.fetch_steam_page_cached(&req, ctx).await;
+                    (page, res)
+                });
+            }
+        };
+
+        push_next(&mut pending, &mut in_flight);
+        while let Some((page, res)) = in_flight.next().await {
+            match res {
+                Ok(shared_page) => {
+                    collected.push((page, shared_page));
+                    if first_unavailable.is_none()
+                        && first_visibility.is_none()
+                        && Instant::now() < ctx.deadline
+                    {
+                        push_next(&mut pending, &mut in_flight);
+                    }
+                }
+                Err(err @ SteamSearchError::Visibility(_)) => {
+                    if first_visibility.is_none() {
+                        first_visibility = Some(err);
+                    }
+                }
+                Err(err @ SteamSearchError::Unavailable(_)) => {
+                    if first_unavailable.is_none() {
+                        first_unavailable = Some(err);
+                    }
+                }
+            }
+        }
+
+        // Wait for all already-launched page restrictions before allowing a local fallback.
+        if let Some(err) = first_visibility {
+            return Err(err);
+        }
+        if let Some(err) = first_unavailable {
+            return Err(err);
+        }
+        if pending.next().is_some() {
+            return Err(SteamSearchError::Unavailable(
+                "Steam CM 请求超出检索超时预算".to_owned(),
+            ));
+        }
+        collected.sort_unstable_by_key(|(page, _)| *page);
+        Ok(collected.into_iter().map(|(_, page)| page).collect())
     }
 
     async fn resolve_native_page(
@@ -937,7 +1224,11 @@ impl HybridSearchService {
                 }
             }
 
-            if let Some(existing) = state.inflight.get(request).filter(|rx| !rx.is_closed()) {
+            if let Some((_, existing)) = state
+                .inflight
+                .get(request)
+                .filter(|(_, rx)| !rx.is_closed())
+            {
                 existing.resubscribe()
             } else {
                 if state.inflight.len() >= MAX_INFLIGHT_SEARCHES {
@@ -946,30 +1237,30 @@ impl HybridSearchService {
                     ));
                 }
                 let (tx, rx) = broadcast::channel(1);
-                state.inflight.insert(request.clone(), rx.resubscribe());
+                let inflight_id = state.next_id();
+                state
+                    .inflight
+                    .insert(request.clone(), (inflight_id, rx.resubscribe()));
                 let svc = Arc::clone(self);
                 let cache_state = Arc::clone(&self.cache_state);
                 let req = request.clone();
                 tokio::spawn(async move {
                     let mut guard = PageInflightGuard {
                         state: cache_state,
-                        key: Some(req.clone()),
+                        entry: Some((req.clone(), inflight_id)),
                     };
-                    let result =
-                        tokio::time::timeout(ctx.steam_timeout, svc.upstream.search_files(&req))
-                            .await
-                            .map_err(|_| {
-                                SteamSearchError::Unavailable("Steam CM 实时搜索超时".to_owned())
-                            })
-                            .and_then(|res| {
-                                res.map_err(|err| SteamSearchError::Unavailable(err.to_string()))
-                            })
-                            .map(|raw| {
-                                Arc::new(SharedSteamPage {
-                                    raw,
-                                    restrictions_saved: OnceCell::new(),
-                                })
-                            });
+                    let result = match tokio::time::timeout(
+                        ctx.steam_timeout,
+                        svc.execute_steam_page_rpc(&req, &tx, &mut guard),
+                    )
+                    .await
+                    {
+                        Ok(Some(res)) => res,
+                        Ok(None) => return,
+                        Err(_) => Err(SteamSearchError::Unavailable(
+                            "Steam CM 实时搜索超时".to_owned(),
+                        )),
+                    };
 
                     {
                         let mut state = svc.cache_state.lock().await;
@@ -983,7 +1274,7 @@ impl HybridSearchService {
                                 );
                             }
                         }
-                        state.inflight.remove(&req);
+                        state.remove_inflight_if_matches(&req, inflight_id);
                         guard.disarm();
                         let _ = tx.send(result.clone());
                     }
@@ -1014,6 +1305,56 @@ impl HybridSearchService {
             })??;
         self.save_page_restrictions(&page, ctx.app_id).await?;
         Ok(page)
+    }
+
+    async fn execute_steam_page_rpc(
+        &self,
+        req: &SteamSearchRequest,
+        tx: &broadcast::Sender<SharedPageResult>,
+        guard: &mut PageInflightGuard,
+    ) -> Option<SharedPageResult> {
+        if self.abort_page_if_abandoned(req, tx, guard).await {
+            return None;
+        }
+        let Ok(permit) = self.steam_rpc_gate.acquire().await else {
+            return Some(Err(SteamSearchError::Unavailable(
+                "Steam CM 并发闸门已关闭".to_owned(),
+            )));
+        };
+        if self.abort_page_if_abandoned(req, tx, guard).await {
+            return None;
+        }
+        let res = self.upstream.search_files(req).await;
+        drop(permit);
+        Some(
+            res.map_err(|err| SteamSearchError::Unavailable(err.to_string()))
+                .map(|raw| {
+                    Arc::new(SharedSteamPage {
+                        raw,
+                        restrictions_saved: OnceCell::new(),
+                    })
+                }),
+        )
+    }
+
+    async fn abort_page_if_abandoned(
+        &self,
+        req: &SteamSearchRequest,
+        tx: &broadcast::Sender<SharedPageResult>,
+        guard: &mut PageInflightGuard,
+    ) -> bool {
+        if tx.receiver_count() > 1 {
+            return false;
+        }
+        let mut state = self.cache_state.lock().await;
+        if tx.receiver_count() <= 1 {
+            if let Some(id) = guard.id() {
+                state.remove_inflight_if_matches(req, id);
+            }
+            guard.disarm();
+            return true;
+        }
+        false
     }
 
     async fn save_page_restrictions(
@@ -1064,19 +1405,29 @@ impl HybridSearchService {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 while let Some(batch) = rx.recv().await {
-                    let repo_clone = Arc::clone(&repo);
-                    let res = tokio::task::spawn_blocking(move || {
-                        repo_clone
-                            .apply_upstream_outcomes_with_policy(&batch.observations, batch.policy)
-                    })
-                    .await;
-                    match res {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            tracing::warn!(error = %err, "Steam 检索暖缓存写入失败");
+                    let policy = batch.policy;
+                    let mut remaining = batch.observations;
+                    while !remaining.is_empty() {
+                        let split_at = remaining.len().min(WARM_WRITE_CHUNK_SIZE);
+                        let tail = remaining.split_off(split_at);
+                        let chunk = remaining;
+                        remaining = tail;
+                        let repo_clone = Arc::clone(&repo);
+                        let res = tokio::task::spawn_blocking(move || {
+                            repo_clone.apply_upstream_outcomes_with_policy(&chunk, policy)
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(err)) => {
+                                tracing::warn!(error = %err, "Steam 检索暖缓存写入失败");
+                            }
+                            Err(err) => {
+                                tracing::warn!(error = %err, "Steam 检索暖缓存任务异常退出");
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "Steam 检索暖缓存任务异常退出");
+                        if !remaining.is_empty() {
+                            tokio::task::yield_now().await;
                         }
                     }
                 }
@@ -1736,5 +2087,558 @@ mod tests {
                 .title,
             "新入库条目"
         );
+    }
+
+    #[tokio::test]
+    async fn multi_page_search_bounds_fanout_and_short_circuits_on_failure() {
+        use crate::config::CatalogConfig;
+        use crate::upstream::MockWorkshopUpstream;
+
+        let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+        let config_store = Arc::new(CatalogConfigStore::new(None, CatalogConfig::default()));
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        repo.upsert_item(&unit_sample_item(8100, "Fanout Local Item"), false, true)
+            .unwrap();
+
+        let make_req = |page| SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_ITEMS,
+            page,
+            num_per_page: 1,
+            search_text: Some("Fanout".to_string()),
+            required_tags: Vec::new(),
+            language: 0,
+            days: None,
+            search_text_target: None,
+        };
+        for page in 1..=12u32 {
+            upstream.insert_search_page(
+                make_req(page),
+                WorkshopQueryPage {
+                    total: 12,
+                    next_cursor: None,
+                    outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                        item: unit_sample_item(8100 + u64::from(page), &format!("Fanout {page}")),
+                    })],
+                },
+            );
+        }
+        // Fail every page in the first bounded window so scheduling order cannot advance the window.
+        for page in 2..=(1 + MAX_CONCURRENT_PAGES_PER_SEARCH as u32) {
+            upstream.fail_search_request(make_req(page));
+        }
+
+        let svc = Arc::new(HybridSearchService::new(
+            config_store,
+            repo,
+            upstream.clone(),
+        ));
+        let out = svc
+            .search(
+                &SearchQuery {
+                    query: Some("Fanout".to_string()),
+                    tag: None,
+                    status: None,
+                    sort: None,
+                    page: 1,
+                    page_size: 1,
+                    language: Some("en".to_string()),
+                    search_target: None,
+                    file_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.mode, SearchExecutionMode::LocalFallback);
+        assert_eq!(out.response.total, 1);
+        let recorded = upstream.recorded_searches();
+        assert_eq!(
+            recorded.len(),
+            1 + MAX_CONCURRENT_PAGES_PER_SEARCH,
+            "expected exactly 1 + {} pages before short-circuiting, got {:?}",
+            MAX_CONCURRENT_PAGES_PER_SEARCH,
+            recorded.iter().map(|r| r.page).collect::<Vec<_>>()
+        );
+        assert!(
+            recorded
+                .iter()
+                .all(|r| r.page <= 1 + MAX_CONCURRENT_PAGES_PER_SEARCH as u32),
+            "pages beyond the first window must never be launched"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_queued_steam_search_skips_upstream_rpc() {
+        use crate::config::CatalogConfig;
+        use crate::upstream::MockWorkshopUpstream;
+        use async_trait::async_trait;
+        use l4a_protocol::{CatalogSteamStatus, SteamAuthFlowStatus};
+        use tokio::sync::{oneshot, Notify};
+
+        struct GatedSearchUpstream {
+            inner: Arc<MockWorkshopUpstream>,
+            hold_keyword: &'static str,
+            entered: StdMutex<Option<oneshot::Sender<()>>>,
+            release: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl WorkshopUpstream for GatedSearchUpstream {
+            async fn fetch_details(
+                &self,
+                ids: &[WorkshopId],
+            ) -> anyhow::Result<Vec<WorkshopObservation>> {
+                self.inner.fetch_details(ids).await
+            }
+
+            async fn query_files(
+                &self,
+                query_type: u32,
+                file_type: u32,
+                cursor: &str,
+                num_per_page: u32,
+            ) -> anyhow::Result<WorkshopQueryPage> {
+                self.inner
+                    .query_files(query_type, file_type, cursor, num_per_page)
+                    .await
+            }
+
+            async fn search_files(
+                &self,
+                request: &SteamSearchRequest,
+            ) -> anyhow::Result<WorkshopQueryPage> {
+                if request.search_text.as_deref() == Some(self.hold_keyword) {
+                    if let Some(tx) = self.entered.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    self.release.notified().await;
+                }
+                self.inner.search_files(request).await
+            }
+
+            async fn status(&self) -> CatalogSteamStatus {
+                self.inner.status().await
+            }
+
+            async fn reconnect(&self) -> anyhow::Result<CatalogSteamStatus> {
+                self.inner.reconnect().await
+            }
+
+            async fn start_qr_auth(&self) -> anyhow::Result<SteamAuthFlowStatus> {
+                self.inner.start_qr_auth().await
+            }
+
+            async fn start_credentials_auth(
+                &self,
+                account_name: String,
+                password: String,
+            ) -> anyhow::Result<SteamAuthFlowStatus> {
+                self.inner
+                    .start_credentials_auth(account_name, password)
+                    .await
+            }
+
+            async fn submit_guard_code(
+                &self,
+                flow_id: &str,
+                code: &str,
+            ) -> anyhow::Result<SteamAuthFlowStatus> {
+                self.inner.submit_guard_code(flow_id, code).await
+            }
+
+            async fn set_refresh_token(
+                &self,
+                account_name: String,
+                refresh_token: String,
+            ) -> anyhow::Result<CatalogSteamStatus> {
+                self.inner
+                    .set_refresh_token(account_name, refresh_token)
+                    .await
+            }
+
+            async fn switch_anonymous(&self) -> anyhow::Result<CatalogSteamStatus> {
+                self.inner.switch_anonymous().await
+            }
+        }
+
+        let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+        let mut cfg = CatalogConfig::default();
+        // request_concurrency = 2 -> steam_rpc_gate has 1 permit for searches.
+        cfg.steam.request_concurrency = 2;
+        cfg.search.steam_timeout_ms = 5_000;
+        let config_store = Arc::new(CatalogConfigStore::new(None, cfg));
+        let mock = Arc::new(MockWorkshopUpstream::new());
+
+        let make_steam_req = |kw: &str| SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_ITEMS,
+            page: 1,
+            num_per_page: 30,
+            search_text: Some(kw.to_string()),
+            required_tags: Vec::new(),
+            language: 0,
+            days: None,
+            search_text_target: None,
+        };
+        for (idx, kw) in ["HoldSlot", "DropWhileQueued", "StillWaiting"]
+            .into_iter()
+            .enumerate()
+        {
+            mock.insert_search_page(
+                make_steam_req(kw),
+                WorkshopQueryPage {
+                    total: 1,
+                    next_cursor: None,
+                    outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                        item: unit_sample_item(8200 + idx as u64, kw),
+                    })],
+                },
+            );
+        }
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let gated: Arc<dyn WorkshopUpstream> = Arc::new(GatedSearchUpstream {
+            inner: Arc::clone(&mock),
+            hold_keyword: "HoldSlot",
+            entered: StdMutex::new(Some(entered_tx)),
+            release: Arc::clone(&release),
+        });
+
+        let svc = Arc::new(HybridSearchService::new(config_store, repo, gated));
+        let make_query = |kw: &str| SearchQuery {
+            query: Some(kw.to_string()),
+            tag: None,
+            status: None,
+            sort: None,
+            page: 1,
+            page_size: 30,
+            language: Some("en".to_string()),
+            search_target: None,
+            file_type: None,
+        };
+
+        let svc1 = Arc::clone(&svc);
+        let q1 = tokio::spawn(async move { svc1.search(&make_query("HoldSlot"), None).await });
+        entered_rx.await.unwrap();
+
+        let drop_req = make_steam_req("DropWhileQueued");
+        let still_req = make_steam_req("StillWaiting");
+
+        let svc2 = Arc::clone(&svc);
+        let q2 =
+            tokio::spawn(async move { svc2.search(&make_query("DropWhileQueued"), None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !svc
+                .cache_state
+                .lock()
+                .await
+                .inflight
+                .contains_key(&drop_req)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Cancel q2 after it is confirmed queued in `inflight` behind the single permit.
+        q2.abort();
+        let _ = q2.await;
+
+        let svc3 = Arc::clone(&svc);
+        let q3 = tokio::spawn(async move { svc3.search(&make_query("StillWaiting"), None).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !svc
+                .cache_state
+                .lock()
+                .await
+                .inflight
+                .contains_key(&still_req)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        release.notify_one();
+
+        let out1 = q1.await.unwrap().unwrap();
+        let out3 = q3.await.unwrap().unwrap();
+        assert_eq!(out1.mode, SearchExecutionMode::Hybrid);
+        assert_eq!(out3.mode, SearchExecutionMode::Hybrid);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !svc.cache_state.lock().await.inflight.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let keywords: Vec<Option<String>> = mock
+            .recorded_searches()
+            .into_iter()
+            .map(|r| r.search_text)
+            .collect();
+        assert!(keywords.contains(&Some("HoldSlot".to_string())));
+        assert!(keywords.contains(&Some("StillWaiting".to_string())));
+        assert!(
+            !keywords.contains(&Some("DropWhileQueued".to_string())),
+            "abandoned search should not have sent an upstream RPC: {keywords:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_inflight_guard_drop_does_not_remove_replacement_entry() {
+        let state = Arc::new(Mutex::new(SearchCacheState::default()));
+        let req = SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_ITEMS,
+            page: 1,
+            num_per_page: 30,
+            search_text: Some("Replace".to_string()),
+            required_tags: Vec::new(),
+            language: 0,
+            days: None,
+            search_text_target: None,
+        };
+        let wid = WorkshopId(9901);
+
+        let (_tx1, rx1) = broadcast::channel(1);
+        let (_tx2, rx2) = broadcast::channel(1);
+        let (_etx1, erx1) = broadcast::channel(1);
+        let (_etx2, erx2) = broadcast::channel(1);
+
+        let (id1, id2, eid1, eid2) = {
+            let mut guard = state.lock().await;
+            let id1 = guard.next_id();
+            guard.inflight.insert(req.clone(), (id1, rx1));
+            let id2 = guard.next_id();
+            guard.inflight.insert(req.clone(), (id2, rx2));
+            let eid1 = guard.next_id();
+            guard.inflight_exact.insert(wid, (eid1, erx1));
+            let eid2 = guard.next_id();
+            guard.inflight_exact.insert(wid, (eid2, erx2));
+            (id1, id2, eid1, eid2)
+        };
+
+        // Contend the lock while dropping stale guards to exercise the deferred spawn cleanup path.
+        let lock_guard = state.lock().await;
+        drop(PageInflightGuard {
+            state: Arc::clone(&state),
+            entry: Some((req.clone(), id1)),
+        });
+        drop(ExactInflightGuard {
+            state: Arc::clone(&state),
+            entry: Some((wid, eid1)),
+        });
+        drop(lock_guard);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let guard = state.lock().await;
+        assert_eq!(guard.inflight.get(&req).map(|(id, _)| *id), Some(id2));
+        assert_eq!(
+            guard.inflight_exact.get(&wid).map(|(id, _)| *id),
+            Some(eid2)
+        );
+    }
+
+    #[tokio::test]
+    async fn local_search_bulkhead_sheds_overload_fast_and_hybrid_degrades_gracefully() {
+        use crate::config::CatalogConfig;
+        use crate::upstream::MockWorkshopUpstream;
+        use crate::{build_router, ServerState};
+        use axum::body::Body;
+        use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(ServerRepo::open(&dir.path().join("catalog.db")).unwrap());
+        repo.upsert_item(&unit_sample_item(8301, "Saturated Local"), false, true)
+            .unwrap();
+
+        let mut cfg = CatalogConfig::default();
+        cfg.admin.password = "test-pw".to_string();
+        let config_store = Arc::new(CatalogConfigStore::new(None, cfg));
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        upstream.insert_search_page(
+            SteamSearchRequest {
+                query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+                file_type: MATCHING_FILE_TYPE_ITEMS,
+                page: 1,
+                num_per_page: 30,
+                search_text: Some("SteamSurvives".to_string()),
+                required_tags: Vec::new(),
+                language: 0,
+                days: None,
+                search_text_target: None,
+            },
+            WorkshopQueryPage {
+                total: 1,
+                next_cursor: None,
+                outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                    item: unit_sample_item(8302, "SteamSurvives Map"),
+                })],
+            },
+        );
+
+        let mut svc =
+            HybridSearchService::new(config_store.clone(), repo.clone(), upstream.clone());
+        svc.local_search_queue_wait = Duration::from_millis(50);
+        svc.local_search_timeout = Duration::from_millis(200);
+        svc.local_supplement_queue_wait = Duration::from_millis(50);
+        svc.local_supplement_timeout = Duration::from_millis(200);
+        let svc = Arc::new(svc);
+
+        // Hold all local search bulkhead permits to simulate saturated broad local scans.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_LOCAL_SEARCHES {
+            held.push(svc.local_search_gate.try_acquire().unwrap());
+        }
+
+        // 1. Local-only search fails fast with QueryAbortedError::Busy instead of hanging.
+        let started = Instant::now();
+        let err = svc
+            .search(
+                &SearchQuery {
+                    query: Some("Saturated".to_string()),
+                    tag: None,
+                    status: None,
+                    sort: Some("title".to_string()),
+                    page: 1,
+                    page_size: 30,
+                    language: None,
+                    search_target: None,
+                    file_type: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("saturated local search should return Busy");
+        assert_eq!(
+            err.downcast_ref::<QueryAbortedError>(),
+            Some(&QueryAbortedError::Busy)
+        );
+        assert!(started.elapsed() < Duration::from_millis(400));
+
+        // 2. Hybrid search with Steam hits degrades cleanly to Steam-only instead of failing.
+        let hybrid = svc
+            .search(
+                &SearchQuery {
+                    query: Some("SteamSurvives".to_string()),
+                    tag: None,
+                    status: None,
+                    sort: None,
+                    page: 1,
+                    page_size: 30,
+                    language: Some("en".to_string()),
+                    search_target: None,
+                    file_type: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(hybrid.mode, SearchExecutionMode::Hybrid);
+        assert_eq!(hybrid.response.total, 1);
+        assert_eq!(hybrid.response.items[0].workshop_id, WorkshopId(8302));
+
+        // 3. HTTP layer returns 503 for saturated public/admin search while /health & /items stay 200.
+        let mut state =
+            ServerState::with_components(config_store.clone(), repo.clone(), upstream.clone());
+        let admin_token = state.auth.login("admin", "test-pw").unwrap().token;
+        state.search = Arc::clone(&svc);
+        let app = build_router(state);
+
+        let search_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/items/search?q=Saturated&sort=title")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let admin_search_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/admin/items/search?q=Saturated")
+                    .header(AUTHORIZATION, format!("Bearer {admin_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_search_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let health_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health_resp.status(), StatusCode::OK);
+
+        let item_resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/items/8301")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(item_resp.status(), StatusCode::OK);
+
+        drop(held);
+
+        // 4. Execution timeout also maps cleanly to HTTP 503.
+        let timeout_repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+        let (lock_entered_tx, lock_entered_rx) = std::sync::mpsc::channel();
+        let (lock_release_tx, lock_release_rx) = std::sync::mpsc::channel();
+        let repo_for_lock = Arc::clone(&timeout_repo);
+        let blocker = std::thread::spawn(move || {
+            repo_for_lock
+                .with_transaction(|_| {
+                    let _ = lock_entered_tx.send(());
+                    let _ = lock_release_rx.recv();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        lock_entered_rx.recv().unwrap();
+
+        let mut timeout_svc =
+            HybridSearchService::new(config_store.clone(), timeout_repo.clone(), upstream.clone());
+        timeout_svc.local_search_timeout = Duration::from_millis(30);
+        let mut timeout_state = ServerState::with_components(config_store, timeout_repo, upstream);
+        timeout_state.search = Arc::new(timeout_svc);
+        let timeout_app = build_router(timeout_state);
+        let timeout_resp = timeout_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/items/search?q=Saturated&sort=title")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(timeout_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let _ = lock_release_tx.send(());
+        blocker.join().unwrap();
     }
 }

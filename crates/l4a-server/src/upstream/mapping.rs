@@ -101,6 +101,37 @@ pub fn build_search_files_proto(
     proto
 }
 
+pub(super) fn build_query_files_proto(
+    app_id: u32,
+    query_type: u32,
+    file_type: u32,
+    cursor: &str,
+    num_per_page: u32,
+) -> CPublishedFile_QueryFiles_Request {
+    let cursor_str = if cursor.trim().is_empty() {
+        "*".to_string()
+    } else {
+        cursor.trim().to_string()
+    };
+    CPublishedFile_QueryFiles_Request {
+        query_type: Some(query_type),
+        cursor: Some(cursor_str),
+        numperpage: Some(num_per_page.clamp(1, 100)),
+        appid: Some(app_id),
+        cache_max_age_seconds: Some(0),
+        filetype: Some(file_type),
+        return_vote_data: Some(true),
+        return_tags: Some(true),
+        return_previews: Some(true),
+        return_children: Some(true),
+        // Request full file_description instead of short_description: Steam truncates
+        // short_description on byte boundaries and can split multibyte UTF-8 characters.
+        return_short_description: Some(false),
+        return_details: Some(true),
+        ..Default::default()
+    }
+}
+
 pub(super) fn can_resolve_by_id(d: &PublishedFileDetails) -> bool {
     matches!(d.visibility(), 0 | 3)
 }

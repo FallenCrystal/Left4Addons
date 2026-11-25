@@ -194,14 +194,36 @@ fn internal_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误")
 }
 
+fn search_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
+    if let Some(aborted) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::db::QueryAbortedError>())
+    {
+        tracing::warn!(error = %aborted, "搜索请求因并发限流或超时中止");
+        return match aborted {
+            crate::db::QueryAbortedError::Timeout => err_resp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "搜索耗时过长，请缩小关键词范围后重试",
+            ),
+            crate::db::QueryAbortedError::Busy => {
+                err_resp(StatusCode::SERVICE_UNAVAILABLE, "搜索服务繁忙，请稍后重试")
+            }
+            crate::db::QueryAbortedError::Cancelled => {
+                err_resp(StatusCode::SERVICE_UNAVAILABLE, "搜索请求已取消")
+            }
+        };
+    }
+    internal_err(err)
+}
+
 async fn health(State(state): State<RouteState>) -> ApiResult<Value> {
-    let stats = state.db(move |repo| repo.stats()).await?;
+    let total_items = state.db(move |repo| repo.total_items_count()).await?;
     let steam = state.server.upstream.status().await;
     Ok(Json(json!({
         "status": "ok",
         "service": "l4a-server",
         "version": env!("CARGO_PKG_VERSION"),
-        "items": stats.total_items,
+        "items": total_items,
         "steamState": steam.connection_state,
     })))
 }
@@ -353,7 +375,7 @@ async fn search_items(
         .search
         .search(&q, Some(&accept_language))
         .await
-        .map_err(internal_err)?;
+        .map_err(search_err)?;
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
         HeaderName::from_static("x-l4a-search-mode"),
@@ -370,7 +392,13 @@ async fn admin_search_items(
     state.require_admin(&headers)?;
     let q = SearchQuery::from(params);
     validate_search_query(&q)?;
-    Ok(Json(state.db(move |repo| repo.search(&q, false)).await?))
+    let resp = state
+        .server
+        .search
+        .search_admin(&q)
+        .await
+        .map_err(search_err)?;
+    Ok(Json(resp))
 }
 
 async fn get_collection(

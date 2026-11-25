@@ -138,3 +138,26 @@ fn steam_workshop_url_extracts_exact_id() {
     );
     assert!(score_primary_candidate(&q, 1, "foo", None).is_none());
 }
+
+#[test]
+fn can_match_pinyin_precomputation_matches_query_shapes() {
+    for non_pinyin in ["广州", "ab", "12345", "mission_", "a b", "!!!"] {
+        let q = parse_query(non_pinyin).unwrap();
+        assert!(
+            !q.can_match_pinyin,
+            "expected can_match_pinyin=false for {non_pinyin:?}"
+        );
+    }
+    for pinyin_capable in [
+        "guangzhou",
+        "guang zhou",
+        "guangzhou 8.06",
+        "广州 zengcheng",
+    ] {
+        let q = parse_query(pinyin_capable).unwrap();
+        assert!(
+            q.can_match_pinyin,
+            "expected can_match_pinyin=true for {pinyin_capable:?}"
+        );
+    }
+}

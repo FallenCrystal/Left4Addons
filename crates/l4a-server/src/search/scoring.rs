@@ -87,11 +87,18 @@ pub fn score_primary_candidate(
 
         // Cross-field author + title query (e.g. "perfect_buddy early")
         if query.terms.len() >= 2 && query.literal_substrings.is_empty() {
-            let pinyin_spans = collect_han_pinyin_spans(title);
+            let mut pinyin_spans = None;
             let all_matched = query.terms.iter().all(|term| {
-                match_term_in_tokens(term, &title_tokens, MIN_PREFIX_LEN).is_some()
+                if match_term_in_tokens(term, &title_tokens, MIN_PREFIX_LEN).is_some()
                     || match_term_in_tokens(term, &creator_tokens, MIN_CREATOR_PREFIX_LEN).is_some()
-                    || match_term_in_pinyin(term, &pinyin_spans).is_some()
+                {
+                    return true;
+                }
+                if !query.can_match_pinyin || title.is_ascii() {
+                    return false;
+                }
+                let spans = pinyin_spans.get_or_insert_with(|| collect_han_pinyin_spans(title));
+                match_term_in_pinyin(term, spans).is_some()
             });
             if all_matched {
                 return Some(MatchRank {
@@ -289,7 +296,7 @@ fn score_title_pinyin(
     title: &str,
     title_tokens: &TokenizedText,
 ) -> Option<MatchRank> {
-    if title.is_ascii() || !query.literal_substrings.is_empty() {
+    if !query.can_match_pinyin || title.is_ascii() || !query.literal_substrings.is_empty() {
         return None;
     }
 

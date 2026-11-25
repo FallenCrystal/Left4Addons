@@ -4,6 +4,7 @@ mod mapping;
 mod mock;
 #[cfg(test)]
 mod tests;
+mod wire;
 
 pub use auth::render_qr_svg;
 pub use cm_client::SteamCmClient;

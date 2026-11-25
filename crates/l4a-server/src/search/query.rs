@@ -4,7 +4,7 @@ use super::text::{
 };
 use super::{
     ParsedQuery, QueryTerm, Token, MAX_COMPACT_LEN, MAX_COMPACT_SPAN, MAX_PINYIN_SPAN,
-    MIN_COMPACT_PREFIX_LEN, MIN_CREATOR_PREFIX_LEN, MIN_PREFIX_LEN,
+    MIN_COMPACT_PREFIX_LEN, MIN_CREATOR_PREFIX_LEN, MIN_PINYIN_LEN, MIN_PREFIX_LEN,
 };
 use std::collections::HashSet;
 use url::Url;
@@ -28,6 +28,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
             whole_compact: None,
             literal_substrings: Vec::new(),
             compact_all: String::new(),
+            can_match_pinyin: false,
         });
     }
 
@@ -86,6 +87,21 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
         None
     };
 
+    let can_match_pinyin = literal_substrings.is_empty()
+        && (whole_compact
+            .as_deref()
+            .is_some_and(|wc| is_pure_ascii_alpha(wc) && wc.len() >= MIN_PINYIN_LEN)
+            || terms.iter().any(|term| {
+                matches!(
+                    term,
+                    QueryTerm::Word {
+                        compact,
+                        exact_only: false,
+                        ..
+                    } if is_pure_ascii_alpha(compact) && compact.len() >= MIN_PINYIN_LEN
+                )
+            }));
+
     Some(ParsedQuery {
         raw_trimmed: trimmed.to_string(),
         raw_folded,
@@ -95,6 +111,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
         whole_compact,
         literal_substrings,
         compact_all,
+        can_match_pinyin,
     })
 }
 

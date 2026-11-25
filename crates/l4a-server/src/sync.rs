@@ -595,14 +595,20 @@ impl CatalogSyncCoordinator {
         {
             let mut m = self.metrics.lock().unwrap();
             m.backfill_running = false;
-            if let Err(ref err) = res {
-                m.last_sync_error = Some(err.to_string());
+            match &res {
+                Ok(Some(_)) => {
+                    m.last_sync_error = None;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    m.last_sync_error = Some(err.to_string());
+                }
             }
         }
-        res
+        res.map(|count| count.unwrap_or(0))
     }
 
-    async fn run_backfill_inner(&self) -> anyhow::Result<u64> {
+    async fn run_backfill_inner(&self) -> anyhow::Result<Option<u64>> {
         let batch_size = self
             .config_store
             .get()
@@ -615,7 +621,7 @@ impl CatalogSyncCoordinator {
             .unwrap_or_else(|| "*".to_string());
 
         if cursor == "DONE" {
-            return Ok(0);
+            return Ok(None);
         }
 
         let page = self
@@ -632,8 +638,10 @@ impl CatalogSyncCoordinator {
             .next_cursor
             .filter(|c| c != &cursor && c != "*" && !page.outcomes.is_empty())
             .unwrap_or_else(|| "DONE".to_string());
-        self.db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
-            .await
+        let written = self
+            .db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
+            .await?;
+        Ok(Some(written))
     }
 
     pub async fn reset_backfill_cursor(&self) -> anyhow::Result<()> {
@@ -809,5 +817,53 @@ mod tests {
         assert_eq!(item.file_url.as_deref(), Some("cached-link"));
         release_tx.send(()).unwrap();
         hold_writer.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn backfill_recovery_clears_last_sync_error_without_clearing_on_done_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(ServerRepo::open(&dir.path().join("catalog.db")).unwrap());
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        let coordinator = CatalogSyncCoordinator::new(
+            Arc::new(CatalogConfigStore::new(None, CatalogConfig::default())),
+            Arc::clone(&repo),
+            upstream.clone(),
+        );
+
+        upstream.set_fail_fetches(true);
+        assert!(coordinator.run_backfill_step_once().await.is_err());
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
+
+        upstream.set_fail_fetches(false);
+        assert_eq!(coordinator.run_backfill_step_once().await.unwrap(), 0);
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_none());
+
+        // Cursor is now DONE; an incremental error must not be wiped by a no-op backfill tick.
+        upstream.set_fail_fetches(true);
+        assert!(coordinator.run_incremental_once().await.is_err());
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
+        upstream.set_fail_fetches(false);
+        assert_eq!(coordinator.run_backfill_step_once().await.unwrap(), 0);
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
     }
 }

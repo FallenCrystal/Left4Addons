@@ -1,4 +1,6 @@
-use super::{parse_workshop_id_col, serialize_json_enum, ServerRepo};
+use super::{
+    parse_workshop_id_col, serialize_json_enum, QueryAbortedError, QueryCancelToken, ServerRepo,
+};
 use crate::search::{self, MatchRank, ParsedQuery};
 use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopId};
 use rusqlite::{params_from_iter, types::Value, Connection, Row, Rows};
@@ -191,31 +193,50 @@ impl PartialOrd for RankedEntry {
     }
 }
 
+enum PageStorage {
+    Bounded {
+        limit: u64,
+        best: BinaryHeap<RankedEntry>,
+    },
+    Unbounded(Vec<RankedEntry>),
+}
+
 struct SearchPage {
     sort: SearchSort,
     offset: u64,
-    limit: u64,
     total: u64,
-    best: BinaryHeap<RankedEntry>,
+    storage: PageStorage,
 }
 
 impl SearchPage {
     fn new(sort: SearchSort, page_size: Option<u32>, offset: u64) -> Self {
+        let storage = match page_size {
+            Some(size) => PageStorage::Bounded {
+                limit: offset.saturating_add(u64::from(size)),
+                best: BinaryHeap::new(),
+            },
+            None => PageStorage::Unbounded(Vec::new()),
+        };
         Self {
             sort,
             offset,
-            limit: page_size.map_or(u64::MAX, |size| offset.saturating_add(u64::from(size))),
             total: 0,
-            best: BinaryHeap::new(),
+            storage,
         }
     }
 
     fn collect(
         &mut self,
         mut rows: Rows<'_>,
+        cancel: &QueryCancelToken,
         score: impl Fn(&Row<'_>, WorkshopId) -> rusqlite::Result<Option<MatchRank>>,
-    ) -> rusqlite::Result<()> {
+    ) -> anyhow::Result<()> {
+        let mut scanned: u32 = 0;
         while let Some(row) = rows.next()? {
+            scanned = scanned.wrapping_add(1);
+            if scanned & 0xFF == 0 && cancel.is_cancelled() {
+                return Err(QueryAbortedError::Cancelled.into());
+            }
             let id = parse_workshop_id_col(0, row.get(0)?)?;
             if let Some(rank) = score(row, id)? {
                 self.total += 1;
@@ -223,29 +244,52 @@ impl SearchPage {
                     entry: self.sort.entry(row, id, rank)?,
                     matched: self.sort.ranked_match(row, id, Some(rank))?,
                 };
-                // Count every validated match and keep only the best entries through this page.
-                if (self.best.len() as u64) < self.limit {
-                    self.best.push(entry);
-                } else if let Some(mut last) = self.best.peek_mut() {
-                    if entry.entry < last.entry {
-                        *last = entry;
+                match &mut self.storage {
+                    PageStorage::Bounded { limit, best } => {
+                        // Count every validated match and keep only the best entries through this page.
+                        if (best.len() as u64) < *limit {
+                            best.push(entry);
+                        } else if let Some(mut last) = best.peek_mut() {
+                            if entry.entry < last.entry {
+                                *last = entry;
+                            }
+                        }
+                    }
+                    PageStorage::Unbounded(all) => {
+                        all.push(entry);
                     }
                 }
             }
         }
+        if cancel.is_cancelled() {
+            return Err(QueryAbortedError::Cancelled.into());
+        }
         Ok(())
     }
 
-    fn finish(mut self) -> RankedMatchPage {
+    fn finish(self) -> RankedMatchPage {
         let offset = usize::try_from(self.offset).unwrap_or(usize::MAX);
-        let page_len = self.best.len().saturating_sub(offset);
-        // The requested page is at the end of the retained entries in sort order.
-        let mut matches: Vec<_> = std::iter::from_fn(|| self.best.pop())
-            .take(page_len)
-            .map(|ranked| ranked.matched)
-            .collect();
-        matches.reverse();
-        (self.total, matches)
+        match self.storage {
+            PageStorage::Bounded { mut best, .. } => {
+                let page_len = best.len().saturating_sub(offset);
+                // The requested page is at the end of the retained entries in sort order.
+                let mut matches: Vec<_> = std::iter::from_fn(|| best.pop())
+                    .take(page_len)
+                    .map(|ranked| ranked.matched)
+                    .collect();
+                matches.reverse();
+                (self.total, matches)
+            }
+            PageStorage::Unbounded(mut all) => {
+                all.sort_unstable();
+                let matches = all
+                    .into_iter()
+                    .skip(offset)
+                    .map(|ranked| ranked.matched)
+                    .collect();
+                (self.total, matches)
+            }
+        }
     }
 }
 
@@ -280,14 +324,26 @@ fn numeric_prefix_ranges(prefix: &str) -> Vec<(i64, i64)> {
 
 impl ServerRepo {
     pub fn search(&self, query: &SearchQuery, public_only: bool) -> anyhow::Result<SearchResponse> {
+        self.search_cancellable(query, public_only, &QueryCancelToken::new())
+    }
+
+    pub fn search_cancellable(
+        &self,
+        query: &SearchQuery,
+        public_only: bool,
+        cancel: &QueryCancelToken,
+    ) -> anyhow::Result<SearchResponse> {
         let page = query.page.max(1);
         let page_size = query.page_size.clamp(1, 100);
         let offset = u64::from(page - 1) * u64::from(page_size);
-        self.with_read_snapshot(|conn| {
+        self.with_cancellable_read_snapshot(cancel, |conn| {
             let (total, matches) =
-                Self::ranked_matches(conn, query, public_only, offset, Some(page_size))?;
+                Self::ranked_matches(conn, query, public_only, offset, Some(page_size), cancel)?;
             let mut items = Vec::with_capacity(matches.len());
             for matched in matches {
+                if cancel.is_cancelled() {
+                    return Err(QueryAbortedError::Cancelled.into());
+                }
                 if let Some(meta) = Self::get_item_with_conn(conn, matched.id)? {
                     items.push(meta.record);
                 }
@@ -303,12 +359,13 @@ impl ServerRepo {
     }
 
     /// Return compact matches for the hybrid merge, which loads full local records after paging.
-    pub(crate) fn catalog_search_matches(
+    pub(crate) fn catalog_search_matches_cancellable(
         &self,
         query: &SearchQuery,
+        cancel: &QueryCancelToken,
     ) -> anyhow::Result<Vec<RankedCatalogMatch>> {
-        self.with_read_snapshot(|conn| {
-            let (_, matches) = Self::ranked_matches(conn, query, true, 0, None)?;
+        self.with_cancellable_read_snapshot(cancel, |conn| {
+            let (_, matches) = Self::ranked_matches(conn, query, true, 0, None, cancel)?;
             Ok(matches)
         })
     }
@@ -319,14 +376,18 @@ impl ServerRepo {
         public_only: bool,
         offset: u64,
         limit: Option<u32>,
+        cancel: &QueryCancelToken,
     ) -> anyhow::Result<RankedMatchPage> {
+        if cancel.is_cancelled() {
+            return Err(QueryAbortedError::Cancelled.into());
+        }
         let filters = SearchFilters::new(query, public_only);
         let sort = SearchSort::from_name(query.sort.as_deref());
         let target = LocalSearchTarget::from_name(query.search_target.as_deref());
         let parsed = query.query.as_deref().and_then(search::parse_query);
 
         let Some(parsed) = parsed else {
-            return Self::browse_items(conn, &filters, sort, limit, offset);
+            return Self::browse_items(conn, &filters, sort, limit, offset, cancel);
         };
         if let Some(id) = parsed
             .exact_workshop_id
@@ -337,9 +398,9 @@ impl ServerRepo {
 
         let mut selection = SearchPage::new(sort, limit, offset);
         if parsed.terms.is_empty() {
-            Self::search_symbol_only(conn, &parsed, &filters, target, &mut selection)?;
+            Self::search_symbol_only(conn, &parsed, &filters, target, &mut selection, cancel)?;
         } else {
-            Self::search_indexed(conn, &parsed, &filters, target, &mut selection)?;
+            Self::search_indexed(conn, &parsed, &filters, target, &mut selection, cancel)?;
         }
         Ok(selection.finish())
     }
@@ -350,6 +411,7 @@ impl ServerRepo {
         sort: SearchSort,
         page_size: Option<u32>,
         offset: u64,
+        cancel: &QueryCancelToken,
     ) -> anyhow::Result<RankedMatchPage> {
         let mut filter_params = Vec::new();
         let where_clause = filters.build_where(&mut filter_params);
@@ -366,10 +428,20 @@ impl ServerRepo {
              ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params_from_iter(list_params.iter()), |row| {
-            sort.ranked_match(row, parse_workshop_id_col(0, row.get(0)?)?, None)
-        })?;
-        let matches = rows.collect::<Result<Vec<_>, _>>()?;
+        let mut rows = stmt.query(params_from_iter(list_params.iter()))?;
+        let mut matches = Vec::new();
+        let mut scanned: u32 = 0;
+        while let Some(row) = rows.next()? {
+            scanned = scanned.wrapping_add(1);
+            if scanned & 0xFF == 0 && cancel.is_cancelled() {
+                return Err(QueryAbortedError::Cancelled.into());
+            }
+            matches.push(sort.ranked_match(row, parse_workshop_id_col(0, row.get(0)?)?, None)?);
+        }
+        drop(rows);
+        if cancel.is_cancelled() {
+            return Err(QueryAbortedError::Cancelled.into());
+        }
         let total = if page_size.is_some() {
             let count_sql = format!("SELECT COUNT(*) FROM workshop_items w WHERE {where_clause}");
             let mut count_stmt = conn.prepare_cached(&count_sql)?;
@@ -418,6 +490,7 @@ impl ServerRepo {
         filters: &SearchFilters,
         target: LocalSearchTarget,
         page: &mut SearchPage,
+        cancel: &QueryCancelToken,
     ) -> anyhow::Result<()> {
         if target != LocalSearchTarget::DescriptionOnly {
             let fts_query = match target {
@@ -479,7 +552,7 @@ impl ServerRepo {
 
                 let mut stmt = conn.prepare_cached(&sql)?;
                 let rows = stmt.query(params_from_iter(params.iter()))?;
-                page.collect(rows, |row, id| {
+                page.collect(rows, cancel, |row, id| {
                     let title = row.get_ref(1)?.as_str()?;
                     let creator = row.get_ref(7)?.as_str_or_null()?;
                     Ok(match target {
@@ -495,6 +568,10 @@ impl ServerRepo {
             }
         }
 
+        if cancel.is_cancelled() {
+            return Err(QueryAbortedError::Cancelled.into());
+        }
+
         if target == LocalSearchTarget::DescriptionOnly
             || (target == LocalSearchTarget::All && page.total == 0)
         {
@@ -508,7 +585,7 @@ impl ServerRepo {
                      WHERE workshop_items_fts MATCH ?{fts_idx} AND {where_clause}"
                 ))?;
                 let rows = stmt.query(params_from_iter(params.iter()))?;
-                page.collect(rows, |row, _| {
+                page.collect(rows, cancel, |row, _| {
                     let description = row.get_ref(7)?.as_str_or_null()?;
                     Ok(description.and_then(|desc| search::score_desc_candidate(parsed, desc)))
                 })?;
@@ -524,6 +601,7 @@ impl ServerRepo {
         filters: &SearchFilters,
         target: LocalSearchTarget,
         page: &mut SearchPage,
+        cancel: &QueryCancelToken,
     ) -> anyhow::Result<()> {
         if target != LocalSearchTarget::DescriptionOnly {
             let mut params = Vec::new();
@@ -532,10 +610,14 @@ impl ServerRepo {
                 "SELECT {SEARCH_ORDER_COLUMNS} FROM workshop_items w WHERE {where_clause}"
             ))?;
             let rows = stmt.query(params_from_iter(params.iter()))?;
-            page.collect(rows, |row, _| {
+            page.collect(rows, cancel, |row, _| {
                 let title = row.get_ref(1)?.as_str()?;
                 Ok(search::score_symbol_only_title(parsed, title))
             })?;
+        }
+
+        if cancel.is_cancelled() {
+            return Err(QueryAbortedError::Cancelled.into());
         }
 
         if target == LocalSearchTarget::DescriptionOnly
@@ -548,7 +630,7 @@ impl ServerRepo {
                  WHERE {where_clause} AND w.description IS NOT NULL"
             ))?;
             let rows = stmt.query(params_from_iter(params.iter()))?;
-            page.collect(rows, |row, _| {
+            page.collect(rows, cancel, |row, _| {
                 let description = row.get_ref(7)?.as_str()?;
                 Ok(search::score_symbol_only_desc(parsed, description))
             })?;

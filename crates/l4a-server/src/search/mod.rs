@@ -80,6 +80,7 @@ pub struct ParsedQuery {
     pub whole_compact: Option<String>,
     pub literal_substrings: Vec<String>,
     compact_all: String,
+    pub(super) can_match_pinyin: bool,
 }
 
 impl ParsedQuery {
