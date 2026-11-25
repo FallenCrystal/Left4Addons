@@ -87,7 +87,9 @@
 
 .l4a-addon-cover-wrap > .l4a-card-trigger,
 .l4a-addon-cover-wrap > .l4a-cover-img,
-.l4a-addon-cover-wrap > .l4a-cover-fallback {
+.l4a-addon-cover-wrap > .l4a-cover-fallback,
+.l4a-addon-cover-wrap > .l4a-cover-filtered,
+.l4a-addon-cover-wrap > .l4a-cover-blur-wrap {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -109,6 +111,139 @@
   justify-content: center;
   position: relative;
   overflow: hidden;
+}
+
+.l4a-cover-filtered {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px;
+  text-align: center;
+  background-color: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  position: relative;
+  overflow: hidden;
+}
+
+.l4a-cover-filtered[data-compact='true'] {
+  padding: 2px;
+  gap: 2px;
+}
+
+.l4a-cover-filter-label {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.l4a-cover-lazy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--md-sys-shape-corner-full);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  background-color: var(--md-sys-color-surface-container-lowest);
+  color: var(--md-sys-color-on-surface);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.l4a-cover-lazy-btn[data-compact='true'] {
+  padding: 4px;
+  width: 100%;
+  height: 100%;
+  border-radius: 0;
+  border: 0;
+  background-color: var(--md-sys-color-surface-container-high);
+}
+
+.l4a-cover-lazy-btn:hover {
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.l4a-cover-lazy-btn:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
+}
+
+.l4a-cover-blur-wrap {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+}
+
+.l4a-cover-blur-stage {
+  width: 100%;
+  height: 100%;
+  transition:
+    filter var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard),
+    transform var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.l4a-cover-blur-stage[data-blurred='true'] {
+  filter: blur(20px);
+  transform: scale(1.08);
+}
+
+.l4a-cover-blur-overlay {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  z-index: 2;
+}
+
+.l4a-cover-blur-overlay[data-compact='true'] {
+  inset: 0;
+  right: auto;
+  bottom: auto;
+  width: 100%;
+  height: 100%;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.l4a-cover-peek-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: var(--md-sys-shape-corner-full);
+  border: 1px solid color-mix(in srgb, var(--md-sys-color-outline-variant) 80%, transparent);
+  background-color: color-mix(in srgb, var(--md-sys-color-surface-container-high) 90%, transparent);
+  color: var(--md-sys-color-on-surface);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--md-sys-elevation-1);
+}
+
+.l4a-cover-peek-btn:hover {
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.l4a-cover-peek-btn:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
 }
 
 .l4a-cover-overlay-top {
@@ -350,4 +485,79 @@
   color: var(--md-sys-color-on-surface-variant);
   display: grid;
   place-items: center;
+}
+
+/* ==========================================================================
+   Content Filter: Blur Card & Revealed Text Snippet
+   ========================================================================== */
+.md-card[data-blur-card='true'] > :not(.l4a-blur-card-overlay) {
+  filter: blur(14px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.l4a-list-row {
+  position: relative;
+}
+
+.l4a-list-row[data-blur-card='true'] > :not(.l4a-blur-card-overlay) {
+  filter: blur(12px);
+  pointer-events: none;
+  user-select: none;
+}
+
+.l4a-blur-card-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px;
+  border: 0;
+  background-color: color-mix(in srgb, var(--md-sys-color-surface-container) 58%, transparent);
+  color: var(--md-sys-color-on-surface);
+  cursor: pointer;
+  text-align: center;
+}
+
+.l4a-blur-card-overlay:hover .l4a-blur-card-chip {
+  background-color: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.l4a-blur-card-overlay:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: -2px;
+}
+
+.l4a-blur-card-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: var(--md-sys-shape-corner-full);
+  background-color: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  box-shadow: var(--md-sys-elevation-1);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  transition: background-color var(--md-sys-motion-duration-short) var(--md-sys-motion-easing-standard);
+}
+
+.l4a-revealed-desc {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--md-sys-color-on-surface-variant);
+  padding: 6px 8px;
+  border-radius: var(--md-sys-shape-corner-extra-small);
+  background-color: var(--md-sys-color-surface-container);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }

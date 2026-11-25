@@ -10,9 +10,11 @@ import {
   Download,
   ExternalLink,
   Eye,
+  EyeOff,
   RefreshCw,
   Search,
   Settings,
+  ShieldAlert,
   Store,
   Users,
   X,
@@ -26,7 +28,15 @@ import {
   type WorkshopFileType,
   type WorkshopItemRecord,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../state/useAppController';
+import {
+  collectWorkshopImageUrls,
+  formatDiagnosticVerdictBadge,
+  resolveCardFilterState,
+  resolveDetailFilterState,
+  workshopFilterKey,
+} from '../../utils/contentFilter';
 import {
   buildSteamProtocolUrl,
   buildWorkshopUrl,
@@ -187,6 +197,65 @@ export function WorkshopView({
   const loading = searchResult?.reqKey !== reqKey;
   const response = searchResult?.response ?? null;
   const searchError = searchResult?.error ?? null;
+
+  const {
+    filterConfig,
+    verdicts,
+    revealedCardIds,
+    revealCard,
+    registerWorkshopItems,
+  } = useContentFilterContext();
+  const [showingFilteredCards, setShowingFilteredCards] = useState(false);
+
+  useEffect(() => {
+    const batch: WorkshopItemRecord[] = [];
+    if (response?.items) {
+      batch.push(...response.items);
+    }
+    if (activeItem) {
+      batch.push(activeItem);
+    }
+    if (batch.length > 0) {
+      registerWorkshopItems(batch);
+    }
+  }, [response, activeItem, registerWorkshopItems]);
+
+  const { visibleItems, filteredOutCount } = useMemo(() => {
+    const rawItems = response?.items ?? [];
+    let hiddenCount = 0;
+    const out: WorkshopItemRecord[] = [];
+    for (const item of rawItems) {
+      const state = resolveCardFilterState({
+        config: filterConfig,
+        scope: 'workshop',
+        verdict: verdicts[workshopFilterKey(item.workshopId)],
+      });
+      if (state.hiddenCard) {
+        hiddenCount += 1;
+        if (!showingFilteredCards) {
+          continue;
+        }
+      }
+      out.push(item);
+    }
+    return { visibleItems: out, filteredOutCount: hiddenCount };
+  }, [response, filterConfig, verdicts, showingFilteredCards]);
+
+  const activeGalleryUrls = useMemo(
+    () => (activeItem ? collectWorkshopImageUrls(activeItem) : []),
+    [activeItem],
+  );
+  const activeVerdict = activeItem ? verdicts[workshopFilterKey(activeItem.workshopId)] : undefined;
+  const activeDetailFilter = useMemo(
+    () =>
+      resolveDetailFilterState({
+        config: filterConfig,
+        scope: 'workshop',
+        verdict: activeVerdict,
+        totalImages: activeGalleryUrls.length,
+      }),
+    [filterConfig, activeVerdict, activeGalleryUrls.length],
+  );
 
   const safePageSize = response ? Math.max(1, response.pageSize) : 24;
   const totalPages = response ? Math.max(1, Math.ceil(response.total / safePageSize)) : 1;
@@ -471,6 +540,20 @@ export function WorkshopView({
             />
           ))}
         </div>
+        {filteredOutCount > 0 && (
+          <FilterChip
+            label={
+              showingFilteredCards
+                ? t('filter.filteredCountShowing', { count: filteredOutCount })
+                : t('filter.filteredCount', { count: filteredOutCount })
+            }
+            selected={showingFilteredCards}
+            tone={showingFilteredCards ? 'tertiary' : 'surface'}
+            icon={<EyeOff size={14} />}
+            onClick={() => setShowingFilteredCards((v) => !v)}
+            onRemove={showingFilteredCards ? () => setShowingFilteredCards(false) : undefined}
+          />
+        )}
         <div className="l4a-spacer" />
         {loading && response && <LoadingIndicator size="sm" label={t('common.search')} />}
         {response && (
@@ -531,37 +614,76 @@ export function WorkshopView({
           />
         ) : (
           <>
-            {!response || response.items.length === 0 ? (
+            {!response || visibleItems.length === 0 ? (
               !loading && <EmptyState icon={<Store size={26} />} title={t('common.noResults')} />
             ) : (
               <div className="l4a-grid">
-                {response.items.map((item) => {
+                {visibleItems.map((item) => {
                   const local = localByWorkshopId.get(item.workshopId);
                   const dl = liveDownloads[item.workshopId];
                   const isTracked = item.fileType === 'collection' && trackedIds.has(item.workshopId);
+                  const cardKey = workshopFilterKey(item.workshopId);
+                  const verdict = verdicts[cardKey];
+                  const cardFilter = resolveCardFilterState({
+                    config: filterConfig,
+                    scope: 'workshop',
+                    verdict,
+                    revealed: revealedCardIds.has(cardKey),
+                    forceShowHiddenCards: showingFilteredCards,
+                  });
+                  const displayTitle = cardFilter.redactTitle
+                    ? t('filter.redactedTitleWithId', { id: item.workshopId })
+                    : item.title;
 
                   return (
-                    <article key={item.workshopId} className="md-card" data-clickable="true">
-                      <div className="l4a-addon-cover-wrap">
+                    <article
+                      key={item.workshopId}
+                      className="md-card"
+                      data-clickable="true"
+                      data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
+                    >
+                      {cardFilter.blurWholeCard && (
                         <button
                           type="button"
-                          tabIndex={-1}
-                          aria-hidden="true"
+                          className="l4a-blur-card-overlay"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            revealCard(cardKey);
+                          }}
+                        >
+                          <span className="l4a-blur-card-chip">
+                            <Eye size={14} />
+                            <span>{t('filter.blurCardOverlay')}</span>
+                          </span>
+                        </button>
+                      )}
+
+                      <div className="l4a-addon-cover-wrap">
+                        <div
                           className="l4a-card-trigger"
                           style={{ height: '100%' }}
                           onClick={() => setActiveItem(item)}
                         >
                           <AddonCover
                             src={item.previewUrl}
-                            title={item.title}
+                            title={displayTitle}
                             category={item.tags[0]}
+                            filterMode={cardFilter.coverMode}
                           />
-                        </button>
+                        </div>
                         <div className="l4a-cover-overlay-top">
                           <span className="md-pill" data-tone="surface">
                             {t(`workshop.type.${item.fileType}`)}
                           </span>
                           <div className="l4a-status-pills">
+                            {cardFilter.showDiagnosticBadge && verdict && (
+                              <span className="md-pill" data-tone="tertiary">
+                                {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                                  imageTag: t('filter.modImageShort'),
+                                  textTag: t('filter.modTextShort'),
+                                })}
+                              </span>
+                            )}
                             {isTracked && (
                               <span className="md-pill" data-tone="primary">
                                 {t('workshop.tracked')}
@@ -591,7 +713,7 @@ export function WorkshopView({
                         <LinearProgress
                           value={dl.percent}
                           indeterminate={dl.cancelling || dl.percent === 0}
-                          label={item.title}
+                          label={displayTitle}
                         />
                       )}
 
@@ -601,7 +723,7 @@ export function WorkshopView({
                           className="l4a-card-trigger"
                           onClick={() => setActiveItem(item)}
                         >
-                          <div className="l4a-addon-title">{item.title}</div>
+                          <div className="l4a-addon-title">{displayTitle}</div>
                         </button>
                         <div className="l4a-addon-meta">
                           <span className="l4a-truncate">
@@ -624,10 +746,38 @@ export function WorkshopView({
                           ) : null}
                         </div>
 
+                        {cardFilter.isBlurCardRevealed && (
+                          <div className="l4a-revealed-desc">
+                            {cardFilter.redactDescription
+                              ? t('filter.redactedDescription')
+                              : item.description?.trim() || t('filter.noDescription')}
+                          </div>
+                        )}
+
+                        {!cardFilter.isBlurCardRevealed &&
+                          cardFilter.redactDescription &&
+                          !cardFilter.redactTitle && (
+                            <div className="l4a-revealed-desc">{t('filter.redactedDescription')}</div>
+                          )}
+
                         <div className="l4a-addon-card-footer">
-                          <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                            #{item.workshopId}
-                          </span>
+                          <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                            <span
+                              className="md-body-small md-mono"
+                              style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                            >
+                              #{item.workshopId}
+                            </span>
+                            {cardFilter.isBlurCardRevealed && (
+                              <Button
+                                variant="text"
+                                size="sm"
+                                onClick={() => setActiveItem(item)}
+                              >
+                                {t('common.inspect')}
+                              </Button>
+                            )}
+                          </div>
                           {renderPrimaryAction(item, true)}
                         </div>
                       </div>
@@ -704,16 +854,83 @@ export function WorkshopView({
       >
         {activeItem && (
           <div className="md-sheet-body">
+            {activeDetailFilter.flagged && activeVerdict && (
+              <div className="l4a-callout">
+                <ShieldAlert
+                  size={16}
+                  style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0, marginTop: 2 }}
+                />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                  <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                    <span className="md-label-large">{t('filter.flaggedBannerTitle')}</span>
+                    <span className="md-pill" data-tone="tertiary">
+                      {t(`filter.decisionSource.${activeVerdict.decisionSource}`)}
+                    </span>
+                    {activeDetailFilter.imageSensitive && (
+                      <span className="md-pill" data-tone="secondary">
+                        [{t('filter.modImageShort')}]
+                      </span>
+                    )}
+                    {activeDetailFilter.textSensitive && (
+                      <span className="md-pill" data-tone="secondary">
+                        [{t('filter.modTextShort')}]
+                      </span>
+                    )}
+                  </div>
+                  <span
+                    className="md-body-small"
+                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                  >
+                    {t('filter.scoreSummary', {
+                      score: activeVerdict.evaluatedScore.toFixed(2),
+                      nsfw: activeVerdict.probabilities.nsfwProb.toFixed(2),
+                      gore: activeVerdict.probabilities.goreProb.toFixed(2),
+                    })}
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div
               className="l4a-addon-cover-wrap"
               style={{ borderRadius: 'var(--md-sys-shape-corner-medium)' }}
             >
               <AddonCover
-                src={activeItem.previewUrl}
+                src={activeGalleryUrls[0] ?? activeItem.previewUrl}
                 title={activeItem.title}
                 category={activeItem.tags[0]}
+                filterMode={activeDetailFilter.imageModeAt(0)}
+                allowPeek={activeDetailFilter.imageModeAt(0) === 'blur'}
               />
             </div>
+
+            {activeGalleryUrls.length > 1 && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <span
+                  className="md-label-medium"
+                  style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                >
+                  {t('filter.screenshots', { count: activeGalleryUrls.length - 1 })}
+                </span>
+                <div className="l4a-gallery-grid">
+                  {activeGalleryUrls.slice(1).map((url, offset) => {
+                    const imageIdx = offset + 1;
+                    const imgMode = activeDetailFilter.imageModeAt(imageIdx);
+                    return (
+                      <div key={`${imageIdx}:${url}`} className="l4a-gallery-item">
+                        <AddonCover
+                          src={url}
+                          title={`${activeItem.title} #${imageIdx + 1}`}
+                          category={activeItem.tags[0]}
+                          filterMode={imgMode}
+                          allowPeek={imgMode === 'blur'}
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             <div className="l4a-kv-grid">
               <div className="l4a-kv-item">

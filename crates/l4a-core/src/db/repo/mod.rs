@@ -1,4 +1,5 @@
 mod addons;
+mod filter;
 mod grouping;
 mod metadata;
 mod reconcile_tasks;

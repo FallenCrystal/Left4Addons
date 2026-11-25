@@ -153,3 +153,117 @@ it('reloads overrides on unlock and can explicitly clear a cached download URL',
     dependencies: [{ workshopId: '4203', required: true }],
   });
 });
+
+it('configures the content filter model and runs the probability test sandbox', async () => {
+  let savedConfig: unknown;
+  let sandboxRequest: unknown;
+  const fetchMock = vi.fn(async (path: string, init?: RequestInit) => {
+    if (path.endsWith('/auth/me')) {
+      return Response.json({ authenticated: true, username: 'admin', csrfToken: 'csrf-tok' });
+    }
+    if (path.endsWith('/overview')) {
+      return Response.json({
+        steam: { connectionState: 'connected', mode: 'anonymous' },
+        filter: {
+          config: {
+            enabled: false,
+            backend: 'managed_python',
+            cacheTtlSecs: 3600,
+            params: {
+              threads: 4,
+              enableText: true,
+              enableImage: true,
+              maxImages: 2,
+              galleryAggregation: 'max',
+              goreWeight: 1.0,
+              nsfwWeight: 1.0,
+              temperature: 1.0,
+              bias: 0.0,
+            },
+          },
+          ready: false,
+          totalRequests: 12,
+          cacheHits: 6,
+          failedRequests: 0,
+        },
+      });
+    }
+    if (path.endsWith('/admin/config/filter') && init?.method === 'PATCH') {
+      savedConfig = JSON.parse(String(init.body));
+      return Response.json({
+        config: savedConfig,
+        ready: true,
+        activeEndpoint: 'http://127.0.0.1:8090',
+        modelName: 'Left4Filters',
+        modelVersion: '2.1.0',
+        totalRequests: 12,
+        cacheHits: 6,
+        failedRequests: 0,
+      });
+    }
+    if (path.endsWith('/admin/filter/test') && init?.method === 'POST') {
+      sandboxRequest = JSON.parse(String(init.body));
+      return Response.json({
+        prob: 0.9125,
+        goreProb: 0.0,
+        nsfwProb: 0.9125,
+        textProb: 0.88,
+        titleProb: 0.91,
+        descriptionProb: 0.42,
+        imageProb: 0.76,
+      });
+    }
+    throw new Error(`Unexpected request ${path}`);
+  });
+  vi.stubGlobal('fetch', fetchMock);
+
+  await act(async () => {
+    render(<App />);
+  });
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '内容过滤模型' }));
+  });
+
+  fireEvent.click(screen.getByLabelText('启用内容过滤概率接口'));
+  fireEvent.change(screen.getByLabelText('推理后端模式'), {
+    target: { value: 'upstream_http' },
+  });
+  fireEvent.change(screen.getByLabelText('外部推理服务 URL (upstream_url)'), {
+    target: { value: 'http://127.0.0.1:8090' },
+  });
+  fireEvent.click(screen.getByRole('button', { name: '仅擦边 NSFW' }));
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+  });
+
+  expect(savedConfig).toMatchObject({
+    enabled: true,
+    backend: 'upstream_http',
+    upstreamUrl: 'http://127.0.0.1:8090',
+    params: {
+      goreWeight: 0,
+      nsfwWeight: 1,
+    },
+  });
+  expect(screen.getByText('就绪 (Ready)')).toBeTruthy();
+
+  fireEvent.change(screen.getByLabelText('Workshop ID 或工坊链接 (可选)'), {
+    target: { value: 'https://steamcommunity.com/sharedfiles/filedetails/?id=2814104912' },
+  });
+  fireEvent.change(screen.getByLabelText('自定义标题 (可选)'), {
+    target: { value: 'Sample Skin' },
+  });
+
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '执行概率试算' }));
+  });
+
+  expect(sandboxRequest).toEqual({
+    workshopId: '2814104912',
+    title: 'Sample Skin',
+  });
+  expect(screen.getAllByText('91.25% (0.9125)').length).toBeGreaterThanOrEqual(1);
+});
+

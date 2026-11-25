@@ -1,3 +1,6 @@
+use crate::filter::{
+    ClientFilterConfig, FilterExclusionRecord, FilterItemVerdict, LocalFilterDeploymentStatus,
+};
 use crate::ids::{AddonId, BundleId, GroupId, IssueId, ProfileId, TaskId, WorkshopId};
 use crate::workshop::{MetadataSource, WorkshopItemStatus};
 use chrono::{DateTime, Utc};
@@ -454,7 +457,7 @@ pub enum AddonNamePreference {
     FileName,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub loading_dir: String,
@@ -475,7 +478,7 @@ pub struct AppConfig {
     pub force_steamworks_sdk_download: bool,
     #[serde(default = "default_true_flag")]
     pub https_only: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_server_url: Option<String>,
     #[serde(default = "default_provider_order")]
     pub source_order: Vec<String>,
@@ -485,6 +488,8 @@ pub struct AppConfig {
     pub collapse_campaign_bundles: bool,
     #[serde(default)]
     pub rename_rules: RenameRuleConfig,
+    #[serde(default)]
+    pub filter: ClientFilterConfig,
 }
 
 fn default_concurrency() -> usize {
@@ -521,6 +526,7 @@ impl Default for AppConfig {
             addon_name_preference: AddonNamePreference::default(),
             collapse_campaign_bundles: true,
             rename_rules: RenameRuleConfig::default(),
+            filter: ClientFilterConfig::default(),
         }
     }
 }
@@ -572,8 +578,11 @@ pub struct DashboardSnapshot {
     pub profiles: Vec<LoadoutProfile>,
     pub open_issues: Vec<ReconcileIssue>,
     pub tasks: Vec<TaskRecord>,
+    #[serde(default)]
+    pub filter_exclusions: Vec<FilterExclusionRecord>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
@@ -600,5 +609,11 @@ pub enum CoreEvent {
     },
     WatchError {
         message: String,
+    },
+    FilterVerdictsUpdated {
+        verdicts: Vec<FilterItemVerdict>,
+    },
+    LocalFilterStatusChanged {
+        status: LocalFilterDeploymentStatus,
     },
 }

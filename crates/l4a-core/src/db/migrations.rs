@@ -169,6 +169,25 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS filter_exclusions (
+            addon_id TEXT PRIMARY KEY,
+            display_level TEXT NOT NULL,
+            bind_fingerprint INTEGER NOT NULL DEFAULT 0,
+            bound_fingerprint TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS filter_verdicts (
+            target_key TEXT NOT NULL,
+            content_sig TEXT NOT NULL,
+            policy_sig TEXT NOT NULL,
+            verdict_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (target_key, policy_sig)
+        );
         "#,
     )?;
 

@@ -9,6 +9,8 @@ import {
   Unlock,
 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, BundleRecord } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import { addonFilterKey, resolveCardFilterState } from '../../../utils/contentFilter';
 import { formatBundleMemberLabel, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
 import { Button, EmptyState, IconButton, Switch } from '../../m3/primitives';
@@ -44,6 +46,8 @@ export function BundlesTab({
   onOpenFilterInLibrary,
 }: BundlesTabProps) {
   const { t } = useTranslation();
+  const { filterConfig, verdicts, exclusionsByAddonId, revealedCardIds } =
+    useContentFilterContext();
 
   if (filteredBundles.length === 0) {
     return (
@@ -59,6 +63,17 @@ export function BundlesTab({
       {filteredBundles.map((bundle) => {
         const summary = summarizeGroupMembers(bundle.memberAddonIds, addonsById);
         const toggleableIds = summary.loading.map((a) => a.id);
+        const coverMember =
+          summary.members.find((m) => m.coverImage || m.localCoverImage) ?? summary.members[0];
+        const coverState = coverMember
+          ? resolveCardFilterState({
+              config: filterConfig,
+              scope: 'library',
+              verdict: verdicts[addonFilterKey(coverMember.id)],
+              exclusion: exclusionsByAddonId.get(coverMember.id),
+              revealed: revealedCardIds.has(addonFilterKey(coverMember.id)),
+            })
+          : undefined;
         return (
           <article
             key={bundle.id}
@@ -67,10 +82,7 @@ export function BundlesTab({
             data-muted={summary.loading.length > 0 && summary.noneEnabled ? 'true' : 'false'}
           >
             <div className="l4a-addon-cover-wrap" style={{ aspectRatio: '21 / 9' }}>
-              <button
-                type="button"
-                tabIndex={-1}
-                aria-hidden="true"
+              <div
                 className="l4a-card-trigger"
                 style={{ height: '100%' }}
                 onClick={() => onInspectBundle(bundle.id)}
@@ -80,8 +92,9 @@ export function BundlesTab({
                   fallbackSrc={summary.firstLocalCover}
                   title={bundle.name}
                   category="Campaign"
+                  filterMode={bundle.coverImage ? 'none' : (coverState?.coverMode ?? 'none')}
                 />
-              </button>
+              </div>
               <div className="l4a-cover-overlay-top">
                 <span className="md-pill" data-tone="secondary">
                   {t(`organize.bundleKind.${bundle.kind}`)}

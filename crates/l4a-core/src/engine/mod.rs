@@ -1,4 +1,5 @@
 mod covers;
+mod filter;
 mod hydration;
 mod operations;
 mod transfers;
@@ -11,10 +12,12 @@ use crate::config::{load_config, save_config, AppPaths};
 use crate::db::LocalDb;
 use crate::download_gate::DownloadGate;
 use crate::error::CoreError;
+use crate::filter::{LocalFilterManager, TokenVault};
 use crate::grouping::rebuild_auto_bundles;
 use crate::reconcile::auto_resolve_by_policy;
 use crate::scanner::scan_workspace;
 use crate::watcher::AddonWatcher;
+use filter::sanitize_filter_config;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{AppConfig, CoreEvent, DashboardSnapshot, WorkshopId};
 use l4a_steam::{DynamicSteamBridge, SteamBridge, SteamCapabilities};
@@ -61,6 +64,8 @@ pub struct L4aEngine {
     hydrating_workshop: AtomicBool,
     hydration_pending: AtomicBool,
     hydration_backoff: Mutex<HashMap<WorkshopId, (u32, Instant)>>,
+    local_filter: Arc<LocalFilterManager>,
+    token_vault: RwLock<TokenVault>,
 }
 
 impl L4aEngine {
@@ -73,6 +78,7 @@ impl L4aEngine {
 
         let mut config = load_config(&paths.settings_path)?;
         config.download_concurrency = config.download_concurrency.clamp(1, 8);
+        let _ = sanitize_filter_config(&mut config.filter);
         if config.loading_dir.is_empty() {
             if let Some(detected) = l4a_steam::detect_l4d2_addons_path() {
                 let loading = Path::new(&detected);
@@ -105,6 +111,8 @@ impl L4aEngine {
 
         let db = Arc::new(LocalDb::open(&paths.db_path)?);
         let resolver = build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
+        let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
+        let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -123,6 +131,8 @@ impl L4aEngine {
             hydrating_workshop: AtomicBool::new(false),
             hydration_pending: AtomicBool::new(false),
             hydration_backoff: Mutex::new(HashMap::new()),
+            local_filter,
+            token_vault,
         })
     }
 
@@ -137,7 +147,10 @@ impl L4aEngine {
     ) -> Result<Self, CoreError> {
         paths.ensure_dirs()?;
         config.download_concurrency = config.download_concurrency.clamp(1, 8);
+        let _ = sanitize_filter_config(&mut config.filter);
         mirror.set_https_only(config.https_only);
+        let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
+        let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
             download_gate: DownloadGate::new(config.download_concurrency),
@@ -155,11 +168,29 @@ impl L4aEngine {
             hydrating_workshop: AtomicBool::new(false),
             hydration_pending: AtomicBool::new(false),
             hydration_backoff: Mutex::new(HashMap::new()),
+            local_filter,
+            token_vault,
         })
+    }
+
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
     }
 
     pub fn db(&self) -> &Arc<LocalDb> {
         &self.db
+    }
+
+    pub(crate) fn mirror_router(&self) -> &MirrorRouter {
+        &self.mirror
+    }
+
+    pub(crate) fn local_filter(&self) -> &LocalFilterManager {
+        &self.local_filter
+    }
+
+    pub(crate) fn token_vault(&self) -> TokenVault {
+        self.token_vault.read().unwrap().clone()
     }
 
     pub fn config(&self) -> AppConfig {
@@ -216,14 +247,16 @@ impl L4aEngine {
                 .into_owned();
         }
         next.download_concurrency = next.download_concurrency.clamp(1, 8);
+        sanitize_filter_config(&mut next.filter)?;
         save_config(&self.paths.settings_path, &next)?;
-        let dirs_changed = {
+        let (dirs_changed, filter_params_changed) = {
             let mut guard = self.config.write().unwrap();
             self.mirror.set_https_only(next.https_only);
             let changed =
                 guard.loading_dir != next.loading_dir || guard.workshop_dir != next.workshop_dir;
+            let params_changed = guard.filter.local_params != next.filter.local_params;
             *guard = next.clone();
-            changed
+            (changed, params_changed)
         };
         if let Some(ref dyn_bridge) = self.dynamic_bridge {
             dyn_bridge.set_enabled(!next.disable_steamworks_sdk);
@@ -241,6 +274,14 @@ impl L4aEngine {
             None
         };
         drop(workspace);
+        if filter_params_changed {
+            if let Err(err) = self
+                .local_filter
+                .reconfigure_params_sync(&next.filter.local_params)
+            {
+                tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
+            }
+        }
         if let Some(err) = watch_error {
             self.events.emit(CoreEvent::WatchError {
                 message: format!("重新绑定目录监听失败: {err}"),
@@ -297,6 +338,7 @@ impl L4aEngine {
             profiles: self.db.list_profiles()?,
             open_issues: self.db.list_open_reconcile_issues()?,
             tasks: self.db.list_tasks()?,
+            filter_exclusions: self.db.list_filter_exclusions()?,
         })
     }
 
@@ -305,6 +347,7 @@ impl L4aEngine {
     }
 
     pub async fn shutdown(&self) {
+        let _ = self.local_filter.stop_service().await;
         self.steam_bridge.shutdown().await;
     }
 

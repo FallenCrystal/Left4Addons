@@ -4,6 +4,7 @@ import {
   ArrowUpCircle,
   CloudOff,
   Download,
+  Eye,
   Folder,
   FolderOpen,
   Layers,
@@ -12,7 +13,13 @@ import {
   Store,
 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, BundleRecord } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
+import {
+  addonFilterKey,
+  formatDiagnosticVerdictBadge,
+  resolveCardFilterState,
+} from '../../../utils/contentFilter';
 import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
 import { Button, Checkbox, IconButton, LinearProgress, Switch } from '../../m3/primitives';
@@ -31,6 +38,7 @@ export interface LibraryGridProps {
   showBatchBar: boolean;
   liveDownloads: Record<string, LiveDownloadState>;
   busy: boolean;
+  forceShowHiddenCards?: boolean;
   onToggleSelect: (id: string) => void;
   onToggleSelectMany: (ids: string[]) => void;
   onSelectAddon: (addon: AddonSummary) => void;
@@ -49,6 +57,7 @@ interface BundleGridCardProps {
   batchMode: boolean;
   showBatchBar: boolean;
   busy: boolean;
+  forceShowHiddenCards: boolean;
   onToggleSelectMany: (ids: string[]) => void;
   onInspectBundle: (bundleId: string) => void;
   onBatchToggle: (addonIds: string[], enabled: boolean) => void;
@@ -63,12 +72,15 @@ function BundleGridCard({
   batchMode,
   showBatchBar,
   busy,
+  forceShowHiddenCards,
   onToggleSelectMany,
   onInspectBundle,
   onBatchToggle,
   onOpenInFileManager,
 }: BundleGridCardProps) {
   const { t } = useTranslation();
+  const { filterConfig, verdicts, exclusionsByAddonId, revealedCardIds } =
+    useContentFilterContext();
   const summary = summarizeBundle(allMembers);
   const visibleSummary = summarizeBundle(visibleMembers);
   const visibleIds = visibleMembers.map((m) => m.id);
@@ -76,6 +88,21 @@ function BundleGridCard({
   const loadingIds = visibleSummary.loading.map((m) => m.id);
   const muted = visibleSummary.installed.length > 0 && visibleSummary.enabledInstalled.length === 0;
   const firstPath = visibleSummary.firstPath;
+
+  const coverMember =
+    allMembers.find((m) => m.maps.length > 0 && (m.coverImage || m.localCoverImage)) ??
+    allMembers.find((m) => m.coverImage || m.localCoverImage) ??
+    allMembers[0];
+  const coverState = coverMember
+    ? resolveCardFilterState({
+        config: filterConfig,
+        scope: 'library',
+        verdict: verdicts[addonFilterKey(coverMember.id)],
+        exclusion: exclusionsByAddonId.get(coverMember.id),
+        revealed: revealedCardIds.has(addonFilterKey(coverMember.id)),
+        forceShowHiddenCards,
+      })
+    : undefined;
 
   const handleOpenOrSelect = () => {
     if (batchMode) onToggleSelectMany(visibleIds);
@@ -90,10 +117,7 @@ function BundleGridCard({
       data-muted={muted ? 'true' : 'false'}
     >
       <div className="l4a-addon-cover-wrap">
-        <button
-          type="button"
-          tabIndex={-1}
-          aria-hidden="true"
+        <div
           className="l4a-card-trigger"
           style={{ height: '100%' }}
           onClick={handleOpenOrSelect}
@@ -103,8 +127,9 @@ function BundleGridCard({
             fallbackSrc={summary.firstLocalCover}
             title={bundle.name}
             category="Campaign"
+            filterMode={bundle.coverImage ? 'none' : (coverState?.coverMode ?? 'none')}
           />
-        </button>
+        </div>
         <div className="l4a-cover-overlay-top">
           <div
             className="l4a-card-check"
@@ -230,6 +255,7 @@ interface AddonGridCardProps {
   showBatchBar: boolean;
   dl?: LiveDownloadState;
   busy: boolean;
+  forceShowHiddenCards: boolean;
   onToggleSelect: (id: string) => void;
   onSelectAddon: (addon: AddonSummary) => void;
   onToggleSingle: (addon: AddonSummary, enabled: boolean) => void;
@@ -245,6 +271,7 @@ function AddonGridCard({
   showBatchBar,
   dl,
   busy,
+  forceShowHiddenCards,
   onToggleSelect,
   onSelectAddon,
   onToggleSingle,
@@ -252,7 +279,32 @@ function AddonGridCard({
   onOpenInFileManager,
 }: AddonGridCardProps) {
   const { t } = useTranslation();
-  const displayName = formatAddonDisplayName(addon, namePreference);
+  const { filterConfig, verdicts, exclusionsByAddonId, revealedCardIds, revealCard } =
+    useContentFilterContext();
+
+  const cardKey = addonFilterKey(addon.id);
+  const verdict = verdicts[cardKey];
+  const exclusion = exclusionsByAddonId.get(addon.id);
+  const cardFilter = resolveCardFilterState({
+    config: filterConfig,
+    scope: 'library',
+    verdict,
+    exclusion,
+    revealed: revealedCardIds.has(cardKey),
+    forceShowHiddenCards,
+  });
+
+  const rawDisplayName = formatAddonDisplayName(addon, namePreference);
+  const displayName = cardFilter.redactTitle
+    ? addon.workshopId
+      ? t('filter.redactedTitleWithId', { id: addon.workshopId })
+      : t('filter.redactedTitle')
+    : rawDisplayName;
+  const authorText = cardFilter.redactMeta
+    ? t('filter.redactedAuthor')
+    : addon.author || t('common.unknown');
+  const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
+
   const installed = addon.installState === 'installed';
   const remoteUnavailable = isRemoteUnavailable(addon);
 
@@ -267,12 +319,27 @@ function AddonGridCard({
       data-clickable="true"
       data-selected={selected ? 'true' : 'false'}
       data-muted={installed && !addon.enabled ? 'true' : 'false'}
+      data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
     >
-      <div className="l4a-addon-cover-wrap">
+      {cardFilter.blurWholeCard && (
         <button
           type="button"
-          tabIndex={-1}
-          aria-hidden="true"
+          className="l4a-blur-card-overlay"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (batchMode) onToggleSelect(addon.id);
+            else revealCard(cardKey);
+          }}
+        >
+          <span className="l4a-blur-card-chip">
+            <Eye size={14} />
+            <span>{t('filter.blurCardOverlay')}</span>
+          </span>
+        </button>
+      )}
+
+      <div className="l4a-addon-cover-wrap">
+        <div
           className="l4a-card-trigger"
           style={{ height: '100%' }}
           onClick={handleOpenOrSelect}
@@ -282,8 +349,9 @@ function AddonGridCard({
             fallbackSrc={addon.localCoverImage}
             title={displayName}
             category={addon.categories[0]}
+            filterMode={cardFilter.coverMode}
           />
-        </button>
+        </div>
         <div className="l4a-cover-overlay-top">
           <div
             className="l4a-card-check"
@@ -296,6 +364,29 @@ function AddonGridCard({
             />
           </div>
           <div className="l4a-status-pills">
+            {cardFilter.exclusionActive &&
+              cardFilter.exclusionDisplayLevel &&
+              cardFilter.exclusionDisplayLevel !== 'normal' && (
+                <span className="md-pill" data-tone="secondary">
+                  {t('filter.exclusionBadge', {
+                    level: t(`filter.levels.${cardFilter.exclusionDisplayLevel}`),
+                  })}
+                </span>
+              )}
+            {cardFilter.exclusionInvalidated && (
+              <span className="md-pill" data-tone="error">
+                <AlertTriangle size={12} />
+                {t('filter.exclusionInvalidPill')}
+              </span>
+            )}
+            {cardFilter.showDiagnosticBadge && verdict && (
+              <span className="md-pill" data-tone="tertiary">
+                {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                  imageTag: t('filter.modImageShort'),
+                  textTag: t('filter.modTextShort'),
+                })}
+              </span>
+            )}
             {addon.hasDummyBypass && (
               <span className="md-pill" data-tone="primary">
                 <ShieldCheck size={12} />
@@ -345,7 +436,7 @@ function AddonGridCard({
           <div className="l4a-addon-title">{displayName}</div>
         </button>
         <div className="l4a-addon-meta">
-          <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+          <span className="l4a-truncate">{authorText}</span>
           <span>·</span>
           <span style={{ flexShrink: 0 }}>{formatBytes(addon.fileSize)}</span>
           {addon.maps.length > 0 && (
@@ -366,6 +457,18 @@ function AddonGridCard({
           )}
         </div>
 
+        {cardFilter.isBlurCardRevealed && (
+          <div className="l4a-revealed-desc">
+            {cardFilter.redactDescription
+              ? t('filter.redactedDescription')
+              : description?.trim() || t('filter.noDescription')}
+          </div>
+        )}
+
+        {!cardFilter.isBlurCardRevealed && cardFilter.redactDescription && !cardFilter.redactTitle && (
+          <div className="l4a-revealed-desc">{t('filter.redactedDescription')}</div>
+        )}
+
         <div className="l4a-addon-card-footer">
           <div className="l4a-row-wrap" style={{ gap: 6 }}>
             {addon.primaryDir && (
@@ -380,6 +483,11 @@ function AddonGridCard({
               <span className="md-pill" data-tone="surface">
                 {t('common.disabled')}
               </span>
+            )}
+            {cardFilter.isBlurCardRevealed && (
+              <Button variant="text" size="sm" onClick={() => onSelectAddon(addon)}>
+                {t('common.inspect')}
+              </Button>
             )}
           </div>
 
@@ -439,6 +547,7 @@ export function LibraryGrid({
   showBatchBar,
   liveDownloads,
   busy,
+  forceShowHiddenCards = false,
   onToggleSelect,
   onToggleSelectMany,
   onSelectAddon,
@@ -462,6 +571,7 @@ export function LibraryGrid({
               batchMode={batchMode}
               showBatchBar={showBatchBar}
               busy={busy}
+              forceShowHiddenCards={forceShowHiddenCards}
               onToggleSelectMany={onToggleSelectMany}
               onInspectBundle={onInspectBundle}
               onBatchToggle={onBatchToggle}
@@ -481,6 +591,7 @@ export function LibraryGrid({
             showBatchBar={showBatchBar}
             dl={addon.workshopId ? liveDownloads[addon.workshopId] : undefined}
             busy={busy}
+            forceShowHiddenCards={forceShowHiddenCards}
             onToggleSelect={onToggleSelect}
             onSelectAddon={onSelectAddon}
             onToggleSingle={onToggleSingle}

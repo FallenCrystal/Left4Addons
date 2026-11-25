@@ -1,10 +1,13 @@
 import { useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  AlertTriangle,
   ArrowRightLeft,
   ArrowUpCircle,
   Copy,
   Download,
+  Eye,
+  EyeOff,
   FolderOpen,
   Layers,
   Map as MapIcon,
@@ -17,7 +20,14 @@ import type {
   AddonSummary,
   BundleRecord,
 } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
+import {
+  addonFilterKey,
+  formatDiagnosticVerdictBadge,
+  resolveCardFilterState,
+  resolveDetailFilterState,
+} from '../../../utils/contentFilter';
 import { formatBundleMemberLabel, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
 import { Button, IconButton, SideSheet, Switch, Tabs } from '../../m3/primitives';
@@ -68,12 +78,48 @@ export function BundleDetailSheet({
 }: BundleDetailSheetProps) {
   const { t } = useTranslation();
   const bundleTabsId = useId();
+  const { filterConfig, verdicts, exclusionsByAddonId, revealedCardIds, revealCard } =
+    useContentFilterContext();
 
-  const members = bundle
+  const allMembers = bundle
     ? bundle.memberAddonIds
         .map((id) => addonsById.get(id))
         .filter((a): a is AddonSummary => Boolean(a))
     : [];
+
+  const memberStates = allMembers.map((member) => {
+    const key = addonFilterKey(member.id);
+    const verdict = verdicts[key];
+    const exclusion = exclusionsByAddonId.get(member.id);
+    return {
+      member,
+      key,
+      verdict,
+      state: resolveCardFilterState({
+        config: filterConfig,
+        scope: 'library',
+        verdict,
+        exclusion,
+        revealed: revealedCardIds.has(key),
+      }),
+    };
+  });
+
+  const hiddenMemberCount = memberStates.filter((entry) => entry.state.hiddenCard).length;
+  const visibleMemberEntries = memberStates.filter((entry) => !entry.state.hiddenCard);
+  const members = visibleMemberEntries.map((entry) => entry.member);
+
+  const mapOwner =
+    allMembers.find((m) => m.maps.length > 0) ?? allMembers[0];
+  const mapDetailFilter = mapOwner
+    ? resolveDetailFilterState({
+        config: filterConfig,
+        scope: 'library',
+        verdict: verdicts[addonFilterKey(mapOwner.id)],
+        exclusion: exclusionsByAddonId.get(mapOwner.id),
+      })
+    : undefined;
+
   const summary = bundle ? summarizeBundle(members) : null;
   const loadingIds = summary ? summary.loading.map((m) => m.id) : [];
   const workshopIds = summary ? summary.workshopInstalled.map((m) => m.id) : [];
@@ -186,6 +232,12 @@ export function BundleDetailSheet({
                   <span className="md-pill" data-tone="surface">
                     {formatBytes(summary.totalSize)}
                   </span>
+                  {hiddenMemberCount > 0 && (
+                    <span className="md-pill" data-tone="surface">
+                      <EyeOff size={12} />
+                      {t('filter.filteredCount', { count: hiddenMemberCount })}
+                    </span>
+                  )}
                   {summary.loading.length > 0 && (
                     <span
                       className="md-pill"
@@ -210,22 +262,44 @@ export function BundleDetailSheet({
                 </div>
 
                 <div className="l4a-list">
-                  {members.map((member, idx) => {
+                  {visibleMemberEntries.map(({ member, key, verdict, state: cardFilter }, idx) => {
                     const installed = member.installState === 'installed';
                     const remoteUnavailable = isRemoteUnavailable(member);
                     const dl = member.workshopId ? liveDownloads[member.workshopId] : undefined;
-                    const memberLabel = formatBundleMemberLabel(
+                    const rawLabel = formatBundleMemberLabel(
                       member,
                       members,
                       namePreference,
                       bundle.name,
                     );
+                    const memberLabel = cardFilter.redactTitle
+                      ? member.workshopId
+                        ? t('filter.redactedTitleWithId', { id: member.workshopId })
+                        : t('filter.redactedTitle')
+                      : rawLabel;
+
                     return (
                       <div
                         key={member.id}
                         className="l4a-list-row l4a-list-row-dense"
                         data-muted={installed && !member.enabled ? 'true' : 'false'}
+                        data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
                       >
+                        {cardFilter.blurWholeCard && (
+                          <button
+                            type="button"
+                            className="l4a-blur-card-overlay"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              revealCard(key);
+                            }}
+                          >
+                            <span className="l4a-blur-card-chip">
+                              <Eye size={13} />
+                              <span>{t('filter.blurCardOverlay')}</span>
+                            </span>
+                          </button>
+                        )}
                         <div className="l4a-picker-thumb">
                           <AddonCover
                             compact
@@ -233,6 +307,7 @@ export function BundleDetailSheet({
                             fallbackSrc={member.localCoverImage}
                             title={memberLabel}
                             category={member.categories[0]}
+                            filterMode={cardFilter.coverMode}
                           />
                         </div>
                         <button
@@ -248,6 +323,27 @@ export function BundleDetailSheet({
                               #{idx + 1}
                             </span>
                             <span className="md-title-small l4a-truncate">{memberLabel}</span>
+                            {cardFilter.exclusionActive &&
+                              cardFilter.exclusionDisplayLevel &&
+                              cardFilter.exclusionDisplayLevel !== 'normal' && (
+                                <span className="md-pill" data-tone="secondary">
+                                  {t(`filter.levels.${cardFilter.exclusionDisplayLevel}`)}
+                                </span>
+                              )}
+                            {cardFilter.exclusionInvalidated && (
+                              <span className="md-pill" data-tone="error">
+                                <AlertTriangle size={11} />
+                                {t('filter.exclusionInvalidPill')}
+                              </span>
+                            )}
+                            {cardFilter.showDiagnosticBadge && verdict && (
+                              <span className="md-pill" data-tone="tertiary">
+                                {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                                  imageTag: t('filter.modImageShort'),
+                                  textTag: t('filter.modTextShort'),
+                                })}
+                              </span>
+                            )}
                             {member.updateAvailable && (
                               <span className="md-pill" data-tone="tertiary">
                                 <ArrowUpCircle size={11} />
@@ -265,7 +361,9 @@ export function BundleDetailSheet({
                             )}
                           </div>
                           <div className="l4a-addon-meta">
-                            {member.currentFileName ? (
+                            {cardFilter.redactMeta ? (
+                              <span className="l4a-truncate">{t('filter.redactedAuthor')}</span>
+                            ) : member.currentFileName ? (
                               <span className="md-mono l4a-truncate">{member.currentFileName}</span>
                             ) : (
                               <span className="l4a-truncate">
@@ -352,6 +450,7 @@ export function BundleDetailSheet({
                           src={m.imagePath}
                           title={m.name}
                           category="Map"
+                          filterMode={mapDetailFilter?.mapCoverMode ?? 'none'}
                         />
                       </div>
                     )}

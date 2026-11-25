@@ -10,6 +10,7 @@ import type {
 } from '../ipc';
 import { IpcError } from '../ipc';
 import { extractWorkshopIdInput, previewFilenameByRules } from '../../utils/format';
+import { reconcilePreviewExclusions } from './filter';
 import { PREVIEW_CATALOG } from './fixtures';
 
 export type PreviewEmit = (event: CoreEvent) => void;
@@ -244,9 +245,11 @@ export async function runPreviewTransfer(
       existing.remoteTimeUpdated = nowTs;
       existing.updateAvailable = false;
       existing.fileSize = total;
+      existing.contentHash = `updated_${workshopId}_${nowTs}`;
       taskRecord.status = 'completed';
       taskRecord.progressPercent = 100;
       taskRecord.updatedAt = new Date().toISOString();
+      reconcilePreviewExclusions(state);
       emit({ type: 'snapshot_updated', externalChange: false });
       return structuredClone(existing);
     }

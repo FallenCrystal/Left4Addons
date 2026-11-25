@@ -1,6 +1,12 @@
 import { useTranslation } from 'react-i18next';
-import { FolderOpen, Map as MapIcon, X } from 'lucide-react';
+import { AlertTriangle, Eye, FolderOpen, Map as MapIcon, X } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import {
+  addonFilterKey,
+  formatDiagnosticVerdictBadge,
+  resolveCardFilterState,
+} from '../../../utils/contentFilter';
 import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
 import { IconButton, Switch } from '../../m3/primitives';
@@ -68,14 +74,53 @@ export function OrganizeMemberRow({
   onRemove,
 }: OrganizeMemberRowProps) {
   const { t } = useTranslation();
+  const { filterConfig, verdicts, exclusionsByAddonId, revealedCardIds, revealCard } =
+    useContentFilterContext();
+
+  const cardKey = addonFilterKey(addon.id);
+  const verdict = verdicts[cardKey];
+  const exclusion = exclusionsByAddonId.get(addon.id);
+  const cardFilter = resolveCardFilterState({
+    config: filterConfig,
+    scope: 'library',
+    verdict,
+    exclusion,
+    revealed: revealedCardIds.has(cardKey),
+  });
+
+  if (cardFilter.hiddenCard) {
+    return null;
+  }
+
   const installed = addon.installState === 'installed';
-  const resolvedLabel = displayLabel ?? formatAddonDisplayName(addon, namePreference);
+  const rawLabel = displayLabel ?? formatAddonDisplayName(addon, namePreference);
+  const resolvedLabel = cardFilter.redactTitle
+    ? addon.workshopId
+      ? t('filter.redactedTitleWithId', { id: addon.workshopId })
+      : t('filter.redactedTitle')
+    : rawLabel;
 
   return (
     <div
       className="l4a-list-row l4a-list-row-dense"
       data-muted={installed && !addon.enabled ? 'true' : 'false'}
+      data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
     >
+      {cardFilter.blurWholeCard && (
+        <button
+          type="button"
+          className="l4a-blur-card-overlay"
+          onClick={(e) => {
+            e.stopPropagation();
+            revealCard(cardKey);
+          }}
+        >
+          <span className="l4a-blur-card-chip">
+            <Eye size={13} />
+            <span>{t('filter.blurCardOverlay')}</span>
+          </span>
+        </button>
+      )}
       <div className="l4a-picker-thumb">
         <AddonCover
           compact
@@ -83,6 +128,7 @@ export function OrganizeMemberRow({
           fallbackSrc={addon.localCoverImage}
           title={resolvedLabel}
           category={addon.categories[0]}
+          filterMode={cardFilter.coverMode}
         />
       </div>
       <button
@@ -97,6 +143,27 @@ export function OrganizeMemberRow({
             </span>
           )}
           <span className="md-title-small l4a-truncate">{resolvedLabel}</span>
+          {cardFilter.exclusionActive &&
+            cardFilter.exclusionDisplayLevel &&
+            cardFilter.exclusionDisplayLevel !== 'normal' && (
+              <span className="md-pill" data-tone="secondary">
+                {t(`filter.levels.${cardFilter.exclusionDisplayLevel}`)}
+              </span>
+            )}
+          {cardFilter.exclusionInvalidated && (
+            <span className="md-pill" data-tone="error">
+              <AlertTriangle size={11} />
+              {t('filter.exclusionInvalidPill')}
+            </span>
+          )}
+          {cardFilter.showDiagnosticBadge && verdict && (
+            <span className="md-pill" data-tone="tertiary">
+              {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                imageTag: t('filter.modImageShort'),
+                textTag: t('filter.modTextShort'),
+              })}
+            </span>
+          )}
           {badge && (
             <span className="md-pill" data-tone={badge.tone}>
               {badge.text}
@@ -104,7 +171,9 @@ export function OrganizeMemberRow({
           )}
         </div>
         <div className="l4a-addon-meta">
-          {showFileName && addon.currentFileName ? (
+          {cardFilter.redactMeta ? (
+            <span className="l4a-truncate">{t('filter.redactedAuthor')}</span>
+          ) : showFileName && addon.currentFileName ? (
             <span className="md-mono l4a-truncate">{addon.currentFileName}</span>
           ) : (
             <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>

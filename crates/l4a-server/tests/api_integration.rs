@@ -4901,3 +4901,609 @@ async fn search_preserves_terms_beyond_sixteen_across_hybrid_and_local_fallback(
         vec![9952]
     );
 }
+
+#[tokio::test]
+async fn filter_disabled_returns_public_disabled_info_and_503_on_predict() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    let app = build_router(state);
+
+    let (status, bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&bytes).unwrap();
+    assert!(!info.enabled);
+    assert!(!info.ready);
+    assert_eq!(info.max_images, 2);
+
+    let (pred_status, pred_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Any Addon" })),
+    )
+    .await;
+    assert_eq!(pred_status, StatusCode::SERVICE_UNAVAILABLE);
+    let err_val: serde_json::Value = serde_json::from_slice(&pred_bytes).unwrap();
+    assert!(err_val["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let (ov_status, ov_bytes) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/overview",
+        vec![("x-admin-token", "test-admin-password")],
+        None,
+    )
+    .await;
+    assert_eq!(ov_status, StatusCode::OK);
+    let overview: CatalogOverviewResponse = serde_json::from_slice(&ov_bytes).unwrap();
+    assert!(!overview.filter.config.enabled);
+    assert!(!overview.filter.ready);
+}
+
+#[tokio::test]
+async fn filter_upstream_http_predict_calibration_cache_and_toml_persistence() {
+    use axum::routing::{get, post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let predict_calls = Arc::new(AtomicUsize::new(0));
+    let captured_requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let calls_cl = predict_calls.clone();
+    let reqs_cl = captured_requests.clone();
+    let mock_upstream = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "model": "MockLeft4Filters",
+                    "version": "2.4.0"
+                }))
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let calls = calls_cl.clone();
+                let reqs = reqs_cl.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    reqs.lock().unwrap().push(payload);
+                    axum::Json(json!({
+                        "prob": 0.88,
+                        "goreProb": 0.82,
+                        "nsfwProb": 0.45,
+                        "textProb": 0.75,
+                        "textGoreProb": 0.70,
+                        "textNsfwProb": 0.35,
+                        "titleProb": 0.72,
+                        "descriptionProb": 0.40
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let upstream_url = format!("http://{mock_addr}");
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_upstream).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("catalog.toml");
+    let mut initial_cfg = CatalogConfig::default();
+    initial_cfg.admin.password = "filter-secret-pass".to_string();
+    initial_cfg.server.db_path = dir.path().join("catalog.db");
+    initial_cfg.save_to(&config_path).unwrap();
+
+    let (state, _) = ServerState::open_config_file(&config_path).unwrap();
+    let app = build_router(state);
+    let admin_hdr = vec![("x-admin-token", "filter-secret-pass")];
+
+    // 1. Enable UpstreamHttp via PATCH /api/v1/admin/config/filter and verify persistence to catalog.toml.
+    let enable_dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::UpstreamHttp,
+        deploy_dir: None,
+        python_bin: None,
+        upstream_url: Some(upstream_url.clone()),
+        cache_ttl_secs: 3600,
+        params: l4a_protocol::FilterPresetId::Recommended.default_params(),
+    };
+    let (patch_status, patch_bytes) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&enable_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    let status_resp: l4a_protocol::CatalogFilterStatus =
+        serde_json::from_slice(&patch_bytes).unwrap();
+    assert!(status_resp.ready);
+    assert_eq!(status_resp.model_name.as_deref(), Some("MockLeft4Filters"));
+    assert_eq!(status_resp.model_version.as_deref(), Some("2.4.0"));
+
+    let persisted_raw = std::fs::read_to_string(&config_path).unwrap();
+    let persisted_cfg: CatalogConfig = toml::from_str(&persisted_raw).unwrap();
+    assert!(persisted_cfg.filter.enabled);
+    assert_eq!(
+        persisted_cfg.filter.backend,
+        l4a_protocol::CatalogFilterBackendKind::UpstreamHttp
+    );
+    assert_eq!(
+        persisted_cfg.filter.upstream_url.as_deref(),
+        Some(upstream_url.as_str())
+    );
+
+    // 2. Public GET /api/v1/filter/info reflects ready status and model metadata.
+    let (info_code, info_bytes) =
+        json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(info_code, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&info_bytes).unwrap();
+    assert!(info.enabled);
+    assert!(info.ready);
+    assert_eq!(info.model_name.as_deref(), Some("MockLeft4Filters"));
+
+    // 3. Public POST /api/v1/filter/predict ignores client-injected parameter fields and caches identical inputs.
+    let req_body = json!({
+        "title": "Extreme Gore Pack",
+        "description": "Bloody textures",
+        "tags": ["Textures"],
+        "goreWeight": 0.0,
+        "params": { "goreWeight": 0.0, "nsfwWeight": 0.0 }
+    });
+    let (p1_code, p1_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body.clone()),
+    )
+    .await;
+    assert_eq!(p1_code, StatusCode::OK);
+    let p1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p1_bytes).unwrap();
+    assert!((p1.prob - 0.88).abs() < 1e-5);
+    assert!((p1.gore_prob - 0.82).abs() < 1e-5);
+    assert!((p1.nsfw_prob - 0.45).abs() < 1e-5);
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 1);
+
+    // Second identical request hits TTL cache without calling upstream again.
+    let (p2_code, p2_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body.clone()),
+    )
+    .await;
+    assert_eq!(p2_code, StatusCode::OK);
+    let p2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p2_bytes).unwrap();
+    assert_eq!(p1, p2);
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 1);
+
+    let (st_code, st_bytes) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/filter/status",
+        admin_hdr.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(st_code, StatusCode::OK);
+    let st: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&st_bytes).unwrap();
+    assert_eq!(st.total_requests, 2);
+    assert_eq!(st.cache_hits, 1);
+
+    // 4. Switch server calibration to NsfwOnly (goreWeight = 0.0) via admin PATCH:
+    //    invalidates cache, zeroes out goreProb, and calibrates overall prob to nsfwProb (0.45).
+    let nsfw_only_dto = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterPresetId::NsfwOnly.default_params(),
+        ..enable_dto
+    };
+    let (cal_code, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&nsfw_only_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(cal_code, StatusCode::OK);
+
+    let reloaded_cfg: CatalogConfig =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(reloaded_cfg.filter.gore_weight, 0.0);
+    assert_eq!(reloaded_cfg.filter.nsfw_weight, 1.0);
+
+    let (p3_code, p3_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body),
+    )
+    .await;
+    assert_eq!(p3_code, StatusCode::OK);
+    let p3: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p3_bytes).unwrap();
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(p3.gore_prob, 0.0);
+    assert!((p3.nsfw_prob - 0.45).abs() < 1e-5);
+    assert!((p3.prob - 0.45).abs() < 1e-5);
+    assert_eq!(p3.text_gore_prob, Some(0.0));
+    assert_eq!(p3.text_prob, Some(0.35));
+
+    // 5. Admin restart and sandbox test endpoints + audit logs.
+    let (rst_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/restart",
+        admin_hdr.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(rst_code, StatusCode::OK);
+
+    let (test_code, test_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/test",
+        admin_hdr.clone(),
+        Some(json!({ "title": "Admin Sandbox Check" })),
+    )
+    .await;
+    assert_eq!(test_code, StatusCode::OK);
+    let test_probs: l4a_protocol::FilterProbabilities =
+        serde_json::from_slice(&test_bytes).unwrap();
+    assert_eq!(test_probs.gore_prob, 0.0);
+
+    let (audit_code, audit_bytes) =
+        json_request(&app, "GET", "/api/v1/admin/audit?limit=20", admin_hdr, None).await;
+    assert_eq!(audit_code, StatusCode::OK);
+    let audits: Vec<l4a_protocol::AuditLogEntry> = serde_json::from_slice(&audit_bytes).unwrap();
+    let actions: Vec<&str> = audits.iter().map(|a| a.action.as_str()).collect();
+    assert!(actions.contains(&"filter_config_update"));
+    assert!(actions.contains(&"filter_restart"));
+
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn filter_workshop_id_lookup_populates_public_items_and_rejects_ssrf_and_restricted_items() {
+    use axum::routing::{get, post};
+    use base64::Engine;
+
+    let sample_png: &'static [u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR-mock-image";
+    let captured_requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reqs_cl = captured_requests.clone();
+
+    let mock_srv = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({ "status": "ok", "model": "MockModel", "version": "1.0" }))
+            }),
+        )
+        .route(
+            "/fixture.png",
+            get(move || async move { ([(header::CONTENT_TYPE, "image/png")], sample_png) }),
+        )
+        .route(
+            "/evil-redirect",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, "https://evil.example.com/ssrf.png")],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let reqs = reqs_cl.clone();
+                async move {
+                    reqs.lock().unwrap().push(payload);
+                    axum::Json(json!({
+                        "prob": 0.64,
+                        "goreProb": 0.12,
+                        "nsfwProb": 0.61,
+                        "imageProb": 0.58
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_srv).await;
+    });
+
+    let mut cfg = CatalogConfig::default();
+    cfg.admin.password = "test-admin-password".to_string();
+    cfg.filter.enabled = true;
+    cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+    cfg.filter.upstream_url = Some(format!("http://{addr}"));
+    cfg.filter.max_images = 2;
+
+    let store = Arc::new(CatalogConfigStore::new(None, cfg));
+    let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+    let state = ServerState::with_components(store, repo, Arc::new(MockWorkshopUpstream::new()));
+
+    // Insert public active item 55001, private item 55002, and unlisted item 55003.
+    let mut public_item = sample_item(55001, "Public Anime Survivor", 500, None);
+    public_item.description = Some("Custom survivor model description".to_string());
+    public_item.tags = vec!["Survivors".to_string(), "Models".to_string()];
+    public_item.preview_url = Some(format!("http://{addr}/fixture.png"));
+    public_item.previews = vec![];
+    state.repo.upsert_item(&public_item, false, true).unwrap();
+
+    let mut private_item = sample_item(55002, "Hidden Private Title", 500, None);
+    private_item.status = WorkshopItemStatus::PrivateOrUnavailable;
+    private_item.description = Some("Top secret private description".to_string());
+    state.repo.upsert_item(&private_item, false, true).unwrap();
+
+    let mut unlisted_item = sample_item(55003, "Unlisted Secret Item", 500, None);
+    unlisted_item.description = Some("Unlisted secret description".to_string());
+    state
+        .repo
+        .apply_upstream_outcomes_with_policy(
+            &[WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found {
+                    item: unlisted_item,
+                },
+                listed: false,
+                consumer_appid: Some(550),
+            }],
+            l4a_server::db::CatalogIndexPolicy::CacheOnly,
+        )
+        .unwrap();
+
+    let app = build_router(state.clone());
+
+    // 1. Default SSRF enforcement (production mode: loopback HTTP and arbitrary hosts rejected with 400).
+    for disallowed_url in [
+        "https://evil.example.com/a.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://images.steamusercontent.com/ugc/123/plain_http.jpg",
+        "https://images.steamusercontent.com:8443/ugc/123/custom_port.jpg",
+        &format!("http://{addr}/fixture.png"),
+    ] {
+        let (code, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({
+                "title": "SSRF Probe",
+                "imageUrls": [disallowed_url]
+            })),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "expected 400 Bad Request for disallowed imageUrl: {disallowed_url}"
+        );
+    }
+    assert!(captured_requests.lock().unwrap().is_empty());
+
+    // 2. Enable test loopback flag to test local image fetch & cross-host redirect SSRF protection.
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+
+    let (redir_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Redirect SSRF Probe",
+            "imageUrls": [format!("http://{addr}/evil-redirect")]
+        })),
+    )
+    .await;
+    assert_eq!(redir_code, StatusCode::BAD_REQUEST);
+
+    // 3. Public active `workshopId` populates title, description, tags, and preview image bytes.
+    let (ok_code, ok_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "55001" })),
+    )
+    .await;
+    assert_eq!(ok_code, StatusCode::OK);
+    let ok_probs: l4a_protocol::FilterProbabilities = serde_json::from_slice(&ok_bytes).unwrap();
+    assert!((ok_probs.prob - 0.64).abs() < 1e-5);
+
+    {
+        let reqs = captured_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["title"], "Public Anime Survivor");
+        assert_eq!(reqs[0]["description"], "Custom survivor model description");
+        assert_eq!(reqs[0]["tags"], json!(["Survivors", "Models"]));
+        let imgs = reqs[0]["imagesBase64"].as_array().unwrap();
+        assert_eq!(imgs.len(), 1);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(sample_png);
+        assert_eq!(imgs[0].as_str(), Some(expected_b64.as_str()));
+    }
+
+    // 4. Private (55002), unlisted (55003), and missing (55999) items return identical 404 Not Found
+    //    and never leak restricted metadata into the filter backend.
+    for restricted_id in ["55002", "55003", "55999"] {
+        let (code, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "workshopId": restricted_id })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "workshopId={restricted_id}");
+    }
+    assert_eq!(captured_requests.lock().unwrap().len(), 1);
+
+    // Even if caller supplies `title` alongside a private `workshopId`, private description is never read.
+    let (partial_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "55002", "title": "Caller Title Only" })),
+    )
+    .await;
+    assert_eq!(partial_code, StatusCode::OK);
+    {
+        let reqs = captured_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1]["title"], "Caller Title Only");
+        assert_eq!(reqs[1]["description"], "");
+    }
+
+    mock_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cleanly() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let deploy_dir = dir.path().join("deploy");
+    let py_shim_dir = dir.path().join("pyshims");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    std::fs::create_dir_all(&py_shim_dir).unwrap();
+
+    // Minimal numpy shim sufficient for `FILTER_RUNNER_PY` SDK fallback mode.
+    std::fs::write(py_shim_dir.join("numpy.py"), "float32 = float\n").unwrap();
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        r#"class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        self.config = {"model_name": "ManagedMockONNX", "version": "3.1.0"}
+        self.num_threads = num_threads
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        return {"prob": 0.80, "gore_prob": 0.75, "nsfw_prob": 0.30}
+"#,
+    )
+    .unwrap();
+
+    let py_wrapper = dir.path().join("python_wrapper.sh");
+    std::fs::write(
+        &py_wrapper,
+        format!(
+            "#!/usr/bin/env bash\nexport PYTHONPATH=\"{}:${{PYTHONPATH:-}}\"\nexec python3 \"$@\"\n",
+            py_shim_dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&py_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let state = ServerState::in_memory("managed-secret").unwrap();
+    let app = build_router(state);
+    let admin_hdr = vec![("x-admin-token", "managed-secret")];
+
+    // 1. Start ManagedPython runner via admin config PATCH.
+    let cfg_v1 = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(deploy_dir.display().to_string()),
+        python_bin: Some(py_wrapper.display().to_string()),
+        upstream_url: None,
+        cache_ttl_secs: 3600,
+        params: l4a_protocol::FilterPresetId::Recommended.default_params(),
+    };
+    let (code1, bytes1) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_v1).unwrap()),
+    )
+    .await;
+    assert_eq!(code1, StatusCode::OK);
+    let st1: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes1).unwrap();
+    assert!(st1.ready, "last_error={:?}", st1.last_error);
+    let pid1 = st1
+        .running_pid
+        .expect("ManagedPython should report running_pid");
+    assert_eq!(st1.model_name.as_deref(), Some("ManagedMockONNX"));
+    assert_eq!(st1.model_version.as_deref(), Some("3.1.0"));
+
+    // 2. Run prediction (unadjusted Recommended preset).
+    let (p1_code, p1_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Managed Test" })),
+    )
+    .await;
+    assert_eq!(p1_code, StatusCode::OK);
+    let p1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p1_bytes).unwrap();
+    assert!((p1.gore_prob - 0.75).abs() < 1e-5);
+    assert!((p1.nsfw_prob - 0.30).abs() < 1e-5);
+
+    // 3. Reconfigure to NsfwOnly (goreWeight = 0) with same deploy_dir & python_bin:
+    //    pushes live `POST /configure` with bearer token without restarting child PID,
+    //    and ensures ManagedPython response is NOT double-adjusted!
+    let cfg_v2 = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterPresetId::NsfwOnly.default_params(),
+        ..cfg_v1.clone()
+    };
+    let (code2, bytes2) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_v2).unwrap()),
+    )
+    .await;
+    assert_eq!(code2, StatusCode::OK);
+    let st2: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes2).unwrap();
+    assert!(st2.ready);
+    assert_eq!(
+        st2.running_pid,
+        Some(pid1),
+        "live /configure should preserve running child PID"
+    );
+
+    let (p2_code, p2_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Managed Test" })),
+    )
+    .await;
+    assert_eq!(p2_code, StatusCode::OK);
+    let p2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p2_bytes).unwrap();
+    assert_eq!(p2.gore_prob, 0.0);
+    assert!((p2.nsfw_prob - 0.30).abs() < 1e-5);
+    assert!((p2.prob - 0.30).abs() < 1e-5);
+
+    // 4. Disable filter and verify running_pid is cleared.
+    let cfg_off = l4a_protocol::CatalogFilterConfigDto {
+        enabled: false,
+        ..cfg_v2
+    };
+    let (code3, bytes3) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr,
+        Some(serde_json::to_value(&cfg_off).unwrap()),
+    )
+    .await;
+    assert_eq!(code3, StatusCode::OK);
+    let st3: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes3).unwrap();
+    assert!(!st3.ready);
+    assert_eq!(st3.running_pid, None);
+}

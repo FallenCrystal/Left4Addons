@@ -59,6 +59,23 @@ default_language = "english"
 steam_timeout_ms = 4500
 cache_ttl_secs = 60
 cache_steam_results = true
+
+[filter]
+enabled = false
+backend = "managed_python" # 或 "upstream_http"
+# deploy_dir = "./Left4Filters"
+# python_bin = "/opt/left4filters/.venv/bin/python"
+# upstream_url = "http://127.0.0.1:8090"
+cache_ttl_secs = 3600
+threads = 4
+enable_text = true
+enable_image = true
+max_images = 2
+gallery_aggregation = "max" # "max" | "top2_mean" | "mean"
+gore_weight = 1.0
+nsfw_weight = 1.0
+temperature = 1.0
+bias = 0.0
 ```
 
 `[search]` 配置项控制公开搜索接口 `GET /api/v1/items/search` 的混合检索行为：
@@ -68,6 +85,11 @@ cache_steam_results = true
 - `steam_timeout_ms`：单次混合检索等待 Steam CM 的超时预算（毫秒，范围 `500..=15000`）。
 - `cache_ttl_secs`：Steam 搜索结果页在内存中的短缓存 TTL（秒，范围 `0..=3600`；`0` 表示禁用）。
 - `cache_steam_results` 控制公开条目的异步暖缓存，加快后续 `GET /items/{id}` 与下载解析。写入 Steam 确认的可见性限制始终生效。
+
+`[filter]` 配置项控制可选的内容敏感度概率推理接口（`GET /api/v1/filter/info` 与 `POST /api/v1/filter/predict`）：
+
+- **双后端模式 (`backend`)**：`managed_python` 由 `l4a-server` 自动将内嵌 HTTP 运行脚本挂载到您部署的 `Left4Filters` 目录（`deploy_dir`，可选指定 `python_bin` 虚拟环境解释器），支持热更新参数与进程退出守护；`upstream_http` 则连接外部独立的推理服务地址 (`upstream_url`)。
+- **严格的职责与安全边界**：Catalog 过滤接口**仅返回连续校准概率 (`FilterProbabilities`)**，**绝不调用任何外部大语言模型 (LLM)**；模型参数（`threads`、`enable_text`、`enable_image`、`max_images`、`gallery_aggregation`、`gore_weight`、`nsfw_weight`、`temperature`、`bias`）仅允许由服务端 `catalog.toml` 或管理员控制台修改，公开请求无法覆盖参数；远程图片拉取严格限制于受信任的 Steam CDN HTTPS 域名白名单以防御 SSRF。
 
 ---
 
@@ -137,7 +159,8 @@ catalog.example.com {
 1. **总览与同步引擎**：查看缓存命中/下架统计、按 Workshop ID 或链接手动预热抓取、立即触发增量同步、开启或重置全量工坊游标回填、在线调整 TTL 与轮询间隔（自动写回 `catalog.toml`）。
 2. **SteamKit 账号会话**：支持通过 **Steam 手机令牌扫码**、**账号密码 + Steam Guard** 或 **Refresh Token** 登录普通 Steam 账号，登录态自动持久化为 `refresh_token`，也可随时一键切回匿名会话。
 3. **工坊缓存库与人工覆写**：按关键词/标签/状态检索缓存、查看画廊与历史版本时间线、强制从 Steam CM 重刷单条直链，或对已下架模组配置人工覆写与锁定保护。
-4. **安全与审计**：在线修改控制台管理员密码、审阅下架墓碑与人工操作审计记录。
+4. **内容过滤模型**：实时查看 `ManagedPython` / `UpstreamHttp` 推理服务状态与缓存命中率，一键应用预设（推荐均衡、严格高召回、宽松防误伤、仅擦边 NSFW、仅重口血腥、轻量低占用）或微调校准权重并写回 `catalog.toml`，以及通过**在线概率试算沙盒**输入工坊 ID 或自定义文本检验分项敏感度概率。
+5. **安全与审计**：在线修改控制台管理员密码、审阅下架墓碑、过滤配置变更与人工操作审计记录。
 
 ---
 

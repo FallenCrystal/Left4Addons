@@ -3,15 +3,22 @@ import {
   applyProfile,
   applyRenames,
   cancelDownload,
+  checkLocalFilterUpdates,
+  clearFilterCache,
   createManualBundle,
   deleteAddons,
   deleteBundle,
+  deleteFilterExclusion,
   deleteProfile,
   deleteUserGroup,
+  deployLocalFilter,
   detectGameAddonsPath,
   downloadWorkshopItem,
+  evaluateFilterItems,
   fetchWorkshopItem,
   getDashboardSnapshot,
+  getFilterTokenStatus,
+  getLocalFilterStatus,
   getSteamCapabilities,
   getSubscribedWorkshopIds,
   IpcError,
@@ -32,14 +39,19 @@ import {
   searchByMapCode,
   searchWorkshop,
   setBundleLocked,
+  setFilterLlmToken,
+  startLocalFilterService,
+  stopLocalFilterService,
   subscribeCoreEvents,
   syncWorkshop,
   toggleAddons,
   trackCollection,
   untrackCollection,
   updateWorkshopItem,
+  upsertFilterExclusion,
   type CoreEvent,
 } from './ipc';
+import { createDefaultFilterConfig } from '../utils/contentFilter';
 
 const invokeMock = vi.fn();
 let listenCallback: ((event: { payload: CoreEvent }) => void) | null = null;
@@ -235,9 +247,82 @@ describe('v2 IPC client wrapper', () => {
       httpsOnly: true,
       sourceOrder: ['catalog-server'],
       renameRules: rules,
+      filter: createDefaultFilterConfig(),
     };
     await saveConfig(config);
     expect(invokeMock).toHaveBeenCalledWith('save_config', { config });
+  });
+
+  it('forwards all 11 content filter, deployment, token, evaluation, and exclusion IPC commands', async () => {
+    invokeMock.mockResolvedValue({});
+
+    await getLocalFilterStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_local_filter_status');
+
+    await checkLocalFilterUpdates();
+    expect(invokeMock).toHaveBeenCalledWith('check_local_filter_updates');
+
+    const deployRequest = {
+      repoUrl: 'https://github.com/FallenCrystal/Left4Filters.git',
+      trackLatest: false,
+      targetCommit: 'a94f18e',
+      startAfterDeploy: true,
+    };
+    await deployLocalFilter(deployRequest);
+    expect(invokeMock).toHaveBeenCalledWith('deploy_local_filter', {
+      request: deployRequest,
+    });
+
+    await startLocalFilterService();
+    expect(invokeMock).toHaveBeenCalledWith('start_local_filter_service');
+
+    await stopLocalFilterService();
+    expect(invokeMock).toHaveBeenCalledWith('stop_local_filter_service');
+
+    await getFilterTokenStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_filter_token_status');
+
+    await setFilterLlmToken('sk-test-secret');
+    expect(invokeMock).toHaveBeenCalledWith('set_filter_llm_token', {
+      token: 'sk-test-secret',
+    });
+
+    await setFilterLlmToken(null);
+    expect(invokeMock).toHaveBeenCalledWith('set_filter_llm_token', {
+      token: null,
+    });
+
+    const targets = [
+      {
+        targetKey: 'addon:ws:2814104912',
+        addonId: 'ws:2814104912',
+        workshopId: '2814104912',
+        title: 'Sample Addon',
+        tags: ['Campaign'],
+        imageSources: ['https://example.com/cover.jpg'],
+        bypassCache: true,
+      },
+    ];
+    await evaluateFilterItems(targets);
+    expect(invokeMock).toHaveBeenCalledWith('evaluate_filter_items', { targets });
+
+    await clearFilterCache();
+    expect(invokeMock).toHaveBeenCalledWith('clear_filter_cache');
+
+    const exclusionReq = {
+      addonId: 'ws:2814104912',
+      displayLevel: 'lazy_load' as const,
+      bindFingerprint: true,
+    };
+    await upsertFilterExclusion(exclusionReq);
+    expect(invokeMock).toHaveBeenCalledWith('upsert_filter_exclusion', {
+      request: exclusionReq,
+    });
+
+    await deleteFilterExclusion('ws:2814104912');
+    expect(invokeMock).toHaveBeenCalledWith('delete_filter_exclusion', {
+      addonId: 'ws:2814104912',
+    });
   });
 
   it('normalizes serialized CoreEvent payloads including nullable optional fields', async () => {
@@ -269,28 +354,51 @@ describe('v2 IPC client wrapper', () => {
         speedBps: 1048576,
       },
     });
-    expect(received).toEqual([
-      {
-        type: 'download_progress',
-        taskId: 't-1',
-        workshopId: '2814104912',
-        title: undefined,
-        downloaded: 1024,
-        total: undefined,
-        percent: 42,
-        speedBps: undefined,
+    listenCallback?.({
+      payload: {
+        type: 'filter_verdicts_updated',
+        verdicts: [
+          {
+            targetKey: 'ws:3410887766',
+            flagged: true,
+            decisionSource: 'model_direct_flag',
+            evaluatedScore: 0.88,
+            probabilities: { prob: 0.88, goreProb: 0.87, nsfwProb: 0.01 },
+            textSensitive: true,
+            titleSensitive: true,
+            descriptionSensitive: false,
+            imageSensitive: true,
+            sensitiveImageIndices: [0],
+            evaluatedAt: '2026-11-25T00:00:00Z',
+          },
+        ],
       },
-      {
-        type: 'download_progress',
-        taskId: 't-2',
-        workshopId: '3011942811',
-        title: 'Yama Campaign Remastered',
-        downloaded: 2048,
-        total: 4096,
-        percent: 50,
-        speedBps: 1048576,
-      },
-    ]);
+    });
+    expect(received).toHaveLength(3);
+    expect(received[0]).toEqual({
+      type: 'download_progress',
+      taskId: 't-1',
+      workshopId: '2814104912',
+      title: undefined,
+      downloaded: 1024,
+      total: undefined,
+      percent: 42,
+      speedBps: undefined,
+    });
+    expect(received[1]).toEqual({
+      type: 'download_progress',
+      taskId: 't-2',
+      workshopId: '3011942811',
+      title: 'Yama Campaign Remastered',
+      downloaded: 2048,
+      total: 4096,
+      percent: 50,
+      speedBps: 1048576,
+    });
+    expect(received[2]).toMatchObject({
+      type: 'filter_verdicts_updated',
+      verdicts: [{ targetKey: 'ws:3410887766', flagged: true }],
+    });
     unlisten();
   });
 

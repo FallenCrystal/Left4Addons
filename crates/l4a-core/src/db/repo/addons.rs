@@ -389,6 +389,10 @@ impl LocalDb {
             "DELETE FROM bundle_members WHERE addon_id = ?1",
             params![id.as_str()],
         )?;
+        tx.execute(
+            "DELETE FROM filter_exclusions WHERE addon_id = ?1",
+            params![id.as_str()],
+        )?;
         tx.execute("DELETE FROM addons WHERE id = ?1", params![id.as_str()])?;
         tx.commit()?;
         Ok(())

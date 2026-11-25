@@ -20,6 +20,7 @@ import {
   sanitizeVpkFilename,
 } from '../../utils/format';
 import { PREVIEW_CATALOG } from './fixtures';
+import { reconcilePreviewExclusions } from './filter';
 import type { PreviewEmit } from './workshop';
 
 export function resolvePreviewReconcileIssue(
@@ -39,6 +40,7 @@ export function resolvePreviewReconcileIssue(
       if (action === 'adopt_workshop_update') {
         addon.updateAvailable = false;
         addon.localTimeUpdated = addon.remoteTimeUpdated ?? addon.localTimeUpdated;
+        addon.contentHash = `updated_${addon.workshopId ?? addon.id}_${addon.localTimeUpdated ?? Date.now()}`;
         addon.hasDummyBypass = state.config.enableDummyBypass;
       } else if (action === 'import_to_loading_and_create_dummy') {
         addon.primaryDir = 'loading';
@@ -52,6 +54,7 @@ export function resolvePreviewReconcileIssue(
     }
   }
   state.openIssues.splice(idx, 1);
+  reconcilePreviewExclusions(state);
   emit({ type: 'snapshot_updated', externalChange: false });
   return structuredClone(state);
 }
@@ -261,6 +264,7 @@ export function deletePreviewAddons(
     }
     if (purgeKnownRecord) {
       state.addons.splice(idx, 1);
+      state.filterExclusions = state.filterExclusions.filter((e) => e.addonId !== addonId);
       for (const g of state.userGroups) {
         g.addonIds = g.addonIds.filter((id) => id !== addonId);
       }
@@ -275,6 +279,7 @@ export function deletePreviewAddons(
       addon.installState = 'uninstalled_known';
       addon.primaryDir = undefined;
       addon.currentPath = undefined;
+      addon.contentHash = undefined;
       addon.enabled = false;
       addon.hasDummyBypass = false;
       items.push({ addonId, status: 'applied' });
@@ -282,6 +287,7 @@ export function deletePreviewAddons(
       items.push({ addonId, status: 'unchanged' });
     }
   }
+  reconcilePreviewExclusions(state);
   emit({ type: 'snapshot_updated', externalChange: false });
   return { items };
 }

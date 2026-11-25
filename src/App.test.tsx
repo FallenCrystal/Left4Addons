@@ -776,4 +776,240 @@ describe('Left4Addons v2 Material 3 frontend', () => {
       vi.useRealTimers();
     }
   });
+
+  it('skips read_cached_image IPC for hide_image and deferred lazy_load exclusions until Load preview is clicked', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.applyToLibrary = true;
+    snapshot.addons[2].localCoverImage = 'yama_lazy_cover.jpg';
+    snapshot.addons[3].localCoverImage = 'm4a1_hidden_cover.jpg';
+    const nowIso = '2026-11-25T00:00:00Z';
+    snapshot.filterExclusions = [
+      {
+        addonId: snapshot.addons[2].id,
+        displayLevel: 'lazy_load',
+        bindFingerprint: true,
+        boundFingerprint: snapshot.addons[2].contentHash,
+        currentFingerprint: snapshot.addons[2].contentHash,
+        fingerprintValid: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      {
+        addonId: snapshot.addons[3].id,
+        displayLevel: 'hide_image',
+        bindFingerprint: true,
+        boundFingerprint: snapshot.addons[3].contentHash,
+        currentFingerprint: snapshot.addons[3].contentHash,
+        fingerprintValid: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+    ];
+
+    const requestedCacheKeys: string[] = [];
+    invokeMock.mockImplementation(async (cmd: string, args?: { cacheKey?: string }) => {
+      if (cmd === 'read_cached_image') {
+        if (args?.cacheKey) requestedCacheKeys.push(args.cacheKey);
+        return [0xff, 0xd8, 0xff];
+      }
+      if (cmd === 'evaluate_filter_items') {
+        return [];
+      }
+      return snapshot;
+    });
+
+    render(<App />);
+    const yamaBtn = await screen.findByRole('button', { name: 'Yama Campaign Remastered' });
+    const m4Btn = screen.getByRole('button', { name: 'Tactical M4A1 SOPMOD' });
+
+    const yamaCard = yamaBtn.closest('article')!;
+    const m4Card = m4Btn.closest('article')!;
+
+    // Neither hide_image nor unclicked lazy_load renders <img> or invokes read_cached_image!
+    expect(yamaCard.querySelector('img')).toBeNull();
+    expect(m4Card.querySelector('img')).toBeNull();
+    expect(requestedCacheKeys).toEqual([]);
+
+    // Clicking Load preview on lazy_load loads ONLY that cover without opening the detail sheet!
+    const loadPreviewBtn = within(yamaCard).getByRole('button', { name: 'Load preview' });
+    fireEvent.click(loadPreviewBtn);
+
+    await waitFor(() => {
+      expect(requestedCacheKeys).toEqual(['yama_lazy_cover.jpg']);
+      expect(yamaCard.querySelector('img')).not.toBeNull();
+    });
+    expect(m4Card.querySelector('img')).toBeNull();
+    expect(screen.queryByRole('dialog', { name: 'Yama Campaign Remastered' })).toBeNull();
+  });
+
+  it('supports blur_card click-once text reveal while keeping image hidden, and subdivides Workshop detail gallery screenshots', async () => {
+    const initial = await previewEngine.getDashboardSnapshot();
+    await previewEngine.saveConfig({
+      ...initial.config,
+      filter: {
+        ...initial.config.filter,
+        enabled: true,
+        applyToWorkshop: true,
+        flaggedAction: 'blur_card',
+        subdivideModalities: true,
+        localParams: {
+          ...initial.config.filter.localParams,
+          maxImages: 4,
+        },
+      },
+    });
+
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
+    const crimsonTitle = await screen.findByText('Crimson Gore Dissolve FX');
+    const card = crimsonTitle.closest('article')!;
+
+    // Wait for automatic batch evaluation to flag the item and apply blur_card
+    await waitFor(() => {
+      expect(card.getAttribute('data-blur-card')).toBe('true');
+    });
+    expect(card.querySelector('img')).toBeNull();
+
+    // First click on blurred card overlay: unblurs text & shows description, while STILL keeping image hidden!
+    const revealBtn = within(card).getByRole('button', { name: /Sensitive · Click to show text/ });
+    fireEvent.click(revealBtn);
+
+    expect(card.getAttribute('data-blur-card')).toBe('false');
+    expect(
+      within(card).getByText(
+        'Extreme visceral dismemberment and gore shaders for infected closeups.',
+      ),
+    ).toBeTruthy();
+    expect(card.querySelector('img')).toBeNull();
+
+    // Second click (Inspect) opens Workshop SideSheet: text is readable, safe cover (0) & shot (2) unblurred, gore shot (1) blurred!
+    fireEvent.click(within(card).getByRole('button', { name: 'Inspect' }));
+    const sheet = await screen.findByRole('dialog', { name: 'Crimson Gore Dissolve FX' });
+
+    expect(
+      within(sheet).getByText(
+        'Extreme visceral dismemberment and gore shaders for infected closeups.',
+      ),
+    ).toBeTruthy();
+
+    // Cover image (index 0: #safe_cover) is NOT wrapped in blur container
+    const coverImg = within(sheet).getByAltText('Crimson Gore Dissolve FX');
+    expect(coverImg.closest('[data-filter-mode="blur"]')).toBeNull();
+
+    // Gallery screenshot #2 (index 1: #gore_viscera_closeup) IS blurred, with working Show image / Blur image peek button
+    const goreShotImg = within(sheet).getByAltText('Crimson Gore Dissolve FX #2');
+    const goreBlurWrap = goreShotImg.closest('[data-filter-mode="blur"]')!;
+    expect(goreBlurWrap).not.toBeNull();
+    expect(goreBlurWrap.getAttribute('data-blurred')).toBe('true');
+
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Show image' }));
+    expect(goreBlurWrap.getAttribute('data-blurred')).toBe('false');
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Blur image' }));
+    expect(goreBlurWrap.getAttribute('data-blurred')).toBe('true');
+
+    // Gallery screenshot #3 (index 2: #safe_comparison) remains unblurred
+    const safeShotImg = within(sheet).getByAltText('Crimson Gore Dissolve FX #3');
+    expect(safeShotImg.closest('[data-filter-mode="blur"]')).toBeNull();
+  });
+
+  it('manages fingerprint-bound exclusions across updates, hide_text masking, encrypted LLM token storage, and sandbox testing', async () => {
+    const initial = await previewEngine.getDashboardSnapshot();
+    await previewEngine.saveConfig({
+      ...initial.config,
+      collapseCampaignBundles: false,
+      filter: {
+        ...initial.config.filter,
+        enabled: true,
+        applyToLibrary: true,
+      },
+    });
+
+    const { container } = render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Chernobyl: Chapter One' }));
+    const detailSheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
+
+    // Select Hide Images & Text and add fingerprint-bound exclusion
+    const levelSelect = within(detailSheet).getByRole('combobox', {
+      name: 'Display Level When Excluded',
+    });
+    fireEvent.click(levelSelect);
+    fireEvent.click(
+      within(screen.getByRole('listbox', { name: 'Display Level When Excluded' })).getByRole(
+        'option',
+        { name: 'Hide Images & Text' },
+      ),
+    );
+    fireEvent.click(within(detailSheet).getByRole('button', { name: 'Add Exclusion' }));
+
+    // Title & raw metadata are now masked by Hide Images & Text on both card and detail sheet!
+    expect(
+      (await screen.findAllByText('Sensitive title hidden · #2814104912')).length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(
+      within(detailSheet).getByText('Raw metadata masked by Hide Text exclusion level'),
+    ).toBeTruthy();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Adopting Workshop update in Reconcile changes contentHash -> invalidates bound exclusion!
+    fireEvent.click(screen.getByRole('button', { name: /Reconcile/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Overwrite with Workshop' }));
+    const reconcileConfirm = await screen.findByRole('dialog', { name: 'Confirm File Action' });
+    fireEvent.click(
+      within(reconcileConfirm).getByRole('button', { name: 'Overwrite with Workshop' }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog', { name: 'Confirm File Action' })).toBeNull();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    expect(await screen.findByText('Exclusion hash expired')).toBeTruthy();
+
+    // Open detail sheet and click Rebind Current Fingerprint -> restores valid exclusion!
+    fireEvent.click(screen.getByRole('button', { name: 'Chernobyl: Chapter One' }));
+    const invalidatedSheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
+    expect(
+      within(invalidatedSheet).getByText(
+        'Addon fingerprint changed — this exclusion is invalidated',
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      within(invalidatedSheet).getByRole('button', { name: 'Rebind Current Fingerprint' }),
+    );
+    expect(
+      (await screen.findAllByText('Sensitive title hidden · #2814104912')).length,
+    ).toBeGreaterThanOrEqual(2);
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // Navigate to Settings -> Content Filter: check M3 Select/no-[title] compliance, save encrypted token, and run sandbox
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+
+    await screen.findByText('One-Click Local Deployment (Left4Filters)');
+    expect(container.querySelectorAll('select').length).toBe(0);
+    expect(container.querySelectorAll('[title]').length).toBe(0);
+
+    const tokenGroup = screen.getByRole('group', { name: 'API Key Source' });
+    fireEvent.click(within(tokenGroup).getByRole('button', { name: 'Encrypted Local Store' }));
+
+    const keyInput = screen.getByLabelText('Enter New API Key');
+    fireEvent.change(keyInput, { target: { value: 'sk-secret-local-only' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Encrypt & Save Token' }));
+
+    expect(await screen.findByText('Encrypted token stored')).toBeTruthy();
+    // Plaintext token must NEVER appear in AppConfig!
+    const snapAfterToken = await previewEngine.getDashboardSnapshot();
+    expect(JSON.stringify(snapAfterToken.config)).not.toContain('sk-secret-local-only');
+
+    // Run Quick Test Sandbox (saving draft first automatically since llmTokenSource changed)
+    fireEvent.change(screen.getByLabelText('Sample Title'), {
+      target: { value: 'Explicit R18 Bikini Mod' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Test' }));
+
+    expect(await screen.findByText('Verdict: Flagged')).toBeTruthy();
+  });
 });

@@ -14,6 +14,10 @@ pub enum CoreError {
     Vpk(String),
     #[error("创意工坊服务错误: {0}")]
     Workshop(#[from] WorkshopError),
+    #[error("网络请求错误: {0}")]
+    Network(String),
+    #[error("当前环境不支持: {0}")]
+    Unsupported(String),
     #[error("实体未找到: {0}")]
     NotFound(String),
     #[error("操作冲突: {0}")]
@@ -34,10 +38,12 @@ impl From<CoreError> for DesktopError {
             CoreError::Config(_) => Code::Config,
             CoreError::Vpk(_) => Code::Vpk,
             CoreError::Workshop(WorkshopError::Cancelled) => Code::Cancelled,
-            CoreError::Workshop(WorkshopError::Network(_) | WorkshopError::HttpStatus { .. }) => {
+            CoreError::Network(_)
+            | CoreError::Workshop(WorkshopError::Network(_) | WorkshopError::HttpStatus { .. }) => {
                 Code::Network
             }
-            CoreError::Workshop(
+            CoreError::Unsupported(_)
+            | CoreError::Workshop(
                 WorkshopError::Unsupported(_) | WorkshopError::ScraperNotImplemented(_),
             ) => Code::Unsupported,
             CoreError::Workshop(_) => Code::Workshop,

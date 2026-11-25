@@ -2,10 +2,12 @@ use crate::TauriState;
 use l4a_core::{validate_external_url, CoreError};
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
-    DashboardSnapshot, DesktopError, DesktopErrorCode, GroupId, IssueId, LoadoutProfile,
-    ProfileApplyReport, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileBatchReport,
-    RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse, SyncReport,
-    TrackedCollectionRecord, UserGroup, WorkshopId, WorkshopItemRecord,
+    DashboardSnapshot, DeployLocalFilterRequest, DesktopError, DesktopErrorCode,
+    FilterEvaluationTarget, FilterItemVerdict, FilterTokenStatus, GroupId, IssueId, LoadoutProfile,
+    LocalFilterDeploymentStatus, ProfileApplyReport, ProfileId, ReconcileAction,
+    ReconcileBatchItem, ReconcileBatchReport, RenamePreviewItem, RenameRuleConfig, SearchQuery,
+    SearchResponse, SyncReport, TrackedCollectionRecord, UpsertFilterExclusionRequest, UserGroup,
+    WorkshopId, WorkshopItemRecord,
 };
 use l4a_steam::SteamCapabilities;
 use std::io;
@@ -515,4 +517,114 @@ pub async fn search_by_map_code(
     state: State<'_, TauriState>,
 ) -> Result<Vec<AddonSummary>, DesktopError> {
     state.engine.search_by_map_code(&query).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_local_filter_status(
+    state: State<'_, TauriState>,
+) -> Result<LocalFilterDeploymentStatus, DesktopError> {
+    state
+        .engine
+        .get_local_filter_status()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn check_local_filter_updates(
+    state: State<'_, TauriState>,
+) -> Result<LocalFilterDeploymentStatus, DesktopError> {
+    state
+        .engine
+        .check_local_filter_updates()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn deploy_local_filter(
+    request: DeployLocalFilterRequest,
+    state: State<'_, TauriState>,
+) -> Result<LocalFilterDeploymentStatus, DesktopError> {
+    state
+        .engine
+        .deploy_local_filter(request)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn start_local_filter_service(
+    state: State<'_, TauriState>,
+) -> Result<LocalFilterDeploymentStatus, DesktopError> {
+    state
+        .engine
+        .start_local_filter_service()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn stop_local_filter_service(
+    state: State<'_, TauriState>,
+) -> Result<LocalFilterDeploymentStatus, DesktopError> {
+    state
+        .engine
+        .stop_local_filter_service()
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn get_filter_token_status(
+    state: State<'_, TauriState>,
+) -> Result<FilterTokenStatus, DesktopError> {
+    state.engine.get_filter_token_status().map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn set_filter_llm_token(
+    token: Option<String>,
+    state: State<'_, TauriState>,
+) -> Result<FilterTokenStatus, DesktopError> {
+    state.engine.set_filter_llm_token(token).map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn evaluate_filter_items(
+    targets: Vec<FilterEvaluationTarget>,
+    state: State<'_, TauriState>,
+) -> Result<Vec<FilterItemVerdict>, DesktopError> {
+    state
+        .engine
+        .evaluate_filter_items(targets)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn clear_filter_cache(state: State<'_, TauriState>) -> Result<u64, DesktopError> {
+    state.engine.clear_filter_cache().map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn upsert_filter_exclusion(
+    request: UpsertFilterExclusionRequest,
+    state: State<'_, TauriState>,
+) -> Result<DashboardSnapshot, DesktopError> {
+    state
+        .engine
+        .upsert_filter_exclusion(request)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn delete_filter_exclusion(
+    addon_id: AddonId,
+    state: State<'_, TauriState>,
+) -> Result<DashboardSnapshot, DesktopError> {
+    state
+        .engine
+        .delete_filter_exclusion(&addon_id)
+        .map_err(Into::into)
 }

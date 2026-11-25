@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+Managed Left4Filters HTTP runner for Left4Addons (Desktop Client & Catalog Server).
+Wraps an unmodified Left4Filters checkout (`deploy/l4filter.py`) without altering
+any tracked files in the repository, supporting:
+  - Dynamic loopback port binding (`--port 0`) with structured ready banner
+  - Single-vision-pass multimodal + unimodal (text / title / description / per-image) scoring
+  - Live runtime model parameter updates (`POST /configure`) protected by bearer token
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import math
+import os
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+
+
+def resolve_deploy_dir(raw_dir: str) -> Path:
+    base = Path(raw_dir).resolve()
+    if (base / "l4filter.py").is_file():
+        return base
+    if (base / "deploy" / "l4filter.py").is_file():
+        return base / "deploy"
+    raise FileNotFoundError(f"l4filter.py not found under {base} or {base / 'deploy'}")
+
+
+def clamp_prob(p: float) -> float:
+    if math.isnan(p) or math.isinf(p):
+        return 0.0
+    return max(1e-6, min(1.0 - 1e-6, float(p)))
+
+
+def to_logit(p: float) -> float:
+    c = clamp_prob(p)
+    return math.log(c / (1.0 - c))
+
+
+def from_logit(x: float) -> float:
+    if x >= 40.0:
+        return 1.0
+    if x <= -40.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def adjust_triplet(
+    ov: float,
+    gore: float,
+    nsfw: float,
+    gore_weight: float,
+    nsfw_weight: float,
+    temperature: float,
+    bias: float,
+) -> tuple[float, float, float]:
+    gw = max(0.0, float(gore_weight))
+    nw = max(0.0, float(nsfw_weight))
+    temp = max(0.25, min(4.0, float(temperature)))
+    b = max(-5.0, min(5.0, float(bias)))
+
+    if (
+        abs(gw - 1.0) < 1e-5
+        and abs(nw - 1.0) < 1e-5
+        and abs(temp - 1.0) < 1e-5
+        and abs(b) < 1e-5
+    ):
+        return round(float(ov), 6), round(float(gore), 6), round(float(nsfw), 6)
+
+    def adj_single(p: float, w: float) -> float:
+        if w <= 1e-6:
+            return 0.0
+        return from_logit((to_logit(p) + math.log(w)) / temp + b)
+
+    g_adj = adj_single(gore, gw)
+    n_adj = adj_single(nsfw, nw)
+
+    if gw <= 1e-6 and nw <= 1e-6:
+        ov_adj = 0.0
+    elif gw <= 1e-6:
+        ov_adj = n_adj
+    elif nw <= 1e-6:
+        ov_adj = g_adj
+    elif abs(gw - 1.0) < 1e-5 and abs(nw - 1.0) < 1e-5:
+        ov_adj = from_logit(to_logit(ov) / temp + b)
+    else:
+        g_weighted = from_logit(to_logit(gore) + math.log(gw))
+        n_weighted = from_logit(to_logit(nsfw) + math.log(nw))
+        orig_or = clamp_prob(1.0 - (1.0 - clamp_prob(gore)) * (1.0 - clamp_prob(nsfw)))
+        new_or = clamp_prob(1.0 - (1.0 - g_weighted) * (1.0 - n_weighted))
+        delta_scale = min(gw, nw) / max(gw, nw, 1.0)
+        delta_logit = (to_logit(ov) - to_logit(orig_or)) * delta_scale
+        ov_adj = from_logit((to_logit(new_or) + delta_logit) / temp + b)
+
+    return round(float(ov_adj), 6), round(float(g_adj), 6), round(float(n_adj), 6)
+
+
+def aggregate_rows(rows: np.ndarray, mode: str) -> np.ndarray:
+    """Aggregate (N, 3) probability matrix across gallery images into (3,)."""
+    if rows.shape[0] == 1:
+        return rows[0]
+    if mode == "mean":
+        return rows.mean(axis=0)
+    if mode == "top2_mean":
+        if rows.shape[0] <= 2:
+            return rows.mean(axis=0)
+        part = np.sort(rows, axis=0)[-2:, :]
+        return part.mean(axis=0)
+    return rows.max(axis=0)
+
+
+class RunnerEngine:
+    def __init__(self, deploy_dir: Path, initial_params: dict[str, Any]) -> None:
+        self.deploy_dir = deploy_dir
+        sys.path.insert(0, str(deploy_dir))
+        import l4filter as lf  # type: ignore
+
+        self._lf = lf
+        self._lock = threading.RLock()
+        self.params = self._normalize_params(initial_params)
+        self.clf = lf.Left4Filter(str(deploy_dir), num_threads=self.params["threads"])
+
+    @staticmethod
+    def _normalize_params(raw: dict[str, Any]) -> dict[str, Any]:
+        agg = str(raw.get("galleryAggregation") or raw.get("gallery_aggregation") or "max").lower()
+        if agg not in ("max", "top2_mean", "mean"):
+            agg = "max"
+        return {
+            "threads": max(1, min(16, int(raw.get("threads", 4)))),
+            "enable_text": bool(raw.get("enableText", raw.get("enable_text", True))),
+            "enable_image": bool(raw.get("enableImage", raw.get("enable_image", True))),
+            "max_images": max(1, min(8, int(raw.get("maxImages", raw.get("max_images", 2))))),
+            "gallery_aggregation": agg,
+            "gore_weight": max(0.0, min(3.0, float(raw.get("goreWeight", raw.get("gore_weight", 1.0))))),
+            "nsfw_weight": max(0.0, min(3.0, float(raw.get("nsfwWeight", raw.get("nsfw_weight", 1.0))))),
+            "temperature": max(0.25, min(4.0, float(raw.get("temperature", 1.0)))),
+            "bias": max(-5.0, min(5.0, float(raw.get("bias", 0.0)))),
+        }
+
+    def update_params(self, next_raw: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._normalize_params(next_raw)
+        with self._lock:
+            old_threads = self.params["threads"]
+            self.params = normalized
+            if normalized["threads"] != old_threads:
+                self.clf = self._lf.Left4Filter(str(self.deploy_dir), num_threads=normalized["threads"])
+            return dict(self.params)
+
+    def info(self) -> dict[str, Any]:
+        with self._lock:
+            cfg = getattr(self.clf, "config", {}) or {}
+            return {
+                "status": "ok",
+                "model": cfg.get("model_name", "Left4FiltersModel"),
+                "version": cfg.get("version", "1.0.0"),
+                "params": dict(self.params),
+            }
+
+    def _adjust(self, trip: Sequence[float] | np.ndarray, p: dict[str, Any]) -> tuple[float, float, float]:
+        return adjust_triplet(
+            float(trip[0]),
+            float(trip[1]),
+            float(trip[2]),
+            p["gore_weight"],
+            p["nsfw_weight"],
+            p["temperature"],
+            p["bias"],
+        )
+
+    def predict(
+        self,
+        title: str,
+        description: str,
+        tags: list[str] | None,
+        raw_images: list[bytes],
+    ) -> dict[str, Any]:
+        with self._lock:
+            p = dict(self.params)
+            clf = self.clf
+            lf = self._lf
+
+        use_title = title if p["enable_text"] else ""
+        use_desc = description if p["enable_text"] else ""
+        use_tags = tags if p["enable_text"] else None
+        has_txt = bool(use_title.strip() or use_desc.strip() or (use_tags and len(use_tags) > 0))
+        imgs = raw_images[: p["max_images"]] if p["enable_image"] else []
+
+        if not has_txt and not imgs:
+            return {
+                "prob": 0.0,
+                "goreProb": 0.0,
+                "nsfwProb": 0.0,
+                "textProb": None,
+                "textGoreProb": None,
+                "textNsfwProb": None,
+                "titleProb": None,
+                "descriptionProb": None,
+                "imageProb": None,
+                "imageGoreProb": None,
+                "imageNsfwProb": None,
+                "perImageProbs": [],
+            }
+
+        fast_attrs = all(
+            hasattr(clf, attr) for attr in ("vis_sess", "head_sess", "vocab_data", "txt_dim", "img_size")
+        ) and all(
+            hasattr(lf, fn)
+            for fn in ("extract_text_features", "extract_visual_priors", "preprocess_image", "_load_pil")
+        )
+
+        if fast_attrs:
+            return self._predict_fast(clf, lf, p, use_title, use_desc, use_tags, has_txt, imgs)
+        return self._predict_sdk_fallback(clf, p, use_title, use_desc, use_tags, has_txt, imgs)
+
+    def _run_text_only(self, clf: Any, lf: Any, title: str, desc: str, tags: list[str] | None) -> np.ndarray:
+        vis_prior_dim = int(getattr(lf, "VISUAL_PRIOR_DIM", 24))
+        th, tl = lf.extract_text_features(title, desc, tags, clf.vocab_data)
+        return clf.head_sess.run(
+            ["probs"],
+            {
+                "img_emb": np.zeros((1, 512), dtype=np.float32),
+                "img_priors": np.zeros((1, vis_prior_dim), dtype=np.float32),
+                "txt_hash": th[None, ...],
+                "txt_lex": tl[None, ...],
+                "has_img": np.zeros((1, 1), dtype=np.float32),
+                "has_txt": np.ones((1, 1), dtype=np.float32),
+            },
+        )[0][0]
+
+    def _predict_fast(
+        self,
+        clf: Any,
+        lf: Any,
+        p: dict[str, Any],
+        title: str,
+        desc: str,
+        tags: list[str] | None,
+        has_txt: bool,
+        imgs: list[bytes],
+    ) -> dict[str, Any]:
+        lex_dim = int(getattr(lf, "LEXICAL_PRIOR_DIM", 18))
+        text_trip: tuple[float, float, float] | None = None
+        title_prob: float | None = None
+        desc_prob: float | None = None
+
+        if has_txt:
+            th, tl = lf.extract_text_features(title, desc, tags, clf.vocab_data)
+            vis_prior_dim = int(getattr(lf, "VISUAL_PRIOR_DIM", 24))
+            raw_txt = clf.head_sess.run(
+                ["probs"],
+                {
+                    "img_emb": np.zeros((1, 512), dtype=np.float32),
+                    "img_priors": np.zeros((1, vis_prior_dim), dtype=np.float32),
+                    "txt_hash": th[None, ...],
+                    "txt_lex": tl[None, ...],
+                    "has_img": np.zeros((1, 1), dtype=np.float32),
+                    "has_txt": np.ones((1, 1), dtype=np.float32),
+                },
+            )[0][0]
+            text_trip = self._adjust(raw_txt, p)
+
+            if title.strip() or (tags and len(tags) > 0):
+                raw_t = self._run_text_only(clf, lf, title, "", tags)
+                title_prob = self._adjust(raw_t, p)[0]
+            if desc.strip():
+                raw_d = self._run_text_only(clf, lf, "", desc, None)
+                desc_prob = self._adjust(raw_d, p)[0]
+        else:
+            th = np.zeros(clf.txt_dim, dtype=np.float32)
+            tl = np.zeros(lex_dim, dtype=np.float32)
+
+        if not imgs:
+            assert text_trip is not None
+            return {
+                "prob": text_trip[0],
+                "goreProb": text_trip[1],
+                "nsfwProb": text_trip[2],
+                "textProb": text_trip[0],
+                "textGoreProb": text_trip[1],
+                "textNsfwProb": text_trip[2],
+                "titleProb": title_prob,
+                "descriptionProb": desc_prob,
+                "imageProb": None,
+                "imageGoreProb": None,
+                "imageNsfwProb": None,
+                "perImageProbs": [],
+            }
+
+        pils = [lf._load_pil(im) for im in imgs]
+        px_batch = np.stack([lf.preprocess_image(im, clf.img_size) for im in pils], axis=0)
+        pri_batch = np.stack([lf.extract_visual_priors(im) for im in pils], axis=0)
+        emb_batch = clf.vis_sess.run(["img_emb"], {"pixel_values": px_batch})[0]
+
+        n = len(pils)
+        zero_th = np.zeros((n, clf.txt_dim), dtype=np.float32)
+        zero_tl = np.zeros((n, lex_dim), dtype=np.float32)
+        ones_n = np.ones((n, 1), dtype=np.float32)
+        zeros_n = np.zeros((n, 1), dtype=np.float32)
+
+        img_only_rows = clf.head_sess.run(
+            ["probs"],
+            {
+                "img_emb": emb_batch,
+                "img_priors": pri_batch,
+                "txt_hash": zero_th,
+                "txt_lex": zero_tl,
+                "has_img": ones_n,
+                "has_txt": zeros_n,
+            },
+        )[0]
+        per_image_probs = [self._adjust(row, p)[0] for row in img_only_rows]
+        img_agg_raw = aggregate_rows(img_only_rows, p["gallery_aggregation"])
+        img_trip = self._adjust(img_agg_raw, p)
+
+        if has_txt:
+            th_batch = np.repeat(th[None, ...], n, axis=0)
+            tl_batch = np.repeat(tl[None, ...], n, axis=0)
+            joint_rows = clf.head_sess.run(
+                ["probs"],
+                {
+                    "img_emb": emb_batch,
+                    "img_priors": pri_batch,
+                    "txt_hash": th_batch,
+                    "txt_lex": tl_batch,
+                    "has_img": ones_n,
+                    "has_txt": ones_n,
+                },
+            )[0]
+            joint_agg_raw = aggregate_rows(joint_rows, p["gallery_aggregation"])
+            joint_trip = self._adjust(joint_agg_raw, p)
+        else:
+            joint_trip = img_trip
+
+        return {
+            "prob": joint_trip[0],
+            "goreProb": joint_trip[1],
+            "nsfwProb": joint_trip[2],
+            "textProb": text_trip[0] if text_trip else None,
+            "textGoreProb": text_trip[1] if text_trip else None,
+            "textNsfwProb": text_trip[2] if text_trip else None,
+            "titleProb": title_prob,
+            "descriptionProb": desc_prob,
+            "imageProb": img_trip[0],
+            "imageGoreProb": img_trip[1],
+            "imageNsfwProb": img_trip[2],
+            "perImageProbs": per_image_probs,
+        }
+
+    def _predict_sdk_fallback(
+        self,
+        clf: Any,
+        p: dict[str, Any],
+        title: str,
+        desc: str,
+        tags: list[str] | None,
+        has_txt: bool,
+        imgs: list[bytes],
+    ) -> dict[str, Any]:
+        text_trip = None
+        title_prob = None
+        desc_prob = None
+        if has_txt:
+            rt = clf.predict(title=title, description=desc, tags=tags)
+            text_trip = self._adjust([rt["prob"], rt["gore_prob"], rt["nsfw_prob"]], p)
+            if title.strip() or (tags and len(tags) > 0):
+                rt_t = clf.predict(title=title, description="", tags=tags)
+                title_prob = self._adjust([rt_t["prob"], rt_t["gore_prob"], rt_t["nsfw_prob"]], p)[0]
+            if desc.strip():
+                rt_d = clf.predict(title="", description=desc, tags=None)
+                desc_prob = self._adjust([rt_d["prob"], rt_d["gore_prob"], rt_d["nsfw_prob"]], p)[0]
+
+        per_image_probs: list[float] = []
+        img_trip = None
+        if imgs:
+            rows = []
+            for im in imgs:
+                ri = clf.predict(image=im)
+                row = [ri["prob"], ri["gore_prob"], ri["nsfw_prob"]]
+                rows.append(row)
+                per_image_probs.append(self._adjust(row, p)[0])
+            agg = aggregate_rows(np.asarray(rows, dtype=np.float32), p["gallery_aggregation"])
+            img_trip = self._adjust(agg, p)
+
+        rj = clf.predict(title=title, description=desc, tags=tags, images=imgs or None)
+        joint_trip = self._adjust([rj["prob"], rj["gore_prob"], rj["nsfw_prob"]], p)
+
+        return {
+            "prob": joint_trip[0],
+            "goreProb": joint_trip[1],
+            "nsfwProb": joint_trip[2],
+            "textProb": text_trip[0] if text_trip else None,
+            "textGoreProb": text_trip[1] if text_trip else None,
+            "textNsfwProb": text_trip[2] if text_trip else None,
+            "titleProb": title_prob,
+            "descriptionProb": desc_prob,
+            "imageProb": img_trip[0] if img_trip else None,
+            "imageGoreProb": img_trip[1] if img_trip else None,
+            "imageNsfwProb": img_trip[2] if img_trip else None,
+            "perImageProbs": per_image_probs,
+        }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Left4Addons managed Left4Filters HTTP runner")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--deploy-dir", required=True)
+    ap.add_argument("--params-json", default="{}")
+    args = ap.parse_args()
+
+    admin_token = os.environ.get("L4A_RUNNER_TOKEN", "").strip()
+    deploy_dir = resolve_deploy_dir(args.deploy_dir)
+    initial_params = json.loads(args.params_json) if args.params_json else {}
+    engine = RunnerEngine(deploy_dir, initial_params)
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _check_token(self) -> bool:
+            if not admin_token:
+                return True
+            auth = self.headers.get("Authorization", "")
+            return auth == f"Bearer {admin_token}"
+
+        def _read_json(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return {}
+            if length > 32 * 1024 * 1024:
+                raise ValueError("payload_too_large")
+            raw = self.rfile.read(length)
+            return json.loads(raw.decode("utf-8"))
+
+        def do_GET(self) -> None:
+            if self.path == "/health":
+                self._send(200, engine.info())
+            else:
+                self._send(404, {"error": "not_found"})
+
+        def do_POST(self) -> None:
+            if self.path == "/configure":
+                if not self._check_token():
+                    self._send(401, {"error": "unauthorized"})
+                    return
+                try:
+                    req = self._read_json()
+                    updated = engine.update_params(req)
+                    self._send(200, {"status": "ok", "params": updated})
+                except Exception as exc:
+                    self._send(400, {"error": str(exc)})
+                return
+
+            if self.path != "/predict":
+                self._send(404, {"error": "not_found"})
+                return
+
+            try:
+                req = self._read_json()
+                imgs: list[bytes] = []
+                b64_single = req.get("imageBase64") or req.get("image_base64")
+                if b64_single:
+                    imgs.append(base64.b64decode(b64_single))
+                for b64 in req.get("imagesBase64") or req.get("images_base64") or []:
+                    if b64:
+                        imgs.append(base64.b64decode(b64))
+                tags_raw = req.get("tags")
+                tags = [str(x) for x in tags_raw] if isinstance(tags_raw, list) else None
+                res = engine.predict(
+                    title=str(req.get("title") or ""),
+                    description=str(req.get("description") or ""),
+                    tags=tags,
+                    raw_images=imgs,
+                )
+                self._send(200, res)
+            except Exception as exc:
+                self._send(400, {"error": str(exc)})
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            pass
+
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    bound_host, bound_port = srv.server_address[0], srv.server_address[1]
+    ready_payload = engine.info()
+    ready_payload["host"] = bound_host
+    ready_payload["port"] = bound_port
+    print(f"L4A_FILTER_READY {json.dumps(ready_payload, ensure_ascii=False)}", flush=True)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

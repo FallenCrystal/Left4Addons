@@ -9,10 +9,15 @@ pub struct AppPaths {
     pub config_dir: PathBuf,
     pub settings_path: PathBuf,
     pub mirrors_path: PathBuf,
+    pub llm_token_path: PathBuf,
     pub db_path: PathBuf,
     pub cache_dir: PathBuf,
     pub image_cache_dir: PathBuf,
     pub download_cache_dir: PathBuf,
+    pub filters_dir: PathBuf,
+    pub filter_repo_dir: PathBuf,
+    pub filter_venv_dir: PathBuf,
+    pub filter_runner_path: PathBuf,
 }
 
 impl AppPaths {
@@ -20,15 +25,21 @@ impl AppPaths {
         let root = runtime_dir.as_ref().to_path_buf();
         let config_dir = root.join("config");
         let cache_dir = root.join("cache");
+        let filters_dir = root.join("filters");
         Self {
             runtime_dir: root.clone(),
             settings_path: config_dir.join("settings.toml"),
             mirrors_path: config_dir.join("mirrors.json"),
+            llm_token_path: config_dir.join("llm_token.sealed"),
             db_path: root.join("l4a_v2.db"),
             image_cache_dir: cache_dir.join("images"),
             download_cache_dir: cache_dir.join("downloading"),
+            filter_repo_dir: filters_dir.join("Left4Filters"),
+            filter_venv_dir: filters_dir.join("venv"),
+            filter_runner_path: filters_dir.join("l4a_filter_runner.py"),
             config_dir,
             cache_dir,
+            filters_dir,
         }
     }
 
@@ -38,6 +49,7 @@ impl AppPaths {
         fs::create_dir_all(&self.cache_dir)?;
         fs::create_dir_all(&self.image_cache_dir)?;
         fs::create_dir_all(&self.download_cache_dir)?;
+        fs::create_dir_all(&self.filters_dir)?;
         Ok(())
     }
 }

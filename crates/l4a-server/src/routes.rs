@@ -1,10 +1,11 @@
 use crate::auth::{build_clear_session_cookie, build_session_cookie};
 use crate::db::ServerRepo;
+use crate::filter::FilterServiceError;
 use crate::sync::with_catalog_source;
 use crate::web_assets;
 use crate::ServerState;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{
         header::{ACCEPT_LANGUAGE, CACHE_CONTROL, SET_COOKIE, VARY},
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
@@ -17,11 +18,12 @@ use axum::{
 use l4a_protocol::{
     AdminChangePasswordRequest, AdminFetchUpstreamRequest, AdminFetchUpstreamResponse,
     AdminItemDetailResponse, AdminItemOverrideRequest, AdminLoginRequest, AdminSessionInfo,
-    AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogOverviewResponse, CatalogStats,
-    CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, SearchQuery, SearchResponse,
-    SetRefreshTokenRequest, StartCredentialsAuthRequest, SteamAuthFlowStatus,
-    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopFileType, WorkshopId,
-    WorkshopItemRecord, WorkshopItemStatus,
+    AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogFilterConfigDto,
+    CatalogFilterPublicInfo, CatalogFilterStatus, CatalogOverviewResponse, CatalogStats,
+    CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, FilterPredictRequest,
+    FilterProbabilities, SearchQuery, SearchResponse, SetRefreshTokenRequest,
+    StartCredentialsAuthRequest, SteamAuthFlowStatus, SubmitSteamGuardRequest,
+    WorkshopCollectionRecord, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,6 +32,7 @@ use std::str::FromStr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 const MAX_BATCH_SIZE: usize = 200;
+const MAX_FILTER_PREDICT_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RouteState {
@@ -68,6 +71,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/v1/items/batch", post(batch_items))
         .route("/api/v1/items/{workshop_id}", get(get_item))
         .route("/api/v1/collections/{collection_id}", get(get_collection))
+        .route("/api/v1/filter/info", get(filter_info))
+        .route(
+            "/api/v1/filter/predict",
+            post(filter_predict).layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES)),
+        )
         .layer(CorsLayer::permissive());
 
     let admin_routes = Router::new()
@@ -90,6 +98,16 @@ pub fn router(state: ServerState) -> Router {
             post(admin_reset_backfill_cursor),
         )
         .route("/api/v1/admin/sync/fetch", post(admin_fetch_upstream))
+        .route("/api/v1/admin/filter/status", get(admin_filter_status))
+        .route(
+            "/api/v1/admin/config/filter",
+            patch(admin_update_filter_config),
+        )
+        .route("/api/v1/admin/filter/restart", post(admin_restart_filter))
+        .route(
+            "/api/v1/admin/filter/test",
+            post(admin_test_filter).layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES)),
+        )
         .route("/api/v1/admin/steam/status", get(admin_steam_status))
         .route("/api/v1/admin/steam/reconnect", post(admin_steam_reconnect))
         .route(
@@ -508,12 +526,14 @@ async fn admin_overview(
     let stats = state.db(move |repo| repo.stats()).await?;
     let steam = state.server.upstream.status().await;
     let sync = state.server.sync.status().await.map_err(internal_err)?;
+    let filter = state.server.filter.status().await;
     let cfg = state.server.config_store.get();
 
     Ok(Json(CatalogOverviewResponse {
         stats,
         steam,
         sync,
+        filter,
         config_path: state
             .server
             .config_store
@@ -870,4 +890,96 @@ async fn admin_clear_item_override(
         .await?
         .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, format!("未找到条目 {wid}")))?;
     Ok(Json(detail))
+}
+
+fn filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
+    match err {
+        FilterServiceError::Disabled(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
+        FilterServiceError::Unavailable(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
+        FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
+        FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::Internal(err) => internal_err(err),
+    }
+}
+
+async fn filter_info(State(state): State<RouteState>) -> ApiResult<CatalogFilterPublicInfo> {
+    Ok(Json(state.server.filter.public_info().await))
+}
+
+async fn filter_predict(
+    State(state): State<RouteState>,
+    Json(req): Json<FilterPredictRequest>,
+) -> ApiResult<FilterProbabilities> {
+    let probs = state.server.filter.predict(req).await.map_err(filter_err)?;
+    Ok(Json(probs))
+}
+
+async fn admin_filter_status(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+) -> ApiResult<CatalogFilterStatus> {
+    state.require_admin(&headers)?;
+    Ok(Json(state.server.filter.status().await))
+}
+
+async fn admin_update_filter_config(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+    Json(dto): Json<CatalogFilterConfigDto>,
+) -> ApiResult<CatalogFilterStatus> {
+    let actor = state.require_admin(&headers)?;
+    state
+        .server
+        .config_store
+        .update(|cfg| cfg.filter.apply_dto(&dto))
+        .map_err(internal_err)?;
+    let status = state.server.filter.reconfigure().await;
+
+    let reason = format!(
+        "更新内容过滤模型配置: enabled={}, backend={:?}, ttl={}s, threads={}, max_images={}, gore_w={:.2}, nsfw_w={:.2}, temp={:.2}, bias={:.2}",
+        status.config.enabled,
+        status.config.backend,
+        status.config.cache_ttl_secs,
+        status.config.params.threads,
+        status.config.params.max_images,
+        status.config.params.gore_weight,
+        status.config.params.nsfw_weight,
+        status.config.params.temperature,
+        status.config.params.bias,
+    );
+    let _ = state
+        .db(move |repo| {
+            repo.append_audit_log(None, &actor, "filter_config_update", &reason, None, None)
+        })
+        .await;
+
+    Ok(Json(status))
+}
+
+async fn admin_restart_filter(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+) -> ApiResult<CatalogFilterStatus> {
+    let actor = state.require_admin(&headers)?;
+    let status = state.server.filter.restart().await;
+
+    let reason = format!(
+        "重启/探测内容过滤模型后端: backend={:?}, ready={}",
+        status.config.backend, status.ready
+    );
+    let _ = state
+        .db(move |repo| repo.append_audit_log(None, &actor, "filter_restart", &reason, None, None))
+        .await;
+
+    Ok(Json(status))
+}
+
+async fn admin_test_filter(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+    Json(req): Json<FilterPredictRequest>,
+) -> ApiResult<FilterProbabilities> {
+    state.require_admin(&headers)?;
+    let probs = state.server.filter.predict(req).await.map_err(filter_err)?;
+    Ok(Json(probs))
 }

@@ -1,4 +1,5 @@
 import type { DashboardSnapshot, WorkshopItemRecord } from '../ipc';
+import { createDefaultFilterConfig } from '../../utils/contentFilter';
 
 export const PREVIEW_CATALOG: WorkshopItemRecord[] = [
   {
@@ -116,6 +117,39 @@ export const PREVIEW_CATALOG: WorkshopItemRecord[] = [
     fetchedAt: '2026-11-20T00:00:00Z',
   },
   {
+    workshopId: '3410887766',
+    fileType: 'item',
+    status: 'active',
+    title: 'Crimson Gore Dissolve FX',
+    description: 'Extreme visceral dismemberment and gore shaders for infected closeups.',
+    creatorSteamId: '76561198077889900',
+    creatorName: 'ShaderForge',
+    previewUrl:
+      'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%23263238"/></svg>#safe_cover',
+    previews: [
+      {
+        previewId: 'p-gore-1',
+        url: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%23681818"/></svg>#gore_viscera_closeup',
+        previewType: 0,
+      },
+      {
+        previewId: 'p-safe-2',
+        url: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%231f3a2e"/></svg>#safe_comparison',
+        previewType: 0,
+      },
+    ],
+    fileSize: 18_874_368,
+    timeCreated: 1735000000,
+    timeUpdated: 1763520000,
+    tags: ['Infected'],
+    dependencies: [],
+    collectionChildren: [],
+    subscriptions: 84_500,
+    favorites: 9_120,
+    source: 'catalog_server',
+    fetchedAt: '2026-11-20T00:00:00Z',
+  },
+  {
     workshopId: '3499001245',
     fileType: 'collection',
     status: 'active',
@@ -161,6 +195,7 @@ export function createInitialSnapshot(): DashboardSnapshot {
       },
       addonNamePreference: 'workshop_title',
       collapseCampaignBundles: true,
+      filter: createDefaultFilterConfig(),
     },
     addons: [
       {
@@ -508,5 +543,6 @@ export function createInitialSnapshot(): DashboardSnapshot {
         updatedAt: '2026-11-20T00:10:04Z',
       },
     ],
+    filterExclusions: [],
   };
 }

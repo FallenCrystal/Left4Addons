@@ -206,10 +206,197 @@ export interface AddonBatchReport {
   refreshError?: DesktopError;
 }
 
+export type AddonId = string;
+export type WorkshopId = string;
+
 export type GameUpdateDummyPolicy =
   | 'ask'
   | 'auto_adopt_keep_customizations'
   | 'auto_keep_local_regenerate_dummy';
+
+export const DEFAULT_FILTER_REPO_URL = 'https://github.com/FallenCrystal/Left4Filters.git';
+export const DEFAULT_LLM_ENDPOINT = 'https://api.openai.com/v1';
+export const DEFAULT_LLM_MODEL = 'gpt-4o-mini';
+export const DEFAULT_LLM_TOKEN_ENV_VAR = 'L4A_LLM_API_KEY';
+export const DEFAULT_LLM_SYSTEM_PROMPT =
+  'You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins.';
+
+export type FilterGalleryAggregation = 'max' | 'top2_mean' | 'mean';
+
+export type FilterPresetId =
+  | 'recommended'
+  | 'strict'
+  | 'relaxed'
+  | 'nsfw_only'
+  | 'gore_only'
+  | 'low_cpu'
+  | 'custom';
+
+export type ClientFilterSourceMode = 'local' | 'catalog' | 'custom_endpoint';
+export type FilterScoreTarget = 'overall' | 'gore' | 'nsfw' | 'max_category';
+export type LlmTokenSource = 'env_var' | 'encrypted_local';
+export type FlaggedItemAction = 'mark_only' | 'hide_image' | 'blur_card' | 'hide_card';
+
+export type ExclusionDisplayLevel =
+  | 'normal'
+  | 'lazy_load'
+  | 'blur_image'
+  | 'hide_image'
+  | 'hide_text';
+
+export type LocalFilterServiceState = 'stopped' | 'deploying' | 'starting' | 'running' | 'error';
+
+export type FilterDecisionSource =
+  | 'model_safe'
+  | 'model_direct_flag'
+  | 'llm_flagged_true'
+  | 'llm_flagged_false';
+
+export interface FilterModelParams {
+  threads: number;
+  enableText: boolean;
+  enableImage: boolean;
+  maxImages: number;
+  galleryAggregation: FilterGalleryAggregation;
+  goreWeight: number;
+  nsfwWeight: number;
+  temperature: number;
+  bias: number;
+}
+
+export interface FilterProbabilities {
+  prob: number;
+  goreProb: number;
+  nsfwProb: number;
+  textProb?: number;
+  textGoreProb?: number;
+  textNsfwProb?: number;
+  titleProb?: number;
+  descriptionProb?: number;
+  imageProb?: number;
+  imageGoreProb?: number;
+  imageNsfwProb?: number;
+  perImageProbs?: number[];
+}
+
+export interface ClientFilterConfig {
+  enabled: boolean;
+  mode: ClientFilterSourceMode;
+  customEndpointUrl?: string | null;
+  applyToWorkshop: boolean;
+  applyToLibrary: boolean;
+  repoUrl: string;
+  trackLatest: boolean;
+  pinnedCommit?: string | null;
+  autoStartLocalService: boolean;
+  preset: FilterPresetId;
+  localParams: FilterModelParams;
+  scoreTarget: FilterScoreTarget;
+  enableDirectFlag: boolean;
+  flagThreshold: number;
+  llmEnabled: boolean;
+  llmThreshold: number;
+  llmEndpoint: string;
+  llmModel: string;
+  llmSendImages: boolean;
+  llmSystemPrompt: string;
+  llmTokenSource: LlmTokenSource;
+  llmTokenEnvVar: string;
+  flaggedAction: FlaggedItemAction;
+  subdivideModalities: boolean;
+  modalityThreshold: number;
+}
+
+export interface FilterTokenStatus {
+  hasEncryptedToken: boolean;
+  envVarName: string;
+  envVarPresent: boolean;
+}
+
+export interface FilterEnvReport {
+  gitAvailable: boolean;
+  gitVersion?: string;
+  gitPath?: string;
+  pythonAvailable: boolean;
+  pythonVersion?: string;
+  pythonPath?: string;
+  venvAvailable: boolean;
+}
+
+export interface FilterCommitInfo {
+  sha: string;
+  shortSha: string;
+  subject: string;
+  committedAt: string;
+}
+
+export interface LocalFilterDeploymentStatus {
+  env: FilterEnvReport;
+  deployed: boolean;
+  repoDir: string;
+  venvDir: string;
+  serviceState: LocalFilterServiceState;
+  serviceEndpoint?: string;
+  runningPid?: number;
+  currentCommit?: FilterCommitInfo;
+  remoteLatestCommit?: FilterCommitInfo;
+  updateAvailable: boolean;
+  recentCommits: FilterCommitInfo[];
+  stageMessage?: string;
+  lastError?: string;
+}
+
+export interface DeployLocalFilterRequest {
+  repoUrl?: string;
+  trackLatest: boolean;
+  targetCommit?: string;
+  startAfterDeploy: boolean;
+}
+
+export interface FilterExclusionRecord {
+  addonId: AddonId;
+  displayLevel: ExclusionDisplayLevel;
+  bindFingerprint: boolean;
+  boundFingerprint?: string;
+  currentFingerprint?: string;
+  fingerprintValid: boolean;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface UpsertFilterExclusionRequest {
+  addonId: AddonId;
+  displayLevel: ExclusionDisplayLevel;
+  bindFingerprint?: boolean;
+  note?: string;
+}
+
+export interface FilterEvaluationTarget {
+  targetKey: string;
+  addonId?: AddonId;
+  workshopId?: WorkshopId;
+  title: string;
+  description?: string;
+  tags: string[];
+  imageSources: string[];
+  revisionHint?: string;
+  bypassCache?: boolean;
+}
+
+export interface FilterItemVerdict {
+  targetKey: string;
+  flagged: boolean;
+  decisionSource: FilterDecisionSource;
+  evaluatedScore: number;
+  probabilities: FilterProbabilities;
+  textSensitive: boolean;
+  titleSensitive: boolean;
+  descriptionSensitive: boolean;
+  imageSensitive: boolean;
+  sensitiveImageIndices: number[];
+  evaluatedAt: string;
+}
 
 export interface AppConfig {
   loadingDir: string;
@@ -227,6 +414,7 @@ export interface AppConfig {
   renameRules: RenameRuleConfig;
   addonNamePreference?: AddonNamePreference;
   collapseCampaignBundles?: boolean;
+  filter: ClientFilterConfig;
 }
 
 export interface DashboardSnapshot {
@@ -238,6 +426,7 @@ export interface DashboardSnapshot {
   profiles: LoadoutProfile[];
   openIssues: ReconcileIssue[];
   tasks: TaskRecord[];
+  filterExclusions: FilterExclusionRecord[];
 }
 
 export interface SteamCapabilities {
@@ -368,7 +557,9 @@ export type CoreEvent =
       speedBps?: number | null;
     }
   | { type: 'reconcile_issues_detected'; count: number }
-  | { type: 'watch_error'; message: string };
+  | { type: 'watch_error'; message: string }
+  | { type: 'filter_verdicts_updated'; verdicts: FilterItemVerdict[] }
+  | { type: 'local_filter_status_changed'; status: LocalFilterDeploymentStatus };
 
 export class IpcError extends Error {
   constructor(readonly code: string, message: string) {
@@ -594,6 +785,56 @@ export async function openExternalUrl(url: string): Promise<void> {
 
 export async function openInFileManager(path: string): Promise<void> {
   return invokeCommand<void>('open_in_file_manager', { path });
+}
+
+export async function getLocalFilterStatus(): Promise<LocalFilterDeploymentStatus> {
+  return invokeCommand<LocalFilterDeploymentStatus>('get_local_filter_status');
+}
+
+export async function checkLocalFilterUpdates(): Promise<LocalFilterDeploymentStatus> {
+  return invokeCommand<LocalFilterDeploymentStatus>('check_local_filter_updates');
+}
+
+export async function deployLocalFilter(
+  request: DeployLocalFilterRequest,
+): Promise<LocalFilterDeploymentStatus> {
+  return invokeCommand<LocalFilterDeploymentStatus>('deploy_local_filter', { request });
+}
+
+export async function startLocalFilterService(): Promise<LocalFilterDeploymentStatus> {
+  return invokeCommand<LocalFilterDeploymentStatus>('start_local_filter_service');
+}
+
+export async function stopLocalFilterService(): Promise<LocalFilterDeploymentStatus> {
+  return invokeCommand<LocalFilterDeploymentStatus>('stop_local_filter_service');
+}
+
+export async function getFilterTokenStatus(): Promise<FilterTokenStatus> {
+  return invokeCommand<FilterTokenStatus>('get_filter_token_status');
+}
+
+export async function setFilterLlmToken(token: string | null): Promise<FilterTokenStatus> {
+  return invokeCommand<FilterTokenStatus>('set_filter_llm_token', { token });
+}
+
+export async function evaluateFilterItems(
+  targets: FilterEvaluationTarget[],
+): Promise<FilterItemVerdict[]> {
+  return invokeCommand<FilterItemVerdict[]>('evaluate_filter_items', { targets });
+}
+
+export async function clearFilterCache(): Promise<number> {
+  return invokeCommand<number>('clear_filter_cache');
+}
+
+export async function upsertFilterExclusion(
+  request: UpsertFilterExclusionRequest,
+): Promise<DashboardSnapshot> {
+  return invokeCommand<DashboardSnapshot>('upsert_filter_exclusion', { request });
+}
+
+export async function deleteFilterExclusion(addonId: AddonId): Promise<DashboardSnapshot> {
+  return invokeCommand<DashboardSnapshot>('delete_filter_exclusion', { addonId });
 }
 
 export async function subscribeCoreEvents(

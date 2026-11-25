@@ -143,10 +143,82 @@ export interface CatalogStats {
   auditLogsCount: number;
 }
 
+export type FilterGalleryAggregation = 'max' | 'top2_mean' | 'mean';
+export type FilterPresetId =
+  | 'recommended'
+  | 'strict'
+  | 'relaxed'
+  | 'nsfw_only'
+  | 'gore_only'
+  | 'low_cpu'
+  | 'custom';
+export type CatalogFilterBackendKind = 'managed_python' | 'upstream_http';
+
+export interface FilterModelParams {
+  threads: number;
+  enableText: boolean;
+  enableImage: boolean;
+  maxImages: number;
+  galleryAggregation: FilterGalleryAggregation;
+  goreWeight: number;
+  nsfwWeight: number;
+  temperature: number;
+  bias: number;
+}
+
+export interface FilterProbabilities {
+  prob: number;
+  goreProb: number;
+  nsfwProb: number;
+  textProb?: number;
+  textGoreProb?: number;
+  textNsfwProb?: number;
+  titleProb?: number;
+  descriptionProb?: number;
+  imageProb?: number;
+  imageGoreProb?: number;
+  imageNsfwProb?: number;
+  perImageProbs?: number[];
+}
+
+export interface FilterPredictRequest {
+  workshopId?: string;
+  title?: string;
+  description?: string;
+  tags?: string[];
+  imageBase64?: string;
+  imagesBase64?: string[];
+  imageUrls?: string[];
+}
+
+export interface CatalogFilterConfigDto {
+  enabled: boolean;
+  backend: CatalogFilterBackendKind;
+  deployDir?: string;
+  pythonBin?: string;
+  upstreamUrl?: string;
+  cacheTtlSecs: number;
+  params: FilterModelParams;
+}
+
+export interface CatalogFilterStatus {
+  config: CatalogFilterConfigDto;
+  ready: boolean;
+  runningPid?: number;
+  activeEndpoint?: string;
+  modelName?: string;
+  modelVersion?: string;
+  totalRequests: number;
+  cacheHits: number;
+  failedRequests: number;
+  lastError?: string;
+}
+
 export interface CatalogOverviewResponse {
   stats: CatalogStats;
   steam: CatalogSteamStatus;
   sync: CatalogSyncStatus;
+  filter: CatalogFilterStatus;
   configPath: string | null;
   bindAddr: string;
   dbPath: string;
@@ -405,6 +477,139 @@ export async function clearItemOverride(workshopId: string): Promise<AdminItemDe
 
 export async function getAuditLogs(limit = 200): Promise<AuditLogEntry[]> {
   return requestJson<AuditLogEntry[]>(`/api/v1/admin/audit?limit=${limit}`);
+}
+
+export const DEFAULT_FILTER_PARAMS: FilterModelParams = {
+  threads: 4,
+  enableText: true,
+  enableImage: true,
+  maxImages: 2,
+  galleryAggregation: 'max',
+  goreWeight: 1.0,
+  nsfwWeight: 1.0,
+  temperature: 1.0,
+  bias: 0.0,
+};
+
+export const DEFAULT_FILTER_STATUS: CatalogFilterStatus = {
+  config: {
+    enabled: false,
+    backend: 'managed_python',
+    cacheTtlSecs: 3600,
+    params: { ...DEFAULT_FILTER_PARAMS },
+  },
+  ready: false,
+  totalRequests: 0,
+  cacheHits: 0,
+  failedRequests: 0,
+};
+
+export function getPresetFilterParams(
+  preset: Exclude<FilterPresetId, 'custom'>,
+): FilterModelParams {
+  switch (preset) {
+    case 'recommended':
+      return { ...DEFAULT_FILTER_PARAMS };
+    case 'strict':
+      return {
+        threads: 4,
+        enableText: true,
+        enableImage: true,
+        maxImages: 4,
+        galleryAggregation: 'max',
+        goreWeight: 1.15,
+        nsfwWeight: 1.15,
+        temperature: 0.9,
+        bias: 0.35,
+      };
+    case 'relaxed':
+      return {
+        threads: 4,
+        enableText: true,
+        enableImage: true,
+        maxImages: 1,
+        galleryAggregation: 'max',
+        goreWeight: 0.9,
+        nsfwWeight: 0.9,
+        temperature: 1.15,
+        bias: -0.3,
+      };
+    case 'nsfw_only':
+      return {
+        ...DEFAULT_FILTER_PARAMS,
+        goreWeight: 0.0,
+        nsfwWeight: 1.0,
+      };
+    case 'gore_only':
+      return {
+        ...DEFAULT_FILTER_PARAMS,
+        goreWeight: 1.0,
+        nsfwWeight: 0.0,
+      };
+    case 'low_cpu':
+      return {
+        ...DEFAULT_FILTER_PARAMS,
+        threads: 2,
+        maxImages: 1,
+      };
+  }
+}
+
+export function detectFilterPreset(params: FilterModelParams): FilterPresetId {
+  const candidates: Array<Exclude<FilterPresetId, 'custom'>> = [
+    'recommended',
+    'strict',
+    'relaxed',
+    'nsfw_only',
+    'gore_only',
+    'low_cpu',
+  ];
+  const near = (a: number, b: number) => Math.abs(a - b) < 1e-4;
+  for (const id of candidates) {
+    const p = getPresetFilterParams(id);
+    if (
+      p.threads === params.threads &&
+      p.enableText === params.enableText &&
+      p.enableImage === params.enableImage &&
+      p.maxImages === params.maxImages &&
+      p.galleryAggregation === params.galleryAggregation &&
+      near(p.goreWeight, params.goreWeight) &&
+      near(p.nsfwWeight, params.nsfwWeight) &&
+      near(p.temperature, params.temperature) &&
+      near(p.bias, params.bias)
+    ) {
+      return id;
+    }
+  }
+  return 'custom';
+}
+
+export async function getFilterStatus(): Promise<CatalogFilterStatus> {
+  return requestJson<CatalogFilterStatus>('/api/v1/admin/filter/status');
+}
+
+export async function updateFilterConfig(
+  config: CatalogFilterConfigDto,
+): Promise<CatalogFilterStatus> {
+  return requestJson<CatalogFilterStatus>('/api/v1/admin/config/filter', {
+    method: 'PATCH',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function restartFilterBackend(): Promise<CatalogFilterStatus> {
+  return requestJson<CatalogFilterStatus>('/api/v1/admin/filter/restart', {
+    method: 'POST',
+  });
+}
+
+export async function testFilterPredict(
+  payload: FilterPredictRequest,
+): Promise<FilterProbabilities> {
+  return requestJson<FilterProbabilities>('/api/v1/admin/filter/test', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 }
 
 export function parseWorkshopIdsInput(raw: string): string[] {

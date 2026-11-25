@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Database,
+  Filter,
   Gauge,
   LogOut,
   Moon,
@@ -11,13 +12,16 @@ import {
 } from 'lucide-react';
 import {
   ApiError,
+  DEFAULT_FILTER_STATUS,
   getAdminSession,
   getOverview,
   logoutAdmin,
   setSessionToken,
+  type CatalogFilterStatus,
   type CatalogOverviewResponse,
   type CatalogSteamStatus,
 } from './api';
+import { FilterPanel } from './components/FilterPanel';
 import { ItemInspectorDrawer } from './components/ItemInspectorDrawer';
 import { LoginScreen } from './components/LoginScreen';
 import { OverviewPanel } from './components/OverviewPanel';
@@ -25,7 +29,7 @@ import { SettingsAuditPanel } from './components/SettingsAuditPanel';
 import { SteamAuthPanel } from './components/SteamAuthPanel';
 import { WorkshopCachePanel } from './components/WorkshopCachePanel';
 
-type NavTab = 'overview' | 'cache' | 'steam' | 'settings';
+type NavTab = 'overview' | 'cache' | 'steam' | 'filter' | 'settings';
 
 export function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -113,6 +117,10 @@ export function App() {
     setOverview((prev) => (prev ? { ...prev, steam: nextSteam } : prev));
   }, []);
 
+  const handleFilterUpdated = useCallback((nextFilter: CatalogFilterStatus) => {
+    setOverview((prev) => (prev ? { ...prev, filter: nextFilter } : prev));
+  }, []);
+
   if (checkingSession) {
     return (
       <div className="cat-login-shell">
@@ -174,6 +182,15 @@ export function App() {
           >
             <Radio size={16} />
             <span>SteamKit 账号会话</span>
+          </button>
+          <button
+            type="button"
+            className="cat-nav-btn"
+            data-active={activeTab === 'filter' ? 'true' : 'false'}
+            onClick={() => setActiveTab('filter')}
+          >
+            <Filter size={16} />
+            <span>内容过滤模型</span>
           </button>
           <button
             type="button"
@@ -255,6 +272,13 @@ export function App() {
               <SteamAuthPanel
                 steam={overview.steam}
                 onSteamUpdated={handleSteamUpdated}
+                onNotify={notify}
+              />
+            )}
+            {activeTab === 'filter' && (
+              <FilterPanel
+                filter={overview.filter ?? DEFAULT_FILTER_STATUS}
+                onFilterUpdated={handleFilterUpdated}
                 onNotify={notify}
               />
             )}

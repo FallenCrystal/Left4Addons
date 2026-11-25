@@ -25,6 +25,7 @@ import { ReconcileView } from './components/views/ReconcileView';
 import { SettingsView, type SettingsSection } from './components/views/SettingsView';
 import { WorkshopView } from './components/views/WorkshopView';
 import { setAppLanguage } from './i18n';
+import { ContentFilterContext } from './state/ContentFilterContext';
 import { useAppController } from './state/useAppController';
 import { summarizeBatchReport } from './utils/format';
 import {
@@ -189,6 +190,36 @@ export function App() {
     return liveEntries.length + persistedActive;
   }, [ctrl.liveDownloads, ctrl.snapshot]);
 
+  const openFilterSettings = useCallback(() => {
+    setSettingsSection('filter');
+    setDestination('settings');
+  }, []);
+
+  const filterContextValue = useMemo(
+    () => ({
+      filterConfig: ctrl.filterConfig,
+      verdicts: ctrl.filterVerdicts,
+      exclusionsByAddonId: ctrl.exclusionsByAddonId,
+      revealedCardIds: ctrl.revealedCardIds,
+      revealCard: ctrl.revealCard,
+      registerWorkshopItems: ctrl.registerWorkshopItems,
+      upsertFilterExclusion: ctrl.upsertFilterExclusion,
+      deleteFilterExclusion: ctrl.deleteFilterExclusion,
+      onOpenFilterSettings: openFilterSettings,
+    }),
+    [
+      ctrl.deleteFilterExclusion,
+      ctrl.exclusionsByAddonId,
+      ctrl.filterConfig,
+      ctrl.filterVerdicts,
+      ctrl.registerWorkshopItems,
+      ctrl.revealCard,
+      ctrl.revealedCardIds,
+      ctrl.upsertFilterExclusion,
+      openFilterSettings,
+    ],
+  );
+
   const activityLabel = ctrl.syncing
     ? t('window.syncing')
     : ctrl.scanning
@@ -198,7 +229,8 @@ export function App() {
         : null;
 
   return (
-    <div className="l4a-shell">
+    <ContentFilterContext.Provider value={filterContextValue}>
+      <div className="l4a-shell">
       <TitleBar activityLabel={activityLabel} isPreview={!ctrl.isTauri} />
 
       <NavigationRail
@@ -371,6 +403,12 @@ export function App() {
             busy={ctrl.busy}
             themePref={themePref}
             language={language}
+            addons={ctrl.snapshot.addons}
+            exclusions={ctrl.snapshot.filterExclusions}
+            localFilterStatus={ctrl.localFilterStatus}
+            filterStatusBusy={ctrl.filterStatusBusy}
+            filterTokenStatus={ctrl.filterTokenStatus}
+            filterEvalError={ctrl.filterEvalError}
             onSaveConfig={ctrl.saveConfig}
             onDetectPath={ctrl.detectGamePath}
             onOpenInFileManager={handleOpenInFileManager}
@@ -378,6 +416,18 @@ export function App() {
             onChangeTheme={handleChangeTheme}
             onChangeLanguage={setAppLanguage}
             onNotify={(msg, tone) => ctrl.notify(msg, { tone })}
+            onRefreshLocalFilterStatus={ctrl.refreshLocalFilterStatus}
+            onCheckLocalFilterUpdates={ctrl.checkLocalFilterUpdates}
+            onDeployLocalFilter={ctrl.deployLocalFilter}
+            onStartLocalFilterService={ctrl.startLocalFilterService}
+            onStopLocalFilterService={ctrl.stopLocalFilterService}
+            onRefreshFilterTokenStatus={ctrl.refreshFilterTokenStatus}
+            onSetFilterLlmToken={ctrl.setFilterLlmToken}
+            onClearFilterCache={ctrl.clearFilterCache}
+            onEvaluateSandboxTarget={ctrl.evaluateSandboxTarget}
+            onUpsertFilterExclusion={ctrl.upsertFilterExclusion}
+            onDeleteFilterExclusion={ctrl.deleteFilterExclusion}
+            onSelectAddon={(addon) => setDetailAddonId(addon.id)}
           />
         )}
       </main>
@@ -601,9 +651,10 @@ export function App() {
         onClose={() => setExternalUrl(null)}
       />
 
-      <Snackbar item={ctrl.snackbar} onClose={ctrl.dismissSnackbar} />
-      <TooltipHost />
-    </div>
+        <Snackbar item={ctrl.snackbar} onClose={ctrl.dismissSnackbar} />
+        <TooltipHost />
+      </div>
+    </ContentFilterContext.Provider>
   );
 }
 

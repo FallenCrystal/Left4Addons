@@ -8,6 +8,8 @@ import type {
   BundleRecord,
 } from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import { addonFilterKey, resolveCardFilterState } from '../../utils/contentFilter';
 import { Button, EmptyState } from '../m3/primitives';
 import { BundleDetailSheet } from './library/BundleDetailSheet';
 import {
@@ -161,7 +163,29 @@ export function LibraryView({
     [bundles, addonsById],
   );
 
-  const { displayItems, visibleAddons } = useMemo(
+  const { filterConfig, verdicts, exclusionsByAddonId } = useContentFilterContext();
+  const [showingFilteredCards, setShowingFilteredCards] = useState(false);
+
+  const hiddenAddonIds = useMemo(() => {
+    const hidden = new Set<string>();
+    if (!filterConfig.enabled || !filterConfig.applyToLibrary) {
+      return hidden;
+    }
+    for (const addon of addons) {
+      const state = resolveCardFilterState({
+        config: filterConfig,
+        scope: 'library',
+        verdict: verdicts[addonFilterKey(addon.id)],
+        exclusion: exclusionsByAddonId.get(addon.id),
+      });
+      if (state.hiddenCard) {
+        hidden.add(addon.id);
+      }
+    }
+    return hidden;
+  }, [addons, exclusionsByAddonId, filterConfig, verdicts]);
+
+  const { displayItems, visibleAddons, filteredOutCount } = useMemo(
     () =>
       buildLibraryDisplayItems({
         addons,
@@ -176,6 +200,8 @@ export function LibraryView({
         mapMatchedIds,
         sortBy,
         namePreference,
+        hiddenAddonIds,
+        enforceHide: !showingFilteredCards,
       }),
     [
       addons,
@@ -190,6 +216,8 @@ export function LibraryView({
       mapMatchedIds,
       sortBy,
       namePreference,
+      hiddenAddonIds,
+      showingFilteredCards,
     ],
   );
 
@@ -318,6 +346,9 @@ export function LibraryView({
         onToggleCollapseBundles={onToggleCollapseBundles}
         externalFilter={externalFilter}
         onClearExternalFilter={onClearExternalFilter}
+        filteredOutCount={filteredOutCount}
+        showingFilteredCards={showingFilteredCards}
+        onToggleShowFilteredCards={() => setShowingFilteredCards((v) => !v)}
       />
 
       {showBatchBar && (
@@ -363,6 +394,7 @@ export function LibraryView({
             showBatchBar={showBatchBar}
             liveDownloads={liveDownloads}
             busy={busy}
+            forceShowHiddenCards={showingFilteredCards}
             onToggleSelect={toggleSelect}
             onToggleSelectMany={toggleSelectMany}
             onSelectAddon={onSelectAddon}
@@ -380,6 +412,7 @@ export function LibraryView({
             batchMode={batchMode}
             liveDownloads={liveDownloads}
             busy={busy}
+            forceShowHiddenCards={showingFilteredCards}
             onToggleSelect={toggleSelect}
             onToggleSelectMany={toggleSelectMany}
             onSelectAddon={onSelectAddon}

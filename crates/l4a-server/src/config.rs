@@ -1,5 +1,8 @@
 use crate::credentials::write_private_file;
-use l4a_protocol::{CatalogSyncConfigDto, SteamAuthMode};
+use l4a_protocol::{
+    CatalogFilterBackendKind, CatalogFilterConfigDto, CatalogSyncConfigDto,
+    FilterGalleryAggregation, FilterModelParams, SteamAuthMode,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,6 +16,7 @@ pub struct CatalogConfig {
     pub steam: SteamSection,
     pub sync: SyncSection,
     pub search: SearchSection,
+    pub filter: FilterSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +157,152 @@ impl Default for SearchSection {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FilterSection {
+    pub enabled: bool,
+    pub backend: CatalogFilterBackendKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deploy_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_bin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_url: Option<String>,
+    pub cache_ttl_secs: u64,
+    pub threads: u32,
+    pub enable_text: bool,
+    pub enable_image: bool,
+    pub max_images: u32,
+    pub gallery_aggregation: FilterGalleryAggregation,
+    pub gore_weight: f32,
+    pub nsfw_weight: f32,
+    pub temperature: f32,
+    pub bias: f32,
+}
+
+impl Default for FilterSection {
+    fn default() -> Self {
+        let p = FilterModelParams::default();
+        Self {
+            enabled: false,
+            backend: CatalogFilterBackendKind::ManagedPython,
+            deploy_dir: None,
+            python_bin: None,
+            upstream_url: None,
+            cache_ttl_secs: 3_600,
+            threads: p.threads,
+            enable_text: p.enable_text,
+            enable_image: p.enable_image,
+            max_images: p.max_images,
+            gallery_aggregation: p.gallery_aggregation,
+            gore_weight: p.gore_weight,
+            nsfw_weight: p.nsfw_weight,
+            temperature: p.temperature,
+            bias: p.bias,
+        }
+    }
+}
+
+impl FilterSection {
+    pub fn params(&self) -> FilterModelParams {
+        FilterModelParams {
+            threads: self.threads,
+            enable_text: self.enable_text,
+            enable_image: self.enable_image,
+            max_images: self.max_images,
+            gallery_aggregation: self.gallery_aggregation,
+            gore_weight: self.gore_weight,
+            nsfw_weight: self.nsfw_weight,
+            temperature: self.temperature,
+            bias: self.bias,
+        }
+        .sanitized()
+    }
+
+    pub fn normalize(&mut self) {
+        self.deploy_dir = self
+            .deploy_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        self.python_bin = self
+            .python_bin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        self.upstream_url = self
+            .upstream_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        self.cache_ttl_secs = self.cache_ttl_secs.min(86_400);
+
+        let p = self.params();
+        self.threads = p.threads;
+        self.enable_text = p.enable_text;
+        self.enable_image = p.enable_image;
+        self.max_images = p.max_images;
+        self.gallery_aggregation = p.gallery_aggregation;
+        self.gore_weight = p.gore_weight;
+        self.nsfw_weight = p.nsfw_weight;
+        self.temperature = p.temperature;
+        self.bias = p.bias;
+    }
+
+    pub fn to_dto(&self) -> CatalogFilterConfigDto {
+        let mut normalized = self.clone();
+        normalized.normalize();
+        let params = normalized.params();
+        CatalogFilterConfigDto {
+            enabled: normalized.enabled,
+            backend: normalized.backend,
+            deploy_dir: normalized.deploy_dir.map(|p| p.display().to_string()),
+            python_bin: normalized.python_bin,
+            upstream_url: normalized.upstream_url,
+            cache_ttl_secs: normalized.cache_ttl_secs,
+            params,
+        }
+    }
+
+    pub fn apply_dto(&mut self, dto: &CatalogFilterConfigDto) {
+        self.enabled = dto.enabled;
+        self.backend = dto.backend;
+        self.deploy_dir = dto
+            .deploy_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        self.python_bin = dto
+            .python_bin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        self.upstream_url = dto
+            .upstream_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        self.cache_ttl_secs = dto.cache_ttl_secs.min(86_400);
+
+        let p = dto.params.sanitized();
+        self.threads = p.threads;
+        self.enable_text = p.enable_text;
+        self.enable_image = p.enable_image;
+        self.max_images = p.max_images;
+        self.gallery_aggregation = p.gallery_aggregation;
+        self.gore_weight = p.gore_weight;
+        self.nsfw_weight = p.nsfw_weight;
+        self.temperature = p.temperature;
+        self.bias = p.bias;
+    }
+}
+
 pub fn generate_initial_password() -> String {
     format!("cat_{}", uuid::Uuid::new_v4().simple())
 }
@@ -206,6 +356,7 @@ impl CatalogConfig {
         }
         self.search.steam_timeout_ms = self.search.steam_timeout_ms.clamp(500, 15_000);
         self.search.cache_ttl_secs = self.search.cache_ttl_secs.min(3_600);
+        self.filter.normalize();
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {

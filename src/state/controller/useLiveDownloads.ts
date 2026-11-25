@@ -1,6 +1,10 @@
 import type { RefObject } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { DashboardSnapshot } from '../../api/ipc';
+import type {
+  DashboardSnapshot,
+  FilterItemVerdict,
+  LocalFilterDeploymentStatus,
+} from '../../api/ipc';
 import { IpcError } from '../../api/ipc';
 import type {
   DesktopClient,
@@ -17,6 +21,8 @@ export interface UseLiveDownloadsParams {
   onOpenReconcileRef: RefObject<(() => void) | undefined>;
   notify: NotifyFn;
   refresh: () => Promise<boolean>;
+  onFilterVerdictsUpdated?: (verdicts: FilterItemVerdict[]) => void;
+  onLocalFilterStatusChanged?: (status: LocalFilterDeploymentStatus) => void;
 }
 
 export function useLiveDownloads({
@@ -26,6 +32,8 @@ export function useLiveDownloads({
   onOpenReconcileRef,
   notify,
   refresh,
+  onFilterVerdictsUpdated,
+  onLocalFilterStatusChanged,
 }: UseLiveDownloadsParams) {
   const [liveDownloads, setLiveDownloads] = useState<Record<string, LiveDownloadState>>({});
   const downloadSeqRef = useRef(0);
@@ -103,6 +111,10 @@ export function useLiveDownloads({
           });
         } else if (ev.type === 'watch_error') {
           notify(ev.message, { tone: 'error' });
+        } else if (ev.type === 'filter_verdicts_updated') {
+          onFilterVerdictsUpdated?.(ev.verdicts);
+        } else if (ev.type === 'local_filter_status_changed') {
+          onLocalFilterStatusChanged?.(ev.status);
         }
       })
       .then((fn) => {
@@ -121,7 +133,16 @@ export function useLiveDownloads({
       active = false;
       unlisten?.();
     };
-  }, [client, notify, onOpenReconcileRef, refresh, snapshotRef, tRef]);
+  }, [
+    client,
+    notify,
+    onFilterVerdictsUpdated,
+    onLocalFilterStatusChanged,
+    onOpenReconcileRef,
+    refresh,
+    snapshotRef,
+    tRef,
+  ]);
 
   const hasLiveDownloads = Object.keys(liveDownloads).length > 0;
 

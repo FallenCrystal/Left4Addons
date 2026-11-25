@@ -43,6 +43,35 @@
 ### `GET /api/v1/collections/{collection_id}?refresh=false`
 查询合集元数据及其子条目明细（若目标或子条目缺失会自动穿透拉取并补全 `items`；若目标 ID 非合集类型返回 `404`）。
 
+### `GET /api/v1/filter/info`
+查询内容过滤概率推理服务的公开能力信息 (`CatalogFilterPublicInfo`)：
+```json
+{
+  "enabled": true,
+  "ready": true,
+  "modelName": "Left4FiltersModel",
+  "modelVersion": "1.0.0",
+  "maxImages": 2
+}
+```
+
+### `POST /api/v1/filter/predict`
+对创意工坊条目或给定多模态输入执行敏感度概率评估 (`FilterPredictRequest` -> `FilterProbabilities`)：
+```json
+{
+  "workshopId": "2814104912",
+  "title": "Optional Title",
+  "description": "Optional Description",
+  "tags": ["Survivors"],
+  "imagesBase64": [],
+  "imageUrls": ["https://images.steamusercontent.com/ugc/..."]
+}
+```
+- **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
+- **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
+- **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。
+- **SSRF 与载荷限制**：`imageUrls` 仅允许 `https://` 协议及受信任的 Steam CDN 域名白名单（`steamuserimages-a.akamaihd.net`、`images.steamusercontent.com`、`steamcdn-a.akamaihd.net`、`cdn.cloudflare.steamstatic.com`、`shared.cloudflare.steamstatic.com`、`shared.fastly.steamstatic.com`），禁止跨域名重定向至非白名单主机，单图上限 `10 MiB`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+
 ---
 
 ## 2. 管理员认证接口
@@ -61,7 +90,7 @@
 ## 3. 控制台运维与 SteamKit CM 接口
 
 ### 总览、同步与审计
-- `GET /api/v1/admin/overview` — 获取缓存统计、Steam CM 状态、同步引擎进度与实例配置路径
+- `GET /api/v1/admin/overview` — 获取缓存统计、Steam CM 状态、同步引擎进度、内容过滤服务状态 (`filter`) 与实例配置路径
 - `GET /api/v1/admin/stats` — 获取缓存分类计数 (`CatalogStats`)
 - `GET /api/v1/admin/audit?limit=200` — 查询运维与下架墓碑审计日志
 - `GET /api/v1/admin/sync/status` — 获取同步策略与游标进度
@@ -69,6 +98,12 @@
 - `POST /api/v1/admin/sync/trigger` — 立即执行一轮 `RankedByLastUpdatedDate` 增量同步
 - `POST /api/v1/admin/sync/reset-cursor` — 将全量创意工坊回填游标重置为 `*`
 - `POST /api/v1/admin/sync/fetch` — 手动按指定 Workshop ID 列表强制从 Steam CM 抓取预热（若含合集自动展开抓取子项）
+
+### 内容过滤模型服务
+- `GET /api/v1/admin/filter/status` — 获取内容过滤后端配置、就绪态、运行 PID / 活动端点、请求与缓存命中计数及最近错误 (`CatalogFilterStatus`)
+- `PATCH /api/v1/admin/config/filter` — 更新 `[filter]` 后端模式与模型校准参数，持久化写回 `catalog.toml`，热更新 `ManagedPython` 参数或切换后端，并写入 `filter_config_update` 审计日志
+- `POST /api/v1/admin/filter/restart` — 重启托管 Python 过滤子进程或重新探测 `UpstreamHttp` 健康状态，清空推理缓存并写入 `filter_restart` 审计日志
+- `POST /api/v1/admin/filter/test` — 管理员在线概率试算沙盒接口（输入 `FilterPredictRequest`，返回 `FilterProbabilities`）
 
 ### SteamKit CM 账号会话
 - `GET /api/v1/admin/steam/status` — 查看当前 CM 连接详情与进行中的认证流状态
@@ -85,3 +120,4 @@
 - `POST /api/v1/admin/items/{workshop_id}/refresh` — 强制从 Steam CM 重刷单条记录（若处于覆写锁定则返回 `409 Conflict`）
 - `POST /api/v1/admin/items/{workshop_id}/override` — 强制覆写并锁定条目状态、标题、备用 `fileUrl` 或前置依赖
 - `DELETE /api/v1/admin/items/{workshop_id}/override` — 解除管理员覆写锁定并恢复上游同步
+

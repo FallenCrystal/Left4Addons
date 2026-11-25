@@ -7,6 +7,7 @@ import {
   Check,
   Cpu,
   Download,
+  Filter,
   FolderOpen,
   FolderSearch,
   Palette,
@@ -15,10 +16,19 @@ import {
   TextCursorInput,
 } from 'lucide-react';
 import type {
+  AddonId,
+  AddonSummary,
   AppConfig,
+  DeployLocalFilterRequest,
+  FilterEvaluationTarget,
+  FilterExclusionRecord,
+  FilterItemVerdict,
+  FilterTokenStatus,
   GameUpdateDummyPolicy,
   InvalidCharReplace,
+  LocalFilterDeploymentStatus,
   SteamCapabilities,
+  UpsertFilterExclusionRequest,
 } from '../../api/ipc';
 import { previewFilenameByRules } from '../../utils/format';
 import { THEME_SEEDS, type ThemeMode, type ThemePreference } from '../../utils/theme';
@@ -29,12 +39,14 @@ import {
   Switch,
   TextField,
 } from '../m3/primitives';
+import { FilterSettingsSection } from './settings/FilterSettingsSection';
 
 export type SettingsSection =
   | 'paths'
   | 'bypass'
   | 'downloads'
   | 'sources'
+  | 'filter'
   | 'rename'
   | 'appearance';
 
@@ -47,6 +59,12 @@ export interface SettingsViewProps {
   busy: boolean;
   themePref: ThemePreference;
   language: 'zh' | 'en';
+  addons?: AddonSummary[];
+  exclusions?: FilterExclusionRecord[];
+  localFilterStatus?: LocalFilterDeploymentStatus | null;
+  filterStatusBusy?: boolean;
+  filterTokenStatus?: FilterTokenStatus | null;
+  filterEvalError?: string | null;
   onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<boolean>;
   onDetectPath: () => Promise<string | null>;
   onOpenInFileManager: (path: string) => void;
@@ -54,6 +72,22 @@ export interface SettingsViewProps {
   onChangeTheme: (pref: ThemePreference) => void;
   onChangeLanguage: (lang: 'zh' | 'en') => void;
   onNotify: (msg: string, tone?: 'default' | 'error') => void;
+  onRefreshLocalFilterStatus?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onCheckLocalFilterUpdates?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onDeployLocalFilter?: (
+    request: DeployLocalFilterRequest,
+  ) => Promise<LocalFilterDeploymentStatus | null>;
+  onStartLocalFilterService?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onStopLocalFilterService?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onRefreshFilterTokenStatus?: () => Promise<FilterTokenStatus | null>;
+  onSetFilterLlmToken?: (token: string | null) => Promise<FilterTokenStatus | null>;
+  onClearFilterCache?: () => Promise<number | null>;
+  onEvaluateSandboxTarget?: (
+    target: FilterEvaluationTarget,
+  ) => Promise<FilterItemVerdict | null>;
+  onUpsertFilterExclusion?: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
+  onDeleteFilterExclusion?: (addonId: AddonId) => Promise<boolean>;
+  onSelectAddon?: (addon: AddonSummary) => void;
 }
 
 export function SettingsView({
@@ -65,6 +99,12 @@ export function SettingsView({
   busy,
   themePref,
   language,
+  addons = [],
+  exclusions = [],
+  localFilterStatus = null,
+  filterStatusBusy = false,
+  filterTokenStatus = null,
+  filterEvalError = null,
   onSaveConfig,
   onDetectPath,
   onOpenInFileManager,
@@ -72,6 +112,18 @@ export function SettingsView({
   onChangeTheme,
   onChangeLanguage,
   onNotify,
+  onRefreshLocalFilterStatus = async () => null,
+  onCheckLocalFilterUpdates = async () => null,
+  onDeployLocalFilter = async () => null,
+  onStartLocalFilterService = async () => null,
+  onStopLocalFilterService = async () => null,
+  onRefreshFilterTokenStatus = async () => null,
+  onSetFilterLlmToken = async () => null,
+  onClearFilterCache = async () => null,
+  onEvaluateSandboxTarget = async () => null,
+  onUpsertFilterExclusion = async () => false,
+  onDeleteFilterExclusion = async () => false,
+  onSelectAddon,
 }: SettingsViewProps) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<AppConfig | null>(null);
@@ -90,6 +142,7 @@ export function SettingsView({
     { id: 'bypass', label: t('settings.sections.bypass'), icon: Shield },
     { id: 'downloads', label: t('settings.sections.downloads'), icon: Download },
     { id: 'sources', label: t('settings.sections.sources'), icon: Cpu },
+    { id: 'filter', label: t('settings.sections.filter'), icon: Filter },
     { id: 'rename', label: t('settings.sections.rename'), icon: TextCursorInput },
     { id: 'appearance', label: t('settings.sections.appearance'), icon: Palette },
   ];
@@ -508,6 +561,42 @@ export function SettingsView({
                 </div>
               </section>
             </>
+          )}
+
+          {section === 'filter' && (
+            <FilterSettingsSection
+              effectiveConfig={effective}
+              dirty={dirty}
+              busy={busy}
+              filterStatusBusy={filterStatusBusy}
+              localStatus={localFilterStatus}
+              tokenStatus={filterTokenStatus}
+              evalError={filterEvalError}
+              addons={addons}
+              namePreference={effective.addonNamePreference ?? 'workshop_title'}
+              exclusions={exclusions}
+              onUpdateFilter={(updater) =>
+                updateDraft((d) => ({ ...d, filter: updater(d.filter) }))
+              }
+              onSaveDraftFirst={async () => {
+                if (!dirty) return true;
+                const ok = await onSaveConfig(effective, pathsChanged);
+                if (ok) setDraft(null);
+                return ok;
+              }}
+              onRefreshLocalStatus={onRefreshLocalFilterStatus}
+              onCheckLocalUpdates={onCheckLocalFilterUpdates}
+              onDeployLocalFilter={onDeployLocalFilter}
+              onStartLocalService={onStartLocalFilterService}
+              onStopLocalService={onStopLocalFilterService}
+              onRefreshTokenStatus={onRefreshFilterTokenStatus}
+              onSetLlmToken={onSetFilterLlmToken}
+              onClearFilterCache={onClearFilterCache}
+              onEvaluateSandbox={onEvaluateSandboxTarget}
+              onUpsertExclusion={onUpsertFilterExclusion}
+              onDeleteExclusion={onDeleteFilterExclusion}
+              onSelectAddon={onSelectAddon}
+            />
           )}
 
           {section === 'rename' && (

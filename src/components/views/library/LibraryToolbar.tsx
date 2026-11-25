@@ -3,6 +3,7 @@ import {
   ArrowUpCircle,
   CheckSquare,
   CloudOff,
+  EyeOff,
   LayoutGrid,
   Layers,
   List,
@@ -51,6 +52,9 @@ export interface LibraryToolbarProps {
   onToggleCollapseBundles?: (next: boolean) => void;
   externalFilter: ExternalAddonFilter | null;
   onClearExternalFilter: () => void;
+  filteredOutCount?: number;
+  showingFilteredCards?: boolean;
+  onToggleShowFilteredCards?: () => void;
 }
 
 export function LibraryToolbar({
@@ -78,6 +82,9 @@ export function LibraryToolbar({
   onToggleCollapseBundles,
   externalFilter,
   onClearExternalFilter,
+  filteredOutCount = 0,
+  showingFilteredCards = false,
+  onToggleShowFilteredCards,
 }: LibraryToolbarProps) {
   const { t } = useTranslation();
 
@@ -199,6 +206,21 @@ export function LibraryToolbar({
             tone={scope === 'removed' ? 'default' : 'error'}
             icon={<CloudOff size={14} />}
             onClick={() => onScopeChange(scope === 'removed' ? 'all' : 'removed')}
+          />
+        )}
+
+        {filteredOutCount > 0 && (
+          <FilterChip
+            label={
+              showingFilteredCards
+                ? t('filter.filteredCountShowing', { count: filteredOutCount })
+                : t('filter.filteredCount', { count: filteredOutCount })
+            }
+            selected={showingFilteredCards}
+            tone={showingFilteredCards ? 'tertiary' : 'surface'}
+            icon={<EyeOff size={14} />}
+            onClick={onToggleShowFilteredCards}
+            onRemove={showingFilteredCards ? onToggleShowFilteredCards : undefined}
           />
         )}
 

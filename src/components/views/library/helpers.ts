@@ -214,6 +214,8 @@ export interface BuildLibraryDisplayItemsParams {
   mapMatchedIds: Set<string> | null;
   sortBy: LibrarySort;
   namePreference: AddonNamePreference;
+  hiddenAddonIds?: ReadonlySet<string>;
+  enforceHide?: boolean;
 }
 
 export function buildLibraryDisplayItems({
@@ -229,9 +231,12 @@ export function buildLibraryDisplayItems({
   mapMatchedIds,
   sortBy,
   namePreference,
+  hiddenAddonIds,
+  enforceHide = true,
 }: BuildLibraryDisplayItemsParams): {
   displayItems: LibraryDisplayItem[];
   visibleAddons: AddonSummary[];
+  filteredOutCount: number;
 } {
   const extAddonSet = externalFilter?.addonIds ? new Set(externalFilter.addonIds) : null;
   const extWorkshopSet = externalFilter?.workshopIds
@@ -285,6 +290,21 @@ export function buildLibraryDisplayItems({
     return matchesAddonSearch(a, trimmedQuery);
   };
 
+  let filteredOutCount = 0;
+  for (const addon of addons) {
+    if (
+      hiddenAddonIds?.has(addon.id) &&
+      matchesScope(addon) &&
+      matchesCategory(addon) &&
+      matchesQuery(addon)
+    ) {
+      filteredOutCount += 1;
+    }
+  }
+
+  const isOmittedByFilter = (addon: AddonSummary): boolean =>
+    Boolean(enforceHide && hiddenAddonIds?.has(addon.id));
+
   const items: LibraryDisplayItem[] = [];
   const claimedAddonIds = new Set<string>();
   const isGeneralBrowse =
@@ -293,7 +313,7 @@ export function buildLibraryDisplayItems({
   if (collapseBundles && !externalFilter) {
     for (const bundle of bundles) {
       const unclaimedMembers = getInstalledBundleMembers(bundle, addonsById).filter(
-        (addon) => !claimedAddonIds.has(addon.id),
+        (addon) => !claimedAddonIds.has(addon.id) && !isOmittedByFilter(addon),
       );
       if (!canCollapseCampaignBundle(unclaimedMembers)) continue;
 
@@ -338,7 +358,7 @@ export function buildLibraryDisplayItems({
   }
 
   for (const addon of addons) {
-    if (claimedAddonIds.has(addon.id)) continue;
+    if (claimedAddonIds.has(addon.id) || isOmittedByFilter(addon)) continue;
     if (matchesScope(addon) && matchesCategory(addon) && matchesQuery(addon)) {
       items.push({ kind: 'addon', addon });
     }
@@ -401,5 +421,5 @@ export function buildLibraryDisplayItems({
     }
   }
 
-  return { displayItems: items, visibleAddons: flattenedVisible };
+  return { displayItems: items, visibleAddons: flattenedVisible, filteredOutCount };
 }

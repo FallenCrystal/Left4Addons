@@ -5,6 +5,7 @@ import type { AppConfig, DashboardSnapshot, SteamCapabilities, SyncReport } from
 import type { BatchDialogPayload, NotifyOptions, SnackbarItem } from './controller/types';
 import { getClient } from './controller/types';
 import { useAddonActions } from './controller/useAddonActions';
+import { useContentFilter } from './controller/useContentFilter';
 import { useLiveDownloads } from './controller/useLiveDownloads';
 import { useOrganizeActions } from './controller/useOrganizeActions';
 
@@ -212,6 +213,16 @@ export function useAppController(onOpenReconcile?: () => void) {
     };
   }, [bootstrapNonce, client, commitSnapshot, isTauri, nextSnapshotSeq, notify]);
 
+  const contentFilter = useContentFilter({
+    client,
+    snapshot,
+    tRef,
+    commitSnapshot,
+    nextSnapshotSeq,
+    notify,
+    setBusy,
+  });
+
   const liveDownloadController = useLiveDownloads({
     client,
     snapshotRef,
@@ -219,6 +230,8 @@ export function useAppController(onOpenReconcile?: () => void) {
     onOpenReconcileRef,
     notify,
     refresh,
+    onFilterVerdictsUpdated: contentFilter.handleFilterVerdictsUpdated,
+    onLocalFilterStatusChanged: contentFilter.handleLocalFilterStatusChanged,
   });
 
   const addonActions = useAddonActions({
@@ -301,6 +314,27 @@ export function useAppController(onOpenReconcile?: () => void) {
     searchByMapCode: addonActions.searchByMapCode,
     openExternalUrl: addonActions.openExternalUrl,
     openInFileManager: addonActions.openInFileManager,
+    filterConfig: contentFilter.filterConfig,
+    filterVerdicts: contentFilter.filterVerdicts,
+    exclusionsByAddonId: contentFilter.exclusionsByAddonId,
+    localFilterStatus: contentFilter.localFilterStatus,
+    filterStatusBusy: contentFilter.filterStatusBusy,
+    filterTokenStatus: contentFilter.filterTokenStatus,
+    filterEvalError: contentFilter.filterEvalError,
+    revealedCardIds: contentFilter.revealedCardIds,
+    revealCard: contentFilter.revealCard,
+    registerWorkshopItems: contentFilter.registerWorkshopItems,
+    refreshLocalFilterStatus: contentFilter.refreshLocalFilterStatus,
+    checkLocalFilterUpdates: contentFilter.checkLocalFilterUpdates,
+    deployLocalFilter: contentFilter.deployLocalFilter,
+    startLocalFilterService: contentFilter.startLocalFilterService,
+    stopLocalFilterService: contentFilter.stopLocalFilterService,
+    refreshFilterTokenStatus: contentFilter.refreshFilterTokenStatus,
+    setFilterLlmToken: contentFilter.setFilterLlmToken,
+    clearFilterCache: contentFilter.clearFilterCache,
+    evaluateSandboxTarget: contentFilter.evaluateSandboxTarget,
+    upsertFilterExclusion: contentFilter.upsertFilterExclusion,
+    deleteFilterExclusion: contentFilter.deleteFilterExclusion,
   };
 }
 
