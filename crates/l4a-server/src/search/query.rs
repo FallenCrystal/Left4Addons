@@ -4,7 +4,7 @@ use super::text::{
 };
 use super::{
     ParsedQuery, QueryTerm, Token, MAX_COMPACT_LEN, MAX_COMPACT_SPAN, MAX_PINYIN_SPAN,
-    MIN_COMPACT_PREFIX_LEN, MIN_CREATOR_PREFIX_LEN, MIN_PREFIX_LEN,
+    MIN_COMPACT_PREFIX_LEN, MIN_CREATOR_PREFIX_LEN, MIN_PINYIN_LEN, MIN_PREFIX_LEN,
 };
 use std::collections::HashSet;
 use url::Url;
@@ -28,6 +28,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
             whole_compact: None,
             literal_substrings: Vec::new(),
             compact_all: String::new(),
+            can_match_pinyin: false,
         });
     }
 
@@ -61,16 +62,7 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
     let terms = parse_query_terms(trimmed, &exact_only_words);
     let compact_all = query_terms_compact_all(&terms);
 
-    let all_words = !terms.is_empty()
-        && terms.iter().all(|t| {
-            matches!(
-                t,
-                QueryTerm::Word {
-                    exact_only: false,
-                    ..
-                } | QueryTerm::Word { .. }
-            )
-        });
+    let all_words = !terms.is_empty() && terms.iter().all(|t| matches!(t, QueryTerm::Word { .. }));
     let any_exact_literal = !literal_substrings.is_empty();
     let whole_compact = if all_words && !any_exact_literal && terms.len() >= 2 {
         let all_ascii_alpha = terms.iter().all(|t| match t {
@@ -95,6 +87,21 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
         None
     };
 
+    let can_match_pinyin = literal_substrings.is_empty()
+        && (whole_compact
+            .as_deref()
+            .is_some_and(|wc| is_pure_ascii_alpha(wc) && wc.len() >= MIN_PINYIN_LEN)
+            || terms.iter().any(|term| {
+                matches!(
+                    term,
+                    QueryTerm::Word {
+                        compact,
+                        exact_only: false,
+                        ..
+                    } if is_pure_ascii_alpha(compact) && compact.len() >= MIN_PINYIN_LEN
+                )
+            }));
+
     Some(ParsedQuery {
         raw_trimmed: trimmed.to_string(),
         raw_folded,
@@ -104,20 +111,36 @@ pub fn parse_query(raw: &str) -> Option<ParsedQuery> {
         whole_compact,
         literal_substrings,
         compact_all,
+        can_match_pinyin,
     })
 }
 
 pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
+    build_primary_fts_query_inner(query, true)
+}
+
+pub fn build_title_only_fts_query(query: &ParsedQuery) -> Option<String> {
+    build_primary_fts_query_inner(query, false)
+}
+
+const MAX_FTS_QUERY_TERMS: usize = 64;
+
+fn build_primary_fts_query_inner(query: &ParsedQuery, include_creator: bool) -> Option<String> {
     if query.terms.is_empty() {
         return None;
     }
 
-    let mut term_clauses = Vec::with_capacity(query.terms.len());
-    for term in &query.terms {
+    let fts_terms = &query.terms[..query.terms.len().min(MAX_FTS_QUERY_TERMS)];
+    let mut term_clauses = Vec::with_capacity(fts_terms.len());
+    for term in fts_terms {
         match term {
             QueryTerm::Cjk(chars) => {
                 let phrase = cjk_phrase(chars);
-                term_clauses.push(format!("{{title_tokens creator_tokens}} : {phrase}"));
+                if include_creator {
+                    term_clauses.push(format!("{{title_tokens creator_tokens}} : {phrase}"));
+                } else {
+                    term_clauses.push(format!("title_tokens : {phrase}"));
+                }
             }
             QueryTerm::Word {
                 compact,
@@ -128,9 +151,13 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
                 let char_len = compact.chars().count();
                 let q = fts_quote(compact);
                 if *exact_only || char_len < MIN_PREFIX_LEN {
-                    branches.push(format!(
-                        "{{title_tokens title_compact creator_tokens}} : {q}"
-                    ));
+                    if include_creator {
+                        branches.push(format!(
+                            "{{title_tokens title_compact creator_tokens}} : {q}"
+                        ));
+                    } else {
+                        branches.push(format!("{{title_tokens title_compact}} : {q}"));
+                    }
                 } else {
                     branches.push(format!("title_tokens : {q}*"));
                     if char_len >= MIN_COMPACT_PREFIX_LEN {
@@ -138,10 +165,12 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
                     } else {
                         branches.push(format!("title_compact : {q}"));
                     }
-                    if char_len >= MIN_CREATOR_PREFIX_LEN {
-                        branches.push(format!("creator_tokens : {q}*"));
-                    } else {
-                        branches.push(format!("creator_tokens : {q}"));
+                    if include_creator {
+                        if char_len >= MIN_CREATOR_PREFIX_LEN {
+                            branches.push(format!("creator_tokens : {q}*"));
+                        } else {
+                            branches.push(format!("creator_tokens : {q}"));
+                        }
                     }
                 }
 
@@ -162,7 +191,11 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
                         })
                         .collect::<Vec<_>>()
                         .join(" AND ");
-                    branches.push(format!("{{title_tokens creator_tokens}} : ({sub_expr})"));
+                    if include_creator {
+                        branches.push(format!("{{title_tokens creator_tokens}} : ({sub_expr})"));
+                    } else {
+                        branches.push(format!("title_tokens : ({sub_expr})"));
+                    }
                 }
 
                 if !*exact_only {
@@ -178,10 +211,12 @@ pub fn build_primary_fts_query(query: &ParsedQuery) -> Option<String> {
     if let Some(ref wc) = query.whole_compact {
         let wq = fts_quote(wc);
         let mut wc_branches = vec![format!("{{title_tokens title_compact}} : {wq}*")];
-        if wc.chars().count() >= MIN_CREATOR_PREFIX_LEN {
-            wc_branches.push(format!("creator_tokens : {wq}*"));
-        } else {
-            wc_branches.push(format!("creator_tokens : {wq}"));
+        if include_creator {
+            if wc.chars().count() >= MIN_CREATOR_PREFIX_LEN {
+                wc_branches.push(format!("creator_tokens : {wq}*"));
+            } else {
+                wc_branches.push(format!("creator_tokens : {wq}"));
+            }
         }
         wc_branches.extend(pinyin_fts_clause(wc));
         Some(format!("({and_expr}) OR ({})", wc_branches.join(" OR ")))
@@ -195,8 +230,9 @@ pub fn build_desc_fts_query(query: &ParsedQuery) -> Option<String> {
         return None;
     }
 
-    let mut term_clauses = Vec::with_capacity(query.terms.len());
-    for term in &query.terms {
+    let fts_terms = &query.terms[..query.terms.len().min(MAX_FTS_QUERY_TERMS)];
+    let mut term_clauses = Vec::with_capacity(fts_terms.len());
+    for term in fts_terms {
         match term {
             QueryTerm::Cjk(chars) => {
                 let phrase = cjk_phrase(chars);

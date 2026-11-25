@@ -228,16 +228,26 @@ export function LinearProgress({
 export function EmptyState({
   icon,
   title,
+  description,
   action,
 }: {
   icon: ReactNode;
   title: string;
+  description?: string;
   action?: ReactNode;
 }) {
   return (
     <div className="md-empty">
       <div className="md-empty-icon">{icon}</div>
       <div className="md-title-medium">{title}</div>
+      {description && (
+        <div
+          className="md-body-small"
+          style={{ color: 'var(--md-sys-color-on-surface-variant)', maxWidth: 460 }}
+        >
+          {description}
+        </div>
+      )}
       {action}
     </div>
   );

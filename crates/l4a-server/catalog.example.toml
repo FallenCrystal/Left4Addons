@@ -34,3 +34,15 @@ incremental_pages_per_tick = 2
 enable_backfill = false
 backfill_interval_secs = 15
 backfill_batch_size = 50
+
+[search]
+# 启用 SteamKit CM + 本地索引混合检索（复刻创意工坊网页端排序与多语言匹配）
+enable_hybrid_search = true
+# 未指定 lang 参数或 Accept-Language 时的默认 Steam 检索语言（如 english / schinese / tchinese）
+default_language = "english"
+# 单次实时检索 Steam CM 的超时预算（毫秒，超过后自动优雅回退到本地索引）
+steam_timeout_ms = 4500
+# 实时 Steam 检索页在内存中的短缓存 TTL（秒，0 表示禁用缓存）
+cache_ttl_secs = 60
+# 将实时检索到的公开条目异步写入按 ID 查询缓存
+cache_steam_results = true

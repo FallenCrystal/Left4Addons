@@ -522,7 +522,8 @@ impl CatalogSyncCoordinator {
                 .await?;
 
             let next = page.next_cursor.filter(|_| !past_boundary);
-            let stalled = next.as_ref() == Some(&pending.cursor);
+            let stalled =
+                next.as_deref() == Some(pending.cursor.as_str()) || next.as_deref() == Some("*");
             let complete = next.is_none();
             if complete {
                 scan.checkpoint = scan.checkpoint.max(pending.newest);
@@ -594,14 +595,20 @@ impl CatalogSyncCoordinator {
         {
             let mut m = self.metrics.lock().unwrap();
             m.backfill_running = false;
-            if let Err(ref err) = res {
-                m.last_sync_error = Some(err.to_string());
+            match &res {
+                Ok(Some(_)) => {
+                    m.last_sync_error = None;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    m.last_sync_error = Some(err.to_string());
+                }
             }
         }
-        res
+        res.map(|count| count.unwrap_or(0))
     }
 
-    async fn run_backfill_inner(&self) -> anyhow::Result<u64> {
+    async fn run_backfill_inner(&self) -> anyhow::Result<Option<u64>> {
         let batch_size = self
             .config_store
             .get()
@@ -614,7 +621,7 @@ impl CatalogSyncCoordinator {
             .unwrap_or_else(|| "*".to_string());
 
         if cursor == "DONE" {
-            return Ok(0);
+            return Ok(None);
         }
 
         let page = self
@@ -629,10 +636,13 @@ impl CatalogSyncCoordinator {
 
         let next_cursor = page
             .next_cursor
-            .filter(|c| c != &cursor)
+            .map(|c| c.trim().to_string())
+            .filter(|c| !is_terminal_or_stalled_cursor(c, &cursor))
             .unwrap_or_else(|| "DONE".to_string());
-        self.db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
-            .await
+        let written = self
+            .db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
+            .await?;
+        Ok(Some(written))
     }
 
     pub async fn reset_backfill_cursor(&self) -> anyhow::Result<()> {
@@ -750,6 +760,14 @@ fn is_stale(last_verified_at: DateTime<Utc>, ttl_secs: u64) -> bool {
     (Utc::now() - last_verified_at).num_seconds().max(0) as u64 >= ttl_secs
 }
 
+fn is_terminal_or_stalled_cursor(next: &str, current: &str) -> bool {
+    next.is_empty()
+        || next == current
+        || next == "*"
+        || next.eq_ignore_ascii_case("done")
+        || next.eq_ignore_ascii_case("null")
+}
+
 pub(crate) fn with_catalog_source(mut record: WorkshopItemRecord) -> WorkshopItemRecord {
     if record.source != MetadataSource::AdminOverride {
         record.source = MetadataSource::CatalogServer;
@@ -808,5 +826,53 @@ mod tests {
         assert_eq!(item.file_url.as_deref(), Some("cached-link"));
         release_tx.send(()).unwrap();
         hold_writer.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn backfill_recovery_clears_last_sync_error_without_clearing_on_done_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Arc::new(ServerRepo::open(&dir.path().join("catalog.db")).unwrap());
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        let coordinator = CatalogSyncCoordinator::new(
+            Arc::new(CatalogConfigStore::new(None, CatalogConfig::default())),
+            Arc::clone(&repo),
+            upstream.clone(),
+        );
+
+        upstream.set_fail_fetches(true);
+        assert!(coordinator.run_backfill_step_once().await.is_err());
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
+
+        upstream.set_fail_fetches(false);
+        assert_eq!(coordinator.run_backfill_step_once().await.unwrap(), 0);
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_none());
+
+        // Cursor is now DONE; an incremental error must not be wiped by a no-op backfill tick.
+        upstream.set_fail_fetches(true);
+        assert!(coordinator.run_incremental_once().await.is_err());
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
+        upstream.set_fail_fetches(false);
+        assert_eq!(coordinator.run_backfill_step_once().await.unwrap(), 0);
+        assert!(coordinator
+            .status()
+            .await
+            .unwrap()
+            .last_sync_error
+            .is_some());
     }
 }

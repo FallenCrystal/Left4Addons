@@ -67,7 +67,8 @@ export function extractWorkshopIdInput(raw: string): string | null {
 
   try {
     const parsed = new URL(trimmed);
-    const id = parsed.searchParams.get('id')?.trim();
+    const id = Array.from(parsed.searchParams)
+      .find(([key]) => key.toLowerCase() === 'id')?.[1].trim();
     if (id) {
       return normalizePositiveU64(id);
     }

@@ -5,8 +5,13 @@ mod scoring;
 mod tests;
 mod text;
 
-pub use query::{build_desc_fts_query, build_primary_fts_query, parse_query};
-pub use scoring::{score_desc_candidate, score_primary_candidate};
+pub use query::{
+    build_desc_fts_query, build_primary_fts_query, build_title_only_fts_query, parse_query,
+};
+pub use scoring::{
+    score_desc_candidate, score_primary_candidate, score_symbol_only_desc, score_symbol_only_title,
+    score_title_only_candidate,
+};
 pub use text::{fold_text, strip_bbcode_and_urls, tokenize_text};
 
 use pinyin::build_pinyin_tokens;
@@ -75,6 +80,7 @@ pub struct ParsedQuery {
     pub whole_compact: Option<String>,
     pub literal_substrings: Vec<String>,
     compact_all: String,
+    pub(super) can_match_pinyin: bool,
 }
 
 impl ParsedQuery {

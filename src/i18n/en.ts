@@ -330,6 +330,7 @@ export const en = {
       removed: 'Removed',
       private_or_unavailable: 'Unavailable',
     },
+    contentType: 'Content type',
     type: {
       item: 'Item',
       collection: 'Collection',

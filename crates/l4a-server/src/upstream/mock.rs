@@ -1,5 +1,5 @@
 use super::auth::render_qr_svg;
-use super::{WorkshopObservation, WorkshopQueryPage, WorkshopUpstream};
+use super::{SteamSearchRequest, WorkshopObservation, WorkshopQueryPage, WorkshopUpstream};
 use async_trait::async_trait;
 use chrono::Utc;
 use l4a_protocol::{
@@ -8,13 +8,19 @@ use l4a_protocol::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 #[derive(Default)]
 struct MockUpstreamState {
     outcomes: HashMap<WorkshopId, WorkshopObservation>,
     query_pages: HashMap<(u32, u32, String), WorkshopQueryPage>,
+    search_pages: HashMap<SteamSearchRequest, WorkshopQueryPage>,
+    recorded_searches: Vec<SteamSearchRequest>,
     fetch_counts: HashMap<WorkshopId, u64>,
     fail_fetches: bool,
+    fail_searches: bool,
+    failed_searches: HashSet<SteamSearchRequest>,
+    search_delay: Option<Duration>,
     failed_details: HashSet<WorkshopId>,
     mode: SteamAuthMode,
     account_name: Option<String>,
@@ -61,8 +67,28 @@ impl MockWorkshopUpstream {
             .insert((query_type, file_type, cursor.into()), page);
     }
 
+    pub fn insert_search_page(&self, req: SteamSearchRequest, page: WorkshopQueryPage) {
+        self.inner.lock().unwrap().search_pages.insert(req, page);
+    }
+
+    pub fn recorded_searches(&self) -> Vec<SteamSearchRequest> {
+        self.inner.lock().unwrap().recorded_searches.clone()
+    }
+
     pub fn set_fail_fetches(&self, fail: bool) {
         self.inner.lock().unwrap().fail_fetches = fail;
+    }
+
+    pub fn set_fail_searches(&self, fail: bool) {
+        self.inner.lock().unwrap().fail_searches = fail;
+    }
+
+    pub fn fail_search_request(&self, req: SteamSearchRequest) {
+        self.inner.lock().unwrap().failed_searches.insert(req);
+    }
+
+    pub fn set_search_delay(&self, delay: Option<Duration>) {
+        self.inner.lock().unwrap().search_delay = delay;
     }
 
     pub fn fail_details_containing(&self, wid: WorkshopId) {
@@ -129,6 +155,35 @@ impl WorkshopUpstream for MockWorkshopUpstream {
         Ok(guard
             .query_pages
             .get(&key)
+            .cloned()
+            .unwrap_or(WorkshopQueryPage {
+                total: 0,
+                next_cursor: None,
+                outcomes: Vec::new(),
+            }))
+    }
+
+    async fn search_files(
+        &self,
+        request: &SteamSearchRequest,
+    ) -> anyhow::Result<WorkshopQueryPage> {
+        let delay = {
+            let mut guard = self.inner.lock().unwrap();
+            guard.total_requests += 1;
+            guard.recorded_searches.push(request.clone());
+            if guard.fail_fetches || guard.fail_searches || guard.failed_searches.contains(request)
+            {
+                anyhow::bail!("Simulated Steam CM search_files failure");
+            }
+            guard.search_delay
+        };
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        let guard = self.inner.lock().unwrap();
+        Ok(guard
+            .search_pages
+            .get(request)
             .cloned()
             .unwrap_or(WorkshopQueryPage {
                 total: 0,

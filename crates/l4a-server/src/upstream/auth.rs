@@ -106,7 +106,8 @@ impl SteamCmInner {
             cfg.steam.refresh_token = Some(refresh_token);
         })?;
         Self::set_connected_meta(&mut meta, &conn);
-        *connection = Some(conn);
+        connection.generation += 1;
+        connection.conn = Some(conn);
         if let Some(flow) = &mut slot.active {
             flow.status.state = SteamAuthFlowState::Succeeded;
             flow.status.account_name = Some(account_name);
@@ -461,7 +462,8 @@ impl SteamCmClient {
                 cfg.steam.account_name = None;
                 cfg.steam.refresh_token = None;
             })?;
-            *connection = None;
+            connection.generation += 1;
+            connection.conn = None;
         }
         self.inner.persona_cache.write().await.clear();
         self.inner.get_or_connect().await?;

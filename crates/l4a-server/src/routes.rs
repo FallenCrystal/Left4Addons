@@ -6,8 +6,8 @@ use crate::ServerState;
 use axum::{
     extract::{Path, Query, Request, State},
     http::{
-        header::{CACHE_CONTROL, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
+        header::{ACCEPT_LANGUAGE, CACHE_CONTROL, SET_COOKIE, VARY},
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -20,8 +20,8 @@ use l4a_protocol::{
     AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogOverviewResponse, CatalogStats,
     CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, SearchQuery, SearchResponse,
     SetRefreshTokenRequest, StartCredentialsAuthRequest, SteamAuthFlowStatus,
-    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopId, WorkshopItemRecord,
-    WorkshopItemStatus,
+    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopFileType, WorkshopId,
+    WorkshopItemRecord, WorkshopItemStatus,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -58,9 +58,13 @@ impl RouteState {
 
 pub fn router(state: ServerState) -> Router {
     let state = RouteState { server: state };
+    let search_route = Router::new()
+        .route("/api/v1/items/search", get(search_items))
+        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(append_search_vary));
+
     let public_routes = Router::new()
         .route("/api/v1/health", get(health))
-        .route("/api/v1/items/search", get(search_items))
         .route("/api/v1/items/batch", post(batch_items))
         .route("/api/v1/items/{workshop_id}", get(get_item))
         .route("/api/v1/collections/{collection_id}", get(get_collection))
@@ -127,10 +131,32 @@ pub fn router(state: ServerState) -> Router {
         ));
 
     Router::new()
+        .merge(search_route)
         .merge(public_routes)
         .merge(admin_routes)
         .with_state(state)
         .layer(TraceLayer::new_for_http())
+}
+
+async fn append_search_vary(request: Request, next: Next) -> Response {
+    let should_vary = matches!(request.method(), &Method::GET | &Method::HEAD);
+    let mut response = next.run(request).await;
+    if !should_vary {
+        return response;
+    }
+    let has_accept_lang = response
+        .headers()
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| s.split(','))
+        .any(|part| part.trim().eq_ignore_ascii_case("accept-language"));
+    if !has_accept_lang {
+        response
+            .headers_mut()
+            .append(VARY, HeaderValue::from_static("Accept-Language"));
+    }
+    response
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
@@ -168,14 +194,36 @@ fn internal_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误")
 }
 
+fn search_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
+    if let Some(aborted) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::db::QueryAbortedError>())
+    {
+        tracing::warn!(error = %aborted, "搜索请求因并发限流或超时中止");
+        return match aborted {
+            crate::db::QueryAbortedError::Timeout => err_resp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "搜索耗时过长，请缩小关键词范围后重试",
+            ),
+            crate::db::QueryAbortedError::Busy => {
+                err_resp(StatusCode::SERVICE_UNAVAILABLE, "搜索服务繁忙，请稍后重试")
+            }
+            crate::db::QueryAbortedError::Cancelled => {
+                err_resp(StatusCode::SERVICE_UNAVAILABLE, "搜索请求已取消")
+            }
+        };
+    }
+    internal_err(err)
+}
+
 async fn health(State(state): State<RouteState>) -> ApiResult<Value> {
-    let stats = state.db(move |repo| repo.stats()).await?;
+    let total_items = state.db(move |repo| repo.total_items_count()).await?;
     let steam = state.server.upstream.status().await;
     Ok(Json(json!({
         "status": "ok",
         "service": "l4a-server",
         "version": env!("CARGO_PKG_VERSION"),
-        "items": stats.total_items,
+        "items": total_items,
         "steamState": steam.connection_state,
     })))
 }
@@ -224,15 +272,51 @@ async fn batch_items(
     Ok(Json(resp))
 }
 
+const MAX_SEARCH_QUERY_CHARS: usize = 512;
+const MAX_SEARCH_TAG_CHARS: usize = 128;
+
+fn empty_string_as_none<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = opt else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    serde_json::from_value(Value::String(trimmed.to_string()))
+        .or_else(|_| serde_json::from_str(trimmed))
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchParams {
     q: Option<String>,
     tag: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     status: Option<WorkshopItemStatus>,
     sort: Option<String>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     page: Option<u32>,
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     page_size: Option<u32>,
+    #[serde(alias = "language")]
+    lang: Option<String>,
+    #[serde(alias = "search_target", alias = "search_text_target")]
+    search_target: Option<String>,
+    #[serde(
+        default,
+        alias = "filetype",
+        alias = "file_type",
+        deserialize_with = "empty_string_as_none"
+    )]
+    file_type: Option<WorkshopFileType>,
 }
 
 impl From<SearchParams> for SearchQuery {
@@ -244,18 +328,60 @@ impl From<SearchParams> for SearchQuery {
             sort: params.sort,
             page: params.page.unwrap_or(1),
             page_size: params.page_size.unwrap_or(30),
+            language: params.lang,
+            search_target: params.search_target,
+            file_type: params.file_type,
         }
     }
 }
 
+fn validate_search_query(q: &SearchQuery) -> Result<(), (StatusCode, Json<Value>)> {
+    if q.query
+        .as_deref()
+        .is_some_and(|s| s.trim().chars().count() > MAX_SEARCH_QUERY_CHARS)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("搜索关键词长度不能超过 {MAX_SEARCH_QUERY_CHARS} 个字符"),
+        ));
+    }
+    if q.tag
+        .as_deref()
+        .is_some_and(|s| s.trim().chars().count() > MAX_SEARCH_TAG_CHARS)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            format!("标签参数长度不能超过 {MAX_SEARCH_TAG_CHARS} 个字符"),
+        ));
+    }
+    Ok(())
+}
+
 async fn search_items(
     State(state): State<RouteState>,
+    headers: HeaderMap,
     Query(params): Query<SearchParams>,
-) -> ApiResult<SearchResponse> {
+) -> Result<(HeaderMap, Json<SearchResponse>), (StatusCode, Json<Value>)> {
     let q = SearchQuery::from(params);
-    let mut res = state.db(move |repo| repo.search(&q, true)).await?;
-    res.items = res.items.into_iter().map(with_catalog_source).collect();
-    Ok(Json(res))
+    validate_search_query(&q)?;
+    let accept_language = headers
+        .get_all(ACCEPT_LANGUAGE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    let output = state
+        .server
+        .search
+        .search(&q, Some(&accept_language))
+        .await
+        .map_err(search_err)?;
+    let mut resp_headers = HeaderMap::new();
+    resp_headers.insert(
+        HeaderName::from_static("x-l4a-search-mode"),
+        HeaderValue::from_static(output.mode.as_header_value()),
+    );
+    Ok((resp_headers, Json(output.response)))
 }
 
 async fn admin_search_items(
@@ -265,7 +391,14 @@ async fn admin_search_items(
 ) -> ApiResult<SearchResponse> {
     state.require_admin(&headers)?;
     let q = SearchQuery::from(params);
-    Ok(Json(state.db(move |repo| repo.search(&q, false)).await?))
+    validate_search_query(&q)?;
+    let resp = state
+        .server
+        .search
+        .search_admin(&q)
+        .await
+        .map_err(search_err)?;
+    Ok(Json(resp))
 }
 
 async fn get_collection(

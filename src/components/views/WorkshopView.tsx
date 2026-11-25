@@ -23,6 +23,7 @@ import {
   type SearchQuery,
   type SearchResponse,
   type TrackedCollectionRecord,
+  type WorkshopFileType,
   type WorkshopItemRecord,
 } from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
@@ -43,6 +44,7 @@ import {
   IconButton,
   LinearProgress,
   LoadingIndicator,
+  SegmentedButton,
   Select,
   SideSheet,
 } from '../m3/primitives';
@@ -94,21 +96,32 @@ export function WorkshopView({
   onInvalidId,
   onNotify,
 }: WorkshopViewProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const searchLanguage = i18n.language?.trim() || undefined;
+  const [trackedLanguage, setTrackedLanguage] = useState(searchLanguage);
   const [draftQuery, setDraftQuery] = useState('');
   const [searchParams, setSearchParams] = useState<{
     query: string;
+    fileType: WorkshopFileType;
     tag?: string;
     sort: string;
     page: number;
     retryNonce: number;
   }>({
     query: '',
+    fileType: 'item',
     tag: undefined,
     sort: 'relevance',
     page: 1,
     retryNonce: 0,
   });
+
+  if (trackedLanguage !== searchLanguage) {
+    setTrackedLanguage(searchLanguage);
+    if (searchParams.page !== 1) {
+      setSearchParams((prev) => (prev.page === 1 ? prev : { ...prev, page: 1 }));
+    }
+  }
   const [directInput, setDirectInput] = useState('');
   const [directBusy, setDirectBusy] = useState(false);
   const [searchResult, setSearchResult] = useState<{
@@ -120,7 +133,7 @@ export function WorkshopView({
   const [missingSubs, setMissingSubs] = useState<string[] | null>(null);
 
   const searchSeqRef = useRef(0);
-  const reqKey = JSON.stringify(searchParams);
+  const reqKey = JSON.stringify({ ...searchParams, language: searchLanguage });
 
   const localByWorkshopId = useMemo(() => {
     const map = new Map<string, AddonSummary>();
@@ -146,6 +159,8 @@ export function WorkshopView({
       sort: searchParams.sort === 'relevance' ? undefined : searchParams.sort,
       page: searchParams.page,
       pageSize: 24,
+      language: searchLanguage,
+      fileType: searchParams.fileType === 'item' ? undefined : searchParams.fileType,
     })
       .then((res) => {
         if (!active || seq !== searchSeqRef.current) return;
@@ -167,13 +182,15 @@ export function WorkshopView({
     return () => {
       active = false;
     };
-  }, [searchParams, reqKey, onSearch]);
+  }, [searchParams, reqKey, searchLanguage, onSearch]);
 
   const loading = searchResult?.reqKey !== reqKey;
   const response = searchResult?.response ?? null;
   const searchError = searchResult?.error ?? null;
 
-  const totalPages = response ? Math.max(1, Math.ceil(response.total / response.pageSize)) : 1;
+  const safePageSize = response ? Math.max(1, response.pageSize) : 24;
+  const totalPages = response ? Math.max(1, Math.ceil(response.total / safePageSize)) : 1;
+  const displayPage = loading && response ? response.page : searchParams.page;
 
   const handleDirectAction = async (kind: 'inspect' | 'download' | 'track') => {
     const id = extractWorkshopIdInput(directInput);
@@ -314,6 +331,10 @@ export function WorkshopView({
               ...prev,
               query: draftQuery,
               page: 1,
+              retryNonce:
+                prev.query === draftQuery && prev.page === 1
+                  ? prev.retryNonce + 1
+                  : prev.retryNonce,
             }));
           }}
         >
@@ -416,6 +437,19 @@ export function WorkshopView({
       </header>
 
       <div className="l4a-view-toolbar">
+        <SegmentedButton<WorkshopFileType>
+          ariaLabel={t('workshop.contentType')}
+          value={searchParams.fileType}
+          onChange={(next) =>
+            setSearchParams((prev) =>
+              prev.fileType === next ? prev : { ...prev, fileType: next, page: 1 },
+            )
+          }
+          options={[
+            { value: 'item', label: t('workshop.type.item') },
+            { value: 'collection', label: t('workshop.type.collection') },
+          ]}
+        />
         <div className="md-chip-row">
           <FilterChip
             label={t('common.all')}
@@ -447,7 +481,7 @@ export function WorkshopView({
       </div>
 
       <div className="l4a-view-scroll">
-        {loading && !response ? (
+        {loading && (!response || response.items.length === 0) ? (
           <div className="l4a-loading-center">
             <LoadingIndicator size="lg" contained label={t('common.search')} />
           </div>
@@ -459,6 +493,7 @@ export function WorkshopView({
                 ? t('workshop.searchUnavailable')
                 : t('workshop.searchFailed')
             }
+            description={searchError.unsupported ? undefined : searchError.message}
             action={
               <div className="l4a-row-wrap">
                 {!searchError.unsupported && (
@@ -494,113 +529,115 @@ export function WorkshopView({
               </div>
             }
           />
-        ) : !response || response.items.length === 0 ? (
-          !loading && <EmptyState icon={<Store size={26} />} title={t('common.noResults')} />
         ) : (
           <>
-            <div className="l4a-grid">
-              {response.items.map((item) => {
-                const local = localByWorkshopId.get(item.workshopId);
-                const dl = liveDownloads[item.workshopId];
-                const isTracked = item.fileType === 'collection' && trackedIds.has(item.workshopId);
+            {!response || response.items.length === 0 ? (
+              !loading && <EmptyState icon={<Store size={26} />} title={t('common.noResults')} />
+            ) : (
+              <div className="l4a-grid">
+                {response.items.map((item) => {
+                  const local = localByWorkshopId.get(item.workshopId);
+                  const dl = liveDownloads[item.workshopId];
+                  const isTracked = item.fileType === 'collection' && trackedIds.has(item.workshopId);
 
-                return (
-                  <article key={item.workshopId} className="md-card" data-clickable="true">
-                    <div className="l4a-addon-cover-wrap">
-                      <button
-                        type="button"
-                        tabIndex={-1}
-                        aria-hidden="true"
-                        className="l4a-card-trigger"
-                        style={{ height: '100%' }}
-                        onClick={() => setActiveItem(item)}
-                      >
-                        <AddonCover
-                          src={item.previewUrl}
-                          title={item.title}
-                          category={item.tags[0]}
-                        />
-                      </button>
-                      <div className="l4a-cover-overlay-top">
-                        <span className="md-pill" data-tone="surface">
-                          {t(`workshop.type.${item.fileType}`)}
-                        </span>
-                        <div className="l4a-status-pills">
-                          {isTracked && (
-                            <span className="md-pill" data-tone="primary">
-                              {t('workshop.tracked')}
-                            </span>
-                          )}
-                          {local?.installState === 'installed' && (
-                            <span className="md-pill" data-tone="primary">
-                              {t('workshop.status.installed')}
-                            </span>
-                          )}
-                          {local && local.installState !== 'installed' && (
-                            <span className="md-pill" data-tone="secondary">
-                              {t('workshop.status.known')}
-                            </span>
-                          )}
-                          {(item.status === 'removed' ||
-                            item.status === 'private_or_unavailable') && (
-                            <span className="md-pill" data-tone="error">
-                              {t(`workshop.status.${item.status}`)}
-                            </span>
-                          )}
+                  return (
+                    <article key={item.workshopId} className="md-card" data-clickable="true">
+                      <div className="l4a-addon-cover-wrap">
+                        <button
+                          type="button"
+                          tabIndex={-1}
+                          aria-hidden="true"
+                          className="l4a-card-trigger"
+                          style={{ height: '100%' }}
+                          onClick={() => setActiveItem(item)}
+                        >
+                          <AddonCover
+                            src={item.previewUrl}
+                            title={item.title}
+                            category={item.tags[0]}
+                          />
+                        </button>
+                        <div className="l4a-cover-overlay-top">
+                          <span className="md-pill" data-tone="surface">
+                            {t(`workshop.type.${item.fileType}`)}
+                          </span>
+                          <div className="l4a-status-pills">
+                            {isTracked && (
+                              <span className="md-pill" data-tone="primary">
+                                {t('workshop.tracked')}
+                              </span>
+                            )}
+                            {local?.installState === 'installed' && (
+                              <span className="md-pill" data-tone="primary">
+                                {t('workshop.status.installed')}
+                              </span>
+                            )}
+                            {local && local.installState !== 'installed' && (
+                              <span className="md-pill" data-tone="secondary">
+                                {t('workshop.status.known')}
+                              </span>
+                            )}
+                            {(item.status === 'removed' ||
+                              item.status === 'private_or_unavailable') && (
+                              <span className="md-pill" data-tone="error">
+                                {t(`workshop.status.${item.status}`)}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    {dl && (
-                      <LinearProgress
-                        value={dl.percent}
-                        indeterminate={dl.cancelling || dl.percent === 0}
-                        label={item.title}
-                      />
-                    )}
+                      {dl && (
+                        <LinearProgress
+                          value={dl.percent}
+                          indeterminate={dl.cancelling || dl.percent === 0}
+                          label={item.title}
+                        />
+                      )}
 
-                    <div className="l4a-addon-card-body">
-                      <button
-                        type="button"
-                        className="l4a-card-trigger"
-                        onClick={() => setActiveItem(item)}
-                      >
-                        <div className="l4a-addon-title">{item.title}</div>
-                      </button>
-                      <div className="l4a-addon-meta">
-                        <span className="l4a-truncate">
-                          {item.creatorName || t('common.unknown')}
-                        </span>
-                        {item.fileSize ? (
-                          <>
-                            <span>·</span>
-                            <span>{formatBytes(item.fileSize)}</span>
-                          </>
-                        ) : null}
-                        {item.subscriptions ? (
-                          <>
-                            <span>·</span>
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                              <Users size={11} />
-                              {formatCompactNumber(item.subscriptions)}
-                            </span>
-                          </>
-                        ) : null}
+                      <div className="l4a-addon-card-body">
+                        <button
+                          type="button"
+                          className="l4a-card-trigger"
+                          onClick={() => setActiveItem(item)}
+                        >
+                          <div className="l4a-addon-title">{item.title}</div>
+                        </button>
+                        <div className="l4a-addon-meta">
+                          <span className="l4a-truncate">
+                            {item.creatorName || t('common.unknown')}
+                          </span>
+                          {item.fileSize ? (
+                            <>
+                              <span>·</span>
+                              <span>{formatBytes(item.fileSize)}</span>
+                            </>
+                          ) : null}
+                          {item.subscriptions ? (
+                            <>
+                              <span>·</span>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                                <Users size={11} />
+                                {formatCompactNumber(item.subscriptions)}
+                              </span>
+                            </>
+                          ) : null}
+                        </div>
+
+                        <div className="l4a-addon-card-footer">
+                          <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                            #{item.workshopId}
+                          </span>
+                          {renderPrimaryAction(item, true)}
+                        </div>
                       </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
 
-                      <div className="l4a-addon-card-footer">
-                        <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                          #{item.workshopId}
-                        </span>
-                        {renderPrimaryAction(item, true)}
-                      </div>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-
-            {totalPages > 1 && (
+            {response && (totalPages > 1 || searchParams.page > 1) && (
               <div
                 className="l4a-row-wrap"
                 style={{ justifyContent: 'center', marginTop: 20, gap: 12 }}
@@ -608,7 +645,7 @@ export function WorkshopView({
                 <IconButton
                   variant="outlined"
                   label={t('common.previous')}
-                  disabled={searchParams.page <= 1}
+                  disabled={loading || searchParams.page <= 1}
                   onClick={() =>
                     setSearchParams((prev) => ({ ...prev, page: Math.max(1, prev.page - 1) }))
                   }
@@ -616,12 +653,12 @@ export function WorkshopView({
                   <ChevronLeft size={18} />
                 </IconButton>
                 <span className="md-label-large">
-                  {t('workshop.page', { page: searchParams.page, total: totalPages })}
+                  {t('workshop.page', { page: displayPage, total: totalPages })}
                 </span>
                 <IconButton
                   variant="outlined"
                   label={t('common.next')}
-                  disabled={searchParams.page >= totalPages}
+                  disabled={loading || searchParams.page >= totalPages}
                   onClick={() =>
                     setSearchParams((prev) => ({
                       ...prev,

@@ -12,6 +12,7 @@ pub struct CatalogConfig {
     pub admin: AdminSection,
     pub steam: SteamSection,
     pub sync: SyncSection,
+    pub search: SearchSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +131,28 @@ impl SyncSection {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchSection {
+    pub enable_hybrid_search: bool,
+    pub default_language: String,
+    pub steam_timeout_ms: u64,
+    pub cache_ttl_secs: u64,
+    pub cache_steam_results: bool,
+}
+
+impl Default for SearchSection {
+    fn default() -> Self {
+        Self {
+            enable_hybrid_search: true,
+            default_language: "english".to_string(),
+            steam_timeout_ms: 4_500,
+            cache_ttl_secs: 60,
+            cache_steam_results: true,
+        }
+    }
+}
+
 pub fn generate_initial_password() -> String {
     format!("cat_{}", uuid::Uuid::new_v4().simple())
 }
@@ -177,6 +200,12 @@ impl CatalogConfig {
         self.sync.incremental_pages_per_tick = self.sync.incremental_pages_per_tick.clamp(1, 20);
         self.sync.backfill_interval_secs = self.sync.backfill_interval_secs.max(2);
         self.sync.backfill_batch_size = self.sync.backfill_batch_size.clamp(1, 100);
+        self.search.default_language = self.search.default_language.trim().to_string();
+        if self.search.default_language.is_empty() {
+            self.search.default_language = "english".to_string();
+        }
+        self.search.steam_timeout_ms = self.search.steam_timeout_ms.clamp(500, 15_000);
+        self.search.cache_ttl_secs = self.search.cache_ttl_secs.min(3_600);
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
@@ -195,7 +224,8 @@ pub struct CatalogConfigStore {
 }
 
 impl CatalogConfigStore {
-    pub fn new(path: Option<PathBuf>, config: CatalogConfig) -> Self {
+    pub fn new(path: Option<PathBuf>, mut config: CatalogConfig) -> Self {
+        config.normalize();
         Self {
             path,
             inner: RwLock::new(config),

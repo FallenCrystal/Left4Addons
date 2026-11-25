@@ -1,11 +1,16 @@
-use super::{WorkshopObservation, WORKSHOP_FILE_TYPE_COLLECTION};
+use super::{
+    SteamSearchRequest, SteamSearchTarget, WorkshopObservation, PROTO_FIELD_SEARCH_TEXT_TARGET,
+    WORKSHOP_FILE_TYPE_COLLECTION,
+};
 use chrono::{DateTime, Utc};
 use l4a_protocol::{
     MetadataSource, WorkshopDependency, WorkshopFetchOutcome, WorkshopFileType, WorkshopId,
     WorkshopItemRecord, WorkshopItemStatus, WorkshopPreview,
 };
 use steam_vent::EResult;
-use steam_vent_proto_steam::steammessages_publishedfile_steamclient::PublishedFileDetails;
+use steam_vent_proto_steam::steammessages_publishedfile_steamclient::{
+    CPublishedFile_QueryFiles_Request, PublishedFileDetails,
+};
 
 pub(super) fn map_detail(
     d: &PublishedFileDetails,
@@ -54,14 +59,84 @@ pub(super) fn map_detail(
     Some(WorkshopObservation {
         outcome,
         listed: d.visibility() == 0,
+        consumer_appid: d.consumer_appid.filter(|id| *id > 0),
     })
+}
+
+pub fn build_search_files_proto(
+    app_id: u32,
+    request: &SteamSearchRequest,
+) -> CPublishedFile_QueryFiles_Request {
+    let mut proto = CPublishedFile_QueryFiles_Request {
+        query_type: Some(request.query_type),
+        page: Some(request.page.max(1)),
+        numperpage: Some(request.num_per_page.clamp(1, 100)),
+        appid: Some(app_id),
+        // Never restrict creator_appid to 550: L4D2 Authoring Tools maps use creator_appid=563.
+        creator_appid: None,
+        requiredtags: request.required_tags.clone(),
+        match_all_tags: Some(true),
+        search_text: request.search_text.clone(),
+        filetype: Some(request.file_type),
+        days: request.days,
+        cache_max_age_seconds: Some(0),
+        language: Some(request.language),
+        return_vote_data: Some(true),
+        return_tags: Some(true),
+        return_previews: Some(true),
+        return_children: Some(true),
+        return_short_description: Some(false),
+        return_details: Some(true),
+        ..Default::default()
+    };
+    if let Some(target) = request
+        .search_text_target
+        .filter(|t| *t != SteamSearchTarget::All)
+    {
+        proto
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(PROTO_FIELD_SEARCH_TEXT_TARGET, target as u64);
+    }
+    proto
+}
+
+pub(super) fn build_query_files_proto(
+    app_id: u32,
+    query_type: u32,
+    file_type: u32,
+    cursor: &str,
+    num_per_page: u32,
+) -> CPublishedFile_QueryFiles_Request {
+    let cursor_str = if cursor.trim().is_empty() {
+        "*".to_string()
+    } else {
+        cursor.trim().to_string()
+    };
+    CPublishedFile_QueryFiles_Request {
+        query_type: Some(query_type),
+        cursor: Some(cursor_str),
+        numperpage: Some(num_per_page.clamp(1, 100)),
+        appid: Some(app_id),
+        cache_max_age_seconds: Some(0),
+        filetype: Some(file_type),
+        return_vote_data: Some(true),
+        return_tags: Some(true),
+        return_previews: Some(true),
+        return_children: Some(true),
+        // Request full file_description instead of short_description: Steam truncates
+        // short_description on byte boundaries and can split multibyte UTF-8 characters.
+        return_short_description: Some(false),
+        return_details: Some(true),
+        ..Default::default()
+    }
 }
 
 pub(super) fn can_resolve_by_id(d: &PublishedFileDetails) -> bool {
     matches!(d.visibility(), 0 | 3)
 }
 
-fn details_to_record(
+pub(super) fn details_to_record(
     wid: WorkshopId,
     d: &PublishedFileDetails,
     creator_name: Option<String>,
@@ -97,11 +172,16 @@ fn details_to_record(
         .tags
         .iter()
         .filter_map(|t| {
-            t.display_name
+            t.tag
                 .as_deref()
-                .or(t.tag.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    t.display_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
                 .map(ToString::to_string)
         })
         .collect();
@@ -138,9 +218,14 @@ fn details_to_record(
     let description = d
         .file_description
         .as_deref()
-        .or(d.short_description.as_deref())
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            d.short_description
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
         .map(ToString::to_string);
 
     let preview_url = d

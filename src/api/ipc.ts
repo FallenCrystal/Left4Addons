@@ -291,6 +291,9 @@ export interface SearchQuery {
   sort?: string;
   page?: number;
   pageSize?: number;
+  language?: string;
+  searchTarget?: 'all' | 'title' | 'description';
+  fileType?: WorkshopFileType;
 }
 
 export interface SearchResponse {

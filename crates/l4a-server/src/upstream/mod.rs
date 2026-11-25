@@ -4,9 +4,11 @@ mod mapping;
 mod mock;
 #[cfg(test)]
 mod tests;
+mod wire;
 
 pub use auth::render_qr_svg;
 pub use cm_client::SteamCmClient;
+pub use mapping::build_search_files_proto;
 pub use mock::MockWorkshopUpstream;
 
 use async_trait::async_trait;
@@ -14,11 +16,16 @@ use chrono::{DateTime, Utc};
 use l4a_protocol::{CatalogSteamStatus, SteamAuthFlowStatus, WorkshopFetchOutcome, WorkshopId};
 use std::time::Duration;
 
+pub const QUERY_TYPE_RANKED_BY_VOTE: u32 = 0;
 pub const QUERY_TYPE_RANKED_BY_PUBLICATION_DATE: u32 = 1;
+pub const QUERY_TYPE_RANKED_BY_TREND: u32 = 3;
+pub const QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS: u32 = 9;
+pub const QUERY_TYPE_RANKED_BY_TEXT_SEARCH: u32 = 12;
 pub const QUERY_TYPE_RANKED_BY_LAST_UPDATED_DATE: u32 = 21;
 pub const MATCHING_FILE_TYPE_ITEMS: u32 = 0;
 pub const MATCHING_FILE_TYPE_COLLECTIONS: u32 = 1;
 const WORKSHOP_FILE_TYPE_COLLECTION: u32 = 2;
+const PROTO_FIELD_SEARCH_TEXT_TARGET: u32 = 50;
 pub(crate) const DETAILS_BATCH_SIZE: usize = 100;
 const AUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -27,6 +34,7 @@ const AUTH_FLOW_TIMEOUT: Duration = Duration::from_secs(180);
 pub struct WorkshopObservation {
     pub outcome: WorkshopFetchOutcome,
     pub listed: bool,
+    pub consumer_appid: Option<u32>,
 }
 
 impl From<WorkshopFetchOutcome> for WorkshopObservation {
@@ -34,6 +42,7 @@ impl From<WorkshopFetchOutcome> for WorkshopObservation {
         Self {
             outcome,
             listed: true,
+            consumer_appid: None,
         }
     }
 }
@@ -46,6 +55,27 @@ impl WorkshopObservation {
             | WorkshopFetchOutcome::PrivateOrUnavailable { observed_at, .. } => *observed_at,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum SteamSearchTarget {
+    All = 0,
+    Title = 1,
+    Description = 2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SteamSearchRequest {
+    pub query_type: u32,
+    pub file_type: u32,
+    pub page: u32,
+    pub num_per_page: u32,
+    pub search_text: Option<String>,
+    pub required_tags: Vec<String>,
+    pub language: i32,
+    pub days: Option<u32>,
+    pub search_text_target: Option<SteamSearchTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +96,9 @@ pub trait WorkshopUpstream: Send + Sync {
         cursor: &str,
         num_per_page: u32,
     ) -> anyhow::Result<WorkshopQueryPage>;
+
+    async fn search_files(&self, request: &SteamSearchRequest)
+        -> anyhow::Result<WorkshopQueryPage>;
 
     async fn status(&self) -> CatalogSteamStatus;
 

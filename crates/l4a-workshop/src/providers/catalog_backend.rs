@@ -10,11 +10,16 @@ use l4a_protocol::{
 use std::sync::Arc;
 use std::time::Duration;
 
+// At the maximum 15s Steam timeout, the catalog server can spend up to 2s waiting for a
+// local search slot and 5s executing the SQLite fallback, plus response transfer margin.
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 接入自托管 `l4a-server` 创意工坊信息管理后端的客户端 Provider。
 pub struct CatalogBackendProvider {
     base_url: String,
     mirror: Arc<MirrorRouter>,
     timeout: Duration,
+    search_timeout: Duration,
 }
 
 impl CatalogBackendProvider {
@@ -23,7 +28,12 @@ impl CatalogBackendProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             mirror,
             timeout: Duration::from_secs(15),
+            search_timeout: SEARCH_TIMEOUT,
         }
+    }
+
+    pub fn search_timeout(&self) -> Duration {
+        self.search_timeout
     }
 }
 
@@ -150,18 +160,30 @@ impl WorkshopProvider for CatalogBackendProvider {
         let url = format!("{}/api/v1/items/search", self.base_url);
         let (client, _) = self
             .mirror
-            .build_client_for(&url, Some(self.timeout))
+            .build_client_for(&url, Some(self.search_timeout))
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
+        let page = query.page.max(1);
+        let page_size = if query.page_size == 0 {
+            30
+        } else {
+            query.page_size.clamp(1, 100)
+        };
         let mut params = vec![
-            ("page", query.page.to_string()),
-            ("pageSize", query.page_size.to_string()),
+            ("page", page.to_string()),
+            ("pageSize", page_size.to_string()),
         ];
         if let Some(ref q) = query.query {
-            params.push(("q", q.clone()));
+            let trimmed = q.trim();
+            if !trimmed.is_empty() {
+                params.push(("q", trimmed.to_string()));
+            }
         }
         if let Some(ref tag) = query.tag {
-            params.push(("tag", tag.clone()));
+            let trimmed = tag.trim();
+            if !trimmed.is_empty() {
+                params.push(("tag", trimmed.to_string()));
+            }
         }
         if let Some(status) = query.status {
             let status_str = serde_json::to_string(&status)
@@ -175,6 +197,27 @@ impl WorkshopProvider for CatalogBackendProvider {
         if let Some(ref sort) = query.sort {
             if !sort.trim().is_empty() {
                 params.push(("sort", sort.clone()));
+            }
+        }
+        if let Some(ref lang) = query.language {
+            let trimmed = lang.trim();
+            if !trimmed.is_empty() {
+                params.push(("lang", trimmed.to_string()));
+            }
+        }
+        if let Some(ref target) = query.search_target {
+            let trimmed = target.trim();
+            if !trimmed.is_empty() {
+                params.push(("searchTarget", trimmed.to_string()));
+            }
+        }
+        if let Some(file_type) = query.file_type {
+            let ft_str = serde_json::to_string(&file_type)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
+            if !ft_str.is_empty() {
+                params.push(("fileType", ft_str));
             }
         }
 

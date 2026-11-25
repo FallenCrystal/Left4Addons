@@ -208,6 +208,8 @@ impl WorkshopResolver {
         query: &SearchQuery,
     ) -> Result<(SearchResponse, Vec<String>), WorkshopError> {
         let mut warnings = Vec::new();
+        let mut attempted = false;
+        let mut last_error: Option<WorkshopError> = None;
         for provider in &self.providers {
             if !provider.capabilities().search {
                 continue;
@@ -220,11 +222,25 @@ impl WorkshopResolver {
                     return Ok((resp, warnings));
                 }
                 Err(WorkshopError::ScraperNotImplemented(_)) => continue,
-                Err(err) => warnings.push(format!("{}: {err}", provider.name())),
+                Err(err) => {
+                    attempted = true;
+                    warnings.push(format!("{}: {err}", provider.name()));
+                    last_error = Some(err);
+                }
             }
         }
-        Err(WorkshopError::Unsupported(format!(
-            "当前启用数据源不支持搜索: {}",
+        if !attempted {
+            return Err(WorkshopError::Unsupported(
+                "当前启用数据源不支持搜索".to_string(),
+            ));
+        }
+        if warnings.len() == 1 {
+            if let Some(err) = last_error {
+                return Err(err);
+            }
+        }
+        Err(WorkshopError::Provider(format!(
+            "所有搜索数据源均失败: {}",
             warnings.join("; ")
         )))
     }

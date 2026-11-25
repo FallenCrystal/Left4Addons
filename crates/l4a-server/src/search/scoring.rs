@@ -28,7 +28,11 @@ pub fn score_primary_candidate(
     }
 
     if query.terms.is_empty() {
-        return None;
+        return if query.exact_workshop_id.is_some() {
+            None
+        } else {
+            score_symbol_only_title(query, title)
+        };
     }
 
     let title_folded = fold_text(title);
@@ -83,11 +87,18 @@ pub fn score_primary_candidate(
 
         // Cross-field author + title query (e.g. "perfect_buddy early")
         if query.terms.len() >= 2 && query.literal_substrings.is_empty() {
-            let pinyin_spans = collect_han_pinyin_spans(title);
+            let mut pinyin_spans = None;
             let all_matched = query.terms.iter().all(|term| {
-                match_term_in_tokens(term, &title_tokens, MIN_PREFIX_LEN).is_some()
+                if match_term_in_tokens(term, &title_tokens, MIN_PREFIX_LEN).is_some()
                     || match_term_in_tokens(term, &creator_tokens, MIN_CREATOR_PREFIX_LEN).is_some()
-                    || match_term_in_pinyin(term, &pinyin_spans).is_some()
+                {
+                    return true;
+                }
+                if !query.can_match_pinyin || title.is_ascii() {
+                    return false;
+                }
+                let spans = pinyin_spans.get_or_insert_with(|| collect_han_pinyin_spans(title));
+                match_term_in_pinyin(term, spans).is_some()
             });
             if all_matched {
                 return Some(MatchRank {
@@ -101,7 +112,68 @@ pub fn score_primary_candidate(
     None
 }
 
+pub fn score_title_only_candidate(query: &ParsedQuery, title: &str) -> Option<MatchRank> {
+    if query.terms.is_empty() {
+        return score_symbol_only_title(query, title);
+    }
+
+    let title_folded = fold_text(title);
+    if title_folded == query.raw_folded {
+        return Some(MatchRank {
+            tier: 0,
+            sub_rank: 1,
+        });
+    }
+
+    let title_tokens = tokenize_with_aliases(title);
+    if query.contains_required_literals(&title_folded) {
+        if let Some(rank) = score_title_direct(query, &title_folded, &title_tokens)
+            .or_else(|| score_title_pinyin(query, title, &title_tokens))
+        {
+            return Some(rank);
+        }
+    }
+
+    None
+}
+
+pub fn score_symbol_only_title(query: &ParsedQuery, title: &str) -> Option<MatchRank> {
+    let title = fold_text(title);
+    if title == query.raw_folded {
+        Some(MatchRank {
+            tier: 0,
+            sub_rank: 1,
+        })
+    } else if title.starts_with(&query.raw_folded) {
+        Some(MatchRank {
+            tier: 1,
+            sub_rank: 0,
+        })
+    } else if title.contains(&query.raw_folded) {
+        Some(MatchRank {
+            tier: 2,
+            sub_rank: 0,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn score_symbol_only_desc(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
+    let cleaned = strip_bbcode_and_urls(description);
+    fold_text(&cleaned)
+        .contains(&query.raw_folded)
+        .then_some(MatchRank {
+            tier: 6,
+            sub_rank: 0,
+        })
+}
+
 pub fn score_desc_candidate(query: &ParsedQuery, description: &str) -> Option<MatchRank> {
+    if query.terms.is_empty() {
+        return score_symbol_only_desc(query, description);
+    }
+
     let cleaned = strip_bbcode_and_urls(description);
     if !query.literal_substrings.is_empty()
         && !query.contains_required_literals(&fold_text(&cleaned))
@@ -224,7 +296,7 @@ fn score_title_pinyin(
     title: &str,
     title_tokens: &TokenizedText,
 ) -> Option<MatchRank> {
-    if title.is_ascii() || !query.literal_substrings.is_empty() {
+    if !query.can_match_pinyin || title.is_ascii() || !query.literal_substrings.is_empty() {
         return None;
     }
 

@@ -1,14 +1,16 @@
 use super::items::dependency_requirements;
 use super::{
-    parse_workshop_id_col, serialize_json_enum, CatalogIndexPolicy, NegativeObservation,
-    ServerRepo, StoredItemMeta, UpstreamApplySummary, MAX_NEGATIVE_CACHE_ENTRIES,
-    STATE_BACKFILL_CURSOR, STATE_BACKFILL_SYNCED_TOTAL, STATE_REMOTE_WORKSHOP_TOTAL,
+    is_stale_steam_version, parse_workshop_id_col, serialize_json_enum, workshop_id_to_i64,
+    CatalogIndexPolicy, RestrictionKind, RestrictionMarker, ServerRepo, StoredItemMeta,
+    UpstreamApplySummary, MAX_NEGATIVE_CACHE_ENTRIES, STATE_BACKFILL_CURSOR,
+    STATE_BACKFILL_SYNCED_TOTAL, STATE_REMOTE_WORKSHOP_TOTAL,
 };
 use crate::upstream::WorkshopObservation;
 use chrono::{DateTime, Utc};
 use l4a_protocol::{MetadataSource, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 impl ServerRepo {
     /// 将 SteamKit CM 上游拉取结果原子写入缓存库（默认纳入公开目录索引）。
@@ -32,7 +34,217 @@ impl ServerRepo {
         if observations.is_empty() {
             return Ok(UpstreamApplySummary::default());
         }
-        self.apply_upstream_batch(observations, index_policy, |_, summary| Ok(summary))
+        self.apply_upstream_batch(observations, index_policy, None, |_, summary| Ok(summary))
+    }
+
+    pub(crate) fn warm_search_results(
+        &self,
+        observations: &[WorkshopObservation],
+        index_policy: CatalogIndexPolicy,
+        restriction_generation: u64,
+    ) -> anyhow::Result<()> {
+        self.apply_upstream_batch(
+            observations,
+            index_policy,
+            Some(restriction_generation),
+            |_, _| Ok(()),
+        )
+    }
+
+    /// Persist restrictions observed during hybrid search without overwriting canonical metadata or inserting unknown unlisted items.
+    pub(crate) fn persist_confirmed_restrictions(
+        &self,
+        observations: &[WorkshopObservation],
+    ) -> anyhow::Result<()> {
+        if observations.is_empty() {
+            return Ok(());
+        }
+        let mut writer = self.lock_writer()?;
+        let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending_negatives: HashMap<WorkshopId, Option<RestrictionMarker>> = HashMap::new();
+        {
+            let negatives = self.negative_cache.read().unwrap();
+            for observation in observations {
+                let wid = observation.outcome.workshop_id();
+                let observed_at = observation.observed_at();
+                let existing = Self::get_item_tx(&tx, wid)?;
+                if existing.as_ref().is_some_and(|prev| prev.is_admin_override) {
+                    continue;
+                }
+                let incoming_version = match &observation.outcome {
+                    WorkshopFetchOutcome::Found { item }
+                        if item.status != WorkshopItemStatus::PrivateOrUnavailable =>
+                    {
+                        item.time_updated
+                    }
+                    _ => None,
+                };
+                let latest_negative = pending_negatives
+                    .get(&wid)
+                    .copied()
+                    .unwrap_or_else(|| negatives.get(&wid).copied());
+                let stale_version = existing.as_ref().is_some_and(|prev| {
+                    is_stale_steam_version(prev.steam_version, incoming_version)
+                }) || latest_negative.is_some_and(|prev| {
+                    is_stale_steam_version(prev.steam_version, incoming_version)
+                });
+                if existing
+                    .as_ref()
+                    .is_some_and(|prev| observed_at <= prev.visibility_verified_at)
+                    || latest_negative.is_some_and(|prev| observed_at <= prev.observed_at)
+                    || stale_version
+                {
+                    continue;
+                }
+
+                match &observation.outcome {
+                    WorkshopFetchOutcome::Found { item }
+                        if item.status == WorkshopItemStatus::Active && !observation.listed =>
+                    {
+                        if existing.is_some() {
+                            let wid_i64 = workshop_id_to_i64(wid)?;
+                            tx.execute(
+                                "UPDATE workshop_items
+                                 SET is_listed = 0,
+                                     visibility_verified_at = ?2,
+                                     steam_version = COALESCE(?3, steam_version)
+                                 WHERE workshop_id = ?1 AND is_admin_override = 0",
+                                params![wid_i64, observed_at.to_rfc3339(), item.time_updated],
+                            )?;
+                            pending_negatives.insert(wid, None);
+                        } else {
+                            pending_negatives.insert(
+                                wid,
+                                Some(RestrictionMarker {
+                                    kind: RestrictionKind::UnlistedSearchOnly,
+                                    observed_at,
+                                    steam_version: item.time_updated.or_else(|| {
+                                        latest_negative.and_then(|prev| prev.steam_version)
+                                    }),
+                                }),
+                            );
+                        }
+                    }
+                    WorkshopFetchOutcome::Found { item }
+                        if item.status == WorkshopItemStatus::PrivateOrUnavailable =>
+                    {
+                        Self::apply_restricted_observation_tx(
+                            &tx,
+                            wid,
+                            existing.as_ref(),
+                            latest_negative,
+                            observed_at,
+                            item.status,
+                            item.source,
+                            "Steam CM 上游标记私密或不可用",
+                            &mut pending_negatives,
+                        )?;
+                    }
+                    WorkshopFetchOutcome::Removed { source, reason, .. } => {
+                        Self::apply_restricted_observation_tx(
+                            &tx,
+                            wid,
+                            existing.as_ref(),
+                            latest_negative,
+                            observed_at,
+                            WorkshopItemStatus::Removed,
+                            *source,
+                            reason.as_deref().unwrap_or("Steam CM 上游标记已下架"),
+                            &mut pending_negatives,
+                        )?;
+                    }
+                    WorkshopFetchOutcome::PrivateOrUnavailable { source, reason, .. } => {
+                        Self::apply_restricted_observation_tx(
+                            &tx,
+                            wid,
+                            existing.as_ref(),
+                            latest_negative,
+                            observed_at,
+                            WorkshopItemStatus::PrivateOrUnavailable,
+                            *source,
+                            reason.as_deref().unwrap_or("Steam CM 上游标记私密或不可用"),
+                            &mut pending_negatives,
+                        )?;
+                    }
+                    WorkshopFetchOutcome::Found { .. } => {}
+                }
+            }
+        }
+        tx.commit()?;
+        self.apply_pending_negatives(pending_negatives);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_restricted_observation_tx(
+        tx: &Transaction<'_>,
+        wid: WorkshopId,
+        existing: Option<&StoredItemMeta>,
+        latest_negative: Option<RestrictionMarker>,
+        observed_at: DateTime<Utc>,
+        status: WorkshopItemStatus,
+        source: MetadataSource,
+        reason: &str,
+        pending_negatives: &mut HashMap<WorkshopId, Option<RestrictionMarker>>,
+    ) -> anyhow::Result<bool> {
+        if let Some(prev) = existing {
+            Self::apply_tombstone_tx(tx, prev, observed_at, status, source, reason)?;
+            pending_negatives.insert(wid, None);
+            Ok(true)
+        } else {
+            if let (WorkshopItemStatus::PrivateOrUnavailable, Ok(wid_i64)) =
+                (status, i64::try_from(wid.as_u64()))
+            {
+                tx.execute(
+                    "UPDATE workshop_item_dependencies SET dep_title = NULL WHERE dep_workshop_id = ?1",
+                    params![wid_i64],
+                )?;
+            }
+            let kind = match status {
+                WorkshopItemStatus::Removed => RestrictionKind::Removed,
+                _ => RestrictionKind::PrivateOrUnavailable,
+            };
+            pending_negatives.insert(
+                wid,
+                Some(RestrictionMarker {
+                    kind,
+                    observed_at,
+                    steam_version: latest_negative.and_then(|prev| prev.steam_version),
+                }),
+            );
+            Ok(false)
+        }
+    }
+
+    fn apply_pending_negatives(
+        &self,
+        pending_negatives: HashMap<WorkshopId, Option<RestrictionMarker>>,
+    ) {
+        if pending_negatives.is_empty() {
+            return;
+        }
+        let mut negatives = self.negative_cache.write().unwrap();
+        for (wid, update) in pending_negatives {
+            if let Some(observation) = update {
+                if !negatives.contains_key(&wid) && negatives.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
+                    // Cached results may still rely on the markers we are about to forget.
+                    self.search_restriction_generation
+                        .fetch_add(1, Ordering::AcqRel);
+                    let remove_count = (MAX_NEGATIVE_CACHE_ENTRIES / 4).max(1);
+                    let mut by_age: Vec<(WorkshopId, DateTime<Utc>)> = negatives
+                        .iter()
+                        .map(|(&id, obs)| (id, obs.observed_at))
+                        .collect();
+                    by_age.sort_by_key(|&(_, at)| at);
+                    for (evict_id, _) in by_age.into_iter().take(remove_count) {
+                        negatives.remove(&evict_id);
+                    }
+                }
+                negatives.insert(wid, observation);
+            } else {
+                negatives.remove(&wid);
+            }
+        }
     }
 
     pub(crate) fn apply_backfill_page(
@@ -45,6 +257,7 @@ impl ServerRepo {
         self.apply_upstream_batch(
             observations,
             CatalogIndexPolicy::IndexInCatalog,
+            None,
             |tx, summary| {
                 let count = summary.active_written();
                 let prev_total = Self::get_sync_state_with_conn(tx, STATE_BACKFILL_SYNCED_TOTAL)?
@@ -75,14 +288,21 @@ impl ServerRepo {
         &self,
         observations: &[WorkshopObservation],
         index_policy: CatalogIndexPolicy,
+        expected_search_generation: Option<u64>,
         finish: impl FnOnce(&Transaction<'_>, UpstreamApplySummary) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let promote_catalog = index_policy == CatalogIndexPolicy::IndexInCatalog;
         // Negative observations for unknown IDs must take part in the same write ordering.
         let mut writer = self.lock_writer()?;
+        let observations = if expected_search_generation
+            .is_some_and(|generation| generation != self.search_restriction_generation())
+        {
+            &[]
+        } else {
+            observations
+        };
         let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut pending_negatives: HashMap<WorkshopId, Option<NegativeObservation>> =
-            HashMap::new();
+        let mut pending_negatives: HashMap<WorkshopId, Option<RestrictionMarker>> = HashMap::new();
         let summary = {
             let negatives = self.negative_cache.read().unwrap();
             let mut summary = UpstreamApplySummary::default();
@@ -90,6 +310,14 @@ impl ServerRepo {
                 let wid = observation.outcome.workshop_id();
                 let observed_at = observation.observed_at();
                 let existing = Self::get_item_tx(&tx, wid)?;
+                if existing.as_ref().is_some_and(|prev| {
+                    index_policy == CatalogIndexPolicy::InsertOnlyCache
+                        || (index_policy == CatalogIndexPolicy::RefreshUnindexedCache
+                            && prev.catalog_indexed)
+                }) {
+                    summary.skipped_stale += 1;
+                    continue;
+                }
                 if existing.as_ref().is_some_and(|prev| prev.is_admin_override) {
                     summary.skipped_overrides += 1;
                     continue;
@@ -102,19 +330,23 @@ impl ServerRepo {
                     }
                     _ => None,
                 };
-                let stale_version = existing
-                    .as_ref()
-                    .and_then(|prev| prev.steam_version)
-                    .zip(incoming_version)
-                    .is_some_and(|(cached, incoming)| incoming < cached);
                 let latest_negative = pending_negatives
                     .get(&wid)
                     .copied()
                     .unwrap_or_else(|| negatives.get(&wid).copied());
+                let stale_version = existing.as_ref().is_some_and(|prev| {
+                    is_stale_steam_version(prev.steam_version, incoming_version)
+                }) || latest_negative.is_some_and(|prev| {
+                    is_stale_steam_version(prev.steam_version, incoming_version)
+                });
+                let stale_hard_negative = latest_negative.is_some_and(|prev| {
+                    prev.kind != RestrictionKind::UnlistedSearchOnly
+                        && observed_at <= prev.observed_at
+                });
                 if existing
                     .as_ref()
                     .is_some_and(|prev| observed_at <= prev.last_verified_at)
-                    || latest_negative.is_some_and(|prev| observed_at <= prev.observed_at)
+                    || stale_hard_negative
                     || stale_version
                 {
                     let can_promote_existing = promote_catalog
@@ -127,12 +359,14 @@ impl ServerRepo {
                         && existing.as_ref().is_some_and(|prev| {
                             !prev.catalog_indexed
                                 && prev.record.status == WorkshopItemStatus::Active
+                                && (observed_at > prev.visibility_verified_at
+                                    || prev.is_listed == Some(true))
                         });
                     let promoted = can_promote_existing
                         && tx.execute(
                             "UPDATE workshop_items SET catalog_indexed = 1
                              WHERE workshop_id = ?1 AND catalog_indexed = 0 AND is_listed = 1",
-                            params![wid.as_u64() as i64],
+                            params![workshop_id_to_i64(wid)?],
                         )? > 0;
                     if promoted {
                         summary.catalog_promoted += 1;
@@ -142,10 +376,35 @@ impl ServerRepo {
                     continue;
                 }
 
+                let stale_unlisted_marker = existing.is_none()
+                    && latest_negative.is_some_and(|prev| {
+                        prev.kind == RestrictionKind::UnlistedSearchOnly
+                            && observed_at <= prev.observed_at
+                    });
+                if stale_unlisted_marker {
+                    let allow_unlisted_detail_cache = !observation.listed
+                        && matches!(
+                            &observation.outcome,
+                            WorkshopFetchOutcome::Found { item }
+                                if item.status == WorkshopItemStatus::Active
+                        );
+                    if !allow_unlisted_detail_cache {
+                        summary.skipped_stale += 1;
+                        continue;
+                    }
+                }
+
+                let visibility_stale_on_existing = existing
+                    .as_ref()
+                    .is_some_and(|prev| observed_at <= prev.visibility_verified_at);
+
                 let (status, source, reason) = match &observation.outcome {
                     WorkshopFetchOutcome::Found { item }
                         if item.status != WorkshopItemStatus::PrivateOrUnavailable =>
                     {
+                        if i64::try_from(wid.as_u64()).is_err() {
+                            continue;
+                        }
                         let changed = existing.as_ref().is_none_or(|prev| {
                             prev.record.status != item.status
                                 || prev.record.title != item.title
@@ -154,14 +413,36 @@ impl ServerRepo {
                                 || dependency_requirements(&prev.record.dependencies)
                                     != dependency_requirements(&item.dependencies)
                         });
+                        let (next_listed, next_vis_at, next_steam_ver, next_indexed) =
+                            if visibility_stale_on_existing {
+                                (None, None, item.time_updated, None)
+                            } else if stale_unlisted_marker {
+                                let marker = latest_negative.expect("checked above");
+                                (
+                                    Some(false),
+                                    Some(marker.observed_at),
+                                    marker.steam_version.or(item.time_updated),
+                                    None,
+                                )
+                            } else {
+                                (
+                                    Some(observation.listed),
+                                    Some(observed_at),
+                                    item.time_updated,
+                                    (promote_catalog && observation.listed).then_some(true),
+                                )
+                            };
                         Self::upsert_item_tx(
                             &tx,
                             item,
                             false,
                             true,
                             changed,
-                            Some(observation.listed),
-                            (promote_catalog && observation.listed).then_some(true),
+                            next_listed,
+                            next_vis_at,
+                            next_steam_ver,
+                            next_indexed,
+                            observation.consumer_appid,
                         )?;
                         pending_negatives.insert(wid, None);
                         summary.active_upserted += 1;
@@ -181,24 +462,22 @@ impl ServerRepo {
                         reason.as_deref().unwrap_or("Steam CM 上游标记私密或不可用"),
                     ),
                 };
-                if let Some(prev) = existing {
-                    Self::apply_tombstone_tx(&tx, &prev, observed_at, status, source, reason)?;
-                    pending_negatives.insert(wid, None);
+                if visibility_stale_on_existing {
+                    summary.skipped_stale += 1;
+                    continue;
+                }
+                if Self::apply_restricted_observation_tx(
+                    &tx,
+                    wid,
+                    existing.as_ref(),
+                    latest_negative,
+                    observed_at,
+                    status,
+                    source,
+                    reason,
+                    &mut pending_negatives,
+                )? {
                     summary.tombstoned += 1;
-                } else {
-                    if status == WorkshopItemStatus::PrivateOrUnavailable {
-                        tx.execute(
-                            "UPDATE workshop_item_dependencies SET dep_title = NULL WHERE dep_workshop_id = ?1",
-                            params![wid.as_u64() as i64],
-                        )?;
-                    }
-                    pending_negatives.insert(
-                        wid,
-                        Some(NegativeObservation {
-                            status,
-                            observed_at,
-                        }),
-                    );
                 }
             }
             summary
@@ -206,17 +485,7 @@ impl ServerRepo {
         let result = finish(&tx, summary)?;
         tx.commit()?;
 
-        let mut negatives = self.negative_cache.write().unwrap();
-        for (wid, update) in pending_negatives {
-            if let Some(observation) = update {
-                if negatives.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
-                    negatives.clear();
-                }
-                negatives.insert(wid, observation);
-            } else {
-                negatives.remove(&wid);
-            }
-        }
+        self.apply_pending_negatives(pending_negatives);
         Ok(result)
     }
 
@@ -227,8 +496,36 @@ impl ServerRepo {
     ) -> Option<WorkshopItemStatus> {
         let entries = self.negative_cache.read().unwrap();
         let entry = entries.get(&wid)?;
+        let status = match entry.kind {
+            RestrictionKind::Removed => WorkshopItemStatus::Removed,
+            RestrictionKind::PrivateOrUnavailable => WorkshopItemStatus::PrivateOrUnavailable,
+            RestrictionKind::UnlistedSearchOnly => return None,
+        };
         let age = (Utc::now() - entry.observed_at).num_seconds().max(0) as u64;
-        (age < ttl_secs).then_some(entry.status)
+        (age < ttl_secs).then_some(status)
+    }
+
+    pub(crate) fn search_restrictions(
+        &self,
+        ids: &[WorkshopId],
+    ) -> HashMap<WorkshopId, RestrictionMarker> {
+        let entries = self.negative_cache.read().unwrap();
+        ids.iter()
+            .filter_map(|id| entries.get(id).map(|marker| (*id, *marker)))
+            .collect()
+    }
+
+    pub(crate) fn search_restriction_generation(&self) -> u64 {
+        self.search_restriction_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn has_fresh_search_restriction(&self, wid: WorkshopId, ttl_secs: u64) -> bool {
+        let entries = self.negative_cache.read().unwrap();
+        let Some(entry) = entries.get(&wid) else {
+            return false;
+        };
+        let age = (Utc::now() - entry.observed_at).num_seconds().max(0) as u64;
+        age < ttl_secs
     }
 
     pub(crate) fn listing_recheck_ids(
@@ -242,10 +539,15 @@ impl ServerRepo {
             "SELECT workshop_id FROM workshop_items
              WHERE workshop_id > ?1 AND status = 'active' AND is_admin_override = 0
                AND catalog_indexed = 1
-               AND (is_listed IS NULL OR (is_listed = 1 AND unixepoch(last_verified_at) <= ?2))
+               AND (is_listed IS NULL
+                    OR (is_listed = 1
+                        AND unixepoch(COALESCE(visibility_verified_at, last_verified_at)) <= ?2))
              ORDER BY workshop_id LIMIT ?3",
         )?;
-        let after = after.map_or(0, |id| id.as_u64() as i64);
+        let after = match after {
+            Some(id) => workshop_id_to_i64(id)?,
+            None => 0,
+        };
         let rows = stmt.query_map(params![after, verified_before, limit], |row| {
             parse_workshop_id_col(0, row.get(0)?)
         })?;
@@ -261,15 +563,16 @@ impl ServerRepo {
         reason: &str,
     ) -> anyhow::Result<()> {
         let wid = prev.record.workshop_id;
+        let wid_i64 = workshop_id_to_i64(wid)?;
         let observed_at = observed_at.to_rfc3339();
         tx.execute(
             "UPDATE workshop_items
              SET status = ?2, file_url = NULL, source = ?3,
                  fetched_at = ?4, removed_at = COALESCE(removed_at, ?4),
-                 last_verified_at = ?4
+                 last_verified_at = ?4, visibility_verified_at = ?4
              WHERE workshop_id = ?1",
             params![
-                wid.as_u64() as i64,
+                wid_i64,
                 serialize_json_enum(&next_status),
                 serialize_json_enum(&source),
                 observed_at,
@@ -301,7 +604,7 @@ impl ServerRepo {
         wid: Option<WorkshopId>,
         update_index: bool,
     ) -> anyhow::Result<()> {
-        let wid = wid.map(|id| id.as_u64() as i64);
+        let wid = wid.map(workshop_id_to_i64).transpose()?;
         tx.execute(
             "UPDATE workshop_item_dependencies SET dep_title = NULL
              WHERE dep_title IS NOT NULL AND dep_workshop_id IN (

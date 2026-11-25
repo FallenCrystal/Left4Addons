@@ -36,9 +36,11 @@ impl ServerRepo {
                 fetched_at TEXT NOT NULL,
                 removed_at TEXT,
                 last_verified_at TEXT NOT NULL,
+                visibility_verified_at TEXT,
                 is_listed INTEGER,
                 steam_version INTEGER,
-                catalog_indexed INTEGER NOT NULL DEFAULT 0
+                catalog_indexed INTEGER NOT NULL DEFAULT 0,
+                consumer_appid INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_workshop_items_status_updated ON workshop_items(status, time_updated DESC);
             CREATE INDEX IF NOT EXISTS idx_workshop_items_file_type ON workshop_items(file_type);
@@ -115,6 +117,16 @@ impl ServerRepo {
                 [],
             )?;
         }
+        if !has_column(conn, "workshop_items", "visibility_verified_at")? {
+            conn.execute(
+                "ALTER TABLE workshop_items ADD COLUMN visibility_verified_at TEXT",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE workshop_items SET visibility_verified_at = last_verified_at WHERE is_listed IS NOT NULL",
+                [],
+            )?;
+        }
         if !has_column(conn, "workshop_items", "steam_version")? {
             conn.execute(
                 "ALTER TABLE workshop_items ADD COLUMN steam_version INTEGER",
@@ -122,6 +134,12 @@ impl ServerRepo {
             )?;
             conn.execute(
                 "UPDATE workshop_items SET steam_version = time_updated WHERE is_admin_override = 0",
+                [],
+            )?;
+        }
+        if !has_column(conn, "workshop_items", "consumer_appid")? {
+            conn.execute(
+                "ALTER TABLE workshop_items ADD COLUMN consumer_appid INTEGER",
                 [],
             )?;
         }
@@ -144,10 +162,27 @@ impl ServerRepo {
                 ],
             )?;
         }
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public
-             ON workshop_items(catalog_indexed, is_listed)",
-            [],
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_workshop_items_catalog_public;
+            CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public_v2
+                ON workshop_items(
+                    catalog_indexed,
+                    is_listed,
+                    file_type,
+                    COALESCE(subscriptions, 0) DESC,
+                    workshop_id ASC
+                );
+            CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_relevance_v1
+                ON workshop_items(
+                    catalog_indexed,
+                    is_listed,
+                    file_type,
+                    COALESCE(subscriptions, 0) DESC,
+                    COALESCE(time_updated, 0) DESC,
+                    workshop_id ASC
+                );
+            "#,
         )?;
         if has_column(conn, "workshop_item_revisions", "trust_score")? {
             conn.execute(
