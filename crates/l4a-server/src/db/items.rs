@@ -37,7 +37,7 @@ impl ServerRepo {
                     subscriptions, favorites, is_admin_override, source,
                     fetched_at, removed_at, last_verified_at, steam_version,
                     catalog_indexed, is_listed,
-                    COALESCE(visibility_verified_at, last_verified_at)
+                    COALESCE(visibility_verified_at, last_verified_at), consumer_appid
              FROM workshop_items WHERE workshop_id = ?1",
         )?;
 
@@ -91,6 +91,7 @@ impl ServerRepo {
                     steam_version: r.get(21)?,
                     catalog_indexed: catalog_indexed != 0,
                     is_listed: is_listed.map(|v| v != 0),
+                    consumer_appid: r.get(25)?,
                 })
             })
             .optional()?;
@@ -260,6 +261,7 @@ impl ServerRepo {
                     .then_some(record.time_updated)
                     .flatten(),
                 Some(true),
+                None,
             )
         })
     }
@@ -275,6 +277,7 @@ impl ServerRepo {
         visibility_verified_at: Option<DateTime<Utc>>,
         steam_version: Option<i64>,
         catalog_indexed: Option<bool>,
+        consumer_appid: Option<u32>,
     ) -> anyhow::Result<()> {
         let wid = workshop_id_to_i64(record.workshop_id)?;
         let now = Utc::now().to_rfc3339();
@@ -305,11 +308,11 @@ impl ServerRepo {
                 time_created, time_updated, tags_json, collection_children_json,
                 subscriptions, favorites, is_admin_override, source,
                 fetched_at, removed_at, last_verified_at, visibility_verified_at,
-                is_listed, steam_version, catalog_indexed
+                is_listed, steam_version, catalog_indexed, consumer_appid
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
                 ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?20, COALESCE(?25, ?20),
-                COALESCE(?22, ?18), ?23, COALESCE(?24, ?18)
+                COALESCE(?22, ?18), ?23, COALESCE(?24, ?18), ?26
             )
             ON CONFLICT(workshop_id) DO UPDATE SET
                 file_type = excluded.file_type,
@@ -339,7 +342,8 @@ impl ServerRepo {
                 catalog_indexed = CASE
                     WHEN ?24 = 1 THEN 1
                     ELSE workshop_items.catalog_indexed
-                END
+                END,
+                consumer_appid = COALESCE(excluded.consumer_appid, workshop_items.consumer_appid)
             RETURNING title, creator_name, description
             "#,
         )?;
@@ -370,6 +374,7 @@ impl ServerRepo {
                 steam_version,
                 catalog_indexed,
                 visibility_verified_at.map(|dt| dt.to_rfc3339()),
+                consumer_appid,
             ],
             |r| {
                 if searchable_fields_unchanged {

@@ -39,7 +39,8 @@ impl ServerRepo {
                 visibility_verified_at TEXT,
                 is_listed INTEGER,
                 steam_version INTEGER,
-                catalog_indexed INTEGER NOT NULL DEFAULT 0
+                catalog_indexed INTEGER NOT NULL DEFAULT 0,
+                consumer_appid INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_workshop_items_status_updated ON workshop_items(status, time_updated DESC);
             CREATE INDEX IF NOT EXISTS idx_workshop_items_file_type ON workshop_items(file_type);
@@ -133,6 +134,12 @@ impl ServerRepo {
             )?;
             conn.execute(
                 "UPDATE workshop_items SET steam_version = time_updated WHERE is_admin_override = 0",
+                [],
+            )?;
+        }
+        if !has_column(conn, "workshop_items", "consumer_appid")? {
+            conn.execute(
+                "ALTER TABLE workshop_items ADD COLUMN consumer_appid INTEGER",
                 [],
             )?;
         }

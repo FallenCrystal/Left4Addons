@@ -9,7 +9,7 @@ import type {
   WorkshopItemRecord,
 } from '../ipc';
 import { IpcError } from '../ipc';
-import { previewFilenameByRules } from '../../utils/format';
+import { extractWorkshopIdInput, previewFilenameByRules } from '../../utils/format';
 import { PREVIEW_CATALOG } from './fixtures';
 
 export type PreviewEmit = (event: CoreEvent) => void;
@@ -77,14 +77,15 @@ export function searchPreviewWorkshop(query: SearchQuery): SearchResponse {
   const tag = query.tag?.trim().toLowerCase();
   const target = (query.searchTarget ?? 'all').trim().toLowerCase();
   const numericOnly = q.replace(/^#/, '');
-  const isPureUrl =
-    /^https?:\/\/(www\.)?steamcommunity\.com\/(sharedfiles|workshop)\/filedetails\/?/i.test(
+  const isWorkshopLink =
+    /^https?:\/\/(www\.)?steamcommunity\.com\/(sharedfiles|workshop)\/filedetails\/?([?#]|$)/i.test(
       rawQuery,
-    ) || /^steam:\/\/url\/CommunityFilePage\/\d+$/i.test(rawQuery);
+    ) || /^steam:\/\/url\/CommunityFilePage\/\d+\/?$/i.test(rawQuery);
+  const urlId = isWorkshopLink ? extractWorkshopIdInput(rawQuery) : null;
   const isTitleTarget = target === 'title' || target === '1';
   const isDescTarget = target === 'description' || target === 'desc' || target === '2';
   const isBareLongId = /^\d{6,}$/.test(numericOnly) && !isTitleTarget && !isDescTarget;
-  const effectiveFileType = query.fileType ?? (isPureUrl ? undefined : 'item');
+  const effectiveFileType = query.fileType ?? (urlId ? undefined : 'item');
 
   let items = PREVIEW_CATALOG.filter((item) => {
     const allowUntypedExact = !query.fileType && isBareLongId && item.workshopId === numericOnly;
@@ -92,9 +93,8 @@ export function searchPreviewWorkshop(query: SearchQuery): SearchResponse {
       return false;
     }
     if (q) {
-      if (isPureUrl) {
-        const urlId = rawQuery.match(/(?:[?&]id=|\/CommunityFilePage\/)(\d+)/i)?.[1];
-        if (!urlId || item.workshopId !== urlId) return false;
+      if (urlId) {
+        if (item.workshopId !== urlId) return false;
       } else {
         const idMatch = item.workshopId === numericOnly || item.workshopId.includes(q);
         const hit = isTitleTarget

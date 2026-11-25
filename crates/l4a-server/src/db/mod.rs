@@ -12,11 +12,11 @@ use rusqlite::{params, Connection, InterruptHandle, Transaction, TransactionBeha
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 
 const READER_POOL_SIZE: usize = 8;
-const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
+pub(crate) const MAX_NEGATIVE_CACHE_ENTRIES: usize = 4096;
 pub(crate) const STATE_INCREMENTAL_SCAN: &str = "incremental_scan";
 pub(crate) const STATE_BACKFILL_CURSOR: &str = "backfill_cursor";
 pub(crate) const STATE_BACKFILL_SYNCED_TOTAL: &str = "backfill_synced_total";
@@ -206,6 +206,7 @@ pub struct ServerRepo {
     writer: Mutex<Connection>,
     readers: Option<ReaderPool>,
     negative_cache: RwLock<HashMap<WorkshopId, RestrictionMarker>>,
+    search_restriction_generation: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,6 +239,7 @@ pub struct StoredItemMeta {
     steam_version: Option<i64>,
     catalog_indexed: bool,
     pub is_listed: Option<bool>,
+    pub(crate) consumer_appid: Option<u32>,
 }
 
 impl StoredItemMeta {
@@ -307,6 +309,7 @@ impl ServerRepo {
             writer: Mutex::new(writer),
             readers: None,
             negative_cache: RwLock::new(HashMap::new()),
+            search_restriction_generation: AtomicU64::new(0),
         };
         repo.migrate()?;
 
@@ -329,6 +332,7 @@ impl ServerRepo {
             writer: Mutex::new(conn),
             readers: None,
             negative_cache: RwLock::new(HashMap::new()),
+            search_restriction_generation: AtomicU64::new(0),
         };
         repo.migrate()?;
         Ok(repo)

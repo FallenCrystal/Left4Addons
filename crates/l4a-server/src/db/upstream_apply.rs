@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use l4a_protocol::{MetadataSource, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus};
 use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 impl ServerRepo {
     /// 将 SteamKit CM 上游拉取结果原子写入缓存库（默认纳入公开目录索引）。
@@ -33,7 +34,21 @@ impl ServerRepo {
         if observations.is_empty() {
             return Ok(UpstreamApplySummary::default());
         }
-        self.apply_upstream_batch(observations, index_policy, |_, summary| Ok(summary))
+        self.apply_upstream_batch(observations, index_policy, None, |_, summary| Ok(summary))
+    }
+
+    pub(crate) fn warm_search_results(
+        &self,
+        observations: &[WorkshopObservation],
+        index_policy: CatalogIndexPolicy,
+        restriction_generation: u64,
+    ) -> anyhow::Result<()> {
+        self.apply_upstream_batch(
+            observations,
+            index_policy,
+            Some(restriction_generation),
+            |_, _| Ok(()),
+        )
     }
 
     /// Persist restrictions observed during hybrid search without overwriting canonical metadata or inserting unknown unlisted items.
@@ -51,7 +66,6 @@ impl ServerRepo {
             let negatives = self.negative_cache.read().unwrap();
             for observation in observations {
                 let wid = observation.outcome.workshop_id();
-                let wid_i64 = workshop_id_to_i64(wid)?;
                 let observed_at = observation.observed_at();
                 let existing = Self::get_item_tx(&tx, wid)?;
                 if existing.as_ref().is_some_and(|prev| prev.is_admin_override) {
@@ -88,6 +102,7 @@ impl ServerRepo {
                         if item.status == WorkshopItemStatus::Active && !observation.listed =>
                     {
                         if existing.is_some() {
+                            let wid_i64 = workshop_id_to_i64(wid)?;
                             tx.execute(
                                 "UPDATE workshop_items
                                  SET is_listed = 0,
@@ -116,7 +131,6 @@ impl ServerRepo {
                         Self::apply_restricted_observation_tx(
                             &tx,
                             wid,
-                            wid_i64,
                             existing.as_ref(),
                             latest_negative,
                             observed_at,
@@ -130,7 +144,6 @@ impl ServerRepo {
                         Self::apply_restricted_observation_tx(
                             &tx,
                             wid,
-                            wid_i64,
                             existing.as_ref(),
                             latest_negative,
                             observed_at,
@@ -144,7 +157,6 @@ impl ServerRepo {
                         Self::apply_restricted_observation_tx(
                             &tx,
                             wid,
-                            wid_i64,
                             existing.as_ref(),
                             latest_negative,
                             observed_at,
@@ -167,7 +179,6 @@ impl ServerRepo {
     fn apply_restricted_observation_tx(
         tx: &Transaction<'_>,
         wid: WorkshopId,
-        wid_i64: i64,
         existing: Option<&StoredItemMeta>,
         latest_negative: Option<RestrictionMarker>,
         observed_at: DateTime<Utc>,
@@ -181,7 +192,9 @@ impl ServerRepo {
             pending_negatives.insert(wid, None);
             Ok(true)
         } else {
-            if status == WorkshopItemStatus::PrivateOrUnavailable {
+            if let (WorkshopItemStatus::PrivateOrUnavailable, Ok(wid_i64)) =
+                (status, i64::try_from(wid.as_u64()))
+            {
                 tx.execute(
                     "UPDATE workshop_item_dependencies SET dep_title = NULL WHERE dep_workshop_id = ?1",
                     params![wid_i64],
@@ -214,6 +227,9 @@ impl ServerRepo {
         for (wid, update) in pending_negatives {
             if let Some(observation) = update {
                 if !negatives.contains_key(&wid) && negatives.len() >= MAX_NEGATIVE_CACHE_ENTRIES {
+                    // Cached results may still rely on the markers we are about to forget.
+                    self.search_restriction_generation
+                        .fetch_add(1, Ordering::AcqRel);
                     let remove_count = (MAX_NEGATIVE_CACHE_ENTRIES / 4).max(1);
                     let mut by_age: Vec<(WorkshopId, DateTime<Utc>)> = negatives
                         .iter()
@@ -241,6 +257,7 @@ impl ServerRepo {
         self.apply_upstream_batch(
             observations,
             CatalogIndexPolicy::IndexInCatalog,
+            None,
             |tx, summary| {
                 let count = summary.active_written();
                 let prev_total = Self::get_sync_state_with_conn(tx, STATE_BACKFILL_SYNCED_TOTAL)?
@@ -271,11 +288,19 @@ impl ServerRepo {
         &self,
         observations: &[WorkshopObservation],
         index_policy: CatalogIndexPolicy,
+        expected_search_generation: Option<u64>,
         finish: impl FnOnce(&Transaction<'_>, UpstreamApplySummary) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         let promote_catalog = index_policy == CatalogIndexPolicy::IndexInCatalog;
         // Negative observations for unknown IDs must take part in the same write ordering.
         let mut writer = self.lock_writer()?;
+        let observations = if expected_search_generation
+            .is_some_and(|generation| generation != self.search_restriction_generation())
+        {
+            &[]
+        } else {
+            observations
+        };
         let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending_negatives: HashMap<WorkshopId, Option<RestrictionMarker>> = HashMap::new();
         let summary = {
@@ -283,7 +308,6 @@ impl ServerRepo {
             let mut summary = UpstreamApplySummary::default();
             for observation in observations {
                 let wid = observation.outcome.workshop_id();
-                let wid_i64 = workshop_id_to_i64(wid)?;
                 let observed_at = observation.observed_at();
                 let existing = Self::get_item_tx(&tx, wid)?;
                 if existing.as_ref().is_some_and(|prev| {
@@ -342,7 +366,7 @@ impl ServerRepo {
                         && tx.execute(
                             "UPDATE workshop_items SET catalog_indexed = 1
                              WHERE workshop_id = ?1 AND catalog_indexed = 0 AND is_listed = 1",
-                            params![wid_i64],
+                            params![workshop_id_to_i64(wid)?],
                         )? > 0;
                     if promoted {
                         summary.catalog_promoted += 1;
@@ -378,6 +402,9 @@ impl ServerRepo {
                     WorkshopFetchOutcome::Found { item }
                         if item.status != WorkshopItemStatus::PrivateOrUnavailable =>
                     {
+                        if i64::try_from(wid.as_u64()).is_err() {
+                            continue;
+                        }
                         let changed = existing.as_ref().is_none_or(|prev| {
                             prev.record.status != item.status
                                 || prev.record.title != item.title
@@ -415,6 +442,7 @@ impl ServerRepo {
                             next_vis_at,
                             next_steam_ver,
                             next_indexed,
+                            observation.consumer_appid,
                         )?;
                         pending_negatives.insert(wid, None);
                         summary.active_upserted += 1;
@@ -441,7 +469,6 @@ impl ServerRepo {
                 if Self::apply_restricted_observation_tx(
                     &tx,
                     wid,
-                    wid_i64,
                     existing.as_ref(),
                     latest_negative,
                     observed_at,
@@ -478,9 +505,18 @@ impl ServerRepo {
         (age < ttl_secs).then_some(status)
     }
 
-    pub(crate) fn search_restriction(&self, wid: WorkshopId) -> Option<RestrictionMarker> {
+    pub(crate) fn search_restrictions(
+        &self,
+        ids: &[WorkshopId],
+    ) -> HashMap<WorkshopId, RestrictionMarker> {
         let entries = self.negative_cache.read().unwrap();
-        entries.get(&wid).copied()
+        ids.iter()
+            .filter_map(|id| entries.get(id).map(|marker| (*id, *marker)))
+            .collect()
+    }
+
+    pub(crate) fn search_restriction_generation(&self) -> u64 {
+        self.search_restriction_generation.load(Ordering::Acquire)
     }
 
     pub(crate) fn has_fresh_search_restriction(&self, wid: WorkshopId, ttl_secs: u64) -> bool {

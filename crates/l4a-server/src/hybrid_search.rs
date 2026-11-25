@@ -67,6 +67,7 @@ pub struct HybridSearchOutput {
 
 struct SharedSteamPage {
     raw: WorkshopQueryPage,
+    restriction_generation: u64,
     restrictions_outcome: OnceCell<Result<(), SteamSearchError>>,
 }
 
@@ -104,6 +105,7 @@ struct SteamFetchCtx {
     steam_timeout: Duration,
     deadline: Instant,
     cache_steam_results: bool,
+    restriction_generation: u64,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -128,9 +130,16 @@ enum SteamResults {
 }
 
 enum ExactLookup {
-    Local(Option<Box<WorkshopItemRecord>>),
+    Indexed,
+    LocalOnly,
     Steam(Option<Arc<WorkshopObservation>>),
     Unavailable,
+}
+
+#[derive(Default)]
+struct SearchOverlay {
+    items: Vec<WorkshopItemRecord>,
+    restricted_ids: HashSet<WorkshopId>,
 }
 
 #[derive(Clone, Copy)]
@@ -236,6 +245,7 @@ type SharedExactResult = Result<Option<Arc<WorkshopObservation>>, SteamSearchErr
 struct WarmBatch {
     observations: Vec<WorkshopObservation>,
     policy: CatalogIndexPolicy,
+    restriction_generation: u64,
 }
 
 #[derive(Default)]
@@ -517,6 +527,7 @@ impl HybridSearchService {
             steam_timeout,
             deadline: Instant::now() + steam_timeout,
             cache_steam_results: search_cfg.cache_steam_results,
+            restriction_generation: self.repo.search_restriction_generation(),
         };
 
         let exact_lookup_id = if is_pure_url {
@@ -529,10 +540,10 @@ impl HybridSearchService {
         };
 
         let mut exact_observation = None;
-        let mut local_exact_record = None;
+        let mut indexed_exact_id = None;
         if let Some(wid) = exact_lookup_id {
             match self.lookup_exact(wid, ctx, &cfg.sync).await? {
-                ExactLookup::Local(_) if is_pure_url => {
+                ExactLookup::Indexed | ExactLookup::LocalOnly if is_pure_url => {
                     return self
                         .run_local_only(&query, exact_untyped_id, SearchExecutionMode::LocalOnly)
                         .await;
@@ -549,14 +560,22 @@ impl HybridSearchService {
                 ExactLookup::Steam(observation) if is_pure_url => {
                     let items = self
                         .apply_local_overlay(&query, ctx.app_id, observation.as_deref(), false)
-                        .await?;
+                        .await?
+                        .items;
                     let total = items.len() as u64;
                     let items = items.into_iter().skip(pagination.offset).collect();
-                    return Ok(pagination.output(items, total, SearchExecutionMode::Hybrid));
+                    return self
+                        .finish_search_with_current_restrictions(
+                            pagination.output(items, total, SearchExecutionMode::Hybrid),
+                            &query,
+                            exact_untyped_id,
+                            ctx,
+                        )
+                        .await;
                 }
                 ExactLookup::Steam(observation) => exact_observation = observation,
-                ExactLookup::Local(record) => local_exact_record = record.map(|boxed| *boxed),
-                ExactLookup::Unavailable => {}
+                ExactLookup::Indexed => indexed_exact_id = Some(wid),
+                ExactLookup::LocalOnly | ExactLookup::Unavailable => {}
             }
         }
 
@@ -605,47 +624,12 @@ impl HybridSearchService {
         } else {
             query.clone()
         };
-        let exact = self
-            .apply_local_overlay(
-                &exact_query,
-                ctx.app_id,
-                exact_observation.as_deref(),
-                false,
-            )
-            .await?
-            .pop();
-        let local_exact_fallback = local_exact_record.filter(|record| {
-            (query.status.is_none() && record.status == WorkshopItemStatus::Active
-                || query.status == Some(record.status))
-                && matches_filters(record, &exact_query, true)
-        });
-
-        match steam {
-            Err(SteamSearchError::Unavailable(err)) => {
-                tracing::warn!(error = %err, "Steam CM 混合检索失败，回退至本地索引");
-                self.local_with_exact(
-                    &query,
-                    exact_untyped_id,
-                    pagination,
-                    exact.as_ref(),
-                    sort_plan.merge,
-                    SearchExecutionMode::LocalFallback,
-                )
-                .await
-            }
+        let output = match steam {
             Err(
                 err @ (SteamSearchError::Visibility(_) | SteamSearchError::VisibilityAborted(_)),
             ) => Err(err.into()),
             Ok(SteamResults::Complete(pages)) if !pages.is_empty() => {
-                let observations: Vec<_> = pages
-                    .iter()
-                    .flat_map(|page| page.raw.outcomes.iter())
-                    .collect();
-                let steam_items = self
-                    .apply_local_overlay(&query, ctx.app_id, observations.iter().copied(), true)
-                    .await?;
-                let mut local_degraded = false;
-                let local = match self
+                let (local, local_degraded) = match self
                     .catalog_matches_with_budget(
                         &query,
                         exact_untyped_id,
@@ -654,7 +638,7 @@ impl HybridSearchService {
                     )
                     .await
                 {
-                    Ok(matches) => matches,
+                    Ok(matches) => (matches, false),
                     Err(err)
                         if err
                             .chain()
@@ -664,22 +648,36 @@ impl HybridSearchService {
                             error = %err,
                             "本地目录补充检索繁忙或超时，本次混合搜索降级为仅返回 Steam 实时结果"
                         );
-                        local_degraded = true;
-                        Vec::new()
+                        (Vec::new(), true)
                     }
                     Err(err) => return Err(err),
                 };
-                let effective_exact = exact.as_ref().or_else(|| {
-                    local_degraded
-                        .then_some(local_exact_fallback.as_ref())
-                        .flatten()
-                });
+                let overlay = self
+                    .apply_local_overlay(
+                        &query,
+                        ctx.app_id,
+                        pages.iter().flat_map(|page| &page.raw.outcomes),
+                        true,
+                    )
+                    .await?;
+                let exact = self
+                    .load_exact_match(
+                        &exact_query,
+                        ctx.app_id,
+                        exact_observation.as_deref(),
+                        if local_degraded {
+                            indexed_exact_id
+                        } else {
+                            None
+                        },
+                    )
+                    .await?;
                 let hits = merge_matches(
                     &local,
-                    &steam_items,
-                    &observations,
+                    &overlay.items,
+                    &overlay.restricted_ids,
                     pagination.size as usize,
-                    effective_exact,
+                    exact.as_ref(),
                     sort_plan.merge,
                     parsed.as_ref(),
                     search_target,
@@ -697,35 +695,82 @@ impl HybridSearchService {
             Ok(SteamResults::NativePage { page, total }) => {
                 let mut items = self
                     .apply_local_overlay(&query, ctx.app_id, page.raw.outcomes.iter(), true)
-                    .await?;
+                    .await?
+                    .items;
                 let mut seen = HashSet::new();
                 items.retain(|item| seen.insert(item.workshop_id));
-                if let Some(exact_item) = exact.or(local_exact_fallback) {
-                    if sort_plan.merge == MergeStrategy::Relevance {
-                        items.retain(|item| item.workshop_id != exact_item.workshop_id);
-                        if pagination.page == 1 {
-                            items.insert(0, exact_item);
-                            items.truncate(pagination.size as usize);
-                        }
-                    }
-                }
+                // Preserve Steam's page boundaries and ranking, including exact IDs.
                 Ok(pagination.output(items, total, SearchExecutionMode::Hybrid))
             }
             Ok(SteamResults::NativePageEmpty { total }) => {
                 Ok(pagination.output(Vec::new(), total, SearchExecutionMode::Hybrid))
             }
-            Ok(_) => {
+            remaining => {
+                let mode = if let Err(SteamSearchError::Unavailable(err)) = remaining {
+                    tracing::warn!(error = %err, "Steam CM 混合检索失败，回退至本地索引");
+                    SearchExecutionMode::LocalFallback
+                } else {
+                    SearchExecutionMode::Hybrid
+                };
+                let exact = self
+                    .load_exact_match(&exact_query, ctx.app_id, exact_observation.as_deref(), None)
+                    .await?;
                 self.local_with_exact(
                     &query,
                     exact_untyped_id,
                     pagination,
                     exact.as_ref(),
                     sort_plan.merge,
-                    SearchExecutionMode::Hybrid,
+                    mode,
                 )
                 .await
             }
+        }?;
+        self.finish_search_with_current_restrictions(output, &query, exact_untyped_id, ctx)
+            .await
+    }
+
+    async fn finish_search_with_current_restrictions(
+        &self,
+        output: HybridSearchOutput,
+        query: &SearchQuery,
+        exact_untyped_id: Option<WorkshopId>,
+        ctx: SteamFetchCtx,
+    ) -> anyhow::Result<HybridSearchOutput> {
+        if ctx.restriction_generation == self.repo.search_restriction_generation() {
+            return Ok(output);
         }
+        self.run_local_only(query, exact_untyped_id, SearchExecutionMode::LocalFallback)
+            .await
+    }
+
+    async fn load_exact_match(
+        &self,
+        query: &SearchQuery,
+        app_id: u32,
+        observation: Option<&WorkshopObservation>,
+        indexed_id: Option<WorkshopId>,
+    ) -> anyhow::Result<Option<WorkshopItemRecord>> {
+        if let Some(observation) = observation {
+            return Ok(self
+                .apply_local_overlay(query, app_id, [observation], false)
+                .await?
+                .items
+                .pop());
+        }
+        let Some(wid) = indexed_id else {
+            return Ok(None);
+        };
+        // Steam or another request may have changed the indexed row while the search ran.
+        let stored = self.db_call(move |repo| repo.get_item(wid)).await?;
+        Ok(stored
+            .filter(|meta| {
+                meta.is_in_public_catalog()
+                    && meta.record.status == WorkshopItemStatus::Active
+                    && (meta.is_admin_override || meta.consumer_appid.is_none_or(|id| id == app_id))
+                    && matches_filters(&meta.record, query, true)
+            })
+            .map(|meta| meta.record))
     }
 
     async fn lookup_exact(
@@ -735,30 +780,31 @@ impl HybridSearchService {
         sync: &SyncSection,
     ) -> anyhow::Result<ExactLookup> {
         if !sync.enable_read_through {
-            return Ok(ExactLookup::Local(None));
+            return Ok(ExactLookup::LocalOnly);
         }
         let stored = self.db_call(move |r| r.get_item(wid)).await?;
         if let Some(meta) = stored {
             if meta.is_in_public_catalog() {
-                return Ok(ExactLookup::Local(Some(Box::new(meta.record))));
+                return Ok(ExactLookup::Indexed);
             }
             if meta.is_admin_override
                 || meta.record.status == WorkshopItemStatus::PrivateOrUnavailable
                 || meta.is_listed == Some(false)
             {
-                return Ok(ExactLookup::Local(None));
+                return Ok(ExactLookup::LocalOnly);
             }
             let age_secs = (Utc::now() - meta.last_verified_at).num_seconds().max(0) as u64;
             if age_secs < sync.item_ttl_secs {
                 if meta.record.status == WorkshopItemStatus::Removed {
-                    return Ok(ExactLookup::Local(None));
+                    return Ok(ExactLookup::LocalOnly);
                 }
-                if meta.record.status == WorkshopItemStatus::Active && meta.is_listed == Some(true)
-                {
+                if let Some(consumer_appid) = meta.consumer_appid.filter(|_| {
+                    meta.record.status == WorkshopItemStatus::Active && meta.is_listed == Some(true)
+                }) {
                     return Ok(ExactLookup::Steam(Some(Arc::new(WorkshopObservation {
                         outcome: WorkshopFetchOutcome::Found { item: meta.record },
                         listed: true,
-                        consumer_appid: Some(ctx.app_id),
+                        consumer_appid: Some(consumer_appid),
                     }))));
                 }
             }
@@ -767,7 +813,7 @@ impl HybridSearchService {
             .repo
             .has_fresh_search_restriction(wid, sync.item_ttl_secs)
         {
-            return Ok(ExactLookup::Local(None));
+            return Ok(ExactLookup::LocalOnly);
         }
 
         match self.fetch_exact_singleflight(wid, ctx).await {
@@ -838,7 +884,12 @@ impl HybridSearchService {
                             {
                                 Ok(()) => {
                                     if ctx.cache_steam_results {
-                                        svc.warm_public_results(&observations, ctx.app_id, 0);
+                                        svc.warm_public_results(
+                                            &observations,
+                                            ctx.app_id,
+                                            0,
+                                            ctx.restriction_generation,
+                                        );
                                     }
                                     Ok(observations.into_iter().next().map(Arc::new))
                                 }
@@ -850,6 +901,14 @@ impl HybridSearchService {
 
                     {
                         let mut state = svc.cache_state.lock().await;
+                        let final_result = final_result.and_then(|observation| {
+                            if ctx.restriction_generation
+                                != svc.repo.search_restriction_generation()
+                            {
+                                return Err(search_restrictions_changed());
+                            }
+                            Ok(observation)
+                        });
                         state.remove_inflight_exact_if_matches(&wid, inflight_id);
                         guard.disarm();
                         let _ = tx.send(final_result);
@@ -1061,8 +1120,8 @@ impl HybridSearchService {
     ) -> Result<SteamResults, SteamSearchError> {
         let mut scan_request = request.clone();
         scan_request.page = 1;
-        let first = self.fetch_steam_page_cached(&scan_request, ctx).await?;
-        let total = steam_total(&first.raw);
+        let mut first = self.fetch_steam_page_cached(&scan_request, ctx).await?;
+        let mut total = steam_total(&first.raw);
         // For very broad searches or Steam-only browse sorts (trend/toprated), keep native Steam paging.
         if total > MAX_STEAM_MERGE_ITEMS || (force_native_paging && total > 0) {
             return self.resolve_native_page(request, first, total, ctx).await;
@@ -1071,27 +1130,10 @@ impl HybridSearchService {
             return Ok(SteamResults::Complete(Vec::new()));
         }
 
-        if total.div_ceil(u64::from(request.num_per_page)) > MAX_STEAM_MERGE_PAGES {
+        // Probe with the native page size, then scan in larger pages when merging multiple pages.
+        if total > u64::from(request.num_per_page) && request.num_per_page < STEAM_SCAN_PAGE_SIZE {
             scan_request.num_per_page = STEAM_SCAN_PAGE_SIZE;
-        }
-
-        let mut pages = if scan_request.num_per_page == request.num_per_page {
-            let num_pages = total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
-            let mut pages = Vec::with_capacity(num_pages as usize);
-            pages.push(first);
-            if num_pages >= 2 {
-                pages.extend(
-                    self.fetch_steam_page_range(&scan_request, 2..=num_pages, ctx)
-                        .await?,
-                );
-            }
-            pages
-        } else {
-            let mut repaged_first_req = scan_request.clone();
-            repaged_first_req.page = 1;
-            let repaged_first = self
-                .fetch_steam_page_cached(&repaged_first_req, ctx)
-                .await?;
+            let repaged_first = self.fetch_steam_page_cached(&scan_request, ctx).await?;
             let updated_total = steam_total(&repaged_first.raw);
             if updated_total == 0 {
                 return Err(SteamSearchError::Unavailable(
@@ -1103,18 +1145,19 @@ impl HybridSearchService {
                     .resolve_native_page(request, first, updated_total, ctx)
                     .await;
             }
-            let updated_num_pages =
-                updated_total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
-            let mut pages = Vec::with_capacity(updated_num_pages as usize);
-            pages.push(repaged_first);
-            if updated_num_pages >= 2 {
-                pages.extend(
-                    self.fetch_steam_page_range(&scan_request, 2..=updated_num_pages, ctx)
-                        .await?,
-                );
-            }
-            pages
-        };
+            first = repaged_first;
+            total = updated_total;
+        }
+
+        let num_pages = total.div_ceil(u64::from(scan_request.num_per_page)) as u32;
+        let mut pages = Vec::with_capacity(num_pages as usize);
+        pages.push(first);
+        if num_pages >= 2 {
+            pages.extend(
+                self.fetch_steam_page_range(&scan_request, 2..=num_pages, ctx)
+                    .await?,
+            );
+        }
 
         if pages.iter().all(|page| page.raw.outcomes.is_empty()) {
             pages.clear();
@@ -1217,42 +1260,69 @@ impl HybridSearchService {
         app_id: u32,
         observations: impl IntoIterator<Item = &'a WorkshopObservation>,
         steam_enforced_tags: bool,
-    ) -> anyhow::Result<Vec<WorkshopItemRecord>> {
+    ) -> anyhow::Result<SearchOverlay> {
         let obs_list: Vec<&WorkshopObservation> = observations.into_iter().collect();
         if obs_list.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOverlay::default());
         }
 
         let ids: Vec<WorkshopId> = obs_list
             .iter()
             .map(|obs| obs.outcome.workshop_id())
             .collect();
-        let meta_map = self.db_call(move |r| r.get_overlay_batch(&ids)).await?;
+        let (meta_map, markers) = self
+            .db_call(move |repo| {
+                // A restriction can move from memory to SQLite. Read memory first so the
+                // overlay still sees the restriction if the row is inserted in between.
+                let markers = repo.search_restrictions(&ids);
+                Ok((repo.get_overlay_batch(&ids)?, markers))
+            })
+            .await?;
 
-        let mut out = Vec::with_capacity(obs_list.len());
+        let mut out = SearchOverlay {
+            items: Vec::with_capacity(obs_list.len()),
+            restricted_ids: HashSet::new(),
+        };
         for obs in obs_list {
             let wid = obs.outcome.workshop_id();
-            if let Some(meta) = meta_map.get(&wid) {
-                if meta.is_admin_override {
-                    if !meta.is_in_public_catalog() {
-                        continue;
-                    }
-                    if let Some(ref record) = meta.override_record {
-                        if query.status.is_none()
-                            && matches!(
-                                record.status,
-                                WorkshopItemStatus::PrivateOrUnavailable
-                                    | WorkshopItemStatus::Removed
-                            )
-                        {
-                            continue;
-                        }
-                        if matches_filters(record, query, true) {
-                            out.push(record.clone());
-                        }
-                    }
+            let meta = meta_map.get(&wid);
+            if let Some(meta) = meta.filter(|meta| meta.is_admin_override) {
+                if !meta.is_in_public_catalog()
+                    || (query.status.is_none()
+                        && matches!(
+                            meta.status,
+                            WorkshopItemStatus::PrivateOrUnavailable | WorkshopItemStatus::Removed
+                        ))
+                {
+                    out.restricted_ids.insert(wid);
                     continue;
                 }
+                if let Some(record) = meta
+                    .override_record
+                    .as_ref()
+                    .filter(|record| matches_filters(record, query, true))
+                {
+                    out.items.push(record.clone());
+                }
+                continue;
+            }
+
+            // Restrictions have already been applied in snapshot order. An older Steam
+            // restriction that lost to a newer public row must leave the local match visible.
+            let local_restriction = meta.filter(|meta| {
+                matches!(
+                    meta.status,
+                    WorkshopItemStatus::PrivateOrUnavailable | WorkshopItemStatus::Removed
+                ) || meta.is_listed == Some(false)
+            });
+            let marker = markers.get(&wid).filter(|marker| {
+                meta.is_none_or(|meta| {
+                    marker.observed_at > meta.visibility_verified_at
+                        || is_stale_steam_version(marker.steam_version, meta.steam_version)
+                })
+            });
+            if local_restriction.is_some() || marker.is_some() {
+                out.restricted_ids.insert(wid);
             }
 
             if !is_public_active_for_app(obs, app_id) {
@@ -1265,29 +1335,20 @@ impl HybridSearchService {
                 continue;
             }
 
-            let mut item = item.clone();
-            if let Some(meta) = meta_map.get(&wid) {
-                if (matches!(
-                    meta.status,
-                    WorkshopItemStatus::PrivateOrUnavailable | WorkshopItemStatus::Removed
-                ) || meta.is_listed == Some(false))
-                    && (meta.visibility_verified_at >= item.fetched_at
-                        || is_stale_steam_version(meta.steam_version, item.time_updated))
-                {
-                    continue;
-                }
-                if item.creator_name.is_none() {
-                    item.creator_name = meta.creator_name.clone();
-                }
-            }
-            if let Some(marker) = self.repo.search_restriction(wid) {
-                if marker.observed_at >= item.fetched_at
+            if local_restriction.is_some_and(|meta| {
+                meta.visibility_verified_at >= item.fetched_at
+                    || is_stale_steam_version(meta.steam_version, item.time_updated)
+            }) || marker.is_some_and(|marker| {
+                marker.observed_at >= item.fetched_at
                     || is_stale_steam_version(marker.steam_version, item.time_updated)
-                {
-                    continue;
-                }
+            }) {
+                continue;
             }
-            out.push(item);
+            let mut item = item.clone();
+            if item.creator_name.is_none() {
+                item.creator_name = meta.and_then(|meta| meta.creator_name.clone());
+            }
+            out.items.push(item);
         }
         Ok(out)
     }
@@ -1304,7 +1365,10 @@ impl HybridSearchService {
             let mut state = self.cache_state.lock().await;
             if !ctx.cache_ttl.is_zero() {
                 match state.cache.get(request) {
-                    Some(entry) if entry.cached_at.elapsed() < ctx.cache_ttl => {
+                    Some(entry)
+                        if entry.cached_at.elapsed() < ctx.cache_ttl
+                            && entry.page.restriction_generation == ctx.restriction_generation =>
+                    {
                         let page = entry.page.clone();
                         drop(state);
                         self.save_page_restrictions(request, &page, ctx.app_id)
@@ -1345,7 +1409,12 @@ impl HybridSearchService {
                     };
                     let result = match tokio::time::timeout(
                         ctx.steam_timeout,
-                        svc.execute_steam_page_rpc(&req, &tx, &mut guard),
+                        svc.execute_steam_page_rpc(
+                            &req,
+                            &tx,
+                            &mut guard,
+                            ctx.restriction_generation,
+                        ),
                     )
                     .await
                     {
@@ -1359,7 +1428,10 @@ impl HybridSearchService {
                     {
                         let mut state = svc.cache_state.lock().await;
                         if let Ok(page) = &result {
-                            if !ctx.cache_ttl.is_zero() {
+                            if !ctx.cache_ttl.is_zero()
+                                && page.restriction_generation
+                                    == svc.repo.search_restriction_generation()
+                            {
                                 insert_cached_page_locked(
                                     &mut state.cache,
                                     req.clone(),
@@ -1380,6 +1452,7 @@ impl HybridSearchService {
                                     &page.raw.outcomes,
                                     ctx.app_id,
                                     req.language,
+                                    page.restriction_generation,
                                 );
                             }
                             Ok(()) => {}
@@ -1399,6 +1472,9 @@ impl HybridSearchService {
             })??;
         self.save_page_restrictions(request, &page, ctx.app_id)
             .await?;
+        if page.restriction_generation != ctx.restriction_generation {
+            return Err(search_restrictions_changed());
+        }
         Ok(page)
     }
 
@@ -1407,6 +1483,7 @@ impl HybridSearchService {
         req: &SteamSearchRequest,
         tx: &broadcast::Sender<SharedPageResult>,
         guard: &mut PageInflightGuard,
+        restriction_generation: u64,
     ) -> Option<SharedPageResult> {
         if self.abort_page_if_abandoned(req, tx, guard).await {
             return None;
@@ -1426,6 +1503,7 @@ impl HybridSearchService {
                 .map(|raw| {
                     Arc::new(SharedSteamPage {
                         raw,
+                        restriction_generation,
                         restrictions_outcome: OnceCell::new(),
                     })
                 }),
@@ -1536,6 +1614,7 @@ impl HybridSearchService {
             handle.spawn(async move {
                 while let Some(batch) = rx.recv().await {
                     let policy = batch.policy;
+                    let restriction_generation = batch.restriction_generation;
                     let mut remaining = batch.observations;
                     while !remaining.is_empty() {
                         let split_at = remaining.len().min(WARM_WRITE_CHUNK_SIZE);
@@ -1544,7 +1623,7 @@ impl HybridSearchService {
                         remaining = tail;
                         let repo_clone = Arc::clone(&repo);
                         let res = tokio::task::spawn_blocking(move || {
-                            repo_clone.apply_upstream_outcomes_with_policy(&chunk, policy)
+                            repo_clone.warm_search_results(&chunk, policy, restriction_generation)
                         })
                         .await;
                         match res {
@@ -1570,6 +1649,7 @@ impl HybridSearchService {
         observations: &[WorkshopObservation],
         app_id: u32,
         language: i32,
+        restriction_generation: u64,
     ) {
         let observations: Vec<_> = observations
             .iter()
@@ -1590,6 +1670,7 @@ impl HybridSearchService {
             .try_send(WarmBatch {
                 observations,
                 policy,
+                restriction_generation,
             })
             .is_err()
         {
@@ -1604,7 +1685,10 @@ fn insert_cached_page_locked(
     page: Arc<SharedSteamPage>,
     cache_ttl: Duration,
 ) {
-    cache.retain(|_, entry| entry.cached_at.elapsed() < cache_ttl);
+    cache.retain(|_, entry| {
+        entry.cached_at.elapsed() < cache_ttl
+            && entry.page.restriction_generation == page.restriction_generation
+    });
     if !cache.contains_key(&request) && cache.len() >= MAX_SEARCH_CACHE_ENTRIES {
         if let Some(oldest_key) = cache
             .iter()
@@ -1635,11 +1719,15 @@ fn steam_total(page: &WorkshopQueryPage) -> u64 {
     page.total.max(page.outcomes.len() as u64)
 }
 
+fn search_restrictions_changed() -> SteamSearchError {
+    SteamSearchError::Unavailable("Steam CM 搜索期间可见性缓存已失效".to_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn merge_matches<'a>(
     local: &[RankedCatalogMatch],
     steam: &'a [WorkshopItemRecord],
-    observations: &[&WorkshopObservation],
+    restricted_ids: &HashSet<WorkshopId>,
     first_page_len: usize,
     exact: Option<&'a WorkshopItemRecord>,
     strategy: MergeStrategy,
@@ -1652,18 +1740,11 @@ fn merge_matches<'a>(
         .iter()
         .filter(|item| steam_by_id.insert(item.workshop_id, *item).is_none())
         .collect();
-    // A cached Steam hit can be suppressed by a newer local tombstone. Keep that ID out of the local tail as well.
-    let suppressed: HashSet<_> = observations
-        .iter()
-        .map(|obs| obs.outcome.workshop_id())
-        .filter(|id| !steam_by_id.contains_key(id))
-        .collect();
-
     let local = exact.into_iter().map(SearchHit::Steam).chain(
         local
             .iter()
             .filter(|matched| {
-                !suppressed.contains(&matched.id)
+                !restricted_ids.contains(&matched.id)
                     && exact.is_none_or(|item| item.workshop_id != matched.id)
             })
             .copied()
@@ -1928,7 +2009,7 @@ pub fn parse_steam_language_tag(raw: &str) -> Option<i32> {
         "tr" | "turkish" => Some(21),
         "bg" | "bulgarian" => Some(23),
         "el" | "greek" => Some(24),
-        "uk" | "ukrainian" => Some(25),
+        "uk" | "ukrainian" => Some(26),
         "vi" | "vietnamese" => Some(28),
         "id" | "indonesian" => Some(30),
         _ => None,
@@ -1975,7 +2056,7 @@ pub fn parse_steam_language_tag(raw: &str) -> Option<i32> {
         "tr" => Some(21),
         "bg" => Some(23),
         "el" => Some(24),
-        "uk" => Some(25),
+        "uk" => Some(26),
         "vi" => Some(28),
         "id" => Some(30),
         _ => None,
@@ -2008,6 +2089,13 @@ mod tests {
         assert_eq!(parse_steam_language_tag("ru"), Some(8));
         assert_eq!(parse_steam_language_tag("pt-BR"), Some(22));
         assert_eq!(parse_steam_language_tag("es-419"), Some(27));
+        assert_eq!(parse_steam_language_tag("uk"), Some(26));
+        assert_eq!(parse_steam_language_tag("ukrainian"), Some(26));
+        assert_eq!(resolve_steam_language(Some("uk-UA"), None, "english"), 26);
+        assert_eq!(
+            resolve_steam_language(None, Some("uk-UA,en;q=0.8"), "english"),
+            26
+        );
 
         assert_eq!(
             resolve_steam_language(Some("zh-CN"), Some("en-US,en;q=0.9"), "english"),
@@ -2230,32 +2318,32 @@ mod tests {
         repo.upsert_item(&unit_sample_item(8100, "Fanout Local Item"), false, true)
             .unwrap();
 
-        let make_req = |page| SteamSearchRequest {
+        let make_req = |page, num_per_page| SteamSearchRequest {
             query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
             file_type: MATCHING_FILE_TYPE_ITEMS,
             page,
-            num_per_page: 1,
+            num_per_page,
             search_text: Some("Fanout".to_string()),
             required_tags: Vec::new(),
             language: 0,
             days: None,
             search_text_target: None,
         };
-        for page in 1..=12u32 {
+        for size in [1, STEAM_SCAN_PAGE_SIZE] {
             upstream.insert_search_page(
-                make_req(page),
+                make_req(1, size),
                 WorkshopQueryPage {
-                    total: 12,
+                    total: 600,
                     next_cursor: None,
                     outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
-                        item: unit_sample_item(8100 + u64::from(page), &format!("Fanout {page}")),
+                        item: unit_sample_item(8101, "Fanout 1"),
                     })],
                 },
             );
         }
         // Fail every page in the first bounded window so scheduling order cannot advance the window.
         for page in 2..=(1 + MAX_CONCURRENT_PAGES_PER_SEARCH as u32) {
-            upstream.fail_search_request(make_req(page));
+            upstream.fail_search_request(make_req(page, STEAM_SCAN_PAGE_SIZE));
         }
 
         let svc = Arc::new(HybridSearchService::new(
@@ -2286,8 +2374,8 @@ mod tests {
         let recorded = upstream.recorded_searches();
         assert_eq!(
             recorded.len(),
-            1 + MAX_CONCURRENT_PAGES_PER_SEARCH,
-            "expected exactly 1 + {} pages before short-circuiting, got {:?}",
+            2 + MAX_CONCURRENT_PAGES_PER_SEARCH,
+            "expected two first-page requests and {} scan pages, got {:?}",
             MAX_CONCURRENT_PAGES_PER_SEARCH,
             recorded.iter().map(|r| r.page).collect::<Vec<_>>()
         );
@@ -2297,6 +2385,187 @@ mod tests {
                 .all(|r| r.page <= 1 + MAX_CONCURRENT_PAGES_PER_SEARCH as u32),
             "pages beyond the first window must never be launched"
         );
+    }
+
+    #[tokio::test]
+    async fn indexed_exact_match_is_rechecked_after_restrictions_when_local_supplement_is_busy() {
+        use crate::config::CatalogConfig;
+        use crate::upstream::MockWorkshopUpstream;
+
+        let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+        let cfg = Arc::new(CatalogConfigStore::new(None, CatalogConfig::default()));
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        let mut svc = HybridSearchService::new(cfg, repo.clone(), upstream.clone());
+        svc.local_supplement_queue_wait = Duration::from_millis(10);
+        let svc = Arc::new(svc);
+        let _local_permits = svc
+            .local_search_gate
+            .try_acquire_many(MAX_CONCURRENT_LOCAL_SEARCHES as u32)
+            .unwrap();
+
+        for (wid, private, total) in [(810001, true, 2), (810002, false, 2), (810003, true, 2500)] {
+            let item = unit_sample_item(wid, "Previously listed exact item");
+            repo.upsert_item(&item, false, true).unwrap();
+            let observed_at = item.fetched_at + chrono::Duration::seconds(1);
+            let restriction = if private {
+                WorkshopFetchOutcome::PrivateOrUnavailable {
+                    workshop_id: item.workshop_id,
+                    source: MetadataSource::SteamKit,
+                    observed_at,
+                    reason: None,
+                }
+            } else {
+                WorkshopFetchOutcome::Found {
+                    item: WorkshopItemRecord {
+                        fetched_at: observed_at,
+                        ..item
+                    },
+                }
+            };
+            let query = SearchQuery {
+                query: Some(wid.to_string()),
+                ..Default::default()
+            };
+            upstream.insert_search_page(
+                SteamSearchRequest {
+                    query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+                    file_type: MATCHING_FILE_TYPE_ITEMS,
+                    page: 1,
+                    num_per_page: query.page_size,
+                    search_text: query.query.clone(),
+                    required_tags: Vec::new(),
+                    language: 0,
+                    days: None,
+                    search_text_target: None,
+                },
+                WorkshopQueryPage {
+                    total,
+                    next_cursor: None,
+                    outcomes: vec![
+                        WorkshopObservation {
+                            outcome: restriction,
+                            listed: false,
+                            consumer_appid: Some(550),
+                        },
+                        WorkshopFetchOutcome::Found {
+                            item: unit_sample_item(810010, "Unrelated live item"),
+                        }
+                        .into(),
+                    ],
+                },
+            );
+            let output = svc.search(&query, None).await.unwrap();
+            assert_eq!(output.mode, SearchExecutionMode::Hybrid);
+            assert_eq!(output.response.items.len(), 1);
+            assert_eq!(output.response.items[0].workshop_id, WorkshopId(810010));
+        }
+    }
+
+    #[tokio::test]
+    async fn evicting_search_restrictions_invalidates_cached_pages_and_queued_warming() {
+        use crate::config::CatalogConfig;
+        use crate::db::MAX_NEGATIVE_CACHE_ENTRIES;
+        use crate::upstream::MockWorkshopUpstream;
+
+        let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+        let mut cfg = CatalogConfig::default();
+        cfg.search.cache_steam_results = false;
+        let config_store = Arc::new(CatalogConfigStore::new(None, cfg));
+        let upstream = Arc::new(MockWorkshopUpstream::new());
+        let svc = Arc::new(HybridSearchService::new(
+            config_store,
+            repo.clone(),
+            upstream.clone(),
+        ));
+        let now = Utc::now();
+        let mut item = unit_sample_item(80000, "Once visible item");
+        item.fetched_at = now - chrono::Duration::seconds(2);
+        let wid = item.workshop_id;
+        let public: WorkshopObservation = WorkshopFetchOutcome::Found { item }.into();
+        let private: WorkshopObservation = WorkshopFetchOutcome::PrivateOrUnavailable {
+            workshop_id: wid,
+            source: MetadataSource::SteamKit,
+            observed_at: now - chrono::Duration::seconds(1),
+            reason: None,
+        }
+        .into();
+        let query = SearchQuery {
+            query: Some("Once visible".into()),
+            ..Default::default()
+        };
+        let request = SteamSearchRequest {
+            query_type: QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            file_type: MATCHING_FILE_TYPE_ITEMS,
+            page: 1,
+            num_per_page: query.page_size,
+            search_text: query.query.clone(),
+            required_tags: Vec::new(),
+            language: 0,
+            days: None,
+            search_text_target: None,
+        };
+        upstream.insert_search_page(
+            request.clone(),
+            WorkshopQueryPage {
+                total: 1,
+                next_cursor: None,
+                outcomes: vec![public.clone()],
+            },
+        );
+        let generation = repo.search_restriction_generation();
+        assert_eq!(
+            svc.search(&query, None).await.unwrap().response.items.len(),
+            1
+        );
+        repo.apply_upstream_outcomes(std::slice::from_ref(&private))
+            .unwrap();
+        assert!(svc
+            .search(&query, None)
+            .await
+            .unwrap()
+            .response
+            .items
+            .is_empty());
+        assert_eq!(upstream.recorded_searches().len(), 1);
+
+        let misses: Vec<_> = (1..=MAX_NEGATIVE_CACHE_ENTRIES)
+            .map(|id| {
+                WorkshopFetchOutcome::Removed {
+                    workshop_id: WorkshopId(id as u64),
+                    source: MetadataSource::SteamKit,
+                    observed_at: now,
+                    reason: None,
+                }
+                .into()
+            })
+            .collect();
+        repo.apply_upstream_outcomes(&misses).unwrap();
+        assert!(!repo.has_fresh_search_restriction(wid, 60));
+        assert!(repo.get_item(wid).unwrap().is_none());
+        repo.warm_search_results(
+            &[public],
+            CatalogIndexPolicy::RefreshUnindexedCache,
+            generation,
+        )
+        .unwrap();
+        assert!(repo.get_item(wid).unwrap().is_none());
+
+        upstream.insert_search_page(
+            request,
+            WorkshopQueryPage {
+                total: 1,
+                next_cursor: None,
+                outcomes: vec![private],
+            },
+        );
+        assert!(svc
+            .search(&query, None)
+            .await
+            .unwrap()
+            .response
+            .items
+            .is_empty());
+        assert_eq!(upstream.recorded_searches().len(), 2);
     }
 
     #[tokio::test]

@@ -28,6 +28,7 @@ use steam_vent_proto_steam::steammessages_publishedfile_steamclient::{
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 const MAX_PERSONA_CACHE_ENTRIES: usize = 10_000;
+const SEARCH_PERSONA_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub(super) struct ConnectionSlot {
@@ -98,6 +99,7 @@ pub(super) struct SteamCmInner {
     pub(super) auth_flow: Mutex<AuthFlowSlot>,
     pub(super) guard_file_lock: Arc<StdMutex<()>>,
     pub(super) persona_cache: RwLock<HashMap<u64, String>>,
+    search_persona_gate: Arc<Semaphore>,
     request_gate: Arc<Semaphore>,
     total_requests: AtomicU64,
     failed_requests: AtomicU64,
@@ -123,6 +125,7 @@ impl SteamCmClient {
                 auth_flow: Mutex::new(AuthFlowSlot::default()),
                 guard_file_lock: Arc::new(StdMutex::new(())),
                 persona_cache: RwLock::new(HashMap::new()),
+                search_persona_gate: Arc::new(Semaphore::new(1)),
                 request_gate: Arc::new(Semaphore::new(concurrency)),
                 total_requests: AtomicU64::new(0),
                 failed_requests: AtomicU64::new(0),
@@ -320,6 +323,9 @@ impl SteamCmInner {
                 service_method_lossy(conn, req, GET_PLAYER_LINK_DETAILS_RESPONSE_SCHEMA).await
             {
                 let mut cache = self.persona_cache.write().await;
+                if self.config_store.get().steam.mode != SteamAuthMode::Account {
+                    return;
+                }
                 for acc in resp.accounts {
                     let sid = acc.public_data.steamid();
                     if let Some(ref name) = acc.public_data.persona_name {
@@ -347,12 +353,16 @@ impl SteamCmInner {
         details: &[PublishedFileDetails],
         observed_at: DateTime<Utc>,
     ) -> Vec<WorkshopObservation> {
-        let creators: Vec<u64> = details
-            .iter()
-            .filter(|d| d.result == Some(1) && !d.banned.unwrap_or(false) && can_resolve_by_id(d))
-            .filter_map(|d| d.creator.filter(|c| *c > 0))
-            .collect();
-        self.resolve_persona_names(conn, &creators).await;
+        self.resolve_persona_names(conn, &detail_creator_ids(details))
+            .await;
+        self.map_cached_details(details, observed_at).await
+    }
+
+    async fn map_cached_details(
+        &self,
+        details: &[PublishedFileDetails],
+        observed_at: DateTime<Utc>,
+    ) -> Vec<WorkshopObservation> {
         let persona_map = self.persona_cache.read().await;
 
         details
@@ -362,6 +372,38 @@ impl SteamCmInner {
                 map_detail(d, creator_name, observed_at)
             })
             .collect()
+    }
+
+    fn enrich_search_personas(
+        self: &Arc<Self>,
+        conn: Connection,
+        details: &[PublishedFileDetails],
+    ) {
+        if self.config_store.get().steam.mode != SteamAuthMode::Account {
+            return;
+        }
+        let creators = detail_creator_ids(details);
+        if creators.is_empty() {
+            return;
+        }
+        let Ok(persona_permit) = self.search_persona_gate.clone().try_acquire_owned() else {
+            return;
+        };
+        // Only enrich when the connection has spare capacity for both enrichment and primary RPCs.
+        let Ok(mut spare) = self.request_gate.clone().try_acquire_many_owned(2) else {
+            return;
+        };
+        let request_permit = spare.split(1).expect("two spare permits acquired");
+        drop(spare);
+        let inner = Arc::clone(self);
+        tokio::spawn(async move {
+            let _permits = (persona_permit, request_permit);
+            let _ = tokio::time::timeout(
+                SEARCH_PERSONA_TIMEOUT,
+                inner.resolve_persona_names(&conn, &creators),
+            )
+            .await;
+        });
     }
 
     pub(super) async fn status(&self) -> CatalogSteamStatus {
@@ -387,6 +429,14 @@ impl SteamCmInner {
     }
 }
 
+fn detail_creator_ids(details: &[PublishedFileDetails]) -> Vec<u64> {
+    details
+        .iter()
+        .filter(|d| d.result == Some(1) && !d.banned.unwrap_or(false) && can_resolve_by_id(d))
+        .filter_map(|d| d.creator.filter(|c| *c > 0))
+        .collect()
+}
+
 fn should_retry_network(err: &NetworkError) -> bool {
     matches!(
         err,
@@ -395,6 +445,7 @@ fn should_retry_network(err: &NetworkError) -> bool {
             | NetworkError::CryptoHandshakeFailed
             | NetworkError::CryptoError(_)
             | NetworkError::EOF
+            | NetworkError::Timeout
     )
 }
 
@@ -492,7 +543,7 @@ impl WorkshopUpstream for SteamCmClient {
         &self,
         request: &SteamSearchRequest,
     ) -> anyhow::Result<WorkshopQueryPage> {
-        let _permit = self.inner.request_gate.acquire().await?;
+        let permit = self.inner.request_gate.acquire().await?;
         let app_id = self.inner.config_store.get().steam.app_id;
         let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
         self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -539,7 +590,7 @@ impl WorkshopUpstream for SteamCmClient {
 
         let outcomes = self
             .inner
-            .map_details(&conn, &resp.publishedfiledetails, observed_at)
+            .map_cached_details(&resp.publishedfiledetails, observed_at)
             .await;
         if !resp.publishedfiledetails.is_empty() && outcomes.is_empty() {
             let msg = "Steam CM search_files 未核验任何返回的条目".to_string();
@@ -554,6 +605,9 @@ impl WorkshopUpstream for SteamCmClient {
             );
         }
         self.inner.clear_last_error().await;
+        drop(permit);
+        self.inner
+            .enrich_search_personas(conn, &resp.publishedfiledetails);
         Ok(WorkshopQueryPage {
             total: u64::from(resp.total.unwrap_or(0)),
             next_cursor: resp
@@ -605,5 +659,61 @@ impl WorkshopUpstream for SteamCmClient {
 
     async fn switch_anonymous(&self) -> anyhow::Result<CatalogSteamStatus> {
         self.switch_anonymous_impl().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CatalogConfig;
+    use crate::upstream::wire::decode_response_lossy;
+    use l4a_protocol::WorkshopFetchOutcome;
+    use steam_vent::EResult;
+    use steam_vent_proto_steam::steammessages_publishedfile_steamclient::CPublishedFile_QueryFiles_Response;
+
+    #[test]
+    fn classifies_transport_and_protocol_failures_for_retry() {
+        assert!(should_retry_network(&NetworkError::Timeout));
+        assert!(should_retry_network(&NetworkError::EOF));
+        assert!(!should_retry_network(&NetworkError::ApiError(
+            EResult::Timeout
+        )));
+        let malformed = decode_response_lossy::<CPublishedFile_QueryFiles_Response>(
+            "PublishedFile.QueryFiles#1",
+            &[0x08, 0x80],
+            QUERY_FILES_RESPONSE_SCHEMA,
+        )
+        .unwrap_err();
+        assert!(matches!(malformed, NetworkError::MalformedBody(_)));
+        assert!(!should_retry_network(&malformed));
+    }
+
+    #[tokio::test]
+    async fn search_can_map_details_with_partial_persona_cache_in_account_mode() {
+        let mut config = CatalogConfig::default();
+        config.steam.mode = SteamAuthMode::Account;
+        let client = SteamCmClient::new(Arc::new(CatalogConfigStore::new(None, config)));
+        client
+            .inner
+            .persona_cache
+            .write()
+            .await
+            .insert(11, "Cached creator".into());
+        let details = [11, 22].map(|creator| PublishedFileDetails {
+            publishedfileid: Some(creator),
+            result: Some(1),
+            visibility: Some(0),
+            creator: Some(creator),
+            ..Default::default()
+        });
+
+        let outcomes = client.inner.map_cached_details(&details, Utc::now()).await;
+        assert_eq!(outcomes.len(), 2);
+        for (outcome, expected) in outcomes.into_iter().zip([Some("Cached creator"), None]) {
+            let WorkshopFetchOutcome::Found { item } = outcome.outcome else {
+                panic!("expected an active search hit");
+            };
+            assert_eq!(item.creator_name.as_deref(), expected);
+        }
     }
 }
