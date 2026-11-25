@@ -170,6 +170,32 @@ impl LocalDb {
         Ok(())
     }
 
+    pub(crate) fn migrate_filter_exclusion_addon_id_tx(
+        tx: &Connection,
+        old_id: &AddonId,
+        new_id: &AddonId,
+    ) -> Result<(), CoreError> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        let target_exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM filter_exclusions WHERE addon_id = ?1",
+                params![new_id.as_str()],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if target_exists {
+            return Ok(());
+        }
+        tx.execute(
+            "UPDATE filter_exclusions SET addon_id = ?2, updated_at = ?3 WHERE addon_id = ?1",
+            params![old_id.as_str(), new_id.as_str(), Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn get_cached_filter_verdict(
         &self,
         target_key: &str,
@@ -191,6 +217,27 @@ impl LocalDb {
         Ok(serde_json::from_str::<FilterItemVerdict>(&json_str).ok())
     }
 
+    pub fn list_filter_verdicts_for_policy(
+        &self,
+        policy_sig: &str,
+    ) -> Result<Vec<FilterItemVerdict>, CoreError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn.prepare(
+            "SELECT verdict_json FROM filter_verdicts
+             WHERE policy_sig = ?1
+             ORDER BY target_key ASC",
+        )?;
+        let rows = stmt.query_map(params![policy_sig], |r| r.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row?;
+            if let Ok(verdict) = serde_json::from_str::<FilterItemVerdict>(&raw) {
+                out.push(verdict);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn put_cached_filter_verdict(
         &self,
         target_key: &str,
@@ -201,20 +248,25 @@ impl LocalDb {
         let verdict_json = serde_json::to_string(verdict)
             .map_err(|e| CoreError::Config(format!("序列化过滤判定结果失败: {e}")))?;
         let now = Utc::now().to_rfc3339();
-        let conn = self.lock_conn()?;
-        conn.execute(
-            r#"
-            INSERT INTO filter_verdicts (
-                target_key, content_sig, policy_sig, verdict_json, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(target_key, policy_sig) DO UPDATE SET
-                content_sig = excluded.content_sig,
-                verdict_json = excluded.verdict_json,
-                updated_at = excluded.updated_at
-            "#,
-            params![target_key, content_sig, policy_sig, verdict_json, now],
-        )?;
-        Ok(())
+        self.write(|tx| {
+            tx.execute(
+                "DELETE FROM filter_verdicts WHERE policy_sig != ?1",
+                params![policy_sig],
+            )?;
+            tx.execute(
+                r#"
+                INSERT INTO filter_verdicts (
+                    target_key, content_sig, policy_sig, verdict_json, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(target_key, policy_sig) DO UPDATE SET
+                    content_sig = excluded.content_sig,
+                    verdict_json = excluded.verdict_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![target_key, content_sig, policy_sig, verdict_json, now],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn clear_filter_verdicts(&self) -> Result<u64, CoreError> {

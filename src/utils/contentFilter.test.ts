@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  AddonSummary,
   ClientFilterConfig,
   ExclusionDisplayLevel,
   FilterExclusionRecord,
@@ -15,8 +16,10 @@ import {
   createDefaultFilterConfig,
   formatDiagnosticVerdictBadge,
   getPresetDefaultParams,
+  resolveBundleCoverPresentation,
   resolveCardFilterState,
   resolveDetailFilterState,
+  resolveLookupVerdict,
 } from './contentFilter';
 
 function makeEnabledConfig(overrides: Partial<ClientFilterConfig> = {}): ClientFilterConfig {
@@ -179,21 +182,91 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(subdivided.redactTitle).toBe(true);
     expect(subdivided.redactDescription).toBe(true);
 
-    // With subdivideModalities=false: treats imageSensitive=true and textSensitive=false
-    const coarse = resolveCardFilterState({
+    // With subdivideModalities=false: treats BOTH image and text modalities as sensitive!
+    const coarseFromText = resolveCardFilterState({
       config: makeEnabledConfig({ flaggedAction: 'hide_image', subdivideModalities: false }),
       scope: 'workshop',
       verdict: pureTextVerdict,
       totalImages: 3,
     });
-    expect(coarse.imageSensitive).toBe(true);
-    expect(coarse.textSensitive).toBe(false);
-    expect(coarse.coverMode).toBe('hide');
-    expect(coarse.redactTitle).toBe(false);
-    expect(coarse.sensitiveImageIndices).toEqual([0, 1, 2]);
+    expect(coarseFromText.imageSensitive).toBe(true);
+    expect(coarseFromText.textSensitive).toBe(true);
+    expect(coarseFromText.titleSensitive).toBe(true);
+    expect(coarseFromText.descriptionSensitive).toBe(true);
+    expect(coarseFromText.coverMode).toBe('hide');
+    expect(coarseFromText.redactTitle).toBe(true);
+    expect(coarseFromText.redactDescription).toBe(true);
+    expect(coarseFromText.sensitiveImageIndices).toEqual([0, 1, 2]);
+
+    const coarseFromImageOnly = resolveCardFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'hide_image', subdivideModalities: false }),
+      scope: 'library',
+      verdict: makeFlaggedVerdict({
+        imageSensitive: true,
+        textSensitive: false,
+        titleSensitive: false,
+        descriptionSensitive: false,
+      }),
+    });
+    expect(coarseFromImageOnly.imageSensitive).toBe(true);
+    expect(coarseFromImageOnly.textSensitive).toBe(true);
+    expect(coarseFromImageOnly.redactTitle).toBe(true);
+    expect(coarseFromImageOnly.redactDescription).toBe(true);
   });
 
-  it('enforces image-only blurring in Detail view and subdivides multi-image gallery screenshots', () => {
+  it('prevents raw cover flash while evaluation is pending and clears pending state once evaluated', () => {
+    // Pending evaluation (verdict === undefined, not failed, has content) hides covers immediately
+    const pendingHideImage = resolveCardFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'hide_image' }),
+      scope: 'workshop',
+      verdict: undefined,
+      hasTargetFailed: false,
+      hasContent: true,
+    });
+    expect(pendingHideImage.pendingEvaluation).toBe(true);
+    expect(pendingHideImage.coverMode).toBe('hide');
+    expect(pendingHideImage.blurWholeCard).toBe(false);
+
+    const pendingBlurCard = resolveCardFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'blur_card' }),
+      scope: 'library',
+      verdict: undefined,
+      hasTargetFailed: false,
+      hasContent: true,
+    });
+    expect(pendingBlurCard.pendingEvaluation).toBe(true);
+    expect(pendingBlurCard.coverMode).toBe('hide');
+    expect(pendingBlurCard.blurWholeCard).toBe(true);
+
+    const pendingDetail = resolveDetailFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'hide_card' }),
+      scope: 'workshop',
+      verdict: undefined,
+      hasTargetFailed: false,
+      hasContent: true,
+    });
+    expect(pendingDetail.pendingEvaluation).toBe(true);
+    expect(pendingDetail.coverMode).toBe('hide');
+    expect(pendingDetail.imageModeAt(0)).toBe('hide');
+    expect(pendingDetail.imageModeAt(2)).toBe('hide');
+
+    // Once evaluated safe (present in evaluatedRevisions without flagged verdict), resolveLookupVerdict returns null -> not pending!
+    const lookupSafe = resolveLookupVerdict('workshop:999', {
+      verdicts: {},
+      evaluatedRevisions: { 'workshop:999': 'rev1' },
+    });
+    expect(lookupSafe).toBeNull();
+    const settledSafe = resolveCardFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'blur_card' }),
+      scope: 'workshop',
+      verdict: lookupSafe,
+    });
+    expect(settledSafe.pendingEvaluation).toBe(false);
+    expect(settledSafe.coverMode).toBe('none');
+    expect(settledSafe.blurWholeCard).toBe(false);
+  });
+
+  it('enforces image-only blurring in Detail view, subdivides gallery screenshots, and blurs unscanned screenshots beyond perImageProbs', () => {
     const galleryVerdict = makeFlaggedVerdict({
       imageSensitive: true,
       textSensitive: true,
@@ -204,41 +277,50 @@ describe('contentFilter pure resolution & calibration logic', () => {
         prob: 0.91,
         goreProb: 0.9,
         nsfwProb: 0.02,
-        perImageProbs: [0.03, 0.9, 0.04],
+        // Suppose maxImages=2 scanned only indices 0 and 1, while gallery has 4 total images (indices 0..3)
+        perImageProbs: [0.03, 0.9],
       },
     });
 
-    // Subdivided detail view: never redacts text; cover (0) & shot (2) stay 'none', only shot (1) is 'blur'!
+    // Subdivided detail view: never redacts text; safe cover (0) stays 'none', flagged shot (1) is 'blur',
+    // and unscanned shots (index >= perImageProbs.length: 2, 3) are blurred defensively!
     const detailSubdivided = resolveDetailFilterState({
       config: makeEnabledConfig({ flaggedAction: 'hide_card', subdivideModalities: true }),
       scope: 'workshop',
       verdict: galleryVerdict,
-      totalImages: 3,
+      totalImages: 4,
     });
     expect(detailSubdivided.flagged).toBe(true);
     expect(detailSubdivided.redactText).toBe(false);
     expect(detailSubdivided.coverMode).toBe('none');
     expect(detailSubdivided.imageModeAt(0)).toBe('none');
     expect(detailSubdivided.imageModeAt(1)).toBe('blur');
-    expect(detailSubdivided.imageModeAt(2)).toBe('none');
+    expect(detailSubdivided.imageModeAt(2)).toBe('blur');
+    expect(detailSubdivided.imageModeAt(3)).toBe('blur');
 
-    // Non-subdivided detail view: all images (0, 1, 2) are blurred while text remains unredacted
+    // Non-subdivided detail view: all images (0, 1, 2, 3) are blurred while text remains unredacted
     const detailCoarse = resolveDetailFilterState({
       config: makeEnabledConfig({ flaggedAction: 'hide_card', subdivideModalities: false }),
       scope: 'workshop',
       verdict: galleryVerdict,
-      totalImages: 3,
+      totalImages: 4,
     });
     expect(detailCoarse.redactText).toBe(false);
     expect(detailCoarse.coverMode).toBe('blur');
     expect(detailCoarse.imageModeAt(0)).toBe('blur');
     expect(detailCoarse.imageModeAt(1)).toBe('blur');
     expect(detailCoarse.imageModeAt(2)).toBe('blur');
+    expect(detailCoarse.imageModeAt(3)).toBe('blur');
   });
 
-  it('applies all 5 progressive Library Exclusion display levels and invalidates when fingerprintValid is false', () => {
+  it('applies all 5 progressive Library Exclusion display levels (even when filter.enabled is false) and invalidates when fingerprintValid is false', () => {
     const verdict = makeFlaggedVerdict();
     const config = makeEnabledConfig({ flaggedAction: 'hide_card' });
+    const disabledConfig = makeEnabledConfig({
+      enabled: false,
+      applyToLibrary: false,
+      flaggedAction: 'hide_card',
+    });
 
     const expectedByLevel: Record<
       ExclusionDisplayLevel,
@@ -275,25 +357,32 @@ describe('contentFilter pure resolution & calibration logic', () => {
       [ExclusionDisplayLevel, (typeof expectedByLevel)[ExclusionDisplayLevel]]
     >) {
       const excl = makeExclusion(level, true);
-      const card = resolveCardFilterState({ config, scope: 'library', verdict, exclusion: excl });
-      expect(card.exclusionActive).toBe(true);
-      expect(card.exclusionInvalidated).toBe(false);
-      expect(card.hiddenCard).toBe(false);
-      expect(card.flagged).toBe(false);
-      expect(card.coverMode).toBe(expected.coverMode);
-      expect(card.redactTitle).toBe(expected.redactTitle);
-      expect(card.redactMeta).toBe(expected.redactMeta);
+      for (const cfg of [config, disabledConfig]) {
+        const card = resolveCardFilterState({
+          config: cfg,
+          scope: 'library',
+          verdict,
+          exclusion: excl,
+        });
+        expect(card.exclusionActive).toBe(true);
+        expect(card.exclusionInvalidated).toBe(false);
+        expect(card.hiddenCard).toBe(false);
+        expect(card.flagged).toBe(false);
+        expect(card.coverMode).toBe(expected.coverMode);
+        expect(card.redactTitle).toBe(expected.redactTitle);
+        expect(card.redactMeta).toBe(expected.redactMeta);
 
-      const detail = resolveDetailFilterState({
-        config,
-        scope: 'library',
-        verdict,
-        exclusion: excl,
-      });
-      expect(detail.exclusionActive).toBe(true);
-      expect(detail.coverMode).toBe(expected.coverMode);
-      expect(detail.mapCoverMode).toBe(expected.coverMode);
-      expect(detail.redactText).toBe(expected.detailRedactText);
+        const detail = resolveDetailFilterState({
+          config: cfg,
+          scope: 'library',
+          verdict,
+          exclusion: excl,
+        });
+        expect(detail.exclusionActive).toBe(true);
+        expect(detail.coverMode).toBe(expected.coverMode);
+        expect(detail.mapCoverMode).toBe(expected.coverMode);
+        expect(detail.redactText).toBe(expected.detailRedactText);
+      }
     }
 
     // Expired fingerprint (fingerprintValid === false) invalidates exclusion and falls through to automatic filter!
@@ -320,6 +409,68 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(invalidDetail.flagged).toBe(true);
     expect(invalidDetail.coverMode).toBe('blur');
     expect(invalidDetail.redactText).toBe(false);
+  });
+
+  it('never allows bundle.coverImage to bypass member filterMode on collapsed bundles', () => {
+    const makeAddon = (id: string, coverImage?: string): AddonSummary => ({
+      id,
+      workshopId: id.replace('ws:', ''),
+      title: `Title ${id}`,
+      installState: 'installed',
+      enabled: true,
+      fileSize: 1024,
+      filesCount: 1,
+      categories: ['Campaign'],
+      maps: [{ code: 'c1m1', name: 'Chapter 1' }],
+      hasDummyBypass: false,
+      remoteStatus: 'active',
+      updateAvailable: false,
+      addonInfo: {},
+      coverImage,
+    });
+
+    const memberWithCover = makeAddon('ws:100', 'https://img.example.com/member100.jpg');
+    const memberWithoutCover = makeAddon('ws:200', undefined);
+    const flaggedVerdict100 = makeFlaggedVerdict({
+      targetKey: 'addon:ws:100',
+      imageSensitive: true,
+      textSensitive: true,
+      titleSensitive: true,
+    });
+    const flaggedVerdict200 = makeFlaggedVerdict({
+      targetKey: 'addon:ws:200',
+      imageSensitive: true,
+      textSensitive: true,
+      titleSensitive: true,
+    });
+
+    // Case 1: Member has cover AND bundle.coverImage is populated -> still enforces 'hide' & redactTitle!
+    const presWithMemberCover = resolveBundleCoverPresentation(
+      [memberWithCover],
+      {
+        filterConfig: makeEnabledConfig({ flaggedAction: 'hide_image', subdivideModalities: true }),
+        verdicts: { 'addon:ws:100': flaggedVerdict100 },
+        evaluatedRevisions: { 'addon:ws:100': 'r1' },
+        exclusionsByAddonId: new Map(),
+      },
+      { bundleCoverImage: 'https://img.example.com/explicit_bundle_cover.jpg' },
+    );
+    expect(presWithMemberCover.coverMode).toBe('hide');
+    expect(presWithMemberCover.redactTitle).toBe(true);
+
+    // Case 2: Members have NO individual cover, falling back to bundle.coverImage -> still enforces strictest member coverMode ('hide' / 'blur')!
+    const presFallbackBundleCover = resolveBundleCoverPresentation(
+      [memberWithoutCover],
+      {
+        filterConfig: makeEnabledConfig({ enabled: false }),
+        verdicts: { 'addon:ws:200': flaggedVerdict200 },
+        evaluatedRevisions: {},
+        exclusionsByAddonId: new Map([['ws:200', { ...makeExclusion('blur_image'), addonId: 'ws:200' }]]),
+      },
+      { bundleCoverImage: 'https://img.example.com/explicit_bundle_cover.jpg' },
+    );
+    expect(presFallbackBundleCover.src).toBe('https://img.example.com/explicit_bundle_cover.jpg');
+    expect(presFallbackBundleCover.coverMode).toBe('blur');
   });
 
   it('matches Rust FilterPresetId calibration math, deduplicates Workshop gallery URLs, and tracks policy signatures', () => {

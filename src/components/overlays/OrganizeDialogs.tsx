@@ -7,9 +7,15 @@ import type {
   LoadoutProfile,
   UserGroup,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import {
+  formatFilteredAddonTitle,
+  formatRedactedAddonLabel,
+  getAddonSearchRedaction,
+  resolveLibraryAddonCardFilter,
+} from '../../utils/contentFilter';
 import {
   extractWorkshopIdInput,
-  formatAddonDisplayName,
   formatBytes,
   matchesAddonSearch,
 } from '../../utils/format';
@@ -38,22 +44,30 @@ function AddonPicker({
   onClearAll?: () => void;
 }) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const [filter, setFilter] = useState('');
   const [mode, setMode] = useState<PickerFilterMode>('all');
 
+  const nonHiddenAddons = useMemo(
+    () => addons.filter((a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard),
+    [addons, filterCtx],
+  );
+
   const visible = useMemo(() => {
     const q = filter.trim();
-    return addons.filter((a) => {
+    return nonHiddenAddons.filter((a) => {
       if (mode === 'selected' && !selected.has(a.id)) return false;
       if (mode === 'manual' && a.primaryDir !== 'loading') return false;
       if (!q) return true;
-      return matchesAddonSearch(a, q);
+      return matchesAddonSearch(a, q, getAddonSearchRedaction(a, filterCtx));
     });
-  }, [addons, filter, mode, selected]);
+  }, [nonHiddenAddons, filter, mode, selected, filterCtx]);
 
   const hasMixedDirs = useMemo(
-    () => addons.some((a) => a.primaryDir === 'loading') && addons.some((a) => a.primaryDir === 'workshop'),
-    [addons],
+    () =>
+      nonHiddenAddons.some((a) => a.primaryDir === 'loading') &&
+      nonHiddenAddons.some((a) => a.primaryDir === 'workshop'),
+    [nonHiddenAddons],
   );
 
   return (
@@ -100,7 +114,7 @@ function AddonPicker({
       <div className="md-chip-row">
         <FilterChip
           label={t('organize.pickerAll')}
-          count={addons.length}
+          count={nonHiddenAddons.length}
           selected={mode === 'all'}
           onClick={() => setMode('all')}
         />
@@ -140,7 +154,14 @@ function AddonPicker({
         ) : (
           visible.map((addon) => {
             const checked = selected.has(addon.id);
-            const displayName = formatAddonDisplayName(addon, namePreference);
+            const cardFilter = resolveLibraryAddonCardFilter(addon, filterCtx);
+            const displayName = formatFilteredAddonTitle(addon, namePreference, filterCtx, t);
+            const authorText = cardFilter.redactMeta
+              ? t('filter.redactedAuthor')
+              : addon.author || t('common.unknown');
+            const coverLabel = cardFilter.pendingEvaluation
+              ? t('filter.evaluatingMedia')
+              : undefined;
             return (
               <div
                 key={addon.id}
@@ -160,12 +181,14 @@ function AddonPicker({
                     fallbackSrc={addon.localCoverImage}
                     title={displayName}
                     category={addon.categories[0]}
+                    filterMode={cardFilter.coverMode}
+                    filterLabel={coverLabel}
                   />
                 </div>
                 <div className="l4a-list-main">
                   <span className="md-title-small l4a-truncate">{displayName}</span>
                   <div className="l4a-addon-meta">
-                    <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+                    <span className="l4a-truncate">{authorText}</span>
                     <span>·</span>
                     <span>{formatBytes(addon.fileSize)}</span>
                   </div>
@@ -637,19 +660,29 @@ export function AddToGroupDialog({
 
 export function WorkshopToggleDialog({
   target,
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onMoveThenToggle,
   onToggleDirectly,
 }: {
   target: { addon: AddonSummary; enabled: boolean } | null;
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onMoveThenToggle: (addon: AddonSummary, enabled: boolean) => Promise<void>;
   onToggleDirectly: (addon: AddonSummary, enabled: boolean) => Promise<void>;
 }) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   if (!target) return null;
+
+  const redaction = getAddonSearchRedaction(target.addon, filterCtx);
+  const targetLabel =
+    redaction.redactTitle || redaction.redactMeta
+      ? formatRedactedAddonLabel(target.addon.workshopId, t)
+      : target.addon.currentFileName ||
+        formatFilteredAddonTitle(target.addon, namePreference, filterCtx, t);
 
   return (
     <Dialog
@@ -679,9 +712,7 @@ export function WorkshopToggleDialog({
       }
     >
       <div className="l4a-path-chip">
-        <span className="md-mono l4a-truncate">
-          {target.addon.currentFileName || target.addon.title}
-        </span>
+        <span className="md-mono l4a-truncate">{targetLabel}</span>
       </div>
     </Dialog>
   );

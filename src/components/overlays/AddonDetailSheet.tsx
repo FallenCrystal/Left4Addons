@@ -28,7 +28,13 @@ import type {
   UserGroup,
 } from '../../api/ipc';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
-import { addonFilterKey, resolveDetailFilterState } from '../../utils/contentFilter';
+import {
+  addonFilterKey,
+  collectAddonImageSources,
+  formatRedactedAddonLabel,
+  isAddonTitleRedacted,
+  resolveLibraryAddonDetailFilter,
+} from '../../utils/contentFilter';
 import {
   buildSteamProtocolUrl,
   buildWorkshopUrl,
@@ -103,13 +109,13 @@ export function AddonDetailSheet({
   const [draftBindFingerprint, setDraftBindFingerprint] = useState<boolean>(true);
   const tabsId = useId();
 
+  const filterCtx = useContentFilterContext();
   const {
-    filterConfig,
     verdicts,
     exclusionsByAddonId,
     upsertFilterExclusion,
     deleteFilterExclusion,
-  } = useContentFilterContext();
+  } = filterCtx;
 
   const { primaryInfoEntries, zeroFlagEntries } = useMemo(() => {
     if (!addon) {
@@ -134,14 +140,14 @@ export function AddonDetailSheet({
 
   if (!addon) return null;
 
+  const installed = addon.installState === 'installed';
   const exclusion = exclusionsByAddonId.get(addon.id);
   const verdict = verdicts[addonFilterKey(addon.id)];
-  const detailFilter = resolveDetailFilterState({
-    config: filterConfig,
-    scope: 'library',
-    verdict,
-    exclusion,
-  });
+  const detailFilter = resolveLibraryAddonDetailFilter(addon, filterCtx);
+  const addonImageSources = collectAddonImageSources(addon);
+
+  const canBindFingerprint = installed && Boolean(addon.contentHash);
+  const activeFingerprint = installed ? addon.contentHash : exclusion?.currentFingerprint;
 
   const isSameDraftAddon = draftExclAddonId === addon.id;
   const effectiveDraftLevel: ExclusionDisplayLevel = exclusion
@@ -151,7 +157,7 @@ export function AddonDetailSheet({
       : 'lazy_load';
   const effectiveDraftBind: boolean = exclusion
     ? exclusion.bindFingerprint
-    : !addon.contentHash
+    : !canBindFingerprint
       ? false
       : isSameDraftAddon
         ? draftBindFingerprint
@@ -159,15 +165,17 @@ export function AddonDetailSheet({
 
   const rawDisplayName = formatAddonDisplayName(addon, namePreference);
   const displayName = detailFilter.redactText
-    ? addon.workshopId
-      ? t('filter.redactedTitleWithId', { id: addon.workshopId })
-      : t('filter.redactedTitle')
+    ? formatRedactedAddonLabel(addon.workshopId, t)
     : rawDisplayName;
 
-  const metadataTitle = resolveAddonMetadataTitle(
-    addon,
-    namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
-  );
+  const titleRedactedForTasks =
+    detailFilter.redactText || isAddonTitleRedacted(addon, filterCtx);
+  const metadataTitle = titleRedactedForTasks
+    ? undefined
+    : resolveAddonMetadataTitle(
+        addon,
+        namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
+      );
   const workshopTitle = addon.workshopTitle?.trim();
   const addonInfoTitle = addon.addonTitle?.trim();
   const hasMaps = addon.maps.length > 0;
@@ -178,7 +186,6 @@ export function AddonDetailSheet({
   const visibleInfoEntries = showZeroFlags
     ? [...primaryInfoEntries, ...zeroFlagEntries]
     : primaryInfoEntries;
-  const installed = addon.installState === 'installed';
   const remoteUnavailable =
     addon.remoteStatus === 'removed' || addon.remoteStatus === 'private_or_unavailable';
 
@@ -289,6 +296,9 @@ export function AddonDetailSheet({
                 title={displayName}
                 category={addon.categories[0]}
                 filterMode={detailFilter.coverMode}
+                filterLabel={
+                  detailFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
+                }
                 allowPeek={detailFilter.coverMode === 'blur'}
               />
               <div className="l4a-cover-overlay-top">
@@ -433,17 +443,17 @@ export function AddonDetailSheet({
                     : addon.currentFileName || '—'}
                 </span>
               </div>
-              {addon.contentHash && (
+              {activeFingerprint && (
                 <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                   <span className="l4a-kv-label">{t('detail.hash')}</span>
                   <div className="l4a-row-wrap">
                     <span className="l4a-kv-value md-mono">
-                      {addon.contentHash.slice(0, 16)}
+                      {activeFingerprint.slice(0, 16)}
                     </span>
                     <IconButton
                       size="sm"
                       label={t('common.copy')}
-                      onClick={() => onCopy(addon.contentHash!)}
+                      onClick={() => onCopy(activeFingerprint)}
                     >
                       <Copy size={14} />
                     </IconButton>
@@ -498,7 +508,7 @@ export function AddonDetailSheet({
                 )}
               </div>
 
-              {verdict?.flagged && (
+              {detailFilter.flagged && verdict && (
                 <div className="l4a-callout">
                   <ShieldAlert
                     size={15}
@@ -510,12 +520,12 @@ export function AddonDetailSheet({
                       <span className="md-pill" data-tone="tertiary">
                         {t(`filter.decisionSource.${verdict.decisionSource}`)}
                       </span>
-                      {verdict.imageSensitive && (
+                      {detailFilter.imageSensitive && (
                         <span className="md-pill" data-tone="secondary">
                           [{t('filter.modImageShort')}]
                         </span>
                       )}
-                      {verdict.textSensitive && (
+                      {detailFilter.textSensitive && (
                         <span className="md-pill" data-tone="secondary">
                           [{t('filter.modTextShort')}]
                         </span>
@@ -543,20 +553,21 @@ export function AddonDetailSheet({
                     <span className="md-body-small md-mono">
                       {t('filter.fingerprintChangedDetail', {
                         bound: exclusion.boundFingerprint?.slice(0, 12) ?? '—',
-                        current: addon.contentHash?.slice(0, 12) ?? '—',
+                        current:
+                          (exclusion.currentFingerprint ?? activeFingerprint)?.slice(0, 12) ?? '—',
                       })}
                     </span>
                     <div>
                       <Button
                         variant="filled"
                         size="sm"
-                        disabled={busy || !addon.contentHash}
+                        disabled={busy || !canBindFingerprint}
                         icon={<RefreshCw size={14} />}
                         onClick={() =>
                           void upsertFilterExclusion({
                             addonId: addon.id,
                             displayLevel: exclusion.displayLevel,
-                            bindFingerprint: Boolean(addon.contentHash),
+                            bindFingerprint: canBindFingerprint,
                             note: exclusion.note,
                           })
                         }
@@ -580,7 +591,7 @@ export function AddonDetailSheet({
                       void upsertFilterExclusion({
                         addonId: addon.id,
                         displayLevel: nextLevel,
-                        bindFingerprint: exclusion.bindFingerprint && Boolean(addon.contentHash),
+                        bindFingerprint: exclusion.bindFingerprint && canBindFingerprint,
                         note: exclusion.note,
                       });
                     }
@@ -599,15 +610,15 @@ export function AddonDetailSheet({
                     className="md-body-small md-mono"
                     style={{ color: 'var(--md-sys-color-on-surface-variant)', fontSize: 11 }}
                   >
-                    {addon.contentHash
-                      ? addon.contentHash.slice(0, 16)
+                    {activeFingerprint
+                      ? activeFingerprint.slice(0, 16)
                       : t('filter.noFingerprintHint')}
                   </span>
                 </div>
                 <Switch
                   compact
                   checked={effectiveDraftBind}
-                  disabled={busy || !addon.contentHash}
+                  disabled={busy || !canBindFingerprint}
                   label={t('filter.bindFingerprint')}
                   onChange={(nextBind) => {
                     setDraftExclAddonId(addon.id);
@@ -616,7 +627,7 @@ export function AddonDetailSheet({
                       void upsertFilterExclusion({
                         addonId: addon.id,
                         displayLevel: exclusion.displayLevel,
-                        bindFingerprint: nextBind,
+                        bindFingerprint: nextBind && canBindFingerprint,
                         note: exclusion.note,
                       });
                     }
@@ -646,7 +657,7 @@ export function AddonDetailSheet({
                       void upsertFilterExclusion({
                         addonId: addon.id,
                         displayLevel: effectiveDraftLevel,
-                        bindFingerprint: effectiveDraftBind && Boolean(addon.contentHash),
+                        bindFingerprint: effectiveDraftBind && canBindFingerprint,
                       })
                     }
                   >
@@ -719,7 +730,7 @@ export function AddonDetailSheet({
                   {memberBundles.map((b) => (
                     <span key={b.id} className="md-pill" data-tone="primary">
                       <Layers size={12} />
-                      {b.name}
+                      {titleRedactedForTasks ? t('filter.redactedTitle') : b.name}
                     </span>
                   ))}
                 </div>
@@ -815,46 +826,59 @@ export function AddonDetailSheet({
           </div>
         ) : (
           <div className="l4a-list">
-            {addon.maps.map((m) => (
-              <div
-                key={m.code}
-                className="l4a-list-row"
-                style={{ minHeight: 56, cursor: 'default' }}
-              >
-                {m.imagePath && (
-                  <div className="l4a-list-thumb">
-                    <AddonCover
-                      compact
-                      src={m.imagePath}
-                      title={m.name}
-                      category="Map"
-                      filterMode={detailFilter.mapCoverMode}
-                    />
-                  </div>
-                )}
-                <div className="l4a-list-main">
-                  <span className="md-title-small">
-                    {detailFilter.redactText ? m.code : m.name}
-                  </span>
-                  <span
-                    className="md-body-small md-mono"
-                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                  >
-                    {m.code}
-                  </span>
-                </div>
-                <Button
-                  variant="tonal"
-                  size="sm"
-                  icon={<Copy size={13} />}
-                  title={t('detail.copyMapCode')}
-                  aria-label={`${t('detail.copyMapCode')} ${m.code}`}
-                  onClick={() => onCopy(m.code)}
+            {addon.maps.map((m) => {
+              const trimmedImg = m.imagePath?.trim();
+              const imgIdx = trimmedImg ? addonImageSources.indexOf(trimmedImg) : -1;
+              const mapImgMode = trimmedImg
+                ? imgIdx >= 0
+                  ? detailFilter.imageModeAt(imgIdx)
+                  : detailFilter.mapCoverMode
+                : 'none';
+              const mapLabel = detailFilter.redactText ? m.code : m.name;
+              return (
+                <div
+                  key={m.code}
+                  className="l4a-list-row"
+                  style={{ minHeight: 56, cursor: 'default' }}
                 >
-                  {t('common.copy')}
-                </Button>
-              </div>
-            ))}
+                  {m.imagePath && (
+                    <div className="l4a-list-thumb">
+                      <AddonCover
+                        compact
+                        src={m.imagePath}
+                        title={mapLabel}
+                        category="Map"
+                        filterMode={mapImgMode}
+                        filterLabel={
+                          detailFilter.pendingEvaluation
+                            ? t('filter.evaluatingMedia')
+                            : undefined
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="l4a-list-main">
+                    <span className="md-title-small">{mapLabel}</span>
+                    <span
+                      className="md-body-small md-mono"
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    >
+                      {m.code}
+                    </span>
+                  </div>
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    icon={<Copy size={13} />}
+                    title={t('detail.copyMapCode')}
+                    aria-label={`${t('detail.copyMapCode')} ${m.code}`}
+                    onClick={() => onCopy(m.code)}
+                  >
+                    {t('common.copy')}
+                  </Button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

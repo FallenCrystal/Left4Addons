@@ -340,6 +340,37 @@ pub(crate) fn scan_and_commit<T>(
         .iter()
         .filter(|r| matches!(r.record.role, FileRole::DummyV1 | FileRole::DummyV2))
         .count();
+    // Detect non-Workshop local VPKs (`workshop_id == None`, `hash:<old>`) modified in-place
+    // at a known `current_path` producing `hash:<new>` where `hash:<old>` no longer has any physical file.
+    let mut exclusion_migrations: Vec<(AddonId, AddonId)> = Vec::new();
+    let new_local_by_path: HashMap<&str, &AddonId> = real_addons_by_id
+        .values()
+        .filter(|a| a.workshop_id.is_none() && a.id.as_str().starts_with("hash:"))
+        .filter_map(|a| a.current_path.as_deref().map(|p| (p, &a.id)))
+        .collect();
+
+    for (old_id, old_addon) in &existing_addons {
+        if old_addon.workshop_id.is_some()
+            || !old_id.as_str().starts_with("hash:")
+            || real_addons_by_id.contains_key(old_id)
+        {
+            continue;
+        }
+        let known_path = old_addon.current_path.as_deref().or_else(|| {
+            existing_files
+                .values()
+                .find(|f| f.addon_id.as_ref() == Some(old_id))
+                .map(|f| f.record.path.as_str())
+        });
+        if let Some(path) = known_path {
+            if let Some(&new_id) = new_local_by_path.get(path) {
+                if new_id != old_id {
+                    exclusion_migrations.push((old_id.clone(), new_id.clone()));
+                }
+            }
+        }
+    }
+
     let issues = crate::reconcile::collect_issues(&physical_rows, config);
     let value = db.write(|tx| {
         for addon in real_addons_by_id.values() {
@@ -349,6 +380,9 @@ pub(crate) fn scan_and_commit<T>(
             if !real_addons_by_id.contains_key(old_id) {
                 LocalDb::mark_addon_uninstalled_tx(tx, old_id)?;
             }
+        }
+        for (old_id, new_id) in &exclusion_migrations {
+            LocalDb::migrate_filter_exclusion_addon_id_tx(tx, old_id, new_id)?;
         }
         LocalDb::replace_physical_files_tx(tx, &physical_rows)?;
         LocalDb::replace_open_reconcile_issues_tx(tx, &issues)?;

@@ -52,18 +52,25 @@ pub fn validate_env_var_name(name: &str) -> Result<&str, CoreError> {
     Ok(name)
 }
 
+const MAX_WIPE_BYTES: u64 = 16_384;
+
 #[derive(Debug, Clone)]
 pub struct TokenVault {
     sealed_path: PathBuf,
-    vault_key_path: PathBuf,
+    vault_key_path: Result<PathBuf, String>,
     identity_override: Option<(String, String)>,
 }
 
 impl TokenVault {
     pub fn default_for_paths(paths: &AppPaths) -> Self {
+        let vault_key_path = match default_user_vault_key_path(&paths.runtime_dir) {
+            Ok(path) => Ok(path),
+            Err(CoreError::Config(msg)) => Err(msg),
+            Err(other) => Err(other.to_string()),
+        };
         Self {
             sealed_path: paths.llm_token_path.clone(),
-            vault_key_path: default_user_vault_key_path(&paths.runtime_dir),
+            vault_key_path,
             identity_override: None,
         }
     }
@@ -76,7 +83,7 @@ impl TokenVault {
     ) -> Self {
         Self {
             sealed_path: sealed_path.into(),
-            vault_key_path: vault_key_path.into(),
+            vault_key_path: Ok(vault_key_path.into()),
             identity_override: Some((machine_id.into(), user_id.into())),
         }
     }
@@ -85,8 +92,10 @@ impl TokenVault {
         &self.sealed_path
     }
 
-    pub fn vault_key_path(&self) -> &Path {
-        &self.vault_key_path
+    pub fn vault_key_path(&self) -> Result<&Path, CoreError> {
+        self.vault_key_path
+            .as_deref()
+            .map_err(|msg| CoreError::Config(msg.clone()))
     }
 
     pub fn has_sealed_token(&self) -> bool {
@@ -110,10 +119,10 @@ impl TokenVault {
     pub fn clear(&self) -> Result<(), CoreError> {
         if let Ok(meta) = fs::symlink_metadata(&self.sealed_path) {
             if meta.is_file() {
-                let len = meta.len().min(4096) as usize;
+                let len = meta.len().min(MAX_WIPE_BYTES) as usize;
                 if len > 0 {
                     if let Ok(mut f) = fs::OpenOptions::new().write(true).open(&self.sealed_path) {
-                        let zeros = vec![0u8; len];
+                        let zeros = Zeroizing::new(vec![0u8; len]);
                         let _ = f.write_all(&zeros);
                         let _ = f.sync_all();
                     }
@@ -292,9 +301,13 @@ impl TokenVault {
         machine_id: &str,
         user_id: &str,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-        if self.vault_key_path.exists() {
-            return self.read_existing_vault_key(machine_id, user_id);
+        let key_path = self.vault_key_path()?;
+        match fs::symlink_metadata(key_path) {
+            Ok(_) => return self.read_existing_vault_key(machine_id, user_id),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(CoreError::Io(err)),
         }
+
         let rng = SystemRandom::new();
         let mut key = Zeroizing::new([0u8; KEY_LEN]);
         rng.fill(&mut *key)
@@ -307,13 +320,13 @@ impl TokenVault {
             let mut blob = Vec::with_capacity(DPAPI_KEY_MAGIC.len() + protected.len());
             blob.extend_from_slice(DPAPI_KEY_MAGIC);
             blob.extend_from_slice(&protected);
-            write_private_file(&self.vault_key_path, &blob, true)?;
+            write_private_file(key_path, &blob, true)?;
         }
 
         #[cfg(not(windows))]
         {
             let _ = (machine_id, user_id);
-            write_private_file(&self.vault_key_path, &*key, true)?;
+            write_private_file(key_path, &*key, true)?;
         }
 
         Ok(key)
@@ -324,40 +337,77 @@ impl TokenVault {
         machine_id: &str,
         user_id: &str,
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
-        let raw = Zeroizing::new(fs::read(&self.vault_key_path).map_err(
-            |err| match err.kind() {
-                std::io::ErrorKind::NotFound => {
-                    CoreError::Config("缺少当前用户专属密钥文件，无法解密本地 API Token".into())
-                }
-                _ => CoreError::Io(err),
-            },
-        )?);
+        let key_path = self.vault_key_path()?;
+        verify_existing_vault_key_metadata(key_path)?;
+
+        let raw = Zeroizing::new(fs::read(key_path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                CoreError::Config("缺少当前用户专属密钥文件，无法解密本地 API Token".into())
+            }
+            _ => CoreError::Io(err),
+        })?);
 
         #[cfg(windows)]
         {
-            if raw.len() > DPAPI_KEY_MAGIC.len() && &raw[..DPAPI_KEY_MAGIC.len()] == DPAPI_KEY_MAGIC
+            if raw.len() <= DPAPI_KEY_MAGIC.len()
+                || &raw[..DPAPI_KEY_MAGIC.len()] != DPAPI_KEY_MAGIC
             {
-                let entropy = dpapi_entropy(machine_id, user_id);
-                let plain = dpapi::unprotect(&raw[DPAPI_KEY_MAGIC.len()..], &entropy)?;
-                if plain.len() != KEY_LEN {
-                    return Err(CoreError::Config("当前用户密钥长度异常".into()));
-                }
-                let mut key = Zeroizing::new([0u8; KEY_LEN]);
-                key.copy_from_slice(&plain);
-                return Ok(key);
+                return Err(CoreError::Config(
+                    "当前用户密钥文件缺少 DPAPI 保护头或已损坏".into(),
+                ));
             }
+            let entropy = dpapi_entropy(machine_id, user_id);
+            let plain = dpapi::unprotect(&raw[DPAPI_KEY_MAGIC.len()..], &entropy)?;
+            if plain.len() != KEY_LEN {
+                return Err(CoreError::Config("当前用户密钥长度异常".into()));
+            }
+            let mut key = Zeroizing::new([0u8; KEY_LEN]);
+            key.copy_from_slice(&plain);
+            Ok(key)
         }
 
         #[cfg(not(windows))]
-        let _ = (machine_id, user_id);
-
-        if raw.len() != KEY_LEN {
-            return Err(CoreError::Config("当前用户密钥文件已损坏".into()));
+        {
+            let _ = (machine_id, user_id);
+            if raw.len() != KEY_LEN {
+                return Err(CoreError::Config("当前用户密钥文件已损坏".into()));
+            }
+            let mut key = Zeroizing::new([0u8; KEY_LEN]);
+            key.copy_from_slice(&raw);
+            Ok(key)
         }
-        let mut key = Zeroizing::new([0u8; KEY_LEN]);
-        key.copy_from_slice(&raw);
-        Ok(key)
     }
+}
+
+fn verify_existing_vault_key_metadata(path: &Path) -> Result<(), CoreError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => {
+            CoreError::Config("缺少当前用户专属密钥文件，无法解密本地 API Token".into())
+        }
+        _ => CoreError::Io(err),
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(CoreError::Config(
+            "当前用户密钥文件类型异常（拒绝符号链接或非普通文件）".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.mode() & 0o077 != 0 {
+            return Err(CoreError::Config(
+                "当前用户密钥文件权限过宽（必须为 0600 仅当前用户可读写）".into(),
+            ));
+        }
+        if let Some(euid) = detect_current_unix_euid() {
+            if meta.uid() != euid {
+                return Err(CoreError::Config(
+                    "当前用户密钥文件所有者与当前进程有效用户不一致".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn derive_aead_key(
@@ -391,66 +441,120 @@ fn dpapi_entropy(machine_id: &str, user_id: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn default_user_vault_key_path(runtime_dir: &Path) -> PathBuf {
-    let base_dir = os_user_private_config_dir();
-    let candidate = base_dir.join("vault.key");
-    if let (Ok(canon_rt), Ok(canon_base)) =
-        (fs::canonicalize(runtime_dir), fs::canonicalize(&base_dir))
-    {
-        if canon_base.starts_with(&canon_rt) {
-            return base_dir
-                .parent()
-                .unwrap_or(&base_dir)
-                .join(".left4addons-vault")
-                .join("vault.key");
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
         }
     }
-    candidate
+    out
 }
 
-fn os_user_private_config_dir() -> PathBuf {
+fn resolve_vault_key_path_with_base(runtime_dir: &Path, base_dir: &Path) -> PathBuf {
+    let norm_rt = normalize_path_lexically(runtime_dir);
+    let norm_base = normalize_path_lexically(base_dir);
+    if norm_base.starts_with(&norm_rt) || norm_rt.starts_with(&norm_base) {
+        let anchor = if norm_base.starts_with(&norm_rt) {
+            &norm_rt
+        } else {
+            &norm_base
+        };
+        return anchor
+            .parent()
+            .unwrap_or(anchor)
+            .join(".left4addons-vault")
+            .join("vault.key");
+    }
+    norm_base.join("vault.key")
+}
+
+fn default_user_vault_key_path(runtime_dir: &Path) -> Result<PathBuf, CoreError> {
+    let base_dir = os_user_private_config_dir()?;
+    Ok(resolve_vault_key_key_dir(runtime_dir, &base_dir))
+}
+
+fn resolve_vault_key_key_dir(runtime_dir: &Path, base_dir: &Path) -> PathBuf {
+    resolve_vault_key_path_with_base(runtime_dir, base_dir)
+}
+
+fn os_user_private_config_dir() -> Result<PathBuf, CoreError> {
     #[cfg(windows)]
     {
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA")
             .or_else(|| std::env::var_os("APPDATA"))
             .filter(|v| !v.is_empty())
         {
-            return PathBuf::from(local_app_data).join("Left4Addons");
+            return Ok(PathBuf::from(local_app_data).join("Left4Addons"));
         }
         if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
-            return PathBuf::from(profile)
+            return Ok(PathBuf::from(profile)
                 .join("AppData")
                 .join("Local")
-                .join("Left4Addons");
+                .join("Left4Addons"));
         }
-        std::env::temp_dir().join("Left4Addons-vault")
+        Err(CoreError::Config(
+            "无法确定当前用户的私有配置目录 (LOCALAPPDATA / USERPROFILE)".into(),
+        ))
     }
 
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Left4Addons");
+            let p = PathBuf::from(home);
+            if p.is_absolute() {
+                return Ok(p
+                    .join("Library")
+                    .join("Application Support")
+                    .join("Left4Addons"));
+            }
         }
-        std::env::temp_dir().join("Left4Addons-vault")
+        Err(CoreError::Config(
+            "无法确定当前用户的私有配置目录 (HOME)".into(),
+        ))
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            let p = PathBuf::from(xdg);
-            if p.is_absolute() {
-                return p.join("left4addons");
-            }
-        }
-        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(home).join(".config").join("left4addons");
-        }
-        let uid = detect_os_user_id().unwrap_or_else(|_| "unknown".into());
-        std::env::temp_dir().join(format!("left4addons-vault-{uid}"))
+        unix_private_config_dir_from_vars(
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        )
     }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_private_config_dir_from_vars(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, CoreError> {
+    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(xdg);
+        if p.is_absolute() {
+            return Ok(p.join("left4addons"));
+        }
+    }
+    if let Some(h) = home.filter(|v| !v.is_empty()) {
+        let p = PathBuf::from(h);
+        if p.is_absolute() {
+            return Ok(p.join(".config").join("left4addons"));
+        }
+    }
+    Err(CoreError::Config(
+        "无法确定当前用户的私有配置目录 (XDG_CONFIG_HOME / HOME)".into(),
+    ))
 }
 
 fn detect_os_machine_id() -> Result<String, CoreError> {
@@ -574,6 +678,37 @@ fn detect_os_user_id() -> Result<String, CoreError> {
     Err(CoreError::Config("无法识别当前系统用户标识".into()))
 }
 
+#[cfg(unix)]
+fn detect_current_unix_euid() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("Uid:") {
+                    let mut parts = rest.split_whitespace();
+                    let real = parts.next();
+                    let effective = parts.next().or(real);
+                    if let Some(euid_str) = effective {
+                        if let Ok(parsed) = euid_str.parse::<u32>() {
+                            return Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(out) = std::process::Command::new("id").arg("-u").output() {
+        if out.status.success() {
+            let uid_str = String::from_utf8_lossy(&out.stdout);
+            if let Ok(parsed) = uid_str.trim().parse::<u32>() {
+                return Some(parsed);
+            }
+        }
+    }
+    None
+}
+
 fn write_private_file(
     path: &Path,
     contents: &[u8],
@@ -594,7 +729,7 @@ fn write_private_file(
         }
         builder.create(parent)?;
         if enforce_private_dir {
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
 
         let rng = SystemRandom::new();
@@ -618,12 +753,15 @@ fn write_private_file(
             return Err(CoreError::Io(err));
         }
         drop(file);
-        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+        if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(CoreError::Io(err));
+        }
         if let Err(err) = fs::rename(&tmp_path, path) {
             let _ = fs::remove_file(&tmp_path);
             return Err(CoreError::Io(err));
         }
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 
@@ -809,6 +947,29 @@ mod tests {
             let key_mode = fs::metadata(&key1).unwrap().permissions().mode() & 0o777;
             assert_eq!(sealed_mode, 0o600);
             assert_eq!(key_mode, 0o600);
+
+            // Group/world-readable vault.key must be rejected!
+            fs::set_permissions(&key1, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                vault.unseal().is_err(),
+                "must reject vault.key with 0o077 bits set"
+            );
+            fs::set_permissions(&key1, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(vault.unseal().unwrap().as_str(), "sk-test-super-secret-999");
+
+            // Symlinked vault.key must be rejected!
+            let symlink_key = dir.path().join("symlink_vault.key");
+            std::os::unix::fs::symlink(&key1, &symlink_key).unwrap();
+            let symlink_vault = TokenVault::with_custom_identity(
+                &sealed,
+                &symlink_key,
+                "machine-alpha",
+                "uid:1000",
+            );
+            assert!(
+                symlink_vault.unseal().is_err(),
+                "must reject symlinked vault.key"
+            );
         }
 
         // Wrong machine_id must fail
@@ -838,7 +999,44 @@ mod tests {
         assert!(!err.contains("sk-test-super-secret-999"));
         assert!(vault.unseal().is_err());
 
+        // Large token (>4096 bytes, up to 8192) roundtrip and clear()
+        let long_token = format!("sk-{}", "a".repeat(7000));
+        vault.seal(&long_token).unwrap();
+        assert!(fs::metadata(&sealed).unwrap().len() > 7000);
+        assert_eq!(vault.unseal().unwrap().as_str(), long_token);
+
         vault.clear().unwrap();
         assert!(!vault.has_sealed_token());
+    }
+
+    #[test]
+    fn lexical_vault_key_path_is_identical_before_and_after_dir_creation() {
+        let dir = tempdir().unwrap();
+        let rt_dir = dir.path().join("workspace").join("..").join("runtime");
+        let overlapping_base = dir.path().join("runtime").join("left4addons");
+
+        // Run #1: neither rt_dir nor overlapping_base exists on disk yet
+        let run1 = resolve_vault_key_path_with_base(&rt_dir, &overlapping_base);
+
+        // Create directories as Run #1 would during seal()
+        fs::create_dir_all(&overlapping_base).unwrap();
+        fs::create_dir_all(run1.parent().unwrap()).unwrap();
+
+        // Run #2: directories now exist on disk — path must be 100% identical!
+        let run2 = resolve_vault_key_path_with_base(&rt_dir, &overlapping_base);
+        assert_eq!(run1, run2);
+        assert!(!run1.starts_with(dir.path().join("runtime")));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn missing_user_config_env_returns_error_instead_of_tmp_fallback() {
+        let res = unix_private_config_dir_from_vars(None, None);
+        assert!(matches!(res, Err(CoreError::Config(_))));
+        let rel_res = unix_private_config_dir_from_vars(
+            Some(std::ffi::OsStr::new("relative/xdg")),
+            Some(std::ffi::OsStr::new("")),
+        );
+        assert!(matches!(rel_res, Err(CoreError::Config(_))));
     }
 }

@@ -54,12 +54,32 @@ impl AppPaths {
     }
 }
 
+pub(crate) fn normalize_filter_preset_params(cfg: &mut l4a_protocol::ClientFilterConfig) {
+    use l4a_protocol::{FilterModelParams, FilterPresetId};
+
+    cfg.local_params = cfg.local_params.sanitized();
+    if cfg.preset != FilterPresetId::Custom {
+        let preset_defaults = cfg.preset.default_params().sanitized();
+        let base_defaults = FilterModelParams::default();
+        if cfg.local_params == preset_defaults {
+            // Already matches preset defaults
+        } else if cfg.local_params == base_defaults && preset_defaults != base_defaults {
+            cfg.local_params = preset_defaults;
+        } else {
+            cfg.preset = FilterPresetId::Custom;
+        }
+    }
+}
+
 pub fn load_config(path: &Path) -> Result<AppConfig, CoreError> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
     let content = fs::read_to_string(path)?;
-    toml::from_str::<AppConfig>(&content).map_err(|e| CoreError::Config(e.to_string()))
+    let mut cfg =
+        toml::from_str::<AppConfig>(&content).map_err(|e| CoreError::Config(e.to_string()))?;
+    normalize_filter_preset_params(&mut cfg.filter);
+    Ok(cfg)
 }
 
 pub fn save_config(path: &Path, config: &AppConfig) -> Result<(), CoreError> {

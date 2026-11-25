@@ -427,6 +427,7 @@ export interface DashboardSnapshot {
   openIssues: ReconcileIssue[];
   tasks: TaskRecord[];
   filterExclusions: FilterExclusionRecord[];
+  cachedFilterVerdicts?: FilterItemVerdict[];
 }
 
 export interface SteamCapabilities {
@@ -558,7 +559,11 @@ export type CoreEvent =
     }
   | { type: 'reconcile_issues_detected'; count: number }
   | { type: 'watch_error'; message: string }
-  | { type: 'filter_verdicts_updated'; verdicts: FilterItemVerdict[] }
+  | {
+      type: 'filter_verdicts_updated';
+      verdicts: FilterItemVerdict[];
+      policySignature?: string | null;
+    }
   | { type: 'local_filter_status_changed'; status: LocalFilterDeploymentStatus };
 
 export class IpcError extends Error {
@@ -848,6 +853,13 @@ export async function subscribeCoreEvents(
         title: payload.title ?? undefined,
         total: payload.total ?? undefined,
         speedBps: payload.speedBps ?? undefined,
+      });
+      return;
+    }
+    if (payload.type === 'filter_verdicts_updated') {
+      handler({
+        ...payload,
+        policySignature: payload.policySignature ?? undefined,
       });
       return;
     }

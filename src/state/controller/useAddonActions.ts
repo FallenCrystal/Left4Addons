@@ -31,6 +31,7 @@ export interface UseAddonActionsParams {
   setSyncReport: Dispatch<SetStateAction<SyncReport | null>>;
   setSteamCaps: Dispatch<SetStateAction<SteamCapabilities | null>>;
   setBatchReport: Dispatch<SetStateAction<BatchDialogPayload | null>>;
+  onClearFailedFilterEvaluations?: () => void;
 }
 
 export function useAddonActions({
@@ -49,6 +50,7 @@ export function useAddonActions({
   setSyncReport,
   setSteamCaps,
   setBatchReport,
+  onClearFailedFilterEvaluations,
 }: UseAddonActionsParams) {
   const handleBatchReport = useCallback(
     (report: AddonBatchReport, refreshOk: boolean) => {
@@ -72,6 +74,7 @@ export function useAddonActions({
 
   const scan = useCallback(async (): Promise<boolean> => {
     setScanning(true);
+    onClearFailedFilterEvaluations?.();
     const seq = nextSnapshotSeq();
     try {
       const next = await client.scanWorkspace();
@@ -84,7 +87,15 @@ export function useAddonActions({
     } finally {
       setScanning(false);
     }
-  }, [client, commitSnapshot, nextSnapshotSeq, notify, setScanning, tRef]);
+  }, [
+    client,
+    commitSnapshot,
+    nextSnapshotSeq,
+    notify,
+    onClearFailedFilterEvaluations,
+    setScanning,
+    tRef,
+  ]);
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -325,9 +336,10 @@ export function useAddonActions({
 
   const searchWorkshop = useCallback(
     async (query: SearchQuery) => {
+      onClearFailedFilterEvaluations?.();
       return client.searchWorkshop(query);
     },
-    [client],
+    [client, onClearFailedFilterEvaluations],
   );
 
   const fetchWorkshopItem = useCallback(

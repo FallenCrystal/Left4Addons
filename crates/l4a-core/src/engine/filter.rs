@@ -1,7 +1,7 @@
 use super::L4aEngine;
-use crate::config::save_config;
+use crate::config::{normalize_filter_preset_params, save_config};
 use crate::error::CoreError;
-use crate::filter::deploy::validate_target_commit;
+use crate::filter::deploy::{validate_repo_url, validate_target_commit};
 use crate::filter::secret::validate_env_var_name;
 use crate::filter::{evaluate_targets, TokenVault};
 use l4a_protocol::{
@@ -11,8 +11,8 @@ use l4a_protocol::{
     DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_TOKEN_ENV_VAR,
 };
 
-pub(crate) fn sanitize_filter_config(cfg: &mut ClientFilterConfig) -> Result<(), CoreError> {
-    cfg.local_params = cfg.local_params.sanitized();
+fn sanitize_filter_basics(cfg: &mut ClientFilterConfig) {
+    normalize_filter_preset_params(cfg);
 
     cfg.flag_threshold = if cfg.flag_threshold.is_finite() {
         cfg.flag_threshold.clamp(0.0, 1.0)
@@ -37,16 +37,6 @@ pub(crate) fn sanitize_filter_config(cfg: &mut ClientFilterConfig) -> Result<(),
         trimmed_repo.to_string()
     };
 
-    cfg.pinned_commit = match cfg
-        .pinned_commit
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(commit) => Some(validate_target_commit(commit)?),
-        None => None,
-    };
-
     cfg.custom_endpoint_url = cfg
         .custom_endpoint_url
         .as_deref()
@@ -68,6 +58,29 @@ pub(crate) fn sanitize_filter_config(cfg: &mut ClientFilterConfig) -> Result<(),
         trimmed_model.to_string()
     };
 
+    if cfg.llm_system_prompt.trim().is_empty() {
+        cfg.llm_system_prompt = DEFAULT_LLM_SYSTEM_PROMPT.to_string();
+    }
+}
+
+pub(crate) fn sanitize_filter_config(
+    cfg: &mut ClientFilterConfig,
+    https_only: bool,
+) -> Result<(), CoreError> {
+    sanitize_filter_basics(cfg);
+
+    cfg.repo_url = validate_repo_url(&cfg.repo_url, https_only)?;
+
+    cfg.pinned_commit = match cfg
+        .pinned_commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(commit) => Some(validate_target_commit(commit)?),
+        None => None,
+    };
+
     let trimmed_env = cfg.llm_token_env_var.trim();
     cfg.llm_token_env_var = if trimmed_env.is_empty() {
         DEFAULT_LLM_TOKEN_ENV_VAR.to_string()
@@ -75,11 +88,33 @@ pub(crate) fn sanitize_filter_config(cfg: &mut ClientFilterConfig) -> Result<(),
         validate_env_var_name(trimmed_env)?.to_string()
     };
 
-    if cfg.llm_system_prompt.trim().is_empty() {
-        cfg.llm_system_prompt = DEFAULT_LLM_SYSTEM_PROMPT.to_string();
+    Ok(())
+}
+
+pub(crate) fn sanitize_filter_config_for_startup(cfg: &mut ClientFilterConfig, https_only: bool) {
+    sanitize_filter_basics(cfg);
+
+    match validate_repo_url(&cfg.repo_url, https_only) {
+        Ok(valid) => cfg.repo_url = valid,
+        Err(_) => cfg.repo_url = DEFAULT_FILTER_REPO_URL.to_string(),
     }
 
-    Ok(())
+    cfg.pinned_commit = cfg
+        .pinned_commit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|c| validate_target_commit(c).ok());
+
+    let trimmed_env = cfg.llm_token_env_var.trim().to_string();
+    cfg.llm_token_env_var = if trimmed_env.is_empty() {
+        DEFAULT_LLM_TOKEN_ENV_VAR.to_string()
+    } else {
+        match validate_env_var_name(&trimmed_env) {
+            Ok(valid) => valid.to_string(),
+            Err(_) => DEFAULT_LLM_TOKEN_ENV_VAR.to_string(),
+        }
+    };
 }
 
 impl L4aEngine {

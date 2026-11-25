@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, CheckCircle2, MinusCircle, RefreshCw } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
 import type { BatchDialogPayload } from '../../state/useAppController';
-import { formatAddonDisplayName } from '../../utils/format';
+import { formatFilteredAddonTitle } from '../../utils/contentFilter';
 import { Button, Dialog } from '../m3/primitives';
 
 export interface BatchReportDialogProps {
@@ -22,6 +23,7 @@ export function BatchReportDialog({
   onRescan,
 }: BatchReportDialogProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const [rescanning, setRescanning] = useState(false);
 
   if (!payload) return null;
@@ -130,7 +132,9 @@ export function BatchReportDialog({
                     />
                   )}
                   <span className="md-title-small l4a-truncate">
-                    {addon ? formatAddonDisplayName(addon, namePreference) : item.addonId}
+                    {addon
+                      ? formatFilteredAddonTitle(addon, namePreference, filterCtx, t)
+                      : item.addonId}
                   </span>
                 </div>
                 <div className="l4a-row-wrap">

@@ -490,6 +490,21 @@
 /* ==========================================================================
    Content Filter: Blur Card & Revealed Text Snippet
    ========================================================================== */
+.l4a-blur-card-inner {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+}
+
+.l4a-blur-row-inner {
+  display: flex;
+  align-items: center;
+  gap: inherit;
+  flex: 1;
+  min-width: 0;
+}
+
 .md-card[data-blur-card='true'] > :not(.l4a-blur-card-overlay) {
   filter: blur(14px);
   pointer-events: none;
@@ -523,7 +538,12 @@
   text-align: center;
 }
 
-.l4a-blur-card-overlay:hover .l4a-blur-card-chip {
+.l4a-blur-card-overlay[data-pending='true'] {
+  cursor: default;
+  pointer-events: auto;
+}
+
+.l4a-blur-card-overlay:not([data-pending='true']):hover .l4a-blur-card-chip {
   background-color: var(--md-sys-color-secondary-container);
   color: var(--md-sys-color-on-secondary-container);
 }

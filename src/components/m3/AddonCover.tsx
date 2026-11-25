@@ -137,29 +137,48 @@ export function AddonCover({
   allowPeek = false,
 }: AddonCoverProps) {
   const { t } = useTranslation();
+  const srcKey = `${src ?? ''}|${fallbackSrc ?? ''}`;
+  const resetKey = `${filterMode}|${srcKey}`;
+
+  const [trackedSrcKey, setTrackedSrcKey] = useState(srcKey);
+  const [trackedResetKey, setTrackedResetKey] = useState(resetKey);
   const [failedCandidates, setFailedCandidates] = useState<string[]>([]);
   const [resolvedCacheUrls, setResolvedCacheUrls] = useState<Record<string, string>>({});
-  const [lazyLoadedKey, setLazyLoadedKey] = useState<string | null>(null);
-  const [peekedKey, setPeekedKey] = useState<string | null>(null);
+  const [lazyLoaded, setLazyLoaded] = useState(false);
+  const [peeked, setPeeked] = useState(false);
 
-  const instanceKey = `${src ?? ''}|${fallbackSrc ?? ''}|${title}`;
-  const isLazyDeferred = filterMode === 'lazy' && lazyLoadedKey !== instanceKey;
-  const skipImageLoad = filterMode === 'hide' || isLazyDeferred;
-  const isPeeked = allowPeek && peekedKey === instanceKey;
+  if (trackedSrcKey !== srcKey) {
+    setTrackedSrcKey(srcKey);
+    if (failedCandidates.length > 0) {
+      setFailedCandidates([]);
+    }
+  }
+  if (trackedResetKey !== resetKey) {
+    setTrackedResetKey(resetKey);
+    if (lazyLoaded) setLazyLoaded(false);
+    if (peeked) setPeeked(false);
+  }
 
   const markFailed = (candidate: string) => {
     setFailedCandidates((prev) => (prev.includes(candidate) ? prev : [...prev, candidate]));
   };
 
-  const candidates = skipImageLoad
-    ? []
-    : [src, fallbackSrc].filter(
-        (v, idx, arr): v is string =>
-          Boolean(v) &&
-          arr.indexOf(v) === idx &&
-          Boolean(resolveDirectUrl(v) || (isTauriRuntime() && isLocalCacheKey(v))),
-      );
-  const activeSrc = candidates.find((candidate) => !failedCandidates.includes(candidate));
+  const validCandidates = [src, fallbackSrc].filter(
+    (v, idx, arr): v is string =>
+      Boolean(v) &&
+      arr.indexOf(v) === idx &&
+      Boolean(resolveDirectUrl(v) || (isTauriRuntime() && isLocalCacheKey(v))),
+  );
+  const nonFailedCandidates = validCandidates.filter(
+    (candidate) => !failedCandidates.includes(candidate),
+  );
+  const hasValidCandidate = nonFailedCandidates.length > 0;
+
+  const isLazyDeferred = filterMode === 'lazy' && hasValidCandidate && !lazyLoaded;
+  const skipImageLoad = filterMode === 'hide' || isLazyDeferred;
+  const isPeeked = allowPeek && peeked;
+
+  const activeSrc = skipImageLoad ? undefined : nonFailedCandidates[0];
 
   const directUrl = resolveDirectUrl(activeSrc);
   const shouldLoadCache = Boolean(
@@ -216,7 +235,7 @@ export function AddonCover({
           aria-label={lazyText}
           onClick={(e) => {
             e.stopPropagation();
-            setLazyLoadedKey(instanceKey);
+            setLazyLoaded(true);
           }}
         >
           <ImageIcon size={compact ? 14 : 16} />
@@ -264,7 +283,7 @@ export function AddonCover({
       </div>
     );
 
-  if (filterMode === 'blur') {
+  if (filterMode === 'blur' && hasValidCandidate) {
     const blurred = !isPeeked;
     return (
       <div
@@ -282,7 +301,7 @@ export function AddonCover({
               className="l4a-cover-peek-btn"
               onClick={(e) => {
                 e.stopPropagation();
-                setPeekedKey(isPeeked ? null : instanceKey);
+                setPeeked((v) => !v);
               }}
             >
               {isPeeked ? <EyeOff size={13} /> : <Eye size={13} />}

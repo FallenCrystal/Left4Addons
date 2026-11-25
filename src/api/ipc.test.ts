@@ -357,6 +357,7 @@ describe('v2 IPC client wrapper', () => {
     listenCallback?.({
       payload: {
         type: 'filter_verdicts_updated',
+        policySignature: null,
         verdicts: [
           {
             targetKey: 'ws:3410887766',
@@ -374,7 +375,14 @@ describe('v2 IPC client wrapper', () => {
         ],
       },
     });
-    expect(received).toHaveLength(3);
+    listenCallback?.({
+      payload: {
+        type: 'filter_verdicts_updated',
+        policySignature: 'sig-v1',
+        verdicts: [],
+      },
+    });
+    expect(received).toHaveLength(4);
     expect(received[0]).toEqual({
       type: 'download_progress',
       taskId: 't-1',
@@ -397,7 +405,13 @@ describe('v2 IPC client wrapper', () => {
     });
     expect(received[2]).toMatchObject({
       type: 'filter_verdicts_updated',
+      policySignature: undefined,
       verdicts: [{ targetKey: 'ws:3410887766', flagged: true }],
+    });
+    expect(received[3]).toEqual({
+      type: 'filter_verdicts_updated',
+      policySignature: 'sig-v1',
+      verdicts: [],
     });
     unlisten();
   });

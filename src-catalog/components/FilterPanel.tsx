@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type ChangeEvent } from 'react';
 import {
   Activity,
   FlaskConical,
@@ -29,8 +29,108 @@ import {
 
 export interface FilterPanelProps {
   filter: CatalogFilterStatus;
+  hidden?: boolean;
   onFilterUpdated: (next: CatalogFilterStatus) => void;
   onNotify: (msg: string, tone?: 'default' | 'error') => void;
+}
+
+interface NumericInputProps {
+  id: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: string;
+  integer?: boolean;
+  disabled?: boolean;
+  onChange: (next: number) => void;
+}
+
+function parseCompleteNumber(raw: string, integer: boolean): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (integer) {
+    if (!/^-?\d+$/.test(trimmed)) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed)) return null;
+    return parsed === 0 ? 0 : parsed;
+  }
+  if (!/^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(trimmed)) return null;
+  const parsed = Number.parseFloat(trimmed);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed === 0 ? 0 : parsed;
+}
+
+function NumericInput({
+  id,
+  value,
+  min,
+  max,
+  step,
+  integer = false,
+  disabled = false,
+  onChange,
+}: NumericInputProps) {
+  const [editState, setEditState] = useState<{
+    raw: string;
+    baseValue: number;
+  } | null>(null);
+
+  const displayedValue =
+    editState !== null && editState.baseValue === value
+      ? editState.raw
+      : String(value);
+
+  const handleFocus = () => {
+    setEditState({ raw: String(value), baseValue: value });
+  };
+
+  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const nextRaw = e.target.value;
+    const parsed = parseCompleteNumber(nextRaw, integer);
+    if (parsed !== null && parsed >= min && parsed <= max) {
+      setEditState({ raw: nextRaw, baseValue: parsed });
+      if (parsed !== value) {
+        onChange(parsed);
+      }
+    } else {
+      setEditState({ raw: nextRaw, baseValue: value });
+    }
+  };
+
+  const handleBlur = () => {
+    if (editState === null || editState.baseValue !== value) {
+      setEditState(null);
+      return;
+    }
+    const trimmed = editState.raw.trim();
+    const parsed = integer
+      ? Number.parseInt(trimmed, 10)
+      : Number.parseFloat(trimmed);
+    if (trimmed !== '' && Number.isFinite(parsed)) {
+      const normalized = integer ? Math.round(parsed) : parsed;
+      const clamped = Math.min(max, Math.max(min, normalized));
+      const clean = clamped === 0 ? 0 : clamped;
+      if (clean !== value) {
+        onChange(clean);
+      }
+    }
+    setEditState(null);
+  };
+
+  return (
+    <input
+      id={id}
+      type="text"
+      inputMode={integer ? 'numeric' : 'decimal'}
+      data-step={step}
+      disabled={disabled}
+      className="cat-input cat-mono"
+      value={displayedValue}
+      onFocus={handleFocus}
+      onChange={handleChange}
+      onBlur={handleBlur}
+    />
+  );
 }
 
 const PRESET_OPTIONS: Array<{
@@ -58,7 +158,21 @@ function probBarColor(val: number): string {
   return 'var(--cat-accent)';
 }
 
-export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelProps) {
+function buildConfigPayload(cfg: CatalogFilterConfigDto): CatalogFilterConfigDto {
+  return {
+    ...cfg,
+    deployDir: cfg.deployDir?.trim() ? cfg.deployDir.trim() : undefined,
+    pythonBin: cfg.pythonBin?.trim() ? cfg.pythonBin.trim() : undefined,
+    upstreamUrl: cfg.upstreamUrl?.trim() ? cfg.upstreamUrl.trim() : undefined,
+  };
+}
+
+export function FilterPanel({
+  filter,
+  hidden = false,
+  onFilterUpdated,
+  onNotify,
+}: FilterPanelProps) {
   const [draft, setDraft] = useState<CatalogFilterConfigDto | null>(null);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -120,13 +234,7 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
   const handleSaveConfig = async () => {
     setSaving(true);
     try {
-      const payload: CatalogFilterConfigDto = {
-        ...effective,
-        deployDir: effective.deployDir?.trim() ? effective.deployDir.trim() : undefined,
-        pythonBin: effective.pythonBin?.trim() ? effective.pythonBin.trim() : undefined,
-        upstreamUrl: effective.upstreamUrl?.trim() ? effective.upstreamUrl.trim() : undefined,
-      };
-      const next = await updateFilterConfig(payload);
+      const next = await updateFilterConfig(buildConfigPayload(effective));
       setDraft(null);
       onFilterUpdated(next);
       onNotify('内容过滤配置已应用并持久化至 catalog.toml');
@@ -137,7 +245,7 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
     }
   };
 
-  const handleRunTest = async () => {
+  const buildSandboxRequest = (): FilterPredictRequest | null => {
     const parsedIds = parseWorkshopIdsInput(testWorkshopInput);
     const workshopId = parsedIds[0];
     const title = testTitle.trim();
@@ -147,13 +255,13 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
       .map((s) => s.trim())
       .filter(Boolean);
     const imageUrls = testImageUrlsInput
-      .split(/[\r\n,]+/)
+      .split(/[\s,]+/)
       .map((s) => s.trim())
       .filter(Boolean);
 
     if (!workshopId && !title && !description && tags.length === 0 && imageUrls.length === 0) {
       onNotify('请输入 Workshop ID 或填写自定义标题/简介/预览图链接后再试算', 'error');
-      return;
+      return null;
     }
 
     const req: FilterPredictRequest = {};
@@ -162,6 +270,12 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
     if (description) req.description = description;
     if (tags.length > 0) req.tags = tags;
     if (imageUrls.length > 0) req.imageUrls = imageUrls;
+    return req;
+  };
+
+  const handleRunTest = async () => {
+    const req = buildSandboxRequest();
+    if (!req) return;
 
     setTesting(true);
     try {
@@ -170,6 +284,27 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleSaveAndTest = async () => {
+    const req = buildSandboxRequest();
+    if (!req) return;
+
+    setSaving(true);
+    setTesting(true);
+    try {
+      const next = await updateFilterConfig(buildConfigPayload(effective));
+      setDraft(null);
+      onFilterUpdated(next);
+      const probs = await testFilterPredict(req);
+      setTestResult(probs);
+      onNotify('内容过滤配置已保存并完成概率试算');
+    } catch (err) {
+      onNotify(err instanceof Error ? err.message : String(err), 'error');
+    } finally {
+      setSaving(false);
       setTesting(false);
     }
   };
@@ -186,7 +321,7 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
       : 'danger';
 
   return (
-    <>
+    <div hidden={hidden} style={{ display: hidden ? 'none' : 'contents' }}>
       <div className="cat-page-header">
         <div>
           <h2 className="cat-page-title">内容过滤模型推理服务</h2>
@@ -395,20 +530,16 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
               <label className="cat-label" htmlFor="cat-filter-ttl">
                 结果缓存 TTL (秒，0 禁用)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-ttl"
-                type="number"
                 min={0}
                 max={86400}
-                className="cat-input cat-mono"
+                integer
                 value={effective.cacheTtlSecs}
-                onChange={(e) =>
+                onChange={(next) =>
                   updateDraft((d) => ({
                     ...d,
-                    cacheTtlSecs: Math.min(
-                      86400,
-                      Math.max(0, Number.parseInt(e.target.value || '0', 10) || 0),
-                    ),
+                    cacheTtlSecs: next,
                   }))
                 }
               />
@@ -490,47 +621,45 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
             </div>
           </div>
 
-          <div className="cat-row">
+          <div className="cat-row" style={{ alignItems: 'flex-start' }}>
             <div className="cat-field">
               <label className="cat-label" htmlFor="cat-filter-threads">
                 推理线程数 (1-16)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-threads"
-                type="number"
                 min={1}
                 max={16}
-                className="cat-input cat-mono"
+                integer
+                disabled={effective.backend === 'upstream_http'}
                 value={effective.params.threads}
-                onChange={(e) =>
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    threads: Math.min(
-                      16,
-                      Math.max(1, Number.parseInt(e.target.value || '4', 10) || 4),
-                    ),
+                    threads: next,
                   }))
                 }
               />
+              {effective.backend === 'upstream_http' && (
+                <span style={{ fontSize: 11.5, color: 'var(--cat-text-dim)' }}>
+                  线程数由外部推理进程自行控制
+                </span>
+              )}
             </div>
             <div className="cat-field">
               <label className="cat-label" htmlFor="cat-filter-max-images">
                 最大预览图张数 (1-8)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-max-images"
-                type="number"
                 min={1}
                 max={8}
-                className="cat-input cat-mono"
+                integer
                 value={effective.params.maxImages}
-                onChange={(e) =>
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    maxImages: Math.min(
-                      8,
-                      Math.max(1, Number.parseInt(e.target.value || '2', 10) || 2),
-                    ),
+                    maxImages: next,
                   }))
                 }
               />
@@ -562,42 +691,36 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
               <label className="cat-label" htmlFor="cat-filter-gore-weight">
                 血腥权重 goreWeight (0-3)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-gore-weight"
-                type="number"
                 step="0.05"
                 min={0}
                 max={3}
-                className="cat-input cat-mono"
                 value={effective.params.goreWeight}
-                onChange={(e) => {
-                  const v = Number.parseFloat(e.target.value);
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    goreWeight: Number.isFinite(v) ? Math.min(3, Math.max(0, v)) : 1,
-                  }));
-                }}
+                    goreWeight: next,
+                  }))
+                }
               />
             </div>
             <div className="cat-field">
               <label className="cat-label" htmlFor="cat-filter-nsfw-weight">
                 擦边权重 nsfwWeight (0-3)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-nsfw-weight"
-                type="number"
                 step="0.05"
                 min={0}
                 max={3}
-                className="cat-input cat-mono"
                 value={effective.params.nsfwWeight}
-                onChange={(e) => {
-                  const v = Number.parseFloat(e.target.value);
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    nsfwWeight: Number.isFinite(v) ? Math.min(3, Math.max(0, v)) : 1,
-                  }));
-                }}
+                    nsfwWeight: next,
+                  }))
+                }
               />
             </div>
           </div>
@@ -607,42 +730,36 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
               <label className="cat-label" htmlFor="cat-filter-temperature">
                 校准温度 temperature (0.25-4)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-temperature"
-                type="number"
                 step="0.05"
                 min={0.25}
                 max={4}
-                className="cat-input cat-mono"
                 value={effective.params.temperature}
-                onChange={(e) => {
-                  const v = Number.parseFloat(e.target.value);
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    temperature: Number.isFinite(v) ? Math.min(4, Math.max(0.25, v)) : 1,
-                  }));
-                }}
+                    temperature: next,
+                  }))
+                }
               />
             </div>
             <div className="cat-field">
               <label className="cat-label" htmlFor="cat-filter-bias">
                 对数偏置 bias (-5 ~ +5)
               </label>
-              <input
+              <NumericInput
                 id="cat-filter-bias"
-                type="number"
                 step="0.05"
                 min={-5}
                 max={5}
-                className="cat-input cat-mono"
                 value={effective.params.bias}
-                onChange={(e) => {
-                  const v = Number.parseFloat(e.target.value);
+                onChange={(next) =>
                   updateParams((p) => ({
                     ...p,
-                    bias: Number.isFinite(v) ? Math.min(5, Math.max(-5, v)) : 0,
-                  }));
-                }}
+                    bias: next,
+                  }))
+                }
               />
             </div>
           </div>
@@ -669,21 +786,52 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
               >
                 清空
               </button>
-              <button
-                type="button"
-                className="cat-btn cat-btn-primary cat-btn-sm"
-                disabled={testing}
-                onClick={() => void handleRunTest()}
-              >
-                <Play size={13} />
-                <span>{testing ? '试算中…' : '执行概率试算'}</span>
-              </button>
+              {dirty ? (
+                <>
+                  <button
+                    type="button"
+                    className="cat-btn cat-btn-sm"
+                    disabled={testing || saving}
+                    onClick={() => void handleRunTest()}
+                  >
+                    <Play size={13} />
+                    <span>{testing && !saving ? '试算中…' : '按当前已存配置试算'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="cat-btn cat-btn-primary cat-btn-sm"
+                    disabled={testing || saving}
+                    onClick={() => void handleSaveAndTest()}
+                  >
+                    <Save size={13} />
+                    <span>{saving ? '保存并试算中…' : '保存并试算'}</span>
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="cat-btn cat-btn-primary cat-btn-sm"
+                  disabled={testing || saving}
+                  onClick={() => void handleRunTest()}
+                >
+                  <Play size={13} />
+                  <span>{testing ? '试算中…' : '执行概率试算'}</span>
+                </button>
+              )}
             </div>
           </div>
 
           <p style={{ margin: 0, fontSize: 12.5, color: 'var(--cat-text-muted)' }}>
             输入已缓存的公开 Workshop ID（自动补全标题、简介、标签与预览图）或手动输入文本/图片链接，检验当前生效参数的输出概率。
           </p>
+
+          {dirty && (
+            <div className="cat-banner" style={{ fontSize: 12.5 }}>
+              <span>
+                检测到未保存的模型参数修改尚未生效；试算默认按当前已保存配置运行，也可点击「保存并试算」立即应用新参数。
+              </span>
+            </div>
+          )}
 
           <div className="cat-row">
             <div className="cat-field">
@@ -740,11 +888,13 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
 
           <div className="cat-field">
             <label className="cat-label" htmlFor="cat-test-img-urls">
-              Steam CDN 预览图链接 (可选，仅支持 HTTPS 白名单域名)
+              Steam CDN 预览图链接 (可选，支持换行、空格或逗号分隔白名单域名)
             </label>
-            <input
+            <textarea
               id="cat-test-img-urls"
-              className="cat-input cat-mono"
+              rows={2}
+              className="cat-textarea cat-mono"
+              style={{ minHeight: 56 }}
               placeholder="https://images.steamusercontent.com/ugc/..."
               value={testImageUrlsInput}
               onChange={(e) => setTestImageUrlsInput(e.target.value)}
@@ -818,6 +968,6 @@ export function FilterPanel({ filter, onFilterUpdated, onNotify }: FilterPanelPr
           )}
         </section>
       </div>
-    </>
+    </div>
   );
 }

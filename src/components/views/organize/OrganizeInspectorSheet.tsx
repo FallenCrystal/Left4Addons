@@ -1,5 +1,14 @@
 import { useTranslation } from 'react-i18next';
-import { Download, ExternalLink, Pencil, Play, Trash2 } from 'lucide-react';
+import {
+  AlertTriangle,
+  Download,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  Pencil,
+  Play,
+  Trash2,
+} from 'lucide-react';
 import type {
   AddonNamePreference,
   AddonSummary,
@@ -8,7 +17,15 @@ import type {
   TrackedCollectionRecord,
   UserGroup,
 } from '../../../api/ipc';
-import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import {
+  addonFilterKey,
+  formatDiagnosticVerdictBadge,
+  formatFilteredAddonTitle,
+  isAddonTitleRedacted,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
+import { formatBytes } from '../../../utils/format';
 import { Button, SideSheet, Switch } from '../../m3/primitives';
 import type { ExternalAddonFilter } from '../LibraryView';
 import { BundleInspectorSheet } from './BundleInspectorSheet';
@@ -73,21 +90,64 @@ export function OrganizeInspectorSheet({
   onCopy,
 }: OrganizeInspectorSheetProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
+  const { verdicts, revealCard } = filterCtx;
 
-  const collectionMissing = inspectedCollection
-    ? inspectedCollection.memberWorkshopIds.filter(
-        (wid) => addonsByWorkshopId.get(wid)?.installState !== 'installed',
-      )
+  const visibleCollectionWids = inspectedCollection
+    ? inspectedCollection.memberWorkshopIds.filter((wid) => {
+        const local = addonsByWorkshopId.get(wid);
+        return !local || !resolveLibraryAddonCardFilter(local, filterCtx).hiddenCard;
+      })
     : [];
+  const collectionHiddenCount = inspectedCollection
+    ? inspectedCollection.memberWorkshopIds.length - visibleCollectionWids.length
+    : 0;
+  const collectionMissing = visibleCollectionWids.filter(
+    (wid) => addonsByWorkshopId.get(wid)?.installState !== 'installed',
+  );
 
+  const visibleGroupAddonIds = inspectedGroup
+    ? inspectedGroup.addonIds.filter((id) => {
+        const addon = addonsById.get(id);
+        return !addon || !resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard;
+      })
+    : [];
+  const groupHiddenCount = inspectedGroup
+    ? inspectedGroup.addonIds.length - visibleGroupAddonIds.length
+    : 0;
   const groupSummary = inspectedGroup
-    ? summarizeGroupMembers(inspectedGroup.addonIds, addonsById)
+    ? summarizeGroupMembers(visibleGroupAddonIds, addonsById)
     : null;
   const groupToggleableIds = groupSummary ? groupSummary.loading.map((a) => a.id) : [];
 
-  const profileDiff = inspectedProfile
+  const rawProfileDiff = inspectedProfile
     ? computeProfileDiff(inspectedProfile, addonsById, loadingAddons)
     : null;
+  const profileDiff = rawProfileDiff
+    ? {
+        toEnable: rawProfileDiff.toEnable.filter(
+          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
+        ),
+        toDisable: rawProfileDiff.toDisable.filter(
+          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
+        ),
+        unchangedEnabled: rawProfileDiff.unchangedEnabled.filter(
+          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
+        ),
+        missingIds: rawProfileDiff.missingIds.filter((id) => {
+          const found = addonsById.get(id);
+          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
+        }),
+      }
+    : null;
+  const profileHiddenCount =
+    rawProfileDiff && profileDiff
+      ? rawProfileDiff.toEnable.length -
+        profileDiff.toEnable.length +
+        (rawProfileDiff.toDisable.length - profileDiff.toDisable.length) +
+        (rawProfileDiff.unchangedEnabled.length - profileDiff.unchangedEnabled.length) +
+        (rawProfileDiff.missingIds.length - profileDiff.missingIds.length)
+      : 0;
 
   return (
     <>
@@ -122,7 +182,12 @@ export function OrganizeInspectorSheet({
                   icon={<Download size={14} />}
                   onClick={() => {
                     for (const wid of collectionMissing) {
-                      onDownloadWorkshopItem(wid, addonsByWorkshopId.get(wid)?.title);
+                      const found = addonsByWorkshopId.get(wid);
+                      const safeTitle =
+                        found && !isAddonTitleRedacted(found, filterCtx)
+                          ? found.title
+                          : undefined;
+                      onDownloadWorkshopItem(wid, safeTitle);
                     }
                   }}
                 >
@@ -136,7 +201,7 @@ export function OrganizeInspectorSheet({
                 onClick={() => {
                   onOpenFilterInLibrary({
                     label: inspectedCollection.title,
-                    workshopIds: inspectedCollection.memberWorkshopIds,
+                    workshopIds: visibleCollectionWids,
                   });
                   onClose();
                 }}
@@ -178,6 +243,12 @@ export function OrganizeInspectorSheet({
                   })}
                 </span>
               )}
+              {collectionHiddenCount > 0 && (
+                <span className="md-pill" data-tone="surface">
+                  <EyeOff size={12} />
+                  {t('filter.filteredCount', { count: collectionHiddenCount })}
+                </span>
+              )}
             </div>
 
             {inspectedCollection.description && (
@@ -187,62 +258,171 @@ export function OrganizeInspectorSheet({
             )}
 
             <div className="l4a-list">
-              {inspectedCollection.memberWorkshopIds.map((wid) => {
-                const local = addonsByWorkshopId.get(wid);
-                const removed = inspectedCollection.removedUpstreamIds.includes(wid);
-                if (local && local.installState === 'installed') {
+              {visibleCollectionWids.length === 0 ? (
+                <div
+                  style={{
+                    padding: 20,
+                    textAlign: 'center',
+                    color: 'var(--md-sys-color-on-surface-variant)',
+                  }}
+                >
+                  {t('common.empty')}
+                </div>
+              ) : (
+                visibleCollectionWids.map((wid) => {
+                  const local = addonsByWorkshopId.get(wid);
+                  const removed = inspectedCollection.removedUpstreamIds.includes(wid);
+                  if (local && local.installState === 'installed') {
+                    return (
+                      <OrganizeMemberRow
+                        key={local.id}
+                        addon={local}
+                        namePreference={namePreference}
+                        busy={busy}
+                        badge={
+                          removed
+                            ? { text: t('organize.memberRemoved'), tone: 'error' }
+                            : { text: t('organize.memberInstalled'), tone: 'primary' }
+                        }
+                        onSelectAddon={onSelectAddon}
+                        onOpenInFileManager={onOpenInFileManager}
+                        onToggleSingle={onToggleSingle}
+                      />
+                    );
+                  }
+
+                  const localKey = local ? addonFilterKey(local.id) : undefined;
+                  const localVerdict = localKey ? verdicts[localKey] : undefined;
+                  const localFilter = local
+                    ? resolveLibraryAddonCardFilter(local, filterCtx)
+                    : null;
+                  const localLabel = local
+                    ? formatFilteredAddonTitle(local, namePreference, filterCtx, t)
+                    : `#${wid}`;
+                  const localDesc =
+                    local?.addonInfo.addondescription ?? local?.addonInfo.description;
+
                   return (
-                    <OrganizeMemberRow
-                      key={local.id}
-                      addon={local}
-                      namePreference={namePreference}
-                      busy={busy}
-                      badge={
-                        removed
-                          ? { text: t('organize.memberRemoved'), tone: 'error' }
-                          : { text: t('organize.memberInstalled'), tone: 'primary' }
-                      }
-                      onSelectAddon={onSelectAddon}
-                      onOpenInFileManager={onOpenInFileManager}
-                      onToggleSingle={onToggleSingle}
-                    />
-                  );
-                }
-                return (
-                  <div
-                    key={wid}
-                    className="l4a-list-row l4a-list-row-dense"
-                    style={{ cursor: 'default' }}
-                  >
-                    <div className="l4a-list-main">
-                      <span className="md-title-small l4a-truncate">
-                        {local ? formatAddonDisplayName(local, namePreference) : `#${wid}`}
-                      </span>
-                      <span
-                        className="md-body-small md-mono"
-                        style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    <div
+                      key={wid}
+                      className="l4a-list-row l4a-list-row-dense"
+                      style={{ cursor: local ? 'pointer' : 'default' }}
+                      data-blur-card={localFilter?.blurWholeCard ? 'true' : 'false'}
+                    >
+                      {localFilter?.blurWholeCard &&
+                        localKey &&
+                        (localFilter.pendingEvaluation ? (
+                          <div
+                            className="l4a-blur-card-overlay"
+                            data-pending="true"
+                            aria-hidden="true"
+                          >
+                            <span className="l4a-blur-card-chip">
+                              <span>{t('filter.evaluatingMedia')}</span>
+                            </span>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="l4a-blur-card-overlay"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              revealCard(localKey);
+                            }}
+                          >
+                            <span className="l4a-blur-card-chip">
+                              <Eye size={13} />
+                              <span>{t('filter.blurCardOverlay')}</span>
+                            </span>
+                          </button>
+                        ))}
+                      <div
+                        className="l4a-blur-row-inner"
+                        inert={localFilter?.blurWholeCard || undefined}
+                        aria-hidden={localFilter?.blurWholeCard || undefined}
                       >
-                        #{wid}
-                      </span>
+                        {local ? (
+                          <button
+                            type="button"
+                            className="l4a-card-trigger l4a-list-main"
+                            onClick={() => onSelectAddon(local)}
+                          >
+                            <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                              <span className="md-title-small l4a-truncate">{localLabel}</span>
+                              {localFilter?.exclusionActive &&
+                                localFilter.exclusionDisplayLevel &&
+                                localFilter.exclusionDisplayLevel !== 'normal' && (
+                                  <span className="md-pill" data-tone="secondary">
+                                    {t(`filter.levels.${localFilter.exclusionDisplayLevel}`)}
+                                  </span>
+                                )}
+                              {localFilter?.exclusionInvalidated && (
+                                <span className="md-pill" data-tone="error">
+                                  <AlertTriangle size={11} />
+                                  {t('filter.exclusionInvalidPill')}
+                                </span>
+                              )}
+                              {localFilter?.showDiagnosticBadge && localVerdict && (
+                                <span className="md-pill" data-tone="tertiary">
+                                  {formatDiagnosticVerdictBadge(localVerdict, localFilter, {
+                                    imageTag: t('filter.modImageShort'),
+                                    textTag: t('filter.modTextShort'),
+                                  })}
+                                </span>
+                              )}
+                            </div>
+                            <span
+                              className="md-body-small md-mono"
+                              style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                            >
+                              #{wid}
+                            </span>
+                            {localFilter?.isBlurCardRevealed && (
+                              <div className="l4a-revealed-desc">
+                                {localFilter.redactDescription
+                                  ? t('filter.redactedDescription')
+                                  : localDesc?.trim() || t('filter.noDescription')}
+                              </div>
+                            )}
+                          </button>
+                        ) : (
+                          <div className="l4a-list-main">
+                            <span className="md-title-small l4a-truncate">{localLabel}</span>
+                            <span
+                              className="md-body-small md-mono"
+                              style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                            >
+                              #{wid}
+                            </span>
+                          </div>
+                        )}
+                        <div className="l4a-list-trailing">
+                          <span className="md-pill" data-tone={removed ? 'error' : 'surface'}>
+                            {removed ? t('organize.memberRemoved') : t('organize.memberMissing')}
+                          </span>
+                          {!removed && (
+                            <Button
+                              variant="tonal"
+                              size="sm"
+                              icon={<Download size={13} />}
+                              onClick={() =>
+                                onDownloadWorkshopItem(
+                                  wid,
+                                  local && !isAddonTitleRedacted(local, filterCtx)
+                                    ? local.title
+                                    : undefined,
+                                )
+                              }
+                            >
+                              {t('common.download')}
+                            </Button>
+                          )}
+                        </div>
+                      </div>
                     </div>
-                    <div className="l4a-list-trailing">
-                      <span className="md-pill" data-tone={removed ? 'error' : 'surface'}>
-                        {removed ? t('organize.memberRemoved') : t('organize.memberMissing')}
-                      </span>
-                      {!removed && (
-                        <Button
-                          variant="tonal"
-                          size="sm"
-                          icon={<Download size={13} />}
-                          onClick={() => onDownloadWorkshopItem(wid, local?.title)}
-                        >
-                          {t('common.download')}
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+                  );
+                })
+              )}
             </div>
           </div>
         )}
@@ -271,7 +451,7 @@ export function OrganizeInspectorSheet({
                 onClick={() => {
                   onOpenFilterInLibrary({
                     label: inspectedGroup.name,
-                    addonIds: inspectedGroup.addonIds,
+                    addonIds: visibleGroupAddonIds,
                   });
                   onClose();
                 }}
@@ -308,6 +488,12 @@ export function OrganizeInspectorSheet({
                     {tag}
                   </span>
                 ))}
+                {groupHiddenCount > 0 && (
+                  <span className="md-pill" data-tone="surface">
+                    <EyeOff size={12} />
+                    {t('filter.filteredCount', { count: groupHiddenCount })}
+                  </span>
+                )}
               </div>
               {groupToggleableIds.length > 0 && (
                 <Switch
@@ -418,6 +604,12 @@ export function OrganizeInspectorSheet({
               {profileDiff.missingIds.length > 0 && (
                 <span className="md-pill" data-tone="error">
                   {t('organize.profileMissing', { count: profileDiff.missingIds.length })}
+                </span>
+              )}
+              {profileHiddenCount > 0 && (
+                <span className="md-pill" data-tone="surface">
+                  <EyeOff size={12} />
+                  {t('filter.filteredCount', { count: profileHiddenCount })}
                 </span>
               )}
             </div>

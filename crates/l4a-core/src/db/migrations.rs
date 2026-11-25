@@ -188,6 +188,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
             updated_at TEXT NOT NULL,
             PRIMARY KEY (target_key, policy_sig)
         );
+        CREATE INDEX IF NOT EXISTS idx_filter_verdicts_policy_sig ON filter_verdicts(policy_sig);
         "#,
     )?;
 

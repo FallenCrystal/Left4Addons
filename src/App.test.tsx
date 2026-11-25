@@ -868,14 +868,15 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     const crimsonTitle = await screen.findByText('Crimson Gore Dissolve FX');
     const card = crimsonTitle.closest('article')!;
 
-    // Wait for automatic batch evaluation to flag the item and apply blur_card
-    await waitFor(() => {
-      expect(card.getAttribute('data-blur-card')).toBe('true');
-    });
+    // Zero-flash: card is already blurred with hidden cover and inert inner wrapper even while pending, then settles into reveal button
+    expect(card.getAttribute('data-blur-card')).toBe('true');
     expect(card.querySelector('img')).toBeNull();
+    expect(card.querySelector('.l4a-blur-card-inner')?.hasAttribute('inert')).toBe(true);
 
-    // First click on blurred card overlay: unblurs text & shows description, while STILL keeping image hidden!
-    const revealBtn = within(card).getByRole('button', { name: /Sensitive · Click to show text/ });
+    // First click on settled blurred card overlay: unblurs text & shows description, while STILL keeping image hidden!
+    const revealBtn = await within(card).findByRole('button', {
+      name: /Sensitive · Click to show text/,
+    });
     fireEvent.click(revealBtn);
 
     expect(card.getAttribute('data-blur-card')).toBe('false');
@@ -1012,4 +1013,149 @@ describe('Left4Addons v2 Material 3 frontend', () => {
 
     expect(await screen.findByText('Verdict: Flagged')).toBeTruthy();
   });
+
+  it('enforces Library exclusions with filter disabled, filters collapsed bundle.coverImage, and preserves decimal/negative typing in FilterSettingsSection', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = false;
+    snapshot.config.filter.applyToLibrary = false;
+    snapshot.config.collapseCampaignBundles = true;
+    // Populate explicit bundle.coverImage while members have no individual coverImage
+    snapshot.bundles[0].coverImage =
+      'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%23991111"/></svg>';
+    const nowIso = '2026-11-25T00:00:00Z';
+    snapshot.filterExclusions = [
+      {
+        addonId: 'ws:2814104912',
+        displayLevel: 'hide_image',
+        bindFingerprint: true,
+        boundFingerprint: snapshot.addons[0].contentHash,
+        currentFingerprint: snapshot.addons[0].contentHash,
+        fingerprintValid: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      {
+        addonId: 'ws:3120481120',
+        displayLevel: 'hide_text',
+        bindFingerprint: true,
+        boundFingerprint: snapshot.addons[3].contentHash,
+        currentFingerprint: snapshot.addons[3].contentHash,
+        fingerprintValid: true,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+    ];
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === 'evaluate_filter_items') return [];
+      if (cmd === 'get_local_filter_status') {
+        return {
+          env: {
+            gitAvailable: true,
+            gitVersion: '2.43.0',
+            pythonAvailable: true,
+            pythonVersion: '3.12.3',
+            venvAvailable: true,
+          },
+          deployed: false,
+          repoUrl: snapshot.config.filter.repoUrl,
+          trackLatest: snapshot.config.filter.trackLatest,
+          pinnedCommit: snapshot.config.filter.pinnedCommit,
+          recentCommits: [],
+          updateAvailable: false,
+          serviceState: 'stopped',
+          serviceEndpoint: null,
+          runningPid: null,
+          stageMessage: null,
+          lastError: null,
+        };
+      }
+      if (cmd === 'get_filter_token_status') {
+        return {
+          encryptedTokenStored: false,
+          envVarName: 'L4A_FILTER_OPENAI_API_KEY',
+          envVarPresent: false,
+        };
+      }
+      return snapshot;
+    });
+
+    render(<App />);
+
+    // 1. Collapsed bundle with explicit bundle.coverImage still respects member hide_image exclusion (even with filter.enabled === false)!
+    const bundleHeading = await screen.findByText('Chernobyl: Chapter One');
+    const bundleCard = bundleHeading.closest('article')!;
+    expect(bundleCard.querySelector('img')).toBeNull();
+
+    // 2. hide_text exclusion masks Tactical M4A1 SOPMOD even when filter.enabled === false, and prevents raw title search leaks!
+    expect(screen.queryByText('Tactical M4A1 SOPMOD')).toBeNull();
+    expect(screen.getByText('Sensitive title hidden · #3120481120')).toBeTruthy();
+
+    const searchInput = screen.getByPlaceholderText('Title, author, ID, filename');
+    fireEvent.change(searchInput, { target: { value: 'SOPMOD' } });
+    expect(screen.queryByText('Sensitive title hidden · #3120481120')).toBeNull();
+
+    fireEvent.change(searchInput, { target: { value: '3120481120' } });
+    expect(screen.getByText('Sensitive title hidden · #3120481120')).toBeTruthy();
+
+    // 3. FilterSettingsSection NumericTextField preserves intermediate '-', '-0.', '-0.2', '0.', '0.5', Backspace while focused, and clamps on blur!
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+
+    const biasInput = (await screen.findByLabelText('Logit Bias (-5–5)')) as HTMLInputElement;
+    fireEvent.focus(biasInput);
+    fireEvent.change(biasInput, { target: { value: '-' } });
+    expect(biasInput.value).toBe('-');
+    fireEvent.change(biasInput, { target: { value: '-0.' } });
+    expect(biasInput.value).toBe('-0.');
+    fireEvent.change(biasInput, { target: { value: '-0.2' } });
+    expect(biasInput.value).toBe('-0.2');
+    fireEvent.blur(biasInput);
+    expect(biasInput.value).toBe('-0.2');
+
+    const flagThresholdInput = screen.getByLabelText(
+      'Direct Flag Threshold (0–1)',
+    ) as HTMLInputElement;
+    fireEvent.focus(flagThresholdInput);
+    fireEvent.change(flagThresholdInput, { target: { value: '' } });
+    expect(flagThresholdInput.value).toBe('');
+    fireEvent.change(flagThresholdInput, { target: { value: '0.' } });
+    expect(flagThresholdInput.value).toBe('0.');
+    fireEvent.change(flagThresholdInput, { target: { value: '0.5' } });
+    expect(flagThresholdInput.value).toBe('0.5');
+    fireEvent.change(flagThresholdInput, { target: { value: '9.5' } });
+    expect(flagThresholdInput.value).toBe('9.5');
+    fireEvent.blur(flagThresholdInput);
+    expect(flagThresholdInput.value).toBe('1');
+
+    // 4. Threshold overlap warning when llmThreshold >= flagThreshold
+    fireEvent.focus(flagThresholdInput);
+    fireEvent.change(flagThresholdInput, { target: { value: '0.4' } });
+    fireEvent.blur(flagThresholdInput);
+    fireEvent.click(
+      screen.getByRole('switch', { name: 'Enable External LLM Review for Borderline Scores' }),
+    );
+    const llmThresholdInput = screen.getByLabelText(
+      'LLM Escalation Threshold (0–1)',
+    ) as HTMLInputElement;
+    fireEvent.focus(llmThresholdInput);
+    fireEvent.change(llmThresholdInput, { target: { value: '0.6' } });
+    fireEvent.blur(llmThresholdInput);
+    expect(
+      screen.getByText(/Warning: LLM Escalation Threshold is greater than or equal to Direct Flag Threshold/),
+    ).toBeTruthy();
+
+    // 5. Disabling Track latest without a Pinned Commit SHA disables Deploy Now with helper hint
+    fireEvent.click(screen.getByRole('switch', { name: 'Track latest remote commit (HEAD)' }));
+    expect(
+      screen.getByText(
+        'Select or enter a target commit SHA before deploying when Track latest is turned off.',
+      ),
+    ).toBeTruthy();
+    expect(
+      (screen.getByRole('button', { name: 'Deploy Now' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
 });
+

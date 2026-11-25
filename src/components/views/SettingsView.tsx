@@ -82,6 +82,7 @@ export interface SettingsViewProps {
   onRefreshFilterTokenStatus?: () => Promise<FilterTokenStatus | null>;
   onSetFilterLlmToken?: (token: string | null) => Promise<FilterTokenStatus | null>;
   onClearFilterCache?: () => Promise<number | null>;
+  onRetryFailedEvaluations?: () => void;
   onEvaluateSandboxTarget?: (
     target: FilterEvaluationTarget,
   ) => Promise<FilterItemVerdict | null>;
@@ -120,6 +121,7 @@ export function SettingsView({
   onRefreshFilterTokenStatus = async () => null,
   onSetFilterLlmToken = async () => null,
   onClearFilterCache = async () => null,
+  onRetryFailedEvaluations = () => {},
   onEvaluateSandboxTarget = async () => null,
   onUpsertFilterExclusion = async () => false,
   onDeleteFilterExclusion = async () => false,
@@ -175,9 +177,12 @@ export function SettingsView({
 
   const handleSave = useCallback(async () => {
     if (!dirty || busy) return;
+    const savedDraft = draft;
     const ok = await onSaveConfig(effective, pathsChanged);
-    if (ok) setDraft(null);
-  }, [busy, dirty, effective, onSaveConfig, pathsChanged]);
+    if (ok) {
+      setDraft((curr) => (curr === savedDraft ? null : curr));
+    }
+  }, [busy, dirty, draft, effective, onSaveConfig, pathsChanged]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -580,18 +585,43 @@ export function SettingsView({
               }
               onSaveDraftFirst={async () => {
                 if (!dirty) return true;
+                const savedDraft = draft;
                 const ok = await onSaveConfig(effective, pathsChanged);
-                if (ok) setDraft(null);
+                if (ok) {
+                  setDraft((curr) => (curr === savedDraft ? null : curr));
+                }
                 return ok;
               }}
               onRefreshLocalStatus={onRefreshLocalFilterStatus}
               onCheckLocalUpdates={onCheckLocalFilterUpdates}
-              onDeployLocalFilter={onDeployLocalFilter}
+              onDeployLocalFilter={async (request) => {
+                const status = await onDeployLocalFilter(request);
+                if (status) {
+                  const nextPinned = request.trackLatest
+                    ? null
+                    : (request.targetCommit?.trim() || null);
+                  setDraft((curr) =>
+                    curr
+                      ? {
+                          ...curr,
+                          filter: {
+                            ...curr.filter,
+                            repoUrl: request.repoUrl?.trim() || curr.filter.repoUrl,
+                            trackLatest: request.trackLatest,
+                            pinnedCommit: nextPinned,
+                          },
+                        }
+                      : null,
+                  );
+                }
+                return status;
+              }}
               onStartLocalService={onStartLocalFilterService}
               onStopLocalService={onStopLocalFilterService}
               onRefreshTokenStatus={onRefreshFilterTokenStatus}
               onSetLlmToken={onSetFilterLlmToken}
               onClearFilterCache={onClearFilterCache}
+              onRetryFailedEvaluations={onRetryFailedEvaluations}
               onEvaluateSandbox={onEvaluateSandboxTarget}
               onUpsertExclusion={onUpsertFilterExclusion}
               onDeleteExclusion={onDeleteFilterExclusion}

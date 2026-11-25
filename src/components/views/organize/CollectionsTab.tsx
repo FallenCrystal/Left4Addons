@@ -5,7 +5,13 @@ import type {
   AddonSummary,
   TrackedCollectionRecord,
 } from '../../../api/ipc';
-import { formatAddonDisplayName, formatTimestamp } from '../../../utils/format';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import {
+  formatFilteredAddonTitle,
+  isAddonTitleRedacted,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
+import { formatTimestamp } from '../../../utils/format';
 import { Button, EmptyState, IconButton, LinearProgress } from '../../m3/primitives';
 import type { ExternalAddonFilter } from '../LibraryView';
 
@@ -33,6 +39,7 @@ export function CollectionsTab({
   onUntrackCollection,
 }: CollectionsTabProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
 
   if (filteredCollections.length === 0) {
     return (
@@ -46,15 +53,19 @@ export function CollectionsTab({
   return (
     <div className="l4a-card-grid-wide">
       {filteredCollections.map((col) => {
-        const total = col.memberWorkshopIds.length;
-        const missing = col.memberWorkshopIds.filter(
+        const visibleWids = col.memberWorkshopIds.filter((wid) => {
+          const found = addonsByWorkshopId.get(wid);
+          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
+        });
+        const total = visibleWids.length;
+        const missing = visibleWids.filter(
           (id) => addonsByWorkshopId.get(id)?.installState !== 'installed',
         );
         const installed = total - missing.length;
         const percent = total > 0 ? Math.round((installed / total) * 100) : 0;
-        const previewTitles = col.memberWorkshopIds.slice(0, 3).map((wid) => {
+        const previewTitles = visibleWids.slice(0, 3).map((wid) => {
           const found = addonsByWorkshopId.get(wid);
-          return found ? formatAddonDisplayName(found, namePreference) : `#${wid}`;
+          return found ? formatFilteredAddonTitle(found, namePreference, filterCtx, t) : `#${wid}`;
         });
 
         return (
@@ -134,7 +145,12 @@ export function CollectionsTab({
                     icon={<Download size={13} />}
                     onClick={() => {
                       for (const id of missing) {
-                        onDownloadWorkshopItem(id, addonsByWorkshopId.get(id)?.title);
+                        const found = addonsByWorkshopId.get(id);
+                        const safeTitle =
+                          found && !isAddonTitleRedacted(found, filterCtx)
+                            ? found.title
+                            : undefined;
+                        onDownloadWorkshopItem(id, safeTitle);
                       }
                     }}
                   >
@@ -147,7 +163,7 @@ export function CollectionsTab({
                   onClick={() =>
                     onOpenFilterInLibrary({
                       label: col.title,
-                      workshopIds: col.memberWorkshopIds,
+                      workshopIds: visibleWids,
                     })
                   }
                 >

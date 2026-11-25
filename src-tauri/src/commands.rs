@@ -219,7 +219,8 @@ pub async fn save_config(
     config: AppConfig,
     state: State<'_, TauriState>,
 ) -> Result<AppConfig, DesktopError> {
-    let saved = state.engine.save_config(config)?;
+    let engine = state.engine.clone();
+    let saved = engine.save_config_async(config).await?;
     crate::spawn_workshop_hydration(&state.engine);
     Ok(saved)
 }

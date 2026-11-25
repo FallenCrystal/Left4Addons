@@ -5,6 +5,11 @@ import type {
   BundleRecord,
 } from '../../../api/ipc';
 import {
+  getAddonSearchRedaction,
+  isAddonTitleRedacted,
+  type FilterLookupSource,
+} from '../../../utils/contentFilter';
+import {
   formatAddonDisplayName,
   matchesAddonSearch,
   resolveAddonMetadataTitle,
@@ -77,7 +82,11 @@ export function isRemoteUnavailable(addon: AddonSummary): boolean {
 export function resolveLibraryMetadataTitle(
   addon: AddonSummary,
   namePreference: AddonNamePreference,
-): string {
+  filterCtx?: FilterLookupSource,
+): string | undefined {
+  if (filterCtx && isAddonTitleRedacted(addon, filterCtx)) {
+    return undefined;
+  }
   return resolveAddonMetadataTitle(
     addon,
     namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
@@ -216,6 +225,7 @@ export interface BuildLibraryDisplayItemsParams {
   namePreference: AddonNamePreference;
   hiddenAddonIds?: ReadonlySet<string>;
   enforceHide?: boolean;
+  filterCtx?: FilterLookupSource;
 }
 
 export function buildLibraryDisplayItems({
@@ -233,6 +243,7 @@ export function buildLibraryDisplayItems({
   namePreference,
   hiddenAddonIds,
   enforceHide = true,
+  filterCtx,
 }: BuildLibraryDisplayItemsParams): {
   displayItems: LibraryDisplayItem[];
   visibleAddons: AddonSummary[];
@@ -278,16 +289,20 @@ export function buildLibraryDisplayItems({
 
   const matchesQuery = (a: AddonSummary): boolean => {
     if (!trimmedQuery) return true;
+    const redaction = filterCtx ? getAddonSearchRedaction(a, filterCtx) : undefined;
     if (mapMode) {
+      const needle = trimmedQuery.toLowerCase();
+      if (redaction?.redactTitle) {
+        return a.maps.some((m) => m.code.toLowerCase().includes(needle));
+      }
       if (mapMatchedIds !== null) {
         return mapMatchedIds.has(a.id);
       }
-      const needle = trimmedQuery.toLowerCase();
       return a.maps.some(
         (m) => m.code.toLowerCase().includes(needle) || m.name.toLowerCase().includes(needle),
       );
     }
-    return matchesAddonSearch(a, trimmedQuery);
+    return matchesAddonSearch(a, trimmedQuery, redaction);
   };
 
   let filteredOutCount = 0;
@@ -331,9 +346,15 @@ export function buildLibraryDisplayItems({
       if (categoryMembers.length === 0) continue;
 
       const matchedMembers = categoryMembers.filter(matchesQuery);
+      const allCategoryMembersRedacted = Boolean(
+        filterCtx &&
+          categoryMembers.length > 0 &&
+          categoryMembers.every((m) => getAddonSearchRedaction(m, filterCtx).redactTitle),
+      );
       const bundleNameMatched =
         Boolean(trimmedQuery) &&
         !mapMode &&
+        !allCategoryMembersRedacted &&
         bundle.name.toLowerCase().includes(trimmedQuery.toLowerCase());
 
       const shouldCollapse =
@@ -364,10 +385,22 @@ export function buildLibraryDisplayItems({
     }
   }
 
-  const itemTitle = (entry: LibraryDisplayItem): string =>
-    entry.kind === 'bundle'
-      ? entry.bundle.name
-      : formatAddonDisplayName(entry.addon, namePreference);
+  const itemTitle = (entry: LibraryDisplayItem): string => {
+    if (entry.kind === 'bundle') {
+      if (
+        filterCtx &&
+        entry.visibleMembers.length > 0 &&
+        entry.visibleMembers.every((m) => isAddonTitleRedacted(m, filterCtx))
+      ) {
+        return entry.visibleMembers.find((m) => m.workshopId)?.workshopId ?? entry.bundle.id;
+      }
+      return entry.bundle.name;
+    }
+    if (filterCtx && isAddonTitleRedacted(entry.addon, filterCtx)) {
+      return entry.addon.workshopId ?? entry.addon.id;
+    }
+    return formatAddonDisplayName(entry.addon, namePreference);
+  };
 
   const itemSize = (entry: LibraryDisplayItem): number =>
     entry.kind === 'bundle'

@@ -33,8 +33,11 @@ import type { LiveDownloadState } from '../../state/useAppController';
 import {
   collectWorkshopImageUrls,
   formatDiagnosticVerdictBadge,
+  hasFilterableWorkshopContent,
+  isAddonTitleRedacted,
   resolveCardFilterState,
   resolveDetailFilterState,
+  resolveLookupVerdict,
   workshopFilterKey,
 } from '../../utils/contentFilter';
 import {
@@ -198,14 +201,28 @@ export function WorkshopView({
   const response = searchResult?.response ?? null;
   const searchError = searchResult?.error ?? null;
 
+  const filterCtx = useContentFilterContext();
   const {
     filterConfig,
     verdicts,
+    evaluatedRevisions,
     revealedCardIds,
+    failedTargetKeys,
+    evalError,
     revealCard,
     registerWorkshopItems,
-  } = useContentFilterContext();
+    retryFailedEvaluations,
+  } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
+
+  const filterResetKey = `${searchParams.query}|${searchParams.fileType}|${searchParams.tag ?? ''}|${searchParams.sort}|${searchParams.page}`;
+  const [trackedFilterResetKey, setTrackedFilterResetKey] = useState(filterResetKey);
+  if (trackedFilterResetKey !== filterResetKey) {
+    setTrackedFilterResetKey(filterResetKey);
+    if (showingFilteredCards) {
+      setShowingFilteredCards(false);
+    }
+  }
 
   useEffect(() => {
     const batch: WorkshopItemRecord[] = [];
@@ -225,10 +242,13 @@ export function WorkshopView({
     let hiddenCount = 0;
     const out: WorkshopItemRecord[] = [];
     for (const item of rawItems) {
+      const key = workshopFilterKey(item.workshopId);
       const state = resolveCardFilterState({
         config: filterConfig,
         scope: 'workshop',
-        verdict: verdicts[workshopFilterKey(item.workshopId)],
+        verdict: resolveLookupVerdict(key, { verdicts, evaluatedRevisions }),
+        hasTargetFailed: failedTargetKeys.has(key),
+        hasContent: hasFilterableWorkshopContent(item),
       });
       if (state.hiddenCard) {
         hiddenCount += 1;
@@ -239,22 +259,42 @@ export function WorkshopView({
       out.push(item);
     }
     return { visibleItems: out, filteredOutCount: hiddenCount };
-  }, [response, filterConfig, verdicts, showingFilteredCards]);
+  }, [
+    response,
+    filterConfig,
+    verdicts,
+    evaluatedRevisions,
+    failedTargetKeys,
+    showingFilteredCards,
+  ]);
 
   const activeGalleryUrls = useMemo(
     () => (activeItem ? collectWorkshopImageUrls(activeItem) : []),
     [activeItem],
   );
-  const activeVerdict = activeItem ? verdicts[workshopFilterKey(activeItem.workshopId)] : undefined;
+  const activeKey = activeItem ? workshopFilterKey(activeItem.workshopId) : undefined;
+  const activeVerdict = activeKey ? verdicts[activeKey] : undefined;
   const activeDetailFilter = useMemo(
     () =>
       resolveDetailFilterState({
         config: filterConfig,
         scope: 'workshop',
-        verdict: activeVerdict,
+        verdict: activeKey
+          ? resolveLookupVerdict(activeKey, { verdicts, evaluatedRevisions })
+          : null,
         totalImages: activeGalleryUrls.length,
+        hasTargetFailed: activeKey ? failedTargetKeys.has(activeKey) : false,
+        hasContent: activeItem ? hasFilterableWorkshopContent(activeItem) : false,
       }),
-    [filterConfig, activeVerdict, activeGalleryUrls.length],
+    [
+      filterConfig,
+      activeKey,
+      verdicts,
+      evaluatedRevisions,
+      activeGalleryUrls.length,
+      failedTargetKeys,
+      activeItem,
+    ],
   );
 
   const safePageSize = response ? Math.max(1, response.pageSize) : 24;
@@ -277,10 +317,12 @@ export function WorkshopView({
         }
       } else if (kind === 'download') {
         const local = localByWorkshopId.get(id);
+        const safeLocalTitle =
+          local && !isAddonTitleRedacted(local, filterCtx) ? local.title : undefined;
         const result =
           local?.installState === 'installed'
-            ? await onUpdate(id, local.title)
-            : await onDownload(id, local?.title);
+            ? await onUpdate(id, safeLocalTitle)
+            : await onDownload(id, safeLocalTitle);
         if (result) setDirectInput('');
       } else {
         const tracked = await onTrackCollection(id, true);
@@ -308,6 +350,22 @@ export function WorkshopView({
     const isCollection = item.fileType === 'collection';
     const isTracked = trackedIds.has(item.workshopId);
     const unavailable = item.status === 'removed' || item.status === 'private_or_unavailable';
+    const itemKey = workshopFilterKey(item.workshopId);
+    const itemCardFilter = resolveCardFilterState({
+      config: filterConfig,
+      scope: 'workshop',
+      verdict: resolveLookupVerdict(itemKey, { verdicts, evaluatedRevisions }),
+      revealed: revealedCardIds.has(itemKey),
+      forceShowHiddenCards: showingFilteredCards,
+      hasTargetFailed: failedTargetKeys.has(itemKey),
+      hasContent: hasFilterableWorkshopContent(item),
+    });
+    const shouldOmitTaskTitle =
+      (local ? isAddonTitleRedacted(local, filterCtx) : false) ||
+      itemCardFilter.redactTitle ||
+      ((itemCardFilter.blurWholeCard || itemCardFilter.hiddenCard) &&
+        itemCardFilter.titleSensitive);
+    const safeTaskTitle = shouldOmitTaskTitle ? undefined : item.title;
 
     if (isCollection) {
       return (
@@ -360,7 +418,7 @@ export function WorkshopView({
             icon={<ArrowUpCircle size={14} />}
             onClick={(e) => {
               if (stopProp) e.stopPropagation();
-              void onUpdate(item.workshopId, item.title);
+              void onUpdate(item.workshopId, safeTaskTitle);
             }}
           >
             {t('common.update')}
@@ -381,7 +439,7 @@ export function WorkshopView({
         icon={<Download size={14} />}
         onClick={(e) => {
           if (stopProp) e.stopPropagation();
-          void onDownload(item.workshopId, item.title);
+          void onDownload(item.workshopId, safeTaskTitle);
         }}
       >
         {t('common.download')}
@@ -554,6 +612,14 @@ export function WorkshopView({
             onRemove={showingFilteredCards ? () => setShowingFilteredCards(false) : undefined}
           />
         )}
+        {filterConfig.enabled && filterConfig.applyToWorkshop && evalError && (
+          <FilterChip
+            label={t('filter.evalFailedRetry')}
+            tone="error"
+            icon={<RefreshCw size={13} />}
+            onClick={retryFailedEvaluations}
+          />
+        )}
         <div className="l4a-spacer" />
         {loading && response && <LoadingIndicator size="sm" label={t('common.search')} />}
         {response && (
@@ -627,9 +693,11 @@ export function WorkshopView({
                   const cardFilter = resolveCardFilterState({
                     config: filterConfig,
                     scope: 'workshop',
-                    verdict,
+                    verdict: resolveLookupVerdict(cardKey, { verdicts, evaluatedRevisions }),
                     revealed: revealedCardIds.has(cardKey),
                     forceShowHiddenCards: showingFilteredCards,
+                    hasTargetFailed: failedTargetKeys.has(cardKey),
+                    hasContent: hasFilterableWorkshopContent(item),
                   });
                   const displayTitle = cardFilter.redactTitle
                     ? t('filter.redactedTitleWithId', { id: item.workshopId })
@@ -642,143 +710,169 @@ export function WorkshopView({
                       data-clickable="true"
                       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
                     >
-                      {cardFilter.blurWholeCard && (
-                        <button
-                          type="button"
-                          className="l4a-blur-card-overlay"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            revealCard(cardKey);
-                          }}
-                        >
-                          <span className="l4a-blur-card-chip">
-                            <Eye size={14} />
-                            <span>{t('filter.blurCardOverlay')}</span>
-                          </span>
-                        </button>
-                      )}
+                      {cardFilter.blurWholeCard &&
+                        (cardFilter.pendingEvaluation ? (
+                          <div
+                            className="l4a-blur-card-overlay"
+                            data-pending="true"
+                            aria-hidden="true"
+                          >
+                            <span className="l4a-blur-card-chip">
+                              <span>{t('filter.evaluatingMedia')}</span>
+                            </span>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            className="l4a-blur-card-overlay"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              revealCard(cardKey);
+                            }}
+                          >
+                            <span className="l4a-blur-card-chip">
+                              <Eye size={14} />
+                              <span>{t('filter.blurCardOverlay')}</span>
+                            </span>
+                          </button>
+                        ))}
 
-                      <div className="l4a-addon-cover-wrap">
-                        <div
-                          className="l4a-card-trigger"
-                          style={{ height: '100%' }}
-                          onClick={() => setActiveItem(item)}
-                        >
-                          <AddonCover
-                            src={item.previewUrl}
-                            title={displayTitle}
-                            category={item.tags[0]}
-                            filterMode={cardFilter.coverMode}
+                      <div
+                        className="l4a-blur-card-inner"
+                        inert={cardFilter.blurWholeCard || undefined}
+                        aria-hidden={cardFilter.blurWholeCard || undefined}
+                      >
+                        <div className="l4a-addon-cover-wrap">
+                          <div
+                            className="l4a-card-trigger"
+                            style={{ height: '100%' }}
+                            onClick={() => setActiveItem(item)}
+                          >
+                            <AddonCover
+                              src={item.previewUrl}
+                              title={displayTitle}
+                              category={item.tags[0]}
+                              filterMode={cardFilter.coverMode}
+                              filterLabel={
+                                cardFilter.pendingEvaluation
+                                  ? t('filter.evaluatingMedia')
+                                  : undefined
+                              }
+                            />
+                          </div>
+                          <div className="l4a-cover-overlay-top">
+                            <span className="md-pill" data-tone="surface">
+                              {t(`workshop.type.${item.fileType}`)}
+                            </span>
+                            <div className="l4a-status-pills">
+                              {cardFilter.showDiagnosticBadge && verdict && (
+                                <span className="md-pill" data-tone="tertiary">
+                                  {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                                    imageTag: t('filter.modImageShort'),
+                                    textTag: t('filter.modTextShort'),
+                                  })}
+                                </span>
+                              )}
+                              {isTracked && (
+                                <span className="md-pill" data-tone="primary">
+                                  {t('workshop.tracked')}
+                                </span>
+                              )}
+                              {local?.installState === 'installed' && (
+                                <span className="md-pill" data-tone="primary">
+                                  {t('workshop.status.installed')}
+                                </span>
+                              )}
+                              {local && local.installState !== 'installed' && (
+                                <span className="md-pill" data-tone="secondary">
+                                  {t('workshop.status.known')}
+                                </span>
+                              )}
+                              {(item.status === 'removed' ||
+                                item.status === 'private_or_unavailable') && (
+                                <span className="md-pill" data-tone="error">
+                                  {t(`workshop.status.${item.status}`)}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {dl && (
+                          <LinearProgress
+                            value={dl.percent}
+                            indeterminate={dl.cancelling || dl.percent === 0}
+                            label={displayTitle}
                           />
-                        </div>
-                        <div className="l4a-cover-overlay-top">
-                          <span className="md-pill" data-tone="surface">
-                            {t(`workshop.type.${item.fileType}`)}
-                          </span>
-                          <div className="l4a-status-pills">
-                            {cardFilter.showDiagnosticBadge && verdict && (
-                              <span className="md-pill" data-tone="tertiary">
-                                {formatDiagnosticVerdictBadge(verdict, cardFilter, {
-                                  imageTag: t('filter.modImageShort'),
-                                  textTag: t('filter.modTextShort'),
-                                })}
-                              </span>
-                            )}
-                            {isTracked && (
-                              <span className="md-pill" data-tone="primary">
-                                {t('workshop.tracked')}
-                              </span>
-                            )}
-                            {local?.installState === 'installed' && (
-                              <span className="md-pill" data-tone="primary">
-                                {t('workshop.status.installed')}
-                              </span>
-                            )}
-                            {local && local.installState !== 'installed' && (
-                              <span className="md-pill" data-tone="secondary">
-                                {t('workshop.status.known')}
-                              </span>
-                            )}
-                            {(item.status === 'removed' ||
-                              item.status === 'private_or_unavailable') && (
-                              <span className="md-pill" data-tone="error">
-                                {t(`workshop.status.${item.status}`)}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-
-                      {dl && (
-                        <LinearProgress
-                          value={dl.percent}
-                          indeterminate={dl.cancelling || dl.percent === 0}
-                          label={displayTitle}
-                        />
-                      )}
-
-                      <div className="l4a-addon-card-body">
-                        <button
-                          type="button"
-                          className="l4a-card-trigger"
-                          onClick={() => setActiveItem(item)}
-                        >
-                          <div className="l4a-addon-title">{displayTitle}</div>
-                        </button>
-                        <div className="l4a-addon-meta">
-                          <span className="l4a-truncate">
-                            {item.creatorName || t('common.unknown')}
-                          </span>
-                          {item.fileSize ? (
-                            <>
-                              <span>·</span>
-                              <span>{formatBytes(item.fileSize)}</span>
-                            </>
-                          ) : null}
-                          {item.subscriptions ? (
-                            <>
-                              <span>·</span>
-                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                                <Users size={11} />
-                                {formatCompactNumber(item.subscriptions)}
-                              </span>
-                            </>
-                          ) : null}
-                        </div>
-
-                        {cardFilter.isBlurCardRevealed && (
-                          <div className="l4a-revealed-desc">
-                            {cardFilter.redactDescription
-                              ? t('filter.redactedDescription')
-                              : item.description?.trim() || t('filter.noDescription')}
-                          </div>
                         )}
 
-                        {!cardFilter.isBlurCardRevealed &&
-                          cardFilter.redactDescription &&
-                          !cardFilter.redactTitle && (
-                            <div className="l4a-revealed-desc">{t('filter.redactedDescription')}</div>
+                        <div className="l4a-addon-card-body">
+                          <button
+                            type="button"
+                            className="l4a-card-trigger"
+                            onClick={() => setActiveItem(item)}
+                          >
+                            <div className="l4a-addon-title">{displayTitle}</div>
+                          </button>
+                          <div className="l4a-addon-meta">
+                            <span className="l4a-truncate">
+                              {item.creatorName || t('common.unknown')}
+                            </span>
+                            {item.fileSize ? (
+                              <>
+                                <span>·</span>
+                                <span>{formatBytes(item.fileSize)}</span>
+                              </>
+                            ) : null}
+                            {item.subscriptions ? (
+                              <>
+                                <span>·</span>
+                                <span
+                                  style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}
+                                >
+                                  <Users size={11} />
+                                  {formatCompactNumber(item.subscriptions)}
+                                </span>
+                              </>
+                            ) : null}
+                          </div>
+
+                          {cardFilter.isBlurCardRevealed && (
+                            <div className="l4a-revealed-desc">
+                              {cardFilter.redactDescription
+                                ? t('filter.redactedDescription')
+                                : item.description?.trim() || t('filter.noDescription')}
+                            </div>
                           )}
 
-                        <div className="l4a-addon-card-footer">
-                          <div className="l4a-row-wrap" style={{ gap: 6 }}>
-                            <span
-                              className="md-body-small md-mono"
-                              style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                            >
-                              #{item.workshopId}
-                            </span>
-                            {cardFilter.isBlurCardRevealed && (
-                              <Button
-                                variant="text"
-                                size="sm"
-                                onClick={() => setActiveItem(item)}
-                              >
-                                {t('common.inspect')}
-                              </Button>
+                          {!cardFilter.isBlurCardRevealed &&
+                            cardFilter.redactDescription &&
+                            !cardFilter.redactTitle && (
+                              <div className="l4a-revealed-desc">
+                                {t('filter.redactedDescription')}
+                              </div>
                             )}
+
+                          <div className="l4a-addon-card-footer">
+                            <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                              <span
+                                className="md-body-small md-mono"
+                                style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                              >
+                                #{item.workshopId}
+                              </span>
+                              {cardFilter.isBlurCardRevealed && (
+                                <Button
+                                  variant="text"
+                                  size="sm"
+                                  onClick={() => setActiveItem(item)}
+                                >
+                                  {t('common.inspect')}
+                                </Button>
+                              )}
+                            </div>
+                            {renderPrimaryAction(item, true)}
                           </div>
-                          {renderPrimaryAction(item, true)}
                         </div>
                       </div>
                     </article>
@@ -853,7 +947,7 @@ export function WorkshopView({
         }
       >
         {activeItem && (
-          <div className="md-sheet-body">
+          <div key={activeItem.workshopId} className="md-sheet-body">
             {activeDetailFilter.flagged && activeVerdict && (
               <div className="l4a-callout">
                 <ShieldAlert
@@ -900,6 +994,9 @@ export function WorkshopView({
                 title={activeItem.title}
                 category={activeItem.tags[0]}
                 filterMode={activeDetailFilter.imageModeAt(0)}
+                filterLabel={
+                  activeDetailFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
+                }
                 allowPeek={activeDetailFilter.imageModeAt(0) === 'blur'}
               />
             </div>
@@ -923,6 +1020,11 @@ export function WorkshopView({
                           title={`${activeItem.title} #${imageIdx + 1}`}
                           category={activeItem.tags[0]}
                           filterMode={imgMode}
+                          filterLabel={
+                            activeDetailFilter.pendingEvaluation
+                              ? t('filter.evaluatingMedia')
+                              : undefined
+                          }
                           allowPeek={imgMode === 'blur'}
                         />
                       </div>
@@ -1021,7 +1123,12 @@ export function WorkshopView({
                 </span>
                 <div className="md-chip-row">
                   {activeItem.collectionChildren.map((cid) => {
-                    const installed = localByWorkshopId.get(cid)?.installState === 'installed';
+                    const childLocal = localByWorkshopId.get(cid);
+                    const installed = childLocal?.installState === 'installed';
+                    const safeChildTitle =
+                      childLocal && !isAddonTitleRedacted(childLocal, filterCtx)
+                        ? childLocal.title
+                        : undefined;
                     return (
                       <Button
                         key={cid}
@@ -1029,7 +1136,7 @@ export function WorkshopView({
                         size="sm"
                         disabled={installed || Boolean(liveDownloads[cid])}
                         icon={<Download size={12} />}
-                        onClick={() => void onDownload(cid, localByWorkshopId.get(cid)?.title)}
+                        onClick={() => void onDownload(cid, safeChildTitle)}
                       >
                         #{cid}
                       </Button>

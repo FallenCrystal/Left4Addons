@@ -1,7 +1,11 @@
 import { useTranslation } from 'react-i18next';
 import { Pencil, Play, SlidersHorizontal, Trash2 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, LoadoutProfile } from '../../../api/ipc';
-import { formatAddonDisplayName } from '../../../utils/format';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import {
+  formatFilteredAddonTitle,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
 import { Button, EmptyState, IconButton } from '../../m3/primitives';
 import { computeProfileDiff } from './helpers';
 
@@ -31,6 +35,7 @@ export function ProfilesTab({
   onApplyProfile,
 }: ProfilesTabProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
 
   if (filteredProfiles.length === 0) {
     return (
@@ -41,14 +46,29 @@ export function ProfilesTab({
     );
   }
 
+  const visibleLoadingAddons = loadingAddons.filter(
+    (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
+  );
+
   return (
     <div className="l4a-card-grid-wide">
       {filteredProfiles.map((profile) => {
-        const diff = computeProfileDiff(profile, addonsById, loadingAddons);
-        const noChange = diff.toEnable.length === 0 && diff.toDisable.length === 0;
+        const rawDiff = computeProfileDiff(profile, addonsById, visibleLoadingAddons);
+        const visibleMissingIds = rawDiff.missingIds.filter((id) => {
+          const found = addonsById.get(id);
+          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
+        });
+        const noChange = rawDiff.toEnable.length === 0 && rawDiff.toDisable.length === 0;
         const previewMembers = profile.enabledAddonIds
           .map((id) => addonsById.get(id))
-          .filter((a): a is AddonSummary => Boolean(a));
+          .filter(
+            (a): a is AddonSummary =>
+              Boolean(a) && !resolveLibraryAddonCardFilter(a!, filterCtx).hiddenCard,
+          );
+        const visibleEnabledCount = profile.enabledAddonIds.filter((id) => {
+          const found = addonsById.get(id);
+          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
+        }).length;
 
         return (
           <article
@@ -67,7 +87,7 @@ export function ProfilesTab({
                   {profile.name}
                 </span>
                 <span className="md-pill" data-tone="primary">
-                  {t('common.items', { count: profile.enabledAddonIds.length })}
+                  {t('common.items', { count: visibleEnabledCount })}
                 </span>
               </div>
 
@@ -90,21 +110,21 @@ export function ProfilesTab({
                   </span>
                 ) : (
                   <>
-                    {diff.toEnable.length > 0 && (
+                    {rawDiff.toEnable.length > 0 && (
                       <span className="md-pill" data-tone="primary">
-                        {t('organize.profileDiffEnable', { count: diff.toEnable.length })}
+                        {t('organize.profileDiffEnable', { count: rawDiff.toEnable.length })}
                       </span>
                     )}
-                    {diff.toDisable.length > 0 && (
+                    {rawDiff.toDisable.length > 0 && (
                       <span className="md-pill" data-tone="tertiary">
-                        {t('organize.profileDiffDisable', { count: diff.toDisable.length })}
+                        {t('organize.profileDiffDisable', { count: rawDiff.toDisable.length })}
                       </span>
                     )}
                   </>
                 )}
-                {diff.missingIds.length > 0 && (
+                {visibleMissingIds.length > 0 && (
                   <span className="md-pill" data-tone="error">
-                    {t('organize.profileMissing', { count: diff.missingIds.length })}
+                    {t('organize.profileMissing', { count: visibleMissingIds.length })}
                   </span>
                 )}
               </div>
@@ -113,7 +133,7 @@ export function ProfilesTab({
                 <div className="l4a-member-preview">
                   {previewMembers.slice(0, 3).map((m) => (
                     <span key={m.id} className="l4a-member-chip l4a-truncate">
-                      {formatAddonDisplayName(m, namePreference)}
+                      {formatFilteredAddonTitle(m, namePreference, filterCtx, t)}
                     </span>
                   ))}
                   {previewMembers.length > 3 && (

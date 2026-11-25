@@ -199,20 +199,28 @@ export function App() {
     () => ({
       filterConfig: ctrl.filterConfig,
       verdicts: ctrl.filterVerdicts,
+      evaluatedRevisions: ctrl.evaluatedRevisions,
       exclusionsByAddonId: ctrl.exclusionsByAddonId,
       revealedCardIds: ctrl.revealedCardIds,
+      failedTargetKeys: ctrl.failedTargetKeys,
+      evalError: ctrl.filterEvalError,
       revealCard: ctrl.revealCard,
       registerWorkshopItems: ctrl.registerWorkshopItems,
+      retryFailedEvaluations: ctrl.retryFailedEvaluations,
       upsertFilterExclusion: ctrl.upsertFilterExclusion,
       deleteFilterExclusion: ctrl.deleteFilterExclusion,
       onOpenFilterSettings: openFilterSettings,
     }),
     [
       ctrl.deleteFilterExclusion,
+      ctrl.evaluatedRevisions,
       ctrl.exclusionsByAddonId,
+      ctrl.failedTargetKeys,
       ctrl.filterConfig,
+      ctrl.filterEvalError,
       ctrl.filterVerdicts,
       ctrl.registerWorkshopItems,
+      ctrl.retryFailedEvaluations,
       ctrl.revealCard,
       ctrl.revealedCardIds,
       ctrl.upsertFilterExclusion,
@@ -424,6 +432,7 @@ export function App() {
             onRefreshFilterTokenStatus={ctrl.refreshFilterTokenStatus}
             onSetFilterLlmToken={ctrl.setFilterLlmToken}
             onClearFilterCache={ctrl.clearFilterCache}
+            onRetryFailedEvaluations={ctrl.retryFailedEvaluations}
             onEvaluateSandboxTarget={ctrl.evaluateSandboxTarget}
             onUpsertFilterExclusion={ctrl.upsertFilterExclusion}
             onDeleteFilterExclusion={ctrl.deleteFilterExclusion}
@@ -629,6 +638,7 @@ export function App() {
 
       <WorkshopToggleDialog
         target={workshopToggleTarget}
+        namePreference={ctrl.snapshot?.config.addonNamePreference ?? 'workshop_title'}
         busy={ctrl.busy}
         onClose={() => setWorkshopToggleTarget(null)}
         onMoveThenToggle={async (addon, enabled) => {

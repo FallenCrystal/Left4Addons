@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as ipc from '../api/ipc';
 import type { AppConfig, DashboardSnapshot, SteamCapabilities, SyncReport } from '../api/ipc';
+import { computeFilterPolicySignature } from '../utils/contentFilter';
 import type { BatchDialogPayload, NotifyOptions, SnackbarItem } from './controller/types';
 import { getClient } from './controller/types';
 import { useAddonActions } from './controller/useAddonActions';
@@ -15,6 +16,19 @@ export type {
   LiveDownloadState,
   SnackbarItem,
 } from './controller/types';
+
+function samePolicy(a: AppConfig, b: AppConfig): boolean {
+  return (
+    computeFilterPolicySignature(a.filter, {
+      catalogServerUrl: a.catalogServerUrl,
+      httpsOnly: a.httpsOnly,
+    }) ===
+    computeFilterPolicySignature(b.filter, {
+      catalogServerUrl: b.catalogServerUrl,
+      httpsOnly: b.httpsOnly,
+    })
+  );
+}
 
 export function useAppController(onOpenReconcile?: () => void) {
   const { t } = useTranslation();
@@ -78,7 +92,13 @@ export function useAppController(onOpenReconcile?: () => void) {
       // A refresh started before a config save can still contain fresh addon data.
       publishSnapshot(
         current && seq < lastSavedConfigSeqRef.current
-          ? { ...next, config: current.config }
+          ? {
+              ...next,
+              config: current.config,
+              cachedFilterVerdicts: samePolicy(current.config, next.config)
+                ? next.cachedFilterVerdicts
+                : current.cachedFilterVerdicts,
+            }
           : next,
       );
       return true;
@@ -96,7 +116,13 @@ export function useAppController(onOpenReconcile?: () => void) {
       const current = snapshotRef.current;
       if (!current) return;
       lastSavedConfigSeqRef.current = nextSnapshotSeq();
-      publishSnapshot({ ...current, config });
+      publishSnapshot({
+        ...current,
+        config,
+        cachedFilterVerdicts: samePolicy(current.config, config)
+          ? current.cachedFilterVerdicts
+          : [],
+      });
     },
     [nextSnapshotSeq, publishSnapshot],
   );
@@ -218,6 +244,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     snapshot,
     tRef,
     commitSnapshot,
+    commitSavedConfig,
     nextSnapshotSeq,
     notify,
     setBusy,
@@ -250,6 +277,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     setSyncReport,
     setSteamCaps,
     setBatchReport,
+    onClearFailedFilterEvaluations: contentFilter.retryFailedEvaluations,
   });
 
   const organizeActions = useOrganizeActions({
@@ -316,13 +344,16 @@ export function useAppController(onOpenReconcile?: () => void) {
     openInFileManager: addonActions.openInFileManager,
     filterConfig: contentFilter.filterConfig,
     filterVerdicts: contentFilter.filterVerdicts,
+    evaluatedRevisions: contentFilter.evaluatedRevisions,
     exclusionsByAddonId: contentFilter.exclusionsByAddonId,
     localFilterStatus: contentFilter.localFilterStatus,
     filterStatusBusy: contentFilter.filterStatusBusy,
     filterTokenStatus: contentFilter.filterTokenStatus,
     filterEvalError: contentFilter.filterEvalError,
     revealedCardIds: contentFilter.revealedCardIds,
+    failedTargetKeys: contentFilter.failedTargetKeys,
     revealCard: contentFilter.revealCard,
+    retryFailedEvaluations: contentFilter.retryFailedEvaluations,
     registerWorkshopItems: contentFilter.registerWorkshopItems,
     refreshLocalFilterStatus: contentFilter.refreshLocalFilterStatus,
     checkLocalFilterUpdates: contentFilter.checkLocalFilterUpdates,

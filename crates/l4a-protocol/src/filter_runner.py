@@ -4,13 +4,16 @@ Managed Left4Filters HTTP runner for Left4Addons (Desktop Client & Catalog Serve
 Wraps an unmodified Left4Filters checkout (`deploy/l4filter.py`) without altering
 any tracked files in the repository, supporting:
   - Dynamic loopback port binding (`--port 0`) with structured ready banner
+  - Parent-process death detection (`--watch-stdin`) so runners never stay orphaned
+  - Decompression-bomb, concurrency, chunked-encoding, and payload bounds hardening
   - Single-vision-pass multimodal + unimodal (text / title / description / per-image) scoring
-  - Live runtime model parameter updates (`POST /configure`) protected by bearer token
+  - Live runtime model parameter updates (`POST /configure`) protected by constant-time bearer token
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import json
 import math
 import os
@@ -21,6 +24,17 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import numpy as np
+from PIL import Image
+
+MAX_IMAGE_PIXELS = 16_777_216  # 4096 x 4096 cap against decompression bombs
+MAX_SINGLE_IMAGE_BYTES = 16 * 1024 * 1024
+MAX_REQUEST_BODY_BYTES = 48 * 1024 * 1024
+MAX_TITLE_CHARS = 4096
+MAX_DESC_CHARS = 65536
+MAX_TAGS_COUNT = 64
+MAX_TAG_CHARS = 256
+
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 def resolve_deploy_dir(raw_dir: str) -> Path:
@@ -32,10 +46,22 @@ def resolve_deploy_dir(raw_dir: str) -> Path:
     raise FileNotFoundError(f"l4filter.py not found under {base} or {base / 'deploy'}")
 
 
+def finite_float(v: Any, default: float) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
+
+
 def clamp_prob(p: float) -> float:
-    if math.isnan(p) or math.isinf(p):
-        return 0.0
-    return max(1e-6, min(1.0 - 1e-6, float(p)))
+    f = finite_float(p, 0.0)
+    return max(1e-6, min(1.0 - 1e-6, f))
+
+
+def round_prob(p: float) -> float:
+    f = finite_float(p, 0.0)
+    return round(max(0.0, min(1.0, f)), 6)
 
 
 def to_logit(p: float) -> float:
@@ -44,6 +70,8 @@ def to_logit(p: float) -> float:
 
 
 def from_logit(x: float) -> float:
+    if not math.isfinite(x):
+        return 0.0
     if x >= 40.0:
         return 1.0
     if x <= -40.0:
@@ -60,10 +88,10 @@ def adjust_triplet(
     temperature: float,
     bias: float,
 ) -> tuple[float, float, float]:
-    gw = max(0.0, float(gore_weight))
-    nw = max(0.0, float(nsfw_weight))
-    temp = max(0.25, min(4.0, float(temperature)))
-    b = max(-5.0, min(5.0, float(bias)))
+    gw = max(0.0, min(3.0, finite_float(gore_weight, 1.0)))
+    nw = max(0.0, min(3.0, finite_float(nsfw_weight, 1.0)))
+    temp = max(0.25, min(4.0, finite_float(temperature, 1.0)))
+    b = max(-5.0, min(5.0, finite_float(bias, 0.0)))
 
     if (
         abs(gw - 1.0) < 1e-5
@@ -71,7 +99,7 @@ def adjust_triplet(
         and abs(temp - 1.0) < 1e-5
         and abs(b) < 1e-5
     ):
-        return round(float(ov), 6), round(float(gore), 6), round(float(nsfw), 6)
+        return round_prob(ov), round_prob(gore), round_prob(nsfw)
 
     def adj_single(p: float, w: float) -> float:
         if w <= 1e-6:
@@ -98,7 +126,7 @@ def adjust_triplet(
         delta_logit = (to_logit(ov) - to_logit(orig_or)) * delta_scale
         ov_adj = from_logit((to_logit(new_or) + delta_logit) / temp + b)
 
-    return round(float(ov_adj), 6), round(float(g_adj), 6), round(float(n_adj), 6)
+    return round_prob(ov_adj), round_prob(g_adj), round_prob(n_adj)
 
 
 def aggregate_rows(rows: np.ndarray, mode: str) -> np.ndarray:
@@ -115,33 +143,58 @@ def aggregate_rows(rows: np.ndarray, mode: str) -> np.ndarray:
     return rows.max(axis=0)
 
 
+def decode_b64_image(raw_item: Any) -> bytes:
+    if not isinstance(raw_item, str):
+        raise ValueError("image_base64 must be a string")
+    s = raw_item.strip()
+    if s.startswith("data:"):
+        comma = s.find(",")
+        if comma == -1:
+            raise ValueError("invalid data URL")
+        s = s[comma + 1 :].strip()
+    if len(s) > (MAX_SINGLE_IMAGE_BYTES * 4) // 3 + 64:
+        raise ValueError("image_too_large")
+    decoded = base64.b64decode(s, validate=False)
+    if len(decoded) > MAX_SINGLE_IMAGE_BYTES:
+        raise ValueError("image_too_large")
+    return decoded
+
+
 class RunnerEngine:
-    def __init__(self, deploy_dir: Path, initial_params: dict[str, Any]) -> None:
+    def __init__(self, deploy_dir: Path, initial_params: dict[str, Any], max_concurrency: int = 4) -> None:
         self.deploy_dir = deploy_dir
         sys.path.insert(0, str(deploy_dir))
         import l4filter as lf  # type: ignore
 
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         self._lf = lf
         self._lock = threading.RLock()
+        self._sem = threading.BoundedSemaphore(max(1, min(16, int(max_concurrency))))
         self.params = self._normalize_params(initial_params)
         self.clf = lf.Left4Filter(str(deploy_dir), num_threads=self.params["threads"])
 
     @staticmethod
     def _normalize_params(raw: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raw = {}
         agg = str(raw.get("galleryAggregation") or raw.get("gallery_aggregation") or "max").lower()
         if agg not in ("max", "top2_mean", "mean"):
             agg = "max"
         return {
-            "threads": max(1, min(16, int(raw.get("threads", 4)))),
+            "threads": max(1, min(16, int(finite_float(raw.get("threads", 4), 4.0)))),
             "enable_text": bool(raw.get("enableText", raw.get("enable_text", True))),
             "enable_image": bool(raw.get("enableImage", raw.get("enable_image", True))),
-            "max_images": max(1, min(8, int(raw.get("maxImages", raw.get("max_images", 2))))),
+            "max_images": max(1, min(8, int(finite_float(raw.get("maxImages", raw.get("max_images", 2)), 2.0)))),
             "gallery_aggregation": agg,
-            "gore_weight": max(0.0, min(3.0, float(raw.get("goreWeight", raw.get("gore_weight", 1.0))))),
-            "nsfw_weight": max(0.0, min(3.0, float(raw.get("nsfwWeight", raw.get("nsfw_weight", 1.0))))),
-            "temperature": max(0.25, min(4.0, float(raw.get("temperature", 1.0)))),
-            "bias": max(-5.0, min(5.0, float(raw.get("bias", 0.0)))),
+            "gore_weight": max(0.0, min(3.0, finite_float(raw.get("goreWeight", raw.get("gore_weight", 1.0)), 1.0))),
+            "nsfw_weight": max(0.0, min(3.0, finite_float(raw.get("nsfwWeight", raw.get("nsfw_weight", 1.0)), 1.0))),
+            "temperature": max(0.25, min(4.0, finite_float(raw.get("temperature", 1.0), 1.0))),
+            "bias": max(-5.0, min(5.0, finite_float(raw.get("bias", 0.0), 0.0))),
         }
+
+    def image_limit(self) -> int:
+        with self._lock:
+            return int(self.params["max_images"]) if self.params["enable_image"] else 0
 
     def update_params(self, next_raw: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_params(next_raw)
@@ -150,6 +203,7 @@ class RunnerEngine:
             self.params = normalized
             if normalized["threads"] != old_threads:
                 self.clf = self._lf.Left4Filter(str(self.deploy_dir), num_threads=normalized["threads"])
+                Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
             return dict(self.params)
 
     def info(self) -> dict[str, Any]:
@@ -180,43 +234,44 @@ class RunnerEngine:
         tags: list[str] | None,
         raw_images: list[bytes],
     ) -> dict[str, Any]:
-        with self._lock:
-            p = dict(self.params)
-            clf = self.clf
-            lf = self._lf
+        with self._sem:
+            with self._lock:
+                p = dict(self.params)
+                clf = self.clf
+                lf = self._lf
 
-        use_title = title if p["enable_text"] else ""
-        use_desc = description if p["enable_text"] else ""
-        use_tags = tags if p["enable_text"] else None
-        has_txt = bool(use_title.strip() or use_desc.strip() or (use_tags and len(use_tags) > 0))
-        imgs = raw_images[: p["max_images"]] if p["enable_image"] else []
+            use_title = title[:MAX_TITLE_CHARS] if p["enable_text"] else ""
+            use_desc = description[:MAX_DESC_CHARS] if p["enable_text"] else ""
+            use_tags = tags[:MAX_TAGS_COUNT] if (p["enable_text"] and tags) else None
+            has_txt = bool(use_title.strip() or use_desc.strip() or (use_tags and len(use_tags) > 0))
+            imgs = raw_images[: p["max_images"]] if p["enable_image"] else []
 
-        if not has_txt and not imgs:
-            return {
-                "prob": 0.0,
-                "goreProb": 0.0,
-                "nsfwProb": 0.0,
-                "textProb": None,
-                "textGoreProb": None,
-                "textNsfwProb": None,
-                "titleProb": None,
-                "descriptionProb": None,
-                "imageProb": None,
-                "imageGoreProb": None,
-                "imageNsfwProb": None,
-                "perImageProbs": [],
-            }
+            if not has_txt and not imgs:
+                return {
+                    "prob": 0.0,
+                    "goreProb": 0.0,
+                    "nsfwProb": 0.0,
+                    "textProb": None,
+                    "textGoreProb": None,
+                    "textNsfwProb": None,
+                    "titleProb": None,
+                    "descriptionProb": None,
+                    "imageProb": None,
+                    "imageGoreProb": None,
+                    "imageNsfwProb": None,
+                    "perImageProbs": [],
+                }
 
-        fast_attrs = all(
-            hasattr(clf, attr) for attr in ("vis_sess", "head_sess", "vocab_data", "txt_dim", "img_size")
-        ) and all(
-            hasattr(lf, fn)
-            for fn in ("extract_text_features", "extract_visual_priors", "preprocess_image", "_load_pil")
-        )
+            fast_attrs = all(
+                hasattr(clf, attr) for attr in ("vis_sess", "head_sess", "vocab_data", "txt_dim", "img_size")
+            ) and all(
+                hasattr(lf, fn)
+                for fn in ("extract_text_features", "extract_visual_priors", "preprocess_image", "_load_pil")
+            )
 
-        if fast_attrs:
-            return self._predict_fast(clf, lf, p, use_title, use_desc, use_tags, has_txt, imgs)
-        return self._predict_sdk_fallback(clf, p, use_title, use_desc, use_tags, has_txt, imgs)
+            if fast_attrs:
+                return self._predict_fast(clf, lf, p, use_title, use_desc, use_tags, has_txt, imgs)
+            return self._predict_sdk_fallback(clf, p, use_title, use_desc, use_tags, has_txt, imgs)
 
     def _run_text_only(self, clf: Any, lf: Any, title: str, desc: str, tags: list[str] | None) -> np.ndarray:
         vis_prior_dim = int(getattr(lf, "VISUAL_PRIOR_DIM", 24))
@@ -292,6 +347,7 @@ class RunnerEngine:
                 "perImageProbs": [],
             }
 
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         pils = [lf._load_pil(im) for im in imgs]
         px_batch = np.stack([lf.preprocess_image(im, clf.img_size) for im in pils], axis=0)
         pri_batch = np.stack([lf.extract_visual_priors(im) for im in pils], axis=0)
@@ -362,6 +418,7 @@ class RunnerEngine:
         has_txt: bool,
         imgs: list[bytes],
     ) -> dict[str, Any]:
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
         text_trip = None
         title_prob = None
         desc_prob = None
@@ -387,8 +444,13 @@ class RunnerEngine:
             agg = aggregate_rows(np.asarray(rows, dtype=np.float32), p["gallery_aggregation"])
             img_trip = self._adjust(agg, p)
 
-        rj = clf.predict(title=title, description=desc, tags=tags, images=imgs or None)
-        joint_trip = self._adjust([rj["prob"], rj["gore_prob"], rj["nsfw_prob"]], p)
+        if not has_txt and img_trip is not None:
+            joint_trip = img_trip
+        elif not imgs and text_trip is not None:
+            joint_trip = text_trip
+        else:
+            rj = clf.predict(title=title, description=desc, tags=tags, images=imgs or None)
+            joint_trip = self._adjust([rj["prob"], rj["gore_prob"], rj["nsfw_prob"]], p)
 
         return {
             "prob": joint_trip[0],
@@ -406,18 +468,66 @@ class RunnerEngine:
         }
 
 
+def start_stdin_watchdog() -> None:
+    def _watch() -> None:
+        try:
+            while True:
+                chunk = sys.stdin.buffer.read(64)
+                if not chunk:
+                    break
+        except Exception:
+            pass
+        os._exit(0)
+
+    t = threading.Thread(target=_watch, name="l4a-stdin-watchdog", daemon=True)
+    t.start()
+
+
+def read_chunked_body(rfile: Any, max_bytes: int) -> bytes:
+    out = bytearray()
+    while True:
+        line = rfile.readline(65536)
+        if not line:
+            raise ValueError("incomplete_chunked_body")
+        semi = line.find(b";")
+        hex_part = line[:semi] if semi != -1 else line
+        size = int(hex_part.strip(), 16)
+        if size == 0:
+            while True:
+                trailer = rfile.readline(65536)
+                if not trailer or trailer in (b"\r\n", b"\n"):
+                    break
+            break
+        if len(out) + size > max_bytes:
+            raise OverflowError("payload_too_large")
+        chunk = rfile.read(size)
+        if len(chunk) != size:
+            raise ValueError("truncated_chunk")
+        out.extend(chunk)
+        crlf = rfile.read(2)
+        if crlf != b"\r\n":
+            raise ValueError("invalid_chunk_terminator")
+    return bytes(out)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Left4Addons managed Left4Filters HTTP runner")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--deploy-dir", required=True)
     ap.add_argument("--params-json", default="{}")
+    ap.add_argument("--max-concurrency", type=int, default=4)
+    ap.add_argument("--watch-stdin", action="store_true")
     args = ap.parse_args()
 
+    if args.watch_stdin:
+        start_stdin_watchdog()
+
     admin_token = os.environ.get("L4A_RUNNER_TOKEN", "").strip()
+    expected_auth = f"Bearer {admin_token}".encode("utf-8") if admin_token else None
     deploy_dir = resolve_deploy_dir(args.deploy_dir)
     initial_params = json.loads(args.params_json) if args.params_json else {}
-    engine = RunnerEngine(deploy_dir, initial_params)
+    engine = RunnerEngine(deploy_dir, initial_params, max_concurrency=args.max_concurrency)
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code: int, payload: dict[str, Any]) -> None:
@@ -429,19 +539,35 @@ def main() -> None:
             self.wfile.write(body)
 
         def _check_token(self) -> bool:
-            if not admin_token:
-                return True
-            auth = self.headers.get("Authorization", "")
-            return auth == f"Bearer {admin_token}"
+            if expected_auth is None:
+                return False
+            auth = self.headers.get("Authorization", "").encode("utf-8")
+            return hmac.compare_digest(auth, expected_auth)
 
         def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0:
-                return {}
-            if length > 32 * 1024 * 1024:
-                raise ValueError("payload_too_large")
-            raw = self.rfile.read(length)
-            return json.loads(raw.decode("utf-8"))
+            te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+            if te:
+                if te != "chunked":
+                    raise ValueError(f"unsupported_transfer_encoding:{te}")
+                raw = read_chunked_body(self.rfile, MAX_REQUEST_BODY_BYTES)
+            else:
+                cl_header = self.headers.get("Content-Length")
+                if cl_header is None:
+                    raise ValueError("missing_content_length")
+                length = int(cl_header)
+                if length < 0:
+                    raise ValueError("invalid_content_length")
+                if length == 0:
+                    return {}
+                if length > MAX_REQUEST_BODY_BYTES:
+                    raise OverflowError("payload_too_large")
+                raw = self.rfile.read(length)
+                if len(raw) != length:
+                    raise ValueError("truncated_body")
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                raise ValueError("json_body_must_be_object")
+            return parsed
 
         def do_GET(self) -> None:
             if self.path == "/health":
@@ -458,6 +584,8 @@ def main() -> None:
                     req = self._read_json()
                     updated = engine.update_params(req)
                     self._send(200, {"status": "ok", "params": updated})
+                except OverflowError as exc:
+                    self._send(413, {"error": str(exc)})
                 except Exception as exc:
                     self._send(400, {"error": str(exc)})
                 return
@@ -468,22 +596,42 @@ def main() -> None:
 
             try:
                 req = self._read_json()
+                img_limit = engine.image_limit()
                 imgs: list[bytes] = []
-                b64_single = req.get("imageBase64") or req.get("image_base64")
-                if b64_single:
-                    imgs.append(base64.b64decode(b64_single))
-                for b64 in req.get("imagesBase64") or req.get("images_base64") or []:
-                    if b64:
-                        imgs.append(base64.b64decode(b64))
+                if img_limit > 0:
+                    b64_single = req.get("imageBase64") or req.get("image_base64")
+                    if b64_single is not None and b64_single != "":
+                        imgs.append(decode_b64_image(b64_single))
+                    b64_many = req.get("imagesBase64")
+                    if b64_many is None:
+                        b64_many = req.get("images_base64")
+                    if b64_many is not None:
+                        if not isinstance(b64_many, list):
+                            raise ValueError("images_base64 must be a JSON array")
+                        for item in b64_many:
+                            if len(imgs) >= img_limit:
+                                break
+                            if item is not None and item != "":
+                                imgs.append(decode_b64_image(item))
+
                 tags_raw = req.get("tags")
-                tags = [str(x) for x in tags_raw] if isinstance(tags_raw, list) else None
+                tags: list[str] | None = None
+                if tags_raw is not None:
+                    if not isinstance(tags_raw, list):
+                        raise ValueError("tags must be a JSON array")
+                    tags = [str(x)[:MAX_TAG_CHARS] for x in tags_raw[:MAX_TAGS_COUNT]]
+
+                title_val = req.get("title")
+                desc_val = req.get("description")
                 res = engine.predict(
-                    title=str(req.get("title") or ""),
-                    description=str(req.get("description") or ""),
+                    title=str(title_val)[:MAX_TITLE_CHARS] if title_val is not None else "",
+                    description=str(desc_val)[:MAX_DESC_CHARS] if desc_val is not None else "",
                     tags=tags,
                     raw_images=imgs,
                 )
                 self._send(200, res)
+            except OverflowError as exc:
+                self._send(413, {"error": str(exc)})
             except Exception as exc:
                 self._send(400, {"error": str(exc)})
 

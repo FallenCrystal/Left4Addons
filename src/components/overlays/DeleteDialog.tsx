@@ -2,7 +2,8 @@ import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { HardDrive, Store, Trash2 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary } from '../../api/ipc';
-import { formatAddonDisplayName } from '../../utils/format';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import { formatFilteredAddonTitle } from '../../utils/contentFilter';
 import { Button, Dialog, Switch } from '../m3/primitives';
 
 export interface DeleteDialogProps {
@@ -25,6 +26,7 @@ export function DeleteDialog({
   onConfirm,
 }: DeleteDialogProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const hasInstalled = addons.some((a) => a.installState === 'installed');
   const [deleteDisk, setDeleteDisk] = useState(hasInstalled);
   const [purgeRecord, setPurgeRecord] = useState(!hasInstalled);
@@ -97,7 +99,7 @@ export function DeleteDialog({
         {addons.map((a) => (
           <div key={a.id} className="l4a-picker-row" style={{ cursor: 'default' }}>
             <span className="md-body-medium l4a-truncate" style={{ flex: 1 }}>
-              {formatAddonDisplayName(a, namePreference)}
+              {formatFilteredAddonTitle(a, namePreference, filterCtx, t)}
             </span>
             {a.workshopId ? (
               <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>

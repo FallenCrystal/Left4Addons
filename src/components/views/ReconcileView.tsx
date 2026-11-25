@@ -23,7 +23,12 @@ import type {
   ReconcileIssue,
   ReconcileIssueKind,
 } from '../../api/ipc';
-import { formatAddonDisplayName, formatTimestamp, getFileBaseName } from '../../utils/format';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import {
+  formatFilteredAddonTitle,
+  getAddonSearchRedaction,
+} from '../../utils/contentFilter';
+import { formatTimestamp, getFileBaseName } from '../../utils/format';
 import { Button, Checkbox, Dialog, EmptyState, FilterChip, IconButton } from '../m3/primitives';
 
 export interface ReconcileViewProps {
@@ -90,6 +95,7 @@ export function ReconcileView({
   onOpenBypassSettings,
 }: ReconcileViewProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const [kindFilter, setKindFilter] = useState<ReconcileIssueKind | 'all'>('all');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [expandedHelpIds, setExpandedHelpIds] = useState<Set<string>>(new Set());
@@ -110,6 +116,30 @@ export function ReconcileView({
     for (const a of addons) map.set(a.id, a);
     return map;
   }, [addons]);
+
+  const addonsByWorkshopId = useMemo(() => {
+    const map = new Map<string, AddonSummary>();
+    for (const a of addons) {
+      if (a.workshopId) map.set(a.workshopId, a);
+    }
+    return map;
+  }, [addons]);
+
+  const resolveIssueAddon = (issue: ReconcileIssue): AddonSummary | undefined =>
+    (issue.addonId ? addonsById.get(issue.addonId) : undefined) ??
+    (issue.workshopId ? addonsByWorkshopId.get(issue.workshopId) : undefined);
+
+  const formatSafePathLabel = (path: string, issue: ReconcileIssue): string => {
+    const addon = resolveIssueAddon(issue);
+    if (addon) {
+      const redaction = getAddonSearchRedaction(addon, filterCtx);
+      if (redaction.redactTitle || redaction.redactMeta) {
+        const wid = issue.workshopId ?? addon.workshopId;
+        return wid ? `${wid}.vpk` : t('filter.redactedTitle');
+      }
+    }
+    return getFileBaseName(path);
+  };
 
   const kindCounts = useMemo(() => {
     const map = new Map<ReconcileIssueKind, number>();
@@ -356,9 +386,9 @@ export function ReconcileView({
             </div>
 
             {visibleIssues.map((issue) => {
-              const addon = issue.addonId ? addonsById.get(issue.addonId) : undefined;
+              const addon = resolveIssueAddon(issue);
               const title = addon
-                ? formatAddonDisplayName(addon, config.addonNamePreference)
+                ? formatFilteredAddonTitle(addon, config.addonNamePreference, filterCtx, t)
                 : issue.workshopId
                   ? `#${issue.workshopId}`
                   : issue.id;
@@ -415,7 +445,7 @@ export function ReconcileView({
                                   style={{ color: 'var(--md-sys-color-primary)', flexShrink: 0 }}
                                 />
                                 <span className="md-mono l4a-truncate">
-                                  {getFileBaseName(issue.loadingPath)}
+                                  {formatSafePathLabel(issue.loadingPath, issue)}
                                 </span>
                                 <FolderOpen size={11} style={{ opacity: 0.65, flexShrink: 0 }} />
                               </button>
@@ -441,7 +471,7 @@ export function ReconcileView({
                                   style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0 }}
                                 />
                                 <span className="md-mono l4a-truncate">
-                                  {getFileBaseName(issue.workshopPath)}
+                                  {formatSafePathLabel(issue.workshopPath, issue)}
                                 </span>
                                 <FolderOpen size={11} style={{ opacity: 0.65, flexShrink: 0 }} />
                               </button>
@@ -565,13 +595,20 @@ export function ReconcileView({
                 {pendingConfirm.issue.loadingPath && (
                   <span className="l4a-path-chip">
                     <Folder size={13} style={{ color: 'var(--md-sys-color-primary)' }} />
-                    <span className="md-mono">{getFileBaseName(pendingConfirm.issue.loadingPath)}</span>
+                    <span className="md-mono">
+                      {formatSafePathLabel(pendingConfirm.issue.loadingPath, pendingConfirm.issue)}
+                    </span>
                   </span>
                 )}
                 {pendingConfirm.issue.workshopPath && (
                   <span className="l4a-path-chip">
                     <Store size={13} style={{ color: 'var(--md-sys-color-tertiary)' }} />
-                    <span className="md-mono">{getFileBaseName(pendingConfirm.issue.workshopPath)}</span>
+                    <span className="md-mono">
+                      {formatSafePathLabel(
+                        pendingConfirm.issue.workshopPath,
+                        pendingConfirm.issue,
+                      )}
+                    </span>
                   </span>
                 )}
               </div>

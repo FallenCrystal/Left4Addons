@@ -6,6 +6,8 @@ import {
   CheckCircle2,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
   FlaskConical,
   GitBranch,
   KeyRound,
@@ -39,9 +41,11 @@ import {
   type LocalFilterDeploymentStatus,
   type UpsertFilterExclusionRequest,
 } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import {
   getPresetDefaultParams,
   getPresetRecommendedThresholds,
+  isAddonTitleRedacted,
 } from '../../../utils/contentFilter';
 import { formatAddonDisplayName } from '../../../utils/format';
 import {
@@ -76,6 +80,7 @@ export interface FilterSettingsSectionProps {
   onRefreshTokenStatus: () => Promise<FilterTokenStatus | null>;
   onSetLlmToken: (token: string | null) => Promise<FilterTokenStatus | null>;
   onClearFilterCache: () => Promise<number | null>;
+  onRetryFailedEvaluations?: () => void;
   onEvaluateSandbox: (target: FilterEvaluationTarget) => Promise<FilterItemVerdict | null>;
   onUpsertExclusion: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
   onDeleteExclusion: (addonId: AddonId) => Promise<boolean>;
@@ -114,10 +119,95 @@ const EXCLUSION_LEVEL_OPTIONS: ExclusionDisplayLevel[] = [
   'hide_text',
 ];
 
-function parseClampedFloat(raw: string, fallback: number, min: number, max: number): number {
-  const parsed = Number.parseFloat(raw);
+function clampNumber(
+  raw: string,
+  fallback: number,
+  min: number,
+  max: number,
+  integer: boolean,
+): number {
+  const parsed = Number.parseFloat(raw.trim());
   if (!Number.isFinite(parsed)) return fallback;
-  return Number(Math.min(max, Math.max(min, parsed)).toFixed(4));
+  const clamped = Math.min(max, Math.max(min, parsed));
+  if (integer) return Math.round(clamped);
+  const rounded = Number(clamped.toFixed(4));
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function NumericTextField({
+  label,
+  value,
+  min,
+  max,
+  integer = false,
+  disabled = false,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  integer?: boolean;
+  disabled?: boolean;
+  onCommit: (next: number) => void;
+}) {
+  const [focused, setFocused] = useState(false);
+  const [draftText, setDraftText] = useState<string | null>(null);
+  const [trackedValue, setTrackedValue] = useState(value);
+
+  if (trackedValue !== value) {
+    setTrackedValue(value);
+    if (!focused && draftText !== null) {
+      setDraftText(null);
+    }
+  }
+
+  const displayValue = draftText ?? String(value);
+
+  return (
+    <TextField
+      label={label}
+      type="text"
+      inputMode={integer ? 'numeric' : 'decimal'}
+      disabled={disabled}
+      value={displayValue}
+      onFocus={() => {
+        setFocused(true);
+        setDraftText((curr) => curr ?? String(value));
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setDraftText(raw);
+        const trimmed = raw.trim();
+        const completePattern = integer ? /^-?\d+$/ : /^-?\d+(?:\.\d+)?$/;
+        if (completePattern.test(trimmed)) {
+          const parsed = Number.parseFloat(trimmed);
+          if (Number.isFinite(parsed) && parsed >= min && parsed <= max) {
+            const normalized = integer
+              ? Math.round(parsed)
+              : Object.is(parsed, -0)
+                ? 0
+                : Number(parsed.toFixed(4));
+            setTrackedValue(normalized);
+            if (normalized !== value) {
+              onCommit(normalized);
+            }
+          }
+        }
+      }}
+      onBlur={() => {
+        setFocused(false);
+        if (draftText !== null) {
+          const clamped = clampNumber(draftText, value, min, max, integer);
+          setDraftText(null);
+          setTrackedValue(clamped);
+          if (clamped !== value) {
+            onCommit(clamped);
+          }
+        }
+      }}
+    />
+  );
 }
 
 export function FilterSettingsSection({
@@ -141,18 +231,21 @@ export function FilterSettingsSection({
   onRefreshTokenStatus,
   onSetLlmToken,
   onClearFilterCache,
+  onRetryFailedEvaluations,
   onEvaluateSandbox,
   onUpsertExclusion,
   onDeleteExclusion,
   onSelectAddon,
 }: FilterSettingsSectionProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const systemPromptId = useId();
   const sandboxDescId = useId();
 
   const filter = effectiveConfig.filter;
   const [applyPresetThresholds, setApplyPresetThresholds] = useState(true);
   const [tokenInput, setTokenInput] = useState('');
+  const [revealedExclusionIds, setRevealedExclusionIds] = useState<Set<string>>(new Set());
 
   const [sandboxTitle, setSandboxTitle] = useState('');
   const [sandboxDesc, setSandboxDesc] = useState('');
@@ -223,8 +316,10 @@ export function FilterSettingsSection({
   const serviceTransitioning =
     localStatus?.serviceState === 'deploying' || localStatus?.serviceState === 'starting';
   const catalogParamsLocked = filter.mode === 'catalog';
+  const missingPinnedCommit = !filter.trackLatest && !filter.pinnedCommit?.trim();
 
   const handleDeploy = async (forceLatest = false) => {
+    if (!forceLatest && missingPinnedCommit) return;
     if (dirty) {
       const saved = await onSaveDraftFirst();
       if (!saved) return;
@@ -235,6 +330,39 @@ export function FilterSettingsSection({
       trackLatest,
       targetCommit: trackLatest ? undefined : filter.pinnedCommit?.trim() || undefined,
       startAfterDeploy: filter.autoStartLocalService,
+    });
+  };
+
+  const handleCheckLocalUpdates = async () => {
+    if (dirty) {
+      const saved = await onSaveDraftFirst();
+      if (!saved) return;
+    }
+    await onCheckLocalUpdates();
+  };
+
+  const handleStartLocalService = async () => {
+    if (dirty) {
+      const saved = await onSaveDraftFirst();
+      if (!saved) return;
+    }
+    await onStartLocalService();
+  };
+
+  const handleRefreshTokenStatus = async () => {
+    if (dirty) {
+      const saved = await onSaveDraftFirst();
+      if (!saved) return;
+    }
+    await onRefreshTokenStatus();
+  };
+
+  const toggleRevealExclusionTitle = (addonId: string) => {
+    setRevealedExclusionIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(addonId)) next.delete(addonId);
+      else next.add(addonId);
+      return next;
     });
   };
 
@@ -262,6 +390,8 @@ export function FilterSettingsSection({
     }
   };
 
+  const handleRetryEval = onRetryFailedEvaluations ?? filterCtx.retryFailedEvaluations;
+
   return (
     <>
       {/* 1. Master Switch, Scope & Source */}
@@ -276,9 +406,19 @@ export function FilterSettingsSection({
         </div>
 
         {evalError && filter.enabled && (
-          <div className="l4a-callout" data-tone="error">
-            <AlertCircle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
-            <span className="md-body-small selectable">{evalError}</span>
+          <div className="l4a-callout" data-tone="error" style={{ alignItems: 'center' }}>
+            <AlertCircle size={15} style={{ flexShrink: 0 }} />
+            <span className="md-body-small selectable" style={{ flex: 1 }}>
+              {evalError}
+            </span>
+            <Button
+              variant="tonal"
+              size="sm"
+              icon={<RefreshCw size={13} />}
+              onClick={handleRetryEval}
+            >
+              {t('common.retry')}
+            </Button>
           </div>
         )}
 
@@ -512,38 +652,48 @@ export function FilterSettingsSection({
         </div>
 
         {!filter.trackLatest && (
-          <div className="l4a-filter-param-grid">
-            <div className="md-field">
-              <span className="md-field-label">{t('filter.settings.commitSelect')}</span>
-              <Select<string>
-                ariaLabel={t('filter.settings.commitSelect')}
-                value={matchedCommitSha}
-                onChange={(sha) => {
-                  if (sha === '__custom__') return;
-                  onUpdateFilter((curr) => ({ ...curr, pinnedCommit: sha }));
-                }}
-                options={recentCommitOptions}
+          <>
+            <div className="l4a-filter-param-grid">
+              <div className="md-field">
+                <span className="md-field-label">{t('filter.settings.commitSelect')}</span>
+                <Select<string>
+                  ariaLabel={t('filter.settings.commitSelect')}
+                  value={matchedCommitSha}
+                  onChange={(sha) => {
+                    if (sha === '__custom__') return;
+                    onUpdateFilter((curr) => ({ ...curr, pinnedCommit: sha }));
+                  }}
+                  options={recentCommitOptions}
+                />
+              </div>
+              <TextField
+                label={t('filter.settings.pinnedCommitInput')}
+                placeholder="a94f18e..."
+                value={filter.pinnedCommit ?? ''}
+                onChange={(e) =>
+                  onUpdateFilter((curr) => ({
+                    ...curr,
+                    pinnedCommit: e.target.value || null,
+                  }))
+                }
               />
             </div>
-            <TextField
-              label={t('filter.settings.pinnedCommitInput')}
-              placeholder="a94f18e..."
-              value={filter.pinnedCommit ?? ''}
-              onChange={(e) =>
-                onUpdateFilter((curr) => ({
-                  ...curr,
-                  pinnedCommit: e.target.value || null,
-                }))
-              }
-            />
-          </div>
+            {missingPinnedCommit && (
+              <span
+                className="md-body-small"
+                style={{ color: 'var(--md-sys-color-error)' }}
+              >
+                {t('filter.settings.pinnedCommitRequiredHint')}
+              </span>
+            )}
+          </>
         )}
 
         <div className="l4a-row-wrap">
           <Button
             variant="filled"
             size="sm"
-            disabled={filterStatusBusy || serviceTransitioning}
+            disabled={filterStatusBusy || serviceTransitioning || missingPinnedCommit}
             icon={<Download size={14} />}
             onClick={() => void handleDeploy(false)}
           >
@@ -557,7 +707,7 @@ export function FilterSettingsSection({
             size="sm"
             disabled={filterStatusBusy || serviceTransitioning}
             icon={<RefreshCw size={14} className={filterStatusBusy ? 'md-spin' : undefined} />}
-            onClick={() => void onCheckLocalUpdates()}
+            onClick={() => void handleCheckLocalUpdates()}
           >
             {t('filter.settings.checkUpdatesBtn')}
           </Button>
@@ -591,7 +741,7 @@ export function FilterSettingsSection({
               size="sm"
               disabled={filterStatusBusy || !localStatus?.deployed || serviceTransitioning}
               icon={<Play size={14} />}
-              onClick={() => void onStartLocalService()}
+              onClick={() => void handleStartLocalService()}
             >
               {t('filter.settings.startServiceBtn')}
             </Button>
@@ -685,98 +835,55 @@ export function FilterSettingsSection({
         </div>
 
         <div className="l4a-filter-param-grid">
-          <TextField
+          <NumericTextField
             label={t('filter.settings.threads')}
-            type="number"
             min={1}
             max={16}
-            step={1}
+            integer
             disabled={catalogParamsLocked}
             value={filter.localParams.threads}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                threads: Math.min(16, Math.max(1, Number.parseInt(e.target.value || '4', 10) || 4)),
-              }))
-            }
+            onCommit={(threads) => updateParams((p) => ({ ...p, threads }))}
           />
-          <TextField
+          <NumericTextField
             label={t('filter.settings.maxImages')}
-            type="number"
             min={1}
             max={8}
-            step={1}
+            integer
             disabled={catalogParamsLocked}
             value={filter.localParams.maxImages}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                maxImages: Math.min(
-                  8,
-                  Math.max(1, Number.parseInt(e.target.value || '2', 10) || 2),
-                ),
-              }))
-            }
+            onCommit={(maxImages) => updateParams((p) => ({ ...p, maxImages }))}
           />
-          <TextField
+          <NumericTextField
             label={t('filter.settings.goreWeight')}
-            type="number"
             min={0}
             max={3}
-            step={0.05}
             disabled={catalogParamsLocked}
             value={filter.localParams.goreWeight}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                goreWeight: parseClampedFloat(e.target.value, p.goreWeight, 0, 3),
-              }))
-            }
+            onCommit={(goreWeight) => updateParams((p) => ({ ...p, goreWeight }))}
           />
-          <TextField
+          <NumericTextField
             label={t('filter.settings.nsfwWeight')}
-            type="number"
             min={0}
             max={3}
-            step={0.05}
             disabled={catalogParamsLocked}
             value={filter.localParams.nsfwWeight}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                nsfwWeight: parseClampedFloat(e.target.value, p.nsfwWeight, 0, 3),
-              }))
-            }
+            onCommit={(nsfwWeight) => updateParams((p) => ({ ...p, nsfwWeight }))}
           />
-          <TextField
+          <NumericTextField
             label={t('filter.settings.temperature')}
-            type="number"
             min={0.25}
             max={4}
-            step={0.05}
             disabled={catalogParamsLocked}
             value={filter.localParams.temperature}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                temperature: parseClampedFloat(e.target.value, p.temperature, 0.25, 4),
-              }))
-            }
+            onCommit={(temperature) => updateParams((p) => ({ ...p, temperature }))}
           />
-          <TextField
+          <NumericTextField
             label={t('filter.settings.bias')}
-            type="number"
             min={-5}
             max={5}
-            step={0.05}
             disabled={catalogParamsLocked}
             value={filter.localParams.bias}
-            onChange={(e) =>
-              updateParams((p) => ({
-                ...p,
-                bias: parseClampedFloat(e.target.value, p.bias, -5, 5),
-              }))
-            }
+            onCommit={(bias) => updateParams((p) => ({ ...p, bias }))}
           />
         </div>
       </section>
@@ -811,19 +918,14 @@ export function FilterSettingsSection({
                 }
               />
             </div>
-            <TextField
+            <NumericTextField
               label={t('filter.settings.flagThreshold')}
-              type="number"
               min={0.01}
               max={1}
-              step={0.01}
               disabled={!filter.enableDirectFlag}
               value={filter.flagThreshold}
-              onChange={(e) =>
-                onUpdateFilter((curr) => ({
-                  ...curr,
-                  flagThreshold: parseClampedFloat(e.target.value, curr.flagThreshold, 0.01, 1),
-                }))
+              onCommit={(flagThreshold) =>
+                onUpdateFilter((curr) => ({ ...curr, flagThreshold }))
               }
             />
           </div>
@@ -838,19 +940,14 @@ export function FilterSettingsSection({
                 onChange={(next) => onUpdateFilter((curr) => ({ ...curr, llmEnabled: next }))}
               />
             </div>
-            <TextField
+            <NumericTextField
               label={t('filter.settings.llmThreshold')}
-              type="number"
               min={0}
               max={1}
-              step={0.01}
               disabled={!filter.llmEnabled}
               value={filter.llmThreshold}
-              onChange={(e) =>
-                onUpdateFilter((curr) => ({
-                  ...curr,
-                  llmThreshold: parseClampedFloat(e.target.value, curr.llmThreshold, 0, 1),
-                }))
+              onCommit={(llmThreshold) =>
+                onUpdateFilter((curr) => ({ ...curr, llmThreshold }))
               }
             />
           </div>
@@ -862,6 +959,32 @@ export function FilterSettingsSection({
         >
           {t('filter.settings.routingHint')}
         </span>
+
+        {filter.enableDirectFlag &&
+          filter.llmEnabled &&
+          filter.llmThreshold >= filter.flagThreshold && (
+            <div className="l4a-callout">
+              <AlertTriangle
+                size={15}
+                style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0, marginTop: 2 }}
+              />
+              <span className="md-body-small">
+                {t('filter.settings.routingThresholdOverlapWarning')}
+              </span>
+            </div>
+          )}
+
+        {!filter.enableDirectFlag && !filter.llmEnabled && (
+          <div className="l4a-callout">
+            <AlertTriangle
+              size={15}
+              style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0, marginTop: 2 }}
+            />
+            <span className="md-body-small">
+              {t('filter.settings.routingBothDisabledWarning')}
+            </span>
+          </div>
+        )}
 
         <div className="l4a-divider" />
 
@@ -919,7 +1042,7 @@ export function FilterSettingsSection({
                   variant="text"
                   size="sm"
                   icon={<RefreshCw size={13} />}
-                  onClick={() => void onRefreshTokenStatus()}
+                  onClick={() => void handleRefreshTokenStatus()}
                 >
                   {t('settings.refreshSdk')}
                 </Button>
@@ -1074,24 +1197,14 @@ export function FilterSettingsSection({
 
         <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
           <div style={{ flex: '1 1 220px', maxWidth: 280 }}>
-            <TextField
+            <NumericTextField
               label={t('filter.settings.modalityThreshold')}
-              type="number"
               min={0.01}
               max={1}
-              step={0.01}
               disabled={!filter.subdivideModalities}
               value={filter.modalityThreshold}
-              onChange={(e) =>
-                onUpdateFilter((curr) => ({
-                  ...curr,
-                  modalityThreshold: parseClampedFloat(
-                    e.target.value,
-                    curr.modalityThreshold,
-                    0.01,
-                    1,
-                  ),
-                }))
+              onCommit={(modalityThreshold) =>
+                onUpdateFilter((curr) => ({ ...curr, modalityThreshold }))
               }
             />
           </div>
@@ -1237,9 +1350,23 @@ export function FilterSettingsSection({
             <div className="l4a-list">
               {exclusions.map((excl) => {
                 const addon = addonsById.get(excl.addonId);
-                const label = addon
+                const canBindFingerprint =
+                  addon?.installState === 'installed' && Boolean(addon.contentHash);
+                const shouldRedactTitle =
+                  excl.displayLevel === 'hide_text' ||
+                  Boolean(addon && isAddonTitleRedacted(addon, filterCtx));
+                const isTitleRevealed = revealedExclusionIds.has(excl.addonId);
+                const rawLabel = addon
                   ? formatAddonDisplayName(addon, namePreference)
                   : excl.addonId;
+                const widFromId =
+                  addon?.workshopId ??
+                  (excl.addonId.startsWith('ws:') ? excl.addonId.slice(3) : undefined);
+                const redactedLabel = widFromId
+                  ? t('filter.redactedTitleWithId', { id: widFromId })
+                  : `${t('filter.redactedTitle')} · ${excl.addonId.slice(0, 16)}`;
+                const label =
+                  shouldRedactTitle && !isTitleRevealed ? redactedLabel : rawLabel;
 
                 return (
                   <div
@@ -1280,11 +1407,23 @@ export function FilterSettingsSection({
                         className="md-body-small md-mono"
                         style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
                       >
-                        {excl.addonId}
+                        {widFromId ? `#${widFromId}` : excl.addonId.slice(0, 20)}
                       </span>
                     </button>
 
                     <div className="l4a-list-trailing">
+                      {shouldRedactTitle && Boolean(addon) && (
+                        <IconButton
+                          size="sm"
+                          label={
+                            isTitleRevealed ? t('filter.hideTitle') : t('filter.revealTitle')
+                          }
+                          onClick={() => toggleRevealExclusionTitle(excl.addonId)}
+                        >
+                          {isTitleRevealed ? <EyeOff size={15} /> : <Eye size={15} />}
+                        </IconButton>
+                      )}
+
                       <Select<ExclusionDisplayLevel>
                         ariaLabel={t('filter.exclusionLevelLabel')}
                         value={excl.displayLevel}
@@ -1292,7 +1431,7 @@ export function FilterSettingsSection({
                           void onUpsertExclusion({
                             addonId: excl.addonId,
                             displayLevel: nextLevel,
-                            bindFingerprint: excl.bindFingerprint,
+                            bindFingerprint: excl.bindFingerprint && canBindFingerprint,
                             note: excl.note,
                           })
                         }
@@ -1302,7 +1441,7 @@ export function FilterSettingsSection({
                         }))}
                       />
 
-                      {excl.bindFingerprint && !excl.fingerprintValid && addon?.contentHash && (
+                      {excl.bindFingerprint && !excl.fingerprintValid && canBindFingerprint && (
                         <Button
                           variant="tonal"
                           size="sm"

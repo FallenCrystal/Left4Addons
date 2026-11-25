@@ -32,7 +32,7 @@ use std::str::FromStr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 const MAX_BATCH_SIZE: usize = 200;
-const MAX_FILTER_PREDICT_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_FILTER_PREDICT_BODY_BYTES: usize = 48 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RouteState {
@@ -66,16 +66,20 @@ pub fn router(state: ServerState) -> Router {
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn(append_search_vary));
 
+    let filter_predict_route = post(filter_predict)
+        .layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_filter_enabled,
+        ));
+
     let public_routes = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/items/batch", post(batch_items))
         .route("/api/v1/items/{workshop_id}", get(get_item))
         .route("/api/v1/collections/{collection_id}", get(get_collection))
         .route("/api/v1/filter/info", get(filter_info))
-        .route(
-            "/api/v1/filter/predict",
-            post(filter_predict).layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES)),
-        )
+        .route("/api/v1/filter/predict", filter_predict_route)
         .layer(CorsLayer::permissive());
 
     let admin_routes = Router::new()
@@ -892,7 +896,36 @@ async fn admin_clear_item_override(
     Ok(Json(detail))
 }
 
-fn filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
+async fn guard_filter_enabled(
+    State(state): State<RouteState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    if !state.server.filter.is_enabled() {
+        return Err(err_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "内容过滤服务未启用",
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
+    match err {
+        FilterServiceError::Disabled(_) => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务未启用")
+        }
+        FilterServiceError::Unavailable(detail) => {
+            tracing::warn!(error = %detail, "公开内容过滤接口后端暂不可用");
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务暂不可用")
+        }
+        FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
+        FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::Internal(err) => internal_err(err),
+    }
+}
+
+fn admin_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
     match err {
         FilterServiceError::Disabled(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
         FilterServiceError::Unavailable(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
@@ -910,7 +943,12 @@ async fn filter_predict(
     State(state): State<RouteState>,
     Json(req): Json<FilterPredictRequest>,
 ) -> ApiResult<FilterProbabilities> {
-    let probs = state.server.filter.predict(req).await.map_err(filter_err)?;
+    let probs = state
+        .server
+        .filter
+        .predict(req)
+        .await
+        .map_err(public_filter_err)?;
     Ok(Json(probs))
 }
 
@@ -928,6 +966,15 @@ async fn admin_update_filter_config(
     Json(dto): Json<CatalogFilterConfigDto>,
 ) -> ApiResult<CatalogFilterStatus> {
     let actor = state.require_admin(&headers)?;
+    if let Some(raw_url) = dto
+        .upstream_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        crate::filter::validate_upstream_base_url(raw_url)
+            .map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
+    }
     state
         .server
         .config_store
@@ -980,6 +1027,11 @@ async fn admin_test_filter(
     Json(req): Json<FilterPredictRequest>,
 ) -> ApiResult<FilterProbabilities> {
     state.require_admin(&headers)?;
-    let probs = state.server.filter.predict(req).await.map_err(filter_err)?;
+    let probs = state
+        .server
+        .filter
+        .predict(req)
+        .await
+        .map_err(admin_filter_err)?;
     Ok(Json(probs))
 }

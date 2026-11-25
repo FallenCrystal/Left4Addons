@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Database,
   Filter,
@@ -41,6 +41,7 @@ export function App() {
   const [loggingOut, setLoggingOut] = useState(false);
   const [activeTab, setActiveTab] = useState<NavTab>('overview');
   const [overview, setOverview] = useState<CatalogOverviewResponse | null>(null);
+  const overviewEpochRef = useRef(0);
   const [inspectId, setInspectId] = useState<string | null>(null);
   const closeInspector = useCallback(() => setInspectId(null), []);
   const [toast, setToast] = useState<{ msg: string; tone: 'default' | 'error' } | null>(null);
@@ -61,13 +62,21 @@ export function App() {
   }, [toast]);
 
   const refreshOverview = useCallback(async () => {
+    const reqEpoch = ++overviewEpochRef.current;
     try {
       const data = await getOverview();
+      if (reqEpoch !== overviewEpochRef.current) {
+        return;
+      }
       setOverview(data);
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        overviewEpochRef.current += 1;
         setUsername(null);
         setSessionToken(null);
+        return;
+      }
+      if (reqEpoch !== overviewEpochRef.current) {
         return;
       }
       notify(err instanceof Error ? err.message : String(err), 'error');
@@ -102,6 +111,7 @@ export function App() {
     setLoggingOut(true);
     try {
       await logoutAdmin();
+      overviewEpochRef.current += 1;
       setUsername(null);
       setOverview(null);
       closeInspector();
@@ -114,10 +124,12 @@ export function App() {
   };
 
   const handleSteamUpdated = useCallback((nextSteam: CatalogSteamStatus) => {
+    overviewEpochRef.current += 1;
     setOverview((prev) => (prev ? { ...prev, steam: nextSteam } : prev));
   }, []);
 
   const handleFilterUpdated = useCallback((nextFilter: CatalogFilterStatus) => {
+    overviewEpochRef.current += 1;
     setOverview((prev) => (prev ? { ...prev, filter: nextFilter } : prev));
   }, []);
 
@@ -275,13 +287,12 @@ export function App() {
                 onNotify={notify}
               />
             )}
-            {activeTab === 'filter' && (
-              <FilterPanel
-                filter={overview.filter ?? DEFAULT_FILTER_STATUS}
-                onFilterUpdated={handleFilterUpdated}
-                onNotify={notify}
-              />
-            )}
+            <FilterPanel
+              hidden={activeTab !== 'filter'}
+              filter={overview.filter ?? DEFAULT_FILTER_STATUS}
+              onFilterUpdated={handleFilterUpdated}
+              onNotify={notify}
+            />
             {activeTab === 'settings' && (
               <SettingsAuditPanel
                 overview={overview}

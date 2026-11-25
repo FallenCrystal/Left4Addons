@@ -580,6 +580,8 @@ pub struct DashboardSnapshot {
     pub tasks: Vec<TaskRecord>,
     #[serde(default)]
     pub filter_exclusions: Vec<FilterExclusionRecord>,
+    #[serde(default)]
+    pub cached_filter_verdicts: Vec<FilterItemVerdict>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -612,6 +614,8 @@ pub enum CoreEvent {
     },
     FilterVerdictsUpdated {
         verdicts: Vec<FilterItemVerdict>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy_signature: Option<String>,
     },
     LocalFilterStatusChanged {
         status: LocalFilterDeploymentStatus,

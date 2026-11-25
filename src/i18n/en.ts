@@ -499,11 +499,15 @@ export const en = {
     previewFileManager: 'File manager is unavailable in browser preview mode',
   },
   filter: {
+    evaluatingMedia: 'Evaluating content safety…',
+    evalFailedRetry: 'Filter failed · Retry',
     imageHidden: 'Sensitive image hidden',
     lazyLoadPreview: 'Load preview',
     blurredImage: 'Sensitive image blurred',
     peekShow: 'Show image',
     peekHide: 'Blur image',
+    revealTitle: 'Show title',
+    hideTitle: 'Hide title',
     blurCardOverlay: 'Sensitive · Click to show text',
     blurCardHint: 'Image remains hidden · Click again to inspect',
     redactedTitle: 'Sensitive title hidden',
@@ -586,6 +590,8 @@ export const en = {
       commitSelect: 'Select Recent Commit',
       customCommitOption: 'Custom commit SHA',
       pinnedCommitInput: 'Pinned Commit SHA',
+      pinnedCommitRequiredHint:
+        'Select or enter a target commit SHA before deploying when Track latest is turned off.',
       deployBtn: 'Deploy Now',
       redeployBtn: 'Redeploy',
       checkUpdatesBtn: 'Check Updates',
@@ -635,6 +641,10 @@ export const en = {
       llmThreshold: 'LLM Escalation Threshold (0–1)',
       routingHint:
         'Scores below LLM threshold pass; scores in between escalate to the LLM judge; scores at or above Direct Flag threshold flag immediately.',
+      routingThresholdOverlapWarning:
+        'Warning: LLM Escalation Threshold is greater than or equal to Direct Flag Threshold — items reaching Direct Flag Threshold will flag immediately without ever escalating to the LLM judge.',
+      routingBothDisabledWarning:
+        'Warning: Both High-Score Direct Flagging and External LLM Review are disabled; evaluation falls back to the Direct Flag Threshold.',
       llmEndpoint: 'OpenAI-Compatible Endpoint',
       llmModel: 'Model Name',
       llmSendImages: 'Send Preview Images to Vision LLM',
@@ -657,7 +667,7 @@ export const en = {
       llmSystemPrompt: 'System Prompt',
       resetSystemPrompt: 'Reset Default Prompt',
       builtinUserPromptNote:
-        'The built-in non-configurable user prompt injects addon metadata and model probabilities, requiring a strict JSON boolean response (true = flag, false = allow).',
+        'The built-in non-configurable user prompt injects addon metadata (title, tags, and description), requiring a strict JSON boolean response (true = flag, false = allow).',
       actionsTitle: 'Flagged Actions, Modality Subdivision, Sandbox & Exclusions',
       flaggedAction: 'Card & List Flagged Action',
       actions: {

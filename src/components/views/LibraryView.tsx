@@ -9,7 +9,7 @@ import type {
 } from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
-import { addonFilterKey, resolveCardFilterState } from '../../utils/contentFilter';
+import { resolveLibraryAddonCardFilter } from '../../utils/contentFilter';
 import { Button, EmptyState } from '../m3/primitives';
 import { BundleDetailSheet } from './library/BundleDetailSheet';
 import {
@@ -163,8 +163,21 @@ export function LibraryView({
     [bundles, addonsById],
   );
 
-  const { filterConfig, verdicts, exclusionsByAddonId } = useContentFilterContext();
+  const filterCtx = useContentFilterContext();
+  const { filterConfig, evalError, retryFailedEvaluations } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
+
+  const extFilterKey = externalFilter
+    ? `${externalFilter.label}|${externalFilter.addonIds?.join(',') ?? ''}|${externalFilter.workshopIds?.join(',') ?? ''}`
+    : '';
+  const filterResetKey = `${scope}|${effectiveCategory}|${extFilterKey}`;
+  const [trackedFilterResetKey, setTrackedFilterResetKey] = useState(filterResetKey);
+  if (trackedFilterResetKey !== filterResetKey) {
+    setTrackedFilterResetKey(filterResetKey);
+    if (showingFilteredCards) {
+      setShowingFilteredCards(false);
+    }
+  }
 
   const hiddenAddonIds = useMemo(() => {
     const hidden = new Set<string>();
@@ -172,18 +185,12 @@ export function LibraryView({
       return hidden;
     }
     for (const addon of addons) {
-      const state = resolveCardFilterState({
-        config: filterConfig,
-        scope: 'library',
-        verdict: verdicts[addonFilterKey(addon.id)],
-        exclusion: exclusionsByAddonId.get(addon.id),
-      });
-      if (state.hiddenCard) {
+      if (resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) {
         hidden.add(addon.id);
       }
     }
     return hidden;
-  }, [addons, exclusionsByAddonId, filterConfig, verdicts]);
+  }, [addons, filterConfig.applyToLibrary, filterConfig.enabled, filterCtx]);
 
   const { displayItems, visibleAddons, filteredOutCount } = useMemo(
     () =>
@@ -202,6 +209,7 @@ export function LibraryView({
         namePreference,
         hiddenAddonIds,
         enforceHide: !showingFilteredCards,
+        filterCtx,
       }),
     [
       addons,
@@ -218,6 +226,7 @@ export function LibraryView({
       namePreference,
       hiddenAddonIds,
       showingFilteredCards,
+      filterCtx,
     ],
   );
 
@@ -349,6 +358,8 @@ export function LibraryView({
         filteredOutCount={filteredOutCount}
         showingFilteredCards={showingFilteredCards}
         onToggleShowFilteredCards={() => setShowingFilteredCards((v) => !v)}
+        evalError={filterConfig.enabled && filterConfig.applyToLibrary ? evalError : null}
+        onRetryEval={retryFailedEvaluations}
       />
 
       {showBatchBar && (

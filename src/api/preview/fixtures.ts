@@ -544,5 +544,6 @@ export function createInitialSnapshot(): DashboardSnapshot {
       },
     ],
     filterExclusions: [],
+    cachedFilterVerdicts: [],
   };
 }

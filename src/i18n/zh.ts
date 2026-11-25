@@ -498,11 +498,15 @@ export const zh = {
     previewFileManager: '浏览器预览模式不支持打开本地资源管理器',
   },
   filter: {
+    evaluatingMedia: '正在进行内容安全评估…',
+    evalFailedRetry: '过滤评估失败 · 点击重试',
     imageHidden: '已隐藏敏感图片',
     lazyLoadPreview: '点击加载预览',
     blurredImage: '敏感图片已模糊',
     peekShow: '查看原图',
     peekHide: '恢复模糊',
+    revealTitle: '显示原始标题',
+    hideTitle: '隐藏原始标题',
     blurCardOverlay: '敏感内容 · 点击显示描述',
     blurCardHint: '图片仍保持隐藏，再次点击查看详情',
     redactedTitle: '已隐藏敏感标题',
@@ -585,6 +589,7 @@ export const zh = {
       commitSelect: '选择历史提交版本',
       customCommitOption: '手动输入提交 SHA',
       pinnedCommitInput: '固定提交 SHA',
+      pinnedCommitRequiredHint: '关闭“跟随远端最新提交”时，请先选择或输入目标提交 SHA 后再部署。',
       deployBtn: '一键部署',
       redeployBtn: '重新部署',
       checkUpdatesBtn: '检查更新',
@@ -634,6 +639,10 @@ export const zh = {
       llmThreshold: '进入大模型复核阈值 (0–1)',
       routingHint:
         '低于复核阈值直接放行；介于复核阈值与直接标记阈值之间交由大模型二次裁决；达到直接标记阈值立即拦截。',
+      routingThresholdOverlapWarning:
+        '注意：大模型复核阈值大于或等于直接标记阈值，疑似复核区间为空，达到直接标记阈值的条目将直接拦截而不会触发大模型复核。',
+      routingBothDisabledWarning:
+        '注意：高分直接标记与外部大模型复核均已关闭，系统将回退为按直接标记阈值进行基础模型判定。',
       llmEndpoint: 'OpenAI 兼容接口地址',
       llmModel: '模型名称',
       llmSendImages: '向多模态大模型附带预览图片',
@@ -656,7 +665,7 @@ export const zh = {
       llmSystemPrompt: 'System Prompt (系统提示词)',
       resetSystemPrompt: '恢复默认提示词',
       builtinUserPromptNote:
-        '内置用户提示词（不可更改）会自动注入组件标题、标签、简介摘要与本地模型概率，并要求大模型仅输出严格的 JSON 布尔值（true 表示敏感拦截，false 表示正常放行）。',
+        '内置用户提示词（不可更改）会自动注入组件标题、标签与简介摘要，并要求大模型仅输出严格的 JSON 布尔值（true 表示敏感拦截，false 表示正常放行）。',
       actionsTitle: '标记行为、模态细分、测试沙盒与排除项总览',
       flaggedAction: '卡片与列表标记行为',
       actions: {

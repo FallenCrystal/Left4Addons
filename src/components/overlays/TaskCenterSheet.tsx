@@ -16,7 +16,16 @@ import type {
   SyncReport,
   TaskRecord,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../state/useAppController';
+import {
+  formatFilteredAddonTitle,
+  formatRedactedAddonLabel,
+  isAddonTitleRedacted,
+  resolveCardFilterState,
+  resolveLookupVerdict,
+  workshopFilterKey,
+} from '../../utils/contentFilter';
 import {
   formatAddonDisplayName,
   formatBytes,
@@ -70,9 +79,16 @@ export function TaskCenterSheet({
   onSafeDeleteObsolete,
 }: TaskCenterSheetProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const tabsId = useId();
 
   const activeList = Object.values(liveDownloads);
+
+  const addonsById = useMemo(() => {
+    const map = new Map<string, AddonSummary>();
+    for (const a of addons) map.set(a.id, a);
+    return map;
+  }, [addons]);
 
   const addonsByWid = useMemo(() => {
     const map = new Map<string, AddonSummary>();
@@ -82,9 +98,57 @@ export function TaskCenterSheet({
     return map;
   }, [addons]);
 
+  const isWidTitleRedacted = (wid: string, rawTitle?: string | null): boolean => {
+    const found = addonsByWid.get(wid);
+    if (found) {
+      return isAddonTitleRedacted(found, filterCtx);
+    }
+    const wsKey = workshopFilterKey(wid);
+    const wsState = resolveCardFilterState({
+      config: filterCtx.filterConfig,
+      scope: 'workshop',
+      verdict: resolveLookupVerdict(wsKey, filterCtx),
+      revealed: filterCtx.revealedCardIds.has(wsKey),
+      hasTargetFailed: filterCtx.failedTargetKeys.has(wsKey),
+      hasContent: Boolean(rawTitle?.trim()),
+    });
+    return (
+      wsState.redactTitle ||
+      ((wsState.blurWholeCard || wsState.hiddenCard) && wsState.titleSensitive)
+    );
+  };
+
+  const resolveSafeWidTitle = (
+    wid: string,
+    rawFallback?: string | null,
+    addonId?: string,
+  ): string | undefined => {
+    const found = (addonId ? addonsById.get(addonId) : undefined) ?? addonsByWid.get(wid);
+    if (found) {
+      if (isAddonTitleRedacted(found, filterCtx)) {
+        return formatRedactedAddonLabel(wid, t);
+      }
+      return rawFallback?.trim() || formatAddonDisplayName(found, namePreference);
+    }
+    if (isWidTitleRedacted(wid, rawFallback)) {
+      return formatRedactedAddonLabel(wid, t);
+    }
+    return rawFallback?.trim() || undefined;
+  };
+
   const addonLabel = (wid: string): string | undefined => {
     const found = addonsByWid.get(wid);
-    return found ? formatAddonDisplayName(found, namePreference) : undefined;
+    if (found) {
+      return formatFilteredAddonTitle(found, namePreference, filterCtx, t);
+    }
+    return isWidTitleRedacted(wid) ? formatRedactedAddonLabel(wid, t) : undefined;
+  };
+
+  const safeTitleHint = (wid: string, rawHint?: string | null): string | undefined => {
+    if (isWidTitleRedacted(wid, rawHint)) {
+      return undefined;
+    }
+    return rawHint?.trim() || undefined;
   };
 
   const activeTasksByWid = useMemo(() => {
@@ -183,11 +247,10 @@ export function TaskCenterSheet({
                   </span>
                   {activeList.map((dl) => {
                     const taskRecord = activeTasksByWid.get(dl.workshopId);
-                    const resolvedTitle =
-                      dl.title?.trim() ||
-                      addonLabel(dl.workshopId) ||
-                      taskRecord?.targetTitle?.trim() ||
-                      undefined;
+                    const resolvedTitle = resolveSafeWidTitle(
+                      dl.workshopId,
+                      dl.title?.trim() || taskRecord?.targetTitle?.trim(),
+                    );
                     const isQueued =
                       !dl.hasProgress && !dl.cancelling && taskRecord?.status === 'queued';
                     const statusLabel = dl.cancelling
@@ -272,7 +335,7 @@ export function TaskCenterSheet({
                               : 'surface';
                       const resolvedTitle =
                         task.kind === 'download'
-                          ? task.targetTitle?.trim() || addonLabel(task.targetId)
+                          ? resolveSafeWidTitle(task.targetId, task.targetTitle)
                           : undefined;
                       const detailText =
                         task.error || task.message || formatTimestamp(task.updatedAt);
@@ -349,11 +412,14 @@ export function TaskCenterSheet({
                     const current = addonsByWid.get(item.workshopId);
                     const stillNeedsUpdate = !current || current.updateAvailable;
                     const downloading = Boolean(liveDownloads[item.workshopId]);
+                    const displayTitle =
+                      resolveSafeWidTitle(item.workshopId, item.title, item.addonId) ??
+                      `#${item.workshopId}`;
                     return (
                       <div key={item.addonId} className="l4a-list-row" style={{ cursor: 'default' }}>
                         <ArrowUpCircle size={18} style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0 }} />
                         <div className="l4a-list-main">
-                          <span className="md-title-small l4a-truncate">{item.title}</span>
+                          <span className="md-title-small l4a-truncate">{displayTitle}</span>
                           <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
                             #{item.workshopId} · {formatTimestamp(item.remoteTimeUpdated)}
                           </span>
@@ -364,7 +430,12 @@ export function TaskCenterSheet({
                             variant="tonal"
                             disabled={downloading}
                             label={t('common.update')}
-                            onClick={() => onUpdateItem(item.workshopId, item.title)}
+                            onClick={() =>
+                              onUpdateItem(
+                                item.workshopId,
+                                safeTitleHint(item.workshopId, item.title),
+                              )
+                            }
                           >
                             <ArrowUpCircle size={15} />
                           </IconButton>
@@ -385,22 +456,27 @@ export function TaskCenterSheet({
                   </span>
                 </div>
                 <div className="l4a-list">
-                  {syncReport.removedUpstream.map((item) => (
-                    <div key={item.addonId} className="l4a-list-row" style={{ cursor: 'default' }}>
-                      <CloudOff size={18} style={{ color: 'var(--md-sys-color-error)', flexShrink: 0 }} />
-                      <div className="l4a-list-main">
-                        <span className="md-title-small l4a-truncate">{item.title}</span>
-                        <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
-                          #{item.workshopId}
-                        </span>
+                  {syncReport.removedUpstream.map((item) => {
+                    const displayTitle =
+                      resolveSafeWidTitle(item.workshopId, item.title, item.addonId) ??
+                      `#${item.workshopId}`;
+                    return (
+                      <div key={item.addonId} className="l4a-list-row" style={{ cursor: 'default' }}>
+                        <CloudOff size={18} style={{ color: 'var(--md-sys-color-error)', flexShrink: 0 }} />
+                        <div className="l4a-list-main">
+                          <span className="md-title-small l4a-truncate">{displayTitle}</span>
+                          <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
+                            #{item.workshopId}
+                          </span>
+                        </div>
+                        {item.localFilePreserved && (
+                          <span className="md-pill" data-tone="surface">
+                            {t('tasks.localPreserved')}
+                          </span>
+                        )}
                       </div>
-                      {item.localFilePreserved && (
-                        <span className="md-pill" data-tone="surface">
-                          {t('tasks.localPreserved')}
-                        </span>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -417,6 +493,9 @@ export function TaskCenterSheet({
                   {syncReport.obsoleteDependencies.map((dep) => {
                     const currentAddon = addonsByWid.get(dep.dependencyWorkshopId);
                     const currentlyInstalled = currentAddon?.installState === 'installed';
+                    const depLabel =
+                      resolveSafeWidTitle(dep.dependencyWorkshopId, dep.dependencyTitle) ??
+                      `#${dep.dependencyWorkshopId}`;
                     const parentLabels = dep.remainingActiveParents
                       .map((wid) => addonLabel(wid) ?? `#${wid}`)
                       .join(', ');
@@ -427,9 +506,7 @@ export function TaskCenterSheet({
                         style={{ cursor: 'default' }}
                       >
                         <div className="l4a-list-main">
-                          <span className="md-title-small l4a-truncate">
-                            {dep.dependencyTitle || `#${dep.dependencyWorkshopId}`}
-                          </span>
+                          <span className="md-title-small l4a-truncate">{depLabel}</span>
                           <span className="md-body-small" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
                             {dep.canSafelyRemove
                               ? t('tasks.safeRemove')
@@ -462,39 +539,46 @@ export function TaskCenterSheet({
                   </span>
                 </div>
                 <div className="l4a-list">
-                  {syncReport.dependencyDiffs.map((diff) => (
-                    <div
-                      key={diff.parentWorkshopId}
-                      className="l4a-list-row"
-                      style={{ cursor: 'default' }}
-                    >
-                      <div className="l4a-list-main">
-                        <span className="md-title-small l4a-truncate">{diff.parentTitle}</span>
-                        <div className="l4a-row-wrap">
-                          {diff.addedDependencies.map((id) => {
-                            const installed = addonsByWid.get(id)?.installState === 'installed';
-                            return (
-                              <Button
-                                key={id}
-                                variant={installed ? 'text' : 'tonal'}
-                                size="sm"
-                                disabled={installed || Boolean(liveDownloads[id])}
-                                icon={<Download size={12} />}
-                                onClick={() => onDownloadItem(id, addonsByWid.get(id)?.title)}
-                              >
-                                +{id}
-                              </Button>
-                            );
-                          })}
-                          {diff.removedDependencies.map((id) => (
-                            <span key={id} className="md-pill md-mono" data-tone="surface">
-                              -{id}
-                            </span>
-                          ))}
+                  {syncReport.dependencyDiffs.map((diff) => {
+                    const parentLabel =
+                      resolveSafeWidTitle(diff.parentWorkshopId, diff.parentTitle) ??
+                      `#${diff.parentWorkshopId}`;
+                    return (
+                      <div
+                        key={diff.parentWorkshopId}
+                        className="l4a-list-row"
+                        style={{ cursor: 'default' }}
+                      >
+                        <div className="l4a-list-main">
+                          <span className="md-title-small l4a-truncate">{parentLabel}</span>
+                          <div className="l4a-row-wrap">
+                            {diff.addedDependencies.map((id) => {
+                              const installed = addonsByWid.get(id)?.installState === 'installed';
+                              return (
+                                <Button
+                                  key={id}
+                                  variant={installed ? 'text' : 'tonal'}
+                                  size="sm"
+                                  disabled={installed || Boolean(liveDownloads[id])}
+                                  icon={<Download size={12} />}
+                                  onClick={() =>
+                                    onDownloadItem(id, safeTitleHint(id, addonsByWid.get(id)?.title))
+                                  }
+                                >
+                                  +{id}
+                                </Button>
+                              );
+                            })}
+                            {diff.removedDependencies.map((id) => (
+                              <span key={id} className="md-pill md-mono" data-tone="surface">
+                                -{id}
+                              </span>
+                            ))}
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -526,7 +610,9 @@ export function TaskCenterSheet({
                                 size="sm"
                                 disabled={installed || Boolean(liveDownloads[id])}
                                 icon={<Download size={12} />}
-                                onClick={() => onDownloadItem(id, addonsByWid.get(id)?.title)}
+                                onClick={() =>
+                                  onDownloadItem(id, safeTitleHint(id, addonsByWid.get(id)?.title))
+                                }
                               >
                                 +{addonLabel(id) ?? id}
                               </Button>

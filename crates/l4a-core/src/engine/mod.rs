@@ -17,18 +17,18 @@ use crate::grouping::rebuild_auto_bundles;
 use crate::reconcile::auto_resolve_by_policy;
 use crate::scanner::scan_workspace;
 use crate::watcher::AddonWatcher;
-use filter::sanitize_filter_config;
+use filter::{sanitize_filter_config, sanitize_filter_config_for_startup};
 use l4a_mirror::MirrorRouter;
-use l4a_protocol::{AppConfig, CoreEvent, DashboardSnapshot, WorkshopId};
+use l4a_protocol::{AppConfig, ClientFilterSourceMode, CoreEvent, DashboardSnapshot, WorkshopId};
 use l4a_steam::{DynamicSteamBridge, SteamBridge, SteamCapabilities};
 use l4a_workshop::{ResilientDownloader, WorkshopResolver};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use workshop::build_resolver_from_config;
 
@@ -44,6 +44,25 @@ impl EventSink for NullEventSink {
 }
 
 type RescanCallback = Arc<dyn Fn() + Send + Sync>;
+
+fn build_reusable_http_clients() -> (reqwest::Client, reqwest::Client, reqwest::Client) {
+    let loopback = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let https_only = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let standard = reqwest::Client::builder()
+        .https_only(false)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    (loopback, https_only, standard)
+}
 
 /// 客户端核心门面：协调本地 SQLite 状态、VPK 扫描与 Dummy v2 对账、生命周期同步、
 /// 断点续传下载与四层分组预设操作。
@@ -66,6 +85,10 @@ pub struct L4aEngine {
     hydration_backoff: Mutex<HashMap<WorkshopId, (u32, Instant)>>,
     local_filter: Arc<LocalFilterManager>,
     token_vault: RwLock<TokenVault>,
+    allow_loopback_image_urls_for_testing: AtomicBool,
+    loopback_http_client: reqwest::Client,
+    https_only_http_client: reqwest::Client,
+    standard_http_client: reqwest::Client,
 }
 
 impl L4aEngine {
@@ -78,7 +101,7 @@ impl L4aEngine {
 
         let mut config = load_config(&paths.settings_path)?;
         config.download_concurrency = config.download_concurrency.clamp(1, 8);
-        let _ = sanitize_filter_config(&mut config.filter);
+        sanitize_filter_config_for_startup(&mut config.filter, config.https_only);
         if config.loading_dir.is_empty() {
             if let Some(detected) = l4a_steam::detect_l4d2_addons_path() {
                 let loading = Path::new(&detected);
@@ -112,7 +135,10 @@ impl L4aEngine {
         let db = Arc::new(LocalDb::open(&paths.db_path)?);
         let resolver = build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
         let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
+        local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
+        let (loopback_http_client, https_only_http_client, standard_http_client) =
+            build_reusable_http_clients();
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -133,6 +159,10 @@ impl L4aEngine {
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
             token_vault,
+            allow_loopback_image_urls_for_testing: AtomicBool::new(false),
+            loopback_http_client,
+            https_only_http_client,
+            standard_http_client,
         })
     }
 
@@ -147,10 +177,13 @@ impl L4aEngine {
     ) -> Result<Self, CoreError> {
         paths.ensure_dirs()?;
         config.download_concurrency = config.download_concurrency.clamp(1, 8);
-        let _ = sanitize_filter_config(&mut config.filter);
+        sanitize_filter_config_for_startup(&mut config.filter, config.https_only);
         mirror.set_https_only(config.https_only);
         let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
+        local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
+        let (loopback_http_client, https_only_http_client, standard_http_client) =
+            build_reusable_http_clients();
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
             download_gate: DownloadGate::new(config.download_concurrency),
@@ -170,7 +203,56 @@ impl L4aEngine {
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
             token_vault,
+            allow_loopback_image_urls_for_testing: AtomicBool::new(false),
+            loopback_http_client,
+            https_only_http_client,
+            standard_http_client,
         })
+    }
+
+    /// Enables loopback (`http://127.0.0.1` / `http://localhost`) image URLs strictly for integration tests.
+    pub fn set_allow_loopback_image_urls_for_testing(&self, allow: bool) {
+        self.allow_loopback_image_urls_for_testing
+            .store(allow, Ordering::Release);
+    }
+
+    pub(crate) fn allow_loopback_image_urls_for_testing(&self) -> bool {
+        self.allow_loopback_image_urls_for_testing
+            .load(Ordering::Acquire)
+    }
+
+    pub(crate) fn loopback_http_client(&self) -> &reqwest::Client {
+        &self.loopback_http_client
+    }
+
+    pub(crate) fn prepare_routed_post(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::RequestBuilder, CoreError> {
+        if crate::filter::llm::is_loopback_url(url) {
+            return Ok(self.loopback_http_client.post(url).timeout(timeout));
+        }
+        let resolved = self
+            .mirror
+            .validate_url(url)
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let https_only = self.config.read().unwrap().https_only;
+        if resolved.insecure_tls && !https_only {
+            let (client, _) = self
+                .mirror
+                .build_client_for(url, Some(timeout))
+                .map_err(|e| CoreError::Network(e.to_string()))?;
+            let (req, _) = self.mirror.prepare_post(&client, url);
+            return Ok(req.timeout(timeout));
+        }
+        let client = if https_only {
+            &self.https_only_http_client
+        } else {
+            &self.standard_http_client
+        };
+        let (req, _) = self.mirror.prepare_post(client, url);
+        Ok(req.timeout(timeout))
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -238,7 +320,7 @@ impl L4aEngine {
         self.db.lock_workspace()
     }
 
-    pub fn save_config(&self, mut next: AppConfig) -> Result<AppConfig, CoreError> {
+    fn apply_saved_config(&self, mut next: AppConfig) -> Result<(AppConfig, bool), CoreError> {
         let workspace = self.lock_workspace()?;
         if next.workshop_dir.is_empty() && !next.loading_dir.is_empty() {
             next.workshop_dir = Path::new(&next.loading_dir)
@@ -247,7 +329,7 @@ impl L4aEngine {
                 .into_owned();
         }
         next.download_concurrency = next.download_concurrency.clamp(1, 8);
-        sanitize_filter_config(&mut next.filter)?;
+        sanitize_filter_config(&mut next.filter, next.https_only)?;
         save_config(&self.paths.settings_path, &next)?;
         let (dirs_changed, filter_params_changed) = {
             let mut guard = self.config.write().unwrap();
@@ -258,6 +340,9 @@ impl L4aEngine {
             *guard = next.clone();
             (changed, params_changed)
         };
+        self.local_filter
+            .set_desired_params(&next.filter.local_params);
+
         if let Some(ref dyn_bridge) = self.dynamic_bridge {
             dyn_bridge.set_enabled(!next.disable_steamworks_sdk);
         }
@@ -274,20 +359,42 @@ impl L4aEngine {
             None
         };
         drop(workspace);
-        if filter_params_changed {
-            if let Err(err) = self
-                .local_filter
-                .reconfigure_params_sync(&next.filter.local_params)
-            {
-                tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
-            }
-        }
         if let Some(err) = watch_error {
             self.events.emit(CoreEvent::WatchError {
                 message: format!("重新绑定目录监听失败: {err}"),
             });
-        };
-        Ok(next)
+        }
+        Ok((next, filter_params_changed))
+    }
+
+    pub fn save_config(&self, next: AppConfig) -> Result<AppConfig, CoreError> {
+        let (saved, filter_params_changed) = self.apply_saved_config(next)?;
+        if filter_params_changed {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let lf = self.local_filter.clone();
+                let params = saved.filter.local_params.clone();
+                handle.spawn(async move {
+                    if let Err(err) = lf.reconfigure_params(&params).await {
+                        tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
+                    }
+                });
+            }
+        }
+        Ok(saved)
+    }
+
+    pub async fn save_config_async(&self, next: AppConfig) -> Result<AppConfig, CoreError> {
+        let (saved, filter_params_changed) = self.apply_saved_config(next)?;
+        if filter_params_changed {
+            if let Err(err) = self
+                .local_filter
+                .reconfigure_params(&saved.filter.local_params)
+                .await
+            {
+                tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
+            }
+        }
+        Ok(saved)
     }
 
     pub fn scan(&self) -> Result<DashboardSnapshot, CoreError> {
@@ -329,8 +436,18 @@ impl L4aEngine {
     }
 
     fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {
+        let config = self.config();
+        let local_sha = if config.filter.mode == ClientFilterSourceMode::Local {
+            self.local_filter.active_commit_sha()
+        } else {
+            None
+        };
+        let policy_sig =
+            crate::filter::evaluator::compute_policy_signature(&config, local_sha.as_deref());
+        let cached_filter_verdicts = self.db.list_filter_verdicts_for_policy(&policy_sig)?;
+
         Ok(DashboardSnapshot {
-            config: self.config(),
+            config,
             addons: self.db.list_addons()?,
             bundles: self.db.list_bundles()?,
             collections: self.db.list_tracked_collections()?,
@@ -339,6 +456,7 @@ impl L4aEngine {
             open_issues: self.db.list_open_reconcile_issues()?,
             tasks: self.db.list_tasks()?,
             filter_exclusions: self.db.list_filter_exclusions()?,
+            cached_filter_verdicts,
         })
     }
 
@@ -347,7 +465,7 @@ impl L4aEngine {
     }
 
     pub async fn shutdown(&self) {
-        let _ = self.local_filter.stop_service().await;
+        self.local_filter.shutdown().await;
         self.steam_bridge.shutdown().await;
     }
 

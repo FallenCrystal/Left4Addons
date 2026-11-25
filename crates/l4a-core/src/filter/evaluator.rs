@@ -8,18 +8,22 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
 use chrono::Utc;
 use futures_util::stream::{self, StreamExt};
-use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     AppConfig, ClientFilterConfig, ClientFilterSourceMode, CoreEvent, FilterDecisionSource,
     FilterEvaluationTarget, FilterItemVerdict, FilterPredictRequest, FilterProbabilities,
 };
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CATALOG_IMAGES: usize = 8;
 const EVAL_CONCURRENCY: usize = 4;
 
-pub fn compute_policy_signature(app_cfg: &AppConfig, local_commit_sha: Option<&str>) -> String {
+pub(crate) fn compute_policy_signature(
+    app_cfg: &AppConfig,
+    local_commit_sha: Option<&str>,
+) -> String {
     let cfg = &app_cfg.filter;
     let mut hasher = Sha256::new();
     hasher.update(b"l4a-filter-policy-v1\0");
@@ -114,6 +118,12 @@ pub fn compute_content_signature(target: &FilterEvaluationTarget, max_images: us
     hex::encode(hasher.finalize())
 }
 
+struct DeduplicatedMiss {
+    indices: Vec<usize>,
+    target: FilterEvaluationTarget,
+    content_sig: String,
+}
+
 pub async fn evaluate_targets(
     engine: &L4aEngine,
     targets: Vec<FilterEvaluationTarget>,
@@ -126,18 +136,6 @@ pub async fn evaluate_targets(
     let cfg = &app_cfg.filter;
     let max_images = effective_max_images(cfg);
 
-    // Pre-start local service once before concurrent target evaluation if configured
-    if cfg.mode == ClientFilterSourceMode::Local
-        && engine.local_filter().active_endpoint().is_none()
-        && cfg.auto_start_local_service
-        && engine.local_filter().is_deployed()
-    {
-        engine
-            .local_filter()
-            .ensure_started_endpoint(&cfg.local_params.sanitized())
-            .await?;
-    }
-
     let local_sha = if cfg.mode == ClientFilterSourceMode::Local {
         engine.local_filter().active_commit_sha()
     } else {
@@ -146,12 +144,22 @@ pub async fn evaluate_targets(
     let policy_sig = compute_policy_signature(&app_cfg, local_sha.as_deref());
 
     let mut ordered_verdicts: Vec<Option<FilterItemVerdict>> = vec![None; targets.len()];
-    let mut misses: Vec<(usize, FilterEvaluationTarget, String)> = Vec::new();
+    let mut miss_groups: Vec<DeduplicatedMiss> = Vec::new();
+    let mut miss_index_by_key: HashMap<(String, String), usize> = HashMap::new();
+    let mut invalid_input_errors: usize = 0;
+    let mut first_error: Option<CoreError> = None;
 
     for (idx, target) in targets.into_iter().enumerate() {
         if target.target_key.trim().is_empty() {
-            return Err(CoreError::InvalidInput("targetKey 不能为空".into()));
+            let err = CoreError::InvalidInput("targetKey 不能为空".into());
+            tracing::warn!(index = idx, error = %err, "过滤目标缺少有效的 targetKey");
+            invalid_input_errors += 1;
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+            continue;
         }
+
         let content_sig = compute_content_signature(&target, max_images);
         if !target.bypass_cache {
             if let Some(cached) = engine.db().get_cached_filter_verdict(
@@ -163,34 +171,103 @@ pub async fn evaluate_targets(
                 continue;
             }
         }
-        misses.push((idx, target, content_sig));
+
+        let dedup_key = (target.target_key.clone(), content_sig.clone());
+        if let Some(&existing_group_idx) = miss_index_by_key.get(&dedup_key) {
+            miss_groups[existing_group_idx].indices.push(idx);
+        } else {
+            let group_idx = miss_groups.len();
+            miss_index_by_key.insert(dedup_key, group_idx);
+            miss_groups.push(DeduplicatedMiss {
+                indices: vec![idx],
+                target,
+                content_sig,
+            });
+        }
     }
 
-    if !misses.is_empty() {
-        let computed: Vec<
-            Result<(usize, String, FilterEvaluationTarget, FilterItemVerdict), CoreError>,
-        > = stream::iter(misses)
-            .map(|(idx, target, content_sig)| {
-                let app_cfg_ref = &app_cfg;
-                async move {
-                    let verdict =
-                        evaluate_single_target(engine, app_cfg_ref, &target, max_images).await?;
-                    Ok((idx, content_sig, target, verdict))
-                }
-            })
-            .buffered(EVAL_CONCURRENCY)
-            .collect()
-            .await;
+    let total_uncached_units = miss_groups.len() + invalid_input_errors;
+    let mut succeeded_uncached_units: usize = 0;
 
-        for item in computed {
-            let (idx, content_sig, target, verdict) = item?;
-            engine.db().put_cached_filter_verdict(
-                &target.target_key,
-                &content_sig,
-                &policy_sig,
-                &verdict,
-            )?;
-            ordered_verdicts[idx] = Some(verdict);
+    if !miss_groups.is_empty() {
+        // Pre-start local service once before concurrent target evaluation if configured
+        let prestart_err = if cfg.mode == ClientFilterSourceMode::Local
+            && engine.local_filter().active_endpoint().is_none()
+            && cfg.auto_start_local_service
+            && engine.local_filter().is_deployed()
+        {
+            engine
+                .local_filter()
+                .ensure_started_endpoint(&cfg.local_params.sanitized())
+                .await
+                .err()
+        } else {
+            None
+        };
+
+        if let Some(err) = prestart_err {
+            tracing::warn!(error = %err, "预启动本地过滤服务失败");
+            if first_error.is_none() {
+                first_error = Some(err);
+            }
+        } else {
+            let policy_sig_ref = &policy_sig;
+            let app_cfg_ref = &app_cfg;
+            let computed: Vec<(Vec<usize>, Result<FilterItemVerdict, CoreError>)> =
+                stream::iter(miss_groups)
+                    .map(|group| async move {
+                        let res =
+                            evaluate_single_target(engine, app_cfg_ref, &group.target, max_images)
+                                .await;
+                        match res {
+                            Ok((verdict, had_load_error)) => {
+                                // Guard against fail-open cache poisoning: never cache a safe verdict
+                                // when one or more preview images failed to load!
+                                if verdict.flagged || !had_load_error {
+                                    if let Err(db_err) = engine.db().put_cached_filter_verdict(
+                                        &group.target.target_key,
+                                        &group.content_sig,
+                                        policy_sig_ref,
+                                        &verdict,
+                                    ) {
+                                        tracing::warn!(
+                                            target_key = %group.target.target_key,
+                                            error = %db_err,
+                                            "写入过滤判定缓存失败"
+                                        );
+                                    }
+                                }
+                                (group.indices, Ok(verdict))
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target_key = %group.target.target_key,
+                                    error = %err,
+                                    "单项内容过滤评估失败"
+                                );
+                                (group.indices, Err(err))
+                            }
+                        }
+                    })
+                    .buffered(EVAL_CONCURRENCY)
+                    .collect()
+                    .await;
+
+            for (indices, outcome) in computed {
+                match outcome {
+                    Ok(verdict) => {
+                        succeeded_uncached_units += 1;
+                        for idx in indices {
+                            ordered_verdicts[idx] = Some(verdict.clone());
+                        }
+                    }
+                    Err(err) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -199,13 +276,23 @@ pub async fn evaluate_targets(
     if !final_verdicts.is_empty() {
         engine.emit_event(CoreEvent::FilterVerdictsUpdated {
             verdicts: final_verdicts.clone(),
+            policy_signature: Some(policy_sig),
         });
+    }
+
+    if total_uncached_units > 0 && succeeded_uncached_units == 0 {
+        if let Some(err) = first_error {
+            return Err(err);
+        }
     }
 
     Ok(final_verdicts)
 }
 
 fn effective_max_images(cfg: &ClientFilterConfig) -> usize {
+    if cfg.mode == ClientFilterSourceMode::Catalog {
+        return MAX_CATALOG_IMAGES;
+    }
     let sanitized = cfg.local_params.sanitized();
     if cfg.mode == ClientFilterSourceMode::Local
         && !sanitized.enable_image
@@ -216,18 +303,72 @@ fn effective_max_images(cfg: &ClientFilterConfig) -> usize {
     sanitized.max_images.clamp(1, 8) as usize
 }
 
+#[derive(Debug, Clone)]
+enum ValidatedRemoteImage {
+    SteamCdn(String),
+    LoopbackTest(String),
+    Mirrored(String),
+}
+
+enum CatalogImageSlot {
+    Preloaded(LoadedImage),
+    DeferredRemote(ValidatedRemoteImage),
+}
+
 async fn evaluate_single_target(
     engine: &L4aEngine,
     app_cfg: &AppConfig,
     target: &FilterEvaluationTarget,
     max_images: usize,
-) -> Result<FilterItemVerdict, CoreError> {
+) -> Result<(FilterItemVerdict, bool), CoreError> {
     let cfg = &app_cfg.filter;
-    let images = resolve_target_images(engine, target, max_images, app_cfg.https_only).await;
-    let images_b64: Vec<String> = images.iter().map(|img| img.b64.clone()).collect();
 
-    let (mut probs, custom_predict_url) =
-        fetch_probabilities(engine, app_cfg, target, &images_b64).await?;
+    let mut had_load_error;
+    let mut loaded_images: Vec<LoadedImage> = Vec::new();
+    let mut catalog_slots: Vec<CatalogImageSlot> = Vec::new();
+
+    let (mut probs, custom_predict_url, effective_img_count) = if cfg.mode
+        == ClientFilterSourceMode::Catalog
+    {
+        let (images_b64, image_urls, slots, prep_err) =
+            prepare_catalog_images(engine, target, max_images).await;
+        had_load_error = prep_err;
+        let count = slots.len();
+        catalog_slots = slots;
+
+        let base = app_cfg
+            .catalog_server_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CoreError::Config("未配置目录服务器地址 (catalogServerUrl)".into()))?;
+        let url = resolve_filter_endpoint_url(
+            base,
+            "/api/v1/filter/predict",
+            &["/api/v1/filter/predict"],
+            "目录服务器地址",
+        )?;
+        let req = FilterPredictRequest {
+            workshop_id: target.workshop_id,
+            title: Some(target.title.clone()),
+            description: target.description.clone(),
+            tags: target.tags.clone(),
+            image_base64: None,
+            images_base64: images_b64,
+            image_urls,
+        };
+        let probs = post_predict_request(engine, &url, &req).await?;
+        (probs, None, count)
+    } else {
+        let (imgs, load_err) = resolve_target_images(engine, target, max_images).await;
+        had_load_error = load_err;
+        let images_b64: Vec<String> = imgs.iter().map(|img| img.b64.clone()).collect();
+        let count = imgs.len();
+        loaded_images = imgs;
+        let (probs, custom_url) =
+            fetch_non_catalog_probabilities(engine, app_cfg, target, &images_b64).await?;
+        (probs, custom_url, count)
+    };
 
     let evaluated_score = probs.score_for(cfg.score_target);
     let flag_threshold = if cfg.flag_threshold.is_finite() {
@@ -245,15 +386,23 @@ async fn evaluate_single_target(
     {
         (true, FilterDecisionSource::ModelDirectFlag)
     } else if cfg.llm_enabled && evaluated_score >= llm_threshold {
+        if cfg.mode == ClientFilterSourceMode::Catalog && cfg.llm_send_images {
+            let (materialized, mat_err) =
+                materialize_catalog_images_for_llm(engine, catalog_slots).await;
+            if mat_err {
+                had_load_error = true;
+            }
+            loaded_images = materialized;
+        }
         let vault = engine.token_vault();
         let is_sensitive = judge_with_openai_llm(
+            engine,
             cfg,
             &vault,
-            engine.mirror_router(),
             &target.title,
             &target.tags,
             target.description.as_deref(),
-            &images,
+            &loaded_images,
         )
         .await?;
         if is_sensitive {
@@ -261,8 +410,6 @@ async fn evaluate_single_target(
         } else {
             (false, FilterDecisionSource::LlmFlaggedFalse)
         }
-    } else if !cfg.enable_direct_flag && !cfg.llm_enabled && evaluated_score >= flag_threshold {
-        (true, FilterDecisionSource::ModelDirectFlag)
     } else {
         (false, FilterDecisionSource::ModelSafe)
     };
@@ -271,14 +418,9 @@ async fn evaluate_single_target(
     // issue follow-up unimodal /predict calls when flagged & subdivide_modalities is true.
     if flagged && cfg.subdivide_modalities {
         if let Some(ref endpoint_url) = custom_predict_url {
-            populate_missing_unimodal_scores(
-                engine.mirror_router(),
-                endpoint_url,
-                target,
-                &images_b64,
-                &mut probs,
-            )
-            .await;
+            let images_b64: Vec<String> = loaded_images.iter().map(|img| img.b64.clone()).collect();
+            populate_missing_unimodal_scores(engine, endpoint_url, target, &images_b64, &mut probs)
+                .await;
         }
     }
 
@@ -288,34 +430,142 @@ async fn evaluate_single_target(
         description_sensitive,
         image_sensitive,
         sensitive_image_indices,
-    ) = compute_modality_subdivision(cfg, target, images.len(), &probs, flagged);
+    ) = compute_modality_subdivision(cfg, target, effective_img_count, &probs, flagged);
 
-    Ok(FilterItemVerdict {
-        target_key: target.target_key.clone(),
-        flagged,
-        decision_source,
-        evaluated_score,
-        probabilities: probs,
-        text_sensitive,
-        title_sensitive,
-        description_sensitive,
-        image_sensitive,
-        sensitive_image_indices,
-        evaluated_at: Utc::now(),
-    })
+    Ok((
+        FilterItemVerdict {
+            target_key: target.target_key.clone(),
+            flagged,
+            decision_source,
+            evaluated_score,
+            probabilities: probs,
+            text_sensitive,
+            title_sensitive,
+            description_sensitive,
+            image_sensitive,
+            sensitive_image_indices,
+            evaluated_at: Utc::now(),
+        },
+        had_load_error,
+    ))
+}
+
+async fn prepare_catalog_images(
+    engine: &L4aEngine,
+    target: &FilterEvaluationTarget,
+    max_images: usize,
+) -> (Vec<String>, Vec<String>, Vec<CatalogImageSlot>, bool) {
+    let mut images_b64 = Vec::new();
+    let mut image_urls = Vec::new();
+    let mut slots = Vec::new();
+    let mut had_load_error = false;
+
+    if max_images == 0 || target.image_sources.is_empty() {
+        return (images_b64, image_urls, slots, false);
+    }
+
+    for raw_src in &target.image_sources {
+        if slots.len() >= max_images {
+            break;
+        }
+        let trimmed = raw_src.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if is_valid_local_cover_key(trimmed)
+            || trimmed
+                .get(..11)
+                .is_some_and(|p| p.eq_ignore_ascii_case("data:image/"))
+        {
+            match load_single_image(engine, trimmed).await {
+                Ok(img) => {
+                    images_b64.push(img.b64.clone());
+                    slots.push(CatalogImageSlot::Preloaded(img));
+                }
+                Err(err) => {
+                    had_load_error = true;
+                    tracing::debug!(source = %trimmed, error = %err, "跳过无法加载的本地/内联过滤预览图");
+                }
+            }
+            continue;
+        }
+
+        if is_remote_image_url(trimmed) {
+            match validate_remote_filter_image_url(engine, trimmed) {
+                Ok(
+                    remote @ (ValidatedRemoteImage::SteamCdn(_)
+                    | ValidatedRemoteImage::LoopbackTest(_)),
+                ) => {
+                    let url_str = match &remote {
+                        ValidatedRemoteImage::SteamCdn(u)
+                        | ValidatedRemoteImage::LoopbackTest(u) => u.clone(),
+                        ValidatedRemoteImage::Mirrored(_) => unreachable!(),
+                    };
+                    image_urls.push(url_str);
+                    slots.push(CatalogImageSlot::DeferredRemote(remote));
+                }
+                Ok(remote @ ValidatedRemoteImage::Mirrored(_)) => {
+                    match fetch_validated_remote_image(engine, &remote).await {
+                        Ok(img) => {
+                            images_b64.push(img.b64.clone());
+                            slots.push(CatalogImageSlot::Preloaded(img));
+                        }
+                        Err(err) => {
+                            had_load_error = true;
+                            tracing::debug!(source = %trimmed, error = %err, "跳过无法通过镜像加载的过滤预览图");
+                        }
+                    }
+                }
+                Err(err) => {
+                    had_load_error = true;
+                    tracing::debug!(source = %trimmed, error = %err, "拒绝不安全的远程过滤预览图地址");
+                }
+            }
+            continue;
+        }
+
+        had_load_error = true;
+        tracing::debug!(source = %trimmed, "跳过不受支持的过滤预览图来源格式");
+    }
+
+    (images_b64, image_urls, slots, had_load_error)
+}
+
+async fn materialize_catalog_images_for_llm(
+    engine: &L4aEngine,
+    slots: Vec<CatalogImageSlot>,
+) -> (Vec<LoadedImage>, bool) {
+    let mut out = Vec::with_capacity(slots.len());
+    let mut had_error = false;
+    for slot in slots {
+        match slot {
+            CatalogImageSlot::Preloaded(img) => out.push(img),
+            CatalogImageSlot::DeferredRemote(remote) => {
+                match fetch_validated_remote_image(engine, &remote).await {
+                    Ok(img) => out.push(img),
+                    Err(err) => {
+                        had_error = true;
+                        tracing::debug!(error = %err, "LLM 复核阶段下载远程预览图失败");
+                    }
+                }
+            }
+        }
+    }
+    (out, had_error)
 }
 
 async fn resolve_target_images(
     engine: &L4aEngine,
     target: &FilterEvaluationTarget,
     max_images: usize,
-    https_only: bool,
-) -> Vec<LoadedImage> {
+) -> (Vec<LoadedImage>, bool) {
     if max_images == 0 || target.image_sources.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     let mut loaded = Vec::with_capacity(max_images.min(target.image_sources.len()));
+    let mut had_load_error = false;
     for raw_src in &target.image_sources {
         if loaded.len() >= max_images {
             break;
@@ -324,21 +574,121 @@ async fn resolve_target_images(
         if trimmed.is_empty() {
             continue;
         }
-        match load_single_image(engine, trimmed, https_only).await {
+        match load_single_image(engine, trimmed).await {
             Ok(img) => loaded.push(img),
             Err(err) => {
+                had_load_error = true;
                 tracing::debug!(source = %trimmed, error = %err, "跳过无法加载的过滤预览图");
             }
         }
     }
-    loaded
+    (loaded, had_load_error)
 }
 
-async fn load_single_image(
+pub(crate) fn is_allowed_steam_cdn_image_url(parsed: &url::Url) -> bool {
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+    {
+        return false;
+    }
+    let Some(raw_host) = parsed.host_str() else {
+        return false;
+    };
+    let host = raw_host.to_ascii_lowercase();
+    if host == "steamusercontent.com"
+        || host.ends_with(".steamusercontent.com")
+        || host == "steamstatic.com"
+        || host.ends_with(".steamstatic.com")
+        || host == "media.steampowered.com"
+    {
+        return true;
+    }
+    if let Some(sub) = host.strip_suffix(".steampowered.com") {
+        if !sub.contains('.')
+            && (sub == "cloud"
+                || sub.starts_with("cloud-")
+                || (sub.starts_with("cloud")
+                    && sub["cloud".len()..].bytes().all(|b| b.is_ascii_digit())))
+            && parsed.path().starts_with("/ugc/")
+        {
+            return true;
+        }
+    }
+    if let Some(prefix) = host.strip_suffix(".akamaihd.net") {
+        if !prefix.contains('.')
+            && (matches!(prefix, "steamuserimages" | "steamcdn")
+                || prefix.starts_with("steamuserimages-")
+                || prefix.starts_with("steamcdn-"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_remote_filter_image_url(
     engine: &L4aEngine,
     src: &str,
-    https_only: bool,
+) -> Result<ValidatedRemoteImage, CoreError> {
+    let normalized = normalize_valid_remote_cover_url(src)
+        .ok_or_else(|| CoreError::InvalidInput("无效的远程预览图地址".into()))?;
+    let mut parsed = url::Url::parse(&normalized)
+        .map_err(|_| CoreError::InvalidInput("无效的远程预览图 URL".into()))?;
+
+    if is_allowed_steam_cdn_image_url(&parsed) {
+        if parsed.scheme() == "http" {
+            let _ = parsed.set_scheme("https");
+        }
+        return Ok(ValidatedRemoteImage::SteamCdn(parsed.into()));
+    }
+
+    if engine.allow_loopback_image_urls_for_testing() && is_loopback_url(&normalized) {
+        return Ok(ValidatedRemoteImage::LoopbackTest(normalized));
+    }
+
+    // Allow non-Steam URLs only if explicitly rewritten by a configured MirrorRouter rule
+    let resolved = engine.mirror_router().resolve(&normalized);
+    let rewritten_by_mirror = resolved.url != normalized
+        || resolved.original_host.is_some()
+        || !resolved.headers.is_empty();
+    if rewritten_by_mirror {
+        engine
+            .mirror_router()
+            .validate_url(&normalized)
+            .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
+        return Ok(ValidatedRemoteImage::Mirrored(normalized));
+    }
+
+    Err(CoreError::InvalidInput(
+        "远程预览图地址不在受信任的 Steam 创意工坊 CDN 白名单内".into(),
+    ))
+}
+
+async fn fetch_validated_remote_image(
+    engine: &L4aEngine,
+    remote: &ValidatedRemoteImage,
 ) -> Result<LoadedImage, CoreError> {
+    match remote {
+        ValidatedRemoteImage::LoopbackTest(url) => {
+            let (mime, bytes) = fetch_loopback_image(engine, url).await?;
+            Ok(LoadedImage {
+                mime,
+                b64: STANDARD.encode(&bytes),
+            })
+        }
+        ValidatedRemoteImage::SteamCdn(url) | ValidatedRemoteImage::Mirrored(url) => {
+            let (mime, bytes) = engine.fetch_workshop_cover(url).await?;
+            Ok(LoadedImage {
+                mime,
+                b64: STANDARD.encode(&bytes),
+            })
+        }
+    }
+}
+
+async fn load_single_image(engine: &L4aEngine, src: &str) -> Result<LoadedImage, CoreError> {
     if is_valid_local_cover_key(src) {
         let bytes = engine.read_cached_image(src)?;
         let mime = detect_image_mime(&bytes, Some(src))?;
@@ -356,20 +706,8 @@ async fn load_single_image(
     }
 
     if is_remote_image_url(src) {
-        let normalized = normalize_valid_remote_cover_url(src)
-            .ok_or_else(|| CoreError::InvalidInput("无效的远程预览图地址".into()))?;
-        if https_only && is_loopback_url(&normalized) {
-            let (mime, bytes) = fetch_loopback_image(&normalized).await?;
-            return Ok(LoadedImage {
-                mime,
-                b64: STANDARD.encode(&bytes),
-            });
-        }
-        let (mime, bytes) = engine.fetch_workshop_cover(&normalized).await?;
-        return Ok(LoadedImage {
-            mime,
-            b64: STANDARD.encode(&bytes),
-        });
+        let remote = validate_remote_filter_image_url(engine, src)?;
+        return fetch_validated_remote_image(engine, &remote).await;
     }
 
     Err(CoreError::InvalidInput("不受支持的图片来源格式".into()))
@@ -377,7 +715,7 @@ async fn load_single_image(
 
 fn decode_data_image_url(src: &str) -> Result<LoadedImage, CoreError> {
     let rest = &src["data:".len()..];
-    let Some((meta, b64_part)) = rest.split_once(",") else {
+    let Some((meta, b64_part)) = rest.split_once(',') else {
         return Err(CoreError::InvalidInput("无效的 data URL".into()));
     };
     let mut meta_parts = meta.split(';');
@@ -423,13 +761,14 @@ fn detect_image_mime(bytes: &[u8], filename_hint: Option<&str>) -> Result<String
     Err(CoreError::InvalidInput("无法识别图片文件格式".into()))
 }
 
-async fn fetch_loopback_image(url: &str) -> Result<(String, Vec<u8>), CoreError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| CoreError::Network(e.to_string()))?;
-    let mut resp = client
+async fn fetch_loopback_image(
+    engine: &L4aEngine,
+    url: &str,
+) -> Result<(String, Vec<u8>), CoreError> {
+    let mut resp = engine
+        .loopback_http_client()
         .get(url)
+        .timeout(Duration::from_secs(15))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -453,7 +792,37 @@ async fn fetch_loopback_image(url: &str) -> Result<(String, Vec<u8>), CoreError>
     Ok((fmt.to_mime_type().to_string(), bytes))
 }
 
-async fn fetch_probabilities(
+pub(crate) fn resolve_filter_endpoint_url(
+    raw_base: &str,
+    append_suffix: &str,
+    preserve_if_ends_with: &[&str],
+    label: &str,
+) -> Result<String, CoreError> {
+    let mut parsed = url::Url::parse(raw_base.trim())
+        .map_err(|_| CoreError::InvalidInput(format!("{label}不是有效的 URL")))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(CoreError::InvalidInput(format!(
+            "{label}仅支持不带内联凭据的 HTTP/HTTPS 协议"
+        )));
+    }
+    let clean_path = parsed.path().trim_end_matches('/').to_string();
+    if preserve_if_ends_with
+        .iter()
+        .any(|sfx| clean_path.ends_with(sfx))
+    {
+        parsed.set_path(&clean_path);
+    } else {
+        parsed.set_path(&format!("{clean_path}{append_suffix}"));
+    }
+    parsed.set_fragment(None);
+    Ok(parsed.into())
+}
+
+async fn fetch_non_catalog_probabilities(
     engine: &L4aEngine,
     app_cfg: &AppConfig,
     target: &FilterEvaluationTarget,
@@ -462,18 +831,7 @@ async fn fetch_probabilities(
     let cfg = &app_cfg.filter;
     match cfg.mode {
         ClientFilterSourceMode::Local => {
-            if engine.local_filter().active_endpoint().is_none() {
-                if cfg.auto_start_local_service && engine.local_filter().is_deployed() {
-                    engine
-                        .local_filter()
-                        .ensure_started_endpoint(&cfg.local_params.sanitized())
-                        .await?;
-                } else {
-                    return Err(CoreError::InvalidInput(
-                        "本地过滤守护进程未运行，请先部署或启动服务".into(),
-                    ));
-                }
-            }
+            let sanitized_params = cfg.local_params.sanitized();
             let probs = engine
                 .local_filter()
                 .predict_local(
@@ -481,32 +839,13 @@ async fn fetch_probabilities(
                     target.description.as_deref(),
                     &target.tags,
                     images_b64,
+                    cfg.auto_start_local_service,
+                    &sanitized_params,
                 )
                 .await?;
             Ok((probs, None))
         }
-        ClientFilterSourceMode::Catalog => {
-            let base = app_cfg
-                .catalog_server_url
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    CoreError::Config("未配置目录服务器地址 (catalogServerUrl)".into())
-                })?;
-            let url = format!("{}/api/v1/filter/predict", base.trim_end_matches('/'));
-            let req = FilterPredictRequest {
-                workshop_id: target.workshop_id,
-                title: Some(target.title.clone()),
-                description: target.description.clone(),
-                tags: target.tags.clone(),
-                image_base64: None,
-                images_base64: images_b64.to_vec(),
-                image_urls: Vec::new(),
-            };
-            let probs = post_predict_request(engine.mirror_router(), &url, &req).await?;
-            Ok((probs, None))
-        }
+        ClientFilterSourceMode::Catalog => unreachable!("handled in evaluate_single_target"),
         ClientFilterSourceMode::CustomEndpoint => {
             let base = cfg
                 .custom_endpoint_url
@@ -515,8 +854,7 @@ async fn fetch_probabilities(
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
                     CoreError::Config("未配置自定义过滤服务端点 (customEndpointUrl)".into())
-                })?
-                .trim_end_matches('/');
+                })?;
 
             let req = FilterPredictRequest {
                 workshop_id: target.workshop_id,
@@ -528,19 +866,31 @@ async fn fetch_probabilities(
                 image_urls: Vec::new(),
             };
 
-            if base.ends_with("/predict") {
-                let probs = post_predict_request(engine.mirror_router(), base, &req).await?;
-                return Ok((probs, Some(base.to_string())));
+            let parsed_base = url::Url::parse(base)
+                .map_err(|_| CoreError::InvalidInput("自定义过滤服务端点不是有效的 URL".into()))?;
+            if parsed_base
+                .path()
+                .trim_end_matches('/')
+                .ends_with("/predict")
+            {
+                let direct_url =
+                    resolve_filter_endpoint_url(base, "", &["/predict"], "自定义过滤服务端点")?;
+                let probs = post_predict_request(engine, &direct_url, &req).await?;
+                return Ok((probs, Some(direct_url)));
             }
 
-            let catalog_style_url = format!("{base}/api/v1/filter/predict");
-            match post_predict_with_status(engine.mirror_router(), &catalog_style_url, &req).await {
+            let catalog_style_url = resolve_filter_endpoint_url(
+                base,
+                "/api/v1/filter/predict",
+                &[],
+                "自定义过滤服务端点",
+            )?;
+            match post_predict_with_status(engine, &catalog_style_url, &req).await {
                 Ok(probs) => Ok((probs, Some(catalog_style_url))),
                 Err(PredictHttpOutcome::NotFound) => {
-                    let raw_predict_url = format!("{base}/predict");
-                    let probs =
-                        post_predict_request(engine.mirror_router(), &raw_predict_url, &req)
-                            .await?;
+                    let raw_predict_url =
+                        resolve_filter_endpoint_url(base, "/predict", &[], "自定义过滤服务端点")?;
+                    let probs = post_predict_request(engine, &raw_predict_url, &req).await?;
                     Ok((probs, Some(raw_predict_url)))
                 }
                 Err(PredictHttpOutcome::Other(err)) => Err(err),
@@ -555,24 +905,13 @@ enum PredictHttpOutcome {
 }
 
 async fn post_predict_with_status(
-    mirror: &MirrorRouter,
+    engine: &L4aEngine,
     url: &str,
     req_body: &FilterPredictRequest,
 ) -> Result<FilterProbabilities, PredictHttpOutcome> {
-    let timeout = Duration::from_secs(30);
-    let builder = if is_loopback_url(url) {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|e| PredictHttpOutcome::Other(CoreError::Network(e.to_string())))?;
-        client.post(url)
-    } else {
-        let (client, _) = mirror
-            .build_client_for(url, Some(timeout))
-            .map_err(|e| PredictHttpOutcome::Other(CoreError::Network(e.to_string())))?;
-        let (req, _) = mirror.prepare_post(&client, url);
-        req
-    };
+    let builder = engine
+        .prepare_routed_post(url, Duration::from_secs(30))
+        .map_err(PredictHttpOutcome::Other)?;
 
     let resp = builder
         .json(req_body)
@@ -595,11 +934,11 @@ async fn post_predict_with_status(
 }
 
 async fn post_predict_request(
-    mirror: &MirrorRouter,
+    engine: &L4aEngine,
     url: &str,
     req_body: &FilterPredictRequest,
 ) -> Result<FilterProbabilities, CoreError> {
-    match post_predict_with_status(mirror, url, req_body).await {
+    match post_predict_with_status(engine, url, req_body).await {
         Ok(probs) => Ok(probs),
         Err(PredictHttpOutcome::NotFound) => Err(CoreError::NotFound(format!(
             "过滤预测接口不存在 (404): {url}"
@@ -609,7 +948,7 @@ async fn post_predict_request(
 }
 
 async fn populate_missing_unimodal_scores(
-    mirror: &MirrorRouter,
+    engine: &L4aEngine,
     predict_url: &str,
     target: &FilterEvaluationTarget,
     images_b64: &[String],
@@ -632,7 +971,7 @@ async fn populate_missing_unimodal_scores(
             images_base64: Vec::new(),
             image_urls: Vec::new(),
         };
-        if let Ok(tp) = post_predict_request(mirror, predict_url, &txt_req).await {
+        if let Ok(tp) = post_predict_request(engine, predict_url, &txt_req).await {
             probs.text_prob = Some(tp.prob);
             probs.text_gore_prob = Some(tp.gore_prob);
             probs.text_nsfw_prob = Some(tp.nsfw_prob);
@@ -647,7 +986,7 @@ async fn populate_missing_unimodal_scores(
                     tags: target.tags.clone(),
                     ..Default::default()
                 };
-                if let Ok(tr) = post_predict_request(mirror, predict_url, &title_req).await {
+                if let Ok(tr) = post_predict_request(engine, predict_url, &title_req).await {
                     probs.title_prob = Some(tr.prob);
                 }
             }
@@ -661,7 +1000,7 @@ async fn populate_missing_unimodal_scores(
                     description: target.description.clone(),
                     ..Default::default()
                 };
-                if let Ok(dr) = post_predict_request(mirror, predict_url, &desc_req).await {
+                if let Ok(dr) = post_predict_request(engine, predict_url, &desc_req).await {
                     probs.description_prob = Some(dr.prob);
                 }
             }
@@ -679,7 +1018,7 @@ async fn populate_missing_unimodal_scores(
                 images_base64: vec![b64.clone()],
                 ..Default::default()
             };
-            match post_predict_request(mirror, predict_url, &img_req).await {
+            match post_predict_request(engine, predict_url, &img_req).await {
                 Ok(ir) => {
                     per_img.push(ir.prob);
                     max_ov = max_ov.max(ir.prob);
@@ -860,4 +1199,70 @@ pub fn compute_modality_subdivision(
         image_sensitive,
         sensitive_image_indices,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steam_cdn_allowlist_accepts_trusted_hosts_and_rejects_ssrf_targets() {
+        for valid in [
+            "https://images.steamusercontent.com/ugc/123/abc/",
+            "http://steamuserimages-a.akamaihd.net/ugc/123/abc.jpg",
+            "https://steamcdn-a.akamaihd.net/steamcommunity/public/images/items/550/a.jpg",
+            "https://cdn.cloudflare.steamstatic.com/steam/apps/550/header.jpg",
+            "https://media.steampowered.com/steamcommunity/public/images/avatars/aa/bb.jpg",
+            "http://cloud-3.steampowered.com/ugc/999/preview.jpg",
+            "http://cloud.steampowered.com/ugc/999/preview.jpg",
+        ] {
+            let parsed = url::Url::parse(valid).unwrap();
+            assert!(
+                is_allowed_steam_cdn_image_url(&parsed),
+                "expected {valid} to be allowed"
+            );
+        }
+
+        for rejected in [
+            "https://evil-steamusercontent.com/ugc/123/a.jpg",
+            "https://evil.example.com/a.jpg",
+            "http://127.0.0.1:8080/a.jpg",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.1/a.jpg",
+            "https://10.0.0.1/a.jpg",
+            "http://cloud.steampowered.com/non-ugc/preview.jpg",
+            "https://images.steamusercontent.com:8443/ugc/123/a.jpg",
+            "https://user:pass@images.steamusercontent.com/ugc/123/a.jpg",
+        ] {
+            let parsed = url::Url::parse(rejected).unwrap();
+            assert!(
+                !is_allowed_steam_cdn_image_url(&parsed),
+                "expected {rejected} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_url_append_preserves_query_parameters() {
+        assert_eq!(
+            resolve_filter_endpoint_url(
+                "https://filter.example.com/base?token=abc&v=2",
+                "/api/v1/filter/predict",
+                &["/api/v1/filter/predict"],
+                "endpoint"
+            )
+            .unwrap(),
+            "https://filter.example.com/base/api/v1/filter/predict?token=abc&v=2"
+        );
+        assert_eq!(
+            resolve_filter_endpoint_url(
+                "https://filter.example.com/predict/?token=abc",
+                "",
+                &["/predict"],
+                "endpoint"
+            )
+            .unwrap(),
+            "https://filter.example.com/predict?token=abc"
+        );
+    }
 }

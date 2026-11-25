@@ -17,10 +17,12 @@ import {
 } from '../ipc';
 import {
   adjustProbabilities,
+  buildAddonFilterTarget,
   computeFilterPolicySignature,
   createDefaultModelParams,
   sanitizeModelParams,
   scoreForTarget,
+  type FilterPolicySignatureOptions,
 } from '../../utils/contentFilter';
 import type { PreviewEmit } from './workshop';
 
@@ -96,14 +98,13 @@ export function reconcilePreviewExclusions(state: DashboardSnapshot): void {
   const addonsById = new Map(state.addons.map((a) => [a.id, a]));
   for (const excl of state.filterExclusions) {
     const addon = addonsById.get(excl.addonId);
-    excl.currentFingerprint = addon?.contentHash;
+    const activeHash = addon?.installState === 'installed' ? addon.contentHash : undefined;
+    excl.currentFingerprint = activeHash;
     if (!excl.bindFingerprint) {
       excl.fingerprintValid = true;
     } else {
       excl.fingerprintValid = Boolean(
-        excl.boundFingerprint &&
-          addon?.contentHash &&
-          excl.boundFingerprint === addon.contentHash,
+        excl.boundFingerprint && activeHash && excl.boundFingerprint === activeHash,
       );
     }
   }
@@ -116,8 +117,9 @@ export function upsertPreviewFilterExclusion(
 ): DashboardSnapshot {
   const addon = state.addons.find((a) => a.id === request.addonId);
   const now = new Date().toISOString();
-  const bindFingerprint = Boolean(request.bindFingerprint && addon?.contentHash);
-  const boundFingerprint = bindFingerprint ? addon?.contentHash : undefined;
+  const activeHash = addon?.installState === 'installed' ? addon.contentHash : undefined;
+  const bindFingerprint = Boolean(request.bindFingerprint && activeHash);
+  const boundFingerprint = bindFingerprint ? activeHash : undefined;
   const existingIdx = state.filterExclusions.findIndex((e) => e.addonId === request.addonId);
 
   const nextRecord: FilterExclusionRecord = {
@@ -125,7 +127,7 @@ export function upsertPreviewFilterExclusion(
     displayLevel: request.displayLevel,
     bindFingerprint,
     boundFingerprint,
-    currentFingerprint: addon?.contentHash,
+    currentFingerprint: activeHash,
     fingerprintValid: !bindFingerprint || Boolean(boundFingerprint),
     note: request.note?.trim() || undefined,
     createdAt: existingIdx >= 0 ? state.filterExclusions[existingIdx].createdAt : now,
@@ -190,6 +192,23 @@ export class PreviewFilterRuntime {
 
   getStatus(): LocalFilterDeploymentStatus {
     return structuredClone(this.status);
+  }
+
+  getCachedVerdictsForSnapshot(state: DashboardSnapshot): FilterItemVerdict[] {
+    const policySig = computeFilterPolicySignature(state.config.filter, {
+      catalogServerUrl: state.config.catalogServerUrl,
+      httpsOnly: state.config.httpsOnly,
+    });
+    const out: FilterItemVerdict[] = [];
+    for (const addon of state.addons) {
+      const target = buildAddonFilterTarget(addon);
+      const cacheKey = `${policySig}::${target.targetKey}::${target.revisionHint ?? ''}`;
+      const hit = this.cache.get(cacheKey);
+      if (hit) {
+        out.push(structuredClone(hit));
+      }
+    }
+    return out;
   }
 
   checkUpdates(emit: PreviewEmit): LocalFilterDeploymentStatus {
@@ -290,12 +309,13 @@ export class PreviewFilterRuntime {
     targets: FilterEvaluationTarget[],
     config: ClientFilterConfig,
     emit: PreviewEmit,
+    policyOptions?: FilterPolicySignatureOptions,
   ): FilterItemVerdict[] {
     if (config.mode === 'local' && this.status.serviceState !== 'running') {
       throw new IpcError('config', 'Local Left4Filters service is not running');
     }
 
-    const policySig = computeFilterPolicySignature(config);
+    const policySig = computeFilterPolicySignature(config, policyOptions);
     const params =
       config.mode === 'local'
         ? sanitizeModelParams(config.localParams)
@@ -379,25 +399,74 @@ export class PreviewFilterRuntime {
           BORDERLINE_GORE_REGEX.test(combinedText);
         flagged = llmFlag;
         decisionSource = llmFlag ? 'llm_flagged_true' : 'llm_flagged_false';
+      } else if (!config.enableDirectFlag && !config.llmEnabled && evaluatedScore >= config.flagThreshold) {
+        flagged = true;
+        decisionSource = 'model_direct_flag';
       }
 
-      const modThresh = config.modalityThreshold;
-      const titleSensitive = (probabilities.titleProb ?? 0) >= modThresh;
-      const descriptionSensitive = (probabilities.descriptionProb ?? 0) >= modThresh;
-      const textSensitive =
-        (probabilities.textProb ?? 0) >= modThresh || titleSensitive || descriptionSensitive;
+      let textSensitive = false;
+      let titleSensitive = false;
+      let descriptionSensitive = false;
+      let imageSensitive = false;
+      let sensitiveImageIndices: number[] = [];
 
-      const adjPerImage = probabilities.perImageProbs ?? [];
-      const sensitiveImageIndices: number[] = [];
-      adjPerImage.forEach((p, idx) => {
-        if (p >= modThresh) {
-          sensitiveImageIndices.push(idx);
+      if (flagged) {
+        const hasTitle = Boolean(target.title.trim() || target.tags.length > 0);
+        const hasDesc = Boolean(target.description?.trim());
+        const hasText = hasTitle || hasDesc;
+        const nImgs = rawSources.length;
+
+        if (!config.subdivideModalities) {
+          textSensitive = hasText || nImgs === 0;
+          titleSensitive = hasTitle || (!hasDesc && textSensitive);
+          descriptionSensitive = hasDesc;
+          imageSensitive = nImgs > 0;
+          sensitiveImageIndices = Array.from({ length: nImgs }, (_, idx) => idx);
+        } else {
+          const modThresh = Number.isFinite(config.modalityThreshold)
+            ? Math.min(0.95, Math.max(0.05, config.modalityThreshold))
+            : 0.3;
+          titleSensitive = hasTitle && (probabilities.titleProb ?? 0) >= modThresh;
+          descriptionSensitive = hasDesc && (probabilities.descriptionProb ?? 0) >= modThresh;
+          textSensitive =
+            hasText &&
+            ((probabilities.textProb ?? 0) >= modThresh || titleSensitive || descriptionSensitive);
+
+          const adjPerImage = probabilities.perImageProbs ?? [];
+          adjPerImage.forEach((p, idx) => {
+            if (p >= modThresh) {
+              sensitiveImageIndices.push(idx);
+            }
+          });
+          imageSensitive =
+            nImgs > 0 &&
+            ((probabilities.imageProb ?? 0) >= modThresh ||
+              sensitiveImageIndices.length > 0 ||
+              !textSensitive);
+
+          if (textSensitive && !titleSensitive && !descriptionSensitive) {
+            if (hasTitle && !hasDesc) titleSensitive = true;
+            else if (!hasTitle && hasDesc) descriptionSensitive = true;
+            else if ((probabilities.titleProb ?? 0) >= (probabilities.descriptionProb ?? 0)) {
+              titleSensitive = true;
+            } else {
+              descriptionSensitive = true;
+            }
+          }
+
+          if (imageSensitive && sensitiveImageIndices.length === 0 && nImgs > 0) {
+            if (adjPerImage.length > 0) {
+              let bestIdx = 0;
+              adjPerImage.forEach((p, idx) => {
+                if (p > (adjPerImage[bestIdx] ?? -1)) bestIdx = idx;
+              });
+              sensitiveImageIndices.push(bestIdx);
+            } else {
+              sensitiveImageIndices = Array.from({ length: nImgs }, (_, idx) => idx);
+            }
+          }
         }
-      });
-      const imageSensitive =
-        (probabilities.imageProb ?? 0) >= modThresh ||
-        sensitiveImageIndices.length > 0 ||
-        (flagged && !textSensitive);
+      }
 
       const verdict: FilterItemVerdict = {
         targetKey: target.targetKey,
@@ -420,7 +489,11 @@ export class PreviewFilterRuntime {
     }
 
     if (verdicts.length > 0) {
-      emit({ type: 'filter_verdicts_updated', verdicts: structuredClone(verdicts) });
+      emit({
+        type: 'filter_verdicts_updated',
+        verdicts: structuredClone(verdicts),
+        policySignature: policySig,
+      });
     }
     return verdicts;
   }

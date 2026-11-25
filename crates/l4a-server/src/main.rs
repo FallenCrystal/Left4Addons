@@ -43,7 +43,8 @@ async fn main() -> anyhow::Result<()> {
         cfg,
     ));
     let state = ServerState::from_config_store_with_db_path(store, &db_path)?;
-    let _worker_token = state.sync.spawn_background_workers();
+    let worker_token = state.sync.spawn_background_workers();
+    let filter_service = state.filter.clone();
 
     if generated_password {
         tracing::info!(
@@ -63,6 +64,41 @@ async fn main() -> anyhow::Result<()> {
         "l4a-server (SteamKit CM Catalog) 已启动"
     );
 
-    axum::serve(listener, build_router(state)).await?;
+    let serve_result = axum::serve(listener, build_router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    worker_token.cancel();
+    filter_service.shutdown().await;
+    serve_result?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %err, "无法注册 Ctrl+C 退出信号监听");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "无法注册 SIGTERM 退出信号监听");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("收到退出信号，正在优雅停止 l4a-server 与托管过滤子进程…");
 }

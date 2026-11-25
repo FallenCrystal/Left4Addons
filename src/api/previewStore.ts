@@ -72,6 +72,7 @@ class PreviewEngine {
 
   private cloneSnapshot(): DashboardSnapshot {
     reconcilePreviewExclusions(this.state);
+    this.state.cachedFilterVerdicts = this.filterRuntime.getCachedVerdictsForSnapshot(this.state);
     return structuredClone(this.state);
   }
 
@@ -318,7 +319,26 @@ class PreviewEngine {
   async deployLocalFilter(
     request: DeployLocalFilterRequest,
   ): Promise<LocalFilterDeploymentStatus> {
-    return this.filterRuntime.deploy(request, this.emit);
+    const status = this.filterRuntime.deploy(request, this.emit);
+    let changed = false;
+    const trimmedRepo = request.repoUrl?.trim();
+    if (trimmedRepo && this.state.config.filter.repoUrl !== trimmedRepo) {
+      this.state.config.filter.repoUrl = trimmedRepo;
+      changed = true;
+    }
+    if (this.state.config.filter.trackLatest !== request.trackLatest) {
+      this.state.config.filter.trackLatest = request.trackLatest;
+      changed = true;
+    }
+    const nextPinned = request.trackLatest ? null : (request.targetCommit?.trim() || null);
+    if ((this.state.config.filter.pinnedCommit ?? null) !== nextPinned) {
+      this.state.config.filter.pinnedCommit = nextPinned;
+      changed = true;
+    }
+    if (changed) {
+      this.emit({ type: 'snapshot_updated', externalChange: false });
+    }
+    return status;
   }
 
   async startLocalFilterService(): Promise<LocalFilterDeploymentStatus> {
@@ -340,7 +360,10 @@ class PreviewEngine {
   async evaluateFilterItems(
     targets: FilterEvaluationTarget[],
   ): Promise<FilterItemVerdict[]> {
-    return this.filterRuntime.evaluateItems(targets, this.state.config.filter, this.emit);
+    return this.filterRuntime.evaluateItems(targets, this.state.config.filter, this.emit, {
+      catalogServerUrl: this.state.config.catalogServerUrl,
+      httpsOnly: this.state.config.httpsOnly,
+    });
   }
 
   async clearFilterCache(): Promise<number> {
