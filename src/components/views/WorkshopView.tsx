@@ -23,6 +23,7 @@ import {
   type SearchQuery,
   type SearchResponse,
   type TrackedCollectionRecord,
+  type WorkshopFileType,
   type WorkshopItemRecord,
 } from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
@@ -43,6 +44,7 @@ import {
   IconButton,
   LinearProgress,
   LoadingIndicator,
+  SegmentedButton,
   Select,
   SideSheet,
 } from '../m3/primitives';
@@ -100,12 +102,14 @@ export function WorkshopView({
   const [draftQuery, setDraftQuery] = useState('');
   const [searchParams, setSearchParams] = useState<{
     query: string;
+    fileType: WorkshopFileType;
     tag?: string;
     sort: string;
     page: number;
     retryNonce: number;
   }>({
     query: '',
+    fileType: 'item',
     tag: undefined,
     sort: 'relevance',
     page: 1,
@@ -156,6 +160,7 @@ export function WorkshopView({
       page: searchParams.page,
       pageSize: 24,
       language: searchLanguage,
+      fileType: searchParams.fileType === 'item' ? undefined : searchParams.fileType,
     })
       .then((res) => {
         if (!active || seq !== searchSeqRef.current) return;
@@ -432,6 +437,19 @@ export function WorkshopView({
       </header>
 
       <div className="l4a-view-toolbar">
+        <SegmentedButton<WorkshopFileType>
+          ariaLabel={t('workshop.contentType')}
+          value={searchParams.fileType}
+          onChange={(next) =>
+            setSearchParams((prev) =>
+              prev.fileType === next ? prev : { ...prev, fileType: next, page: 1 },
+            )
+          }
+          options={[
+            { value: 'item', label: t('workshop.type.item') },
+            { value: 'collection', label: t('workshop.type.collection') },
+          ]}
+        />
         <div className="md-chip-row">
           <FilterChip
             label={t('common.all')}

@@ -10,14 +10,16 @@ use l4a_protocol::{
 use std::sync::Arc;
 use std::time::Duration;
 
-// The catalog server can spend up to 15 seconds waiting for Steam before using SQLite.
-const SEARCH_TIMEOUT: Duration = Duration::from_secs(20);
+// At the maximum 15s Steam timeout, the catalog server can spend up to 2s waiting for a
+// local search slot and 5s executing the SQLite fallback, plus response transfer margin.
+pub const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 接入自托管 `l4a-server` 创意工坊信息管理后端的客户端 Provider。
 pub struct CatalogBackendProvider {
     base_url: String,
     mirror: Arc<MirrorRouter>,
     timeout: Duration,
+    search_timeout: Duration,
 }
 
 impl CatalogBackendProvider {
@@ -26,7 +28,12 @@ impl CatalogBackendProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             mirror,
             timeout: Duration::from_secs(15),
+            search_timeout: SEARCH_TIMEOUT,
         }
+    }
+
+    pub fn search_timeout(&self) -> Duration {
+        self.search_timeout
     }
 }
 
@@ -153,7 +160,7 @@ impl WorkshopProvider for CatalogBackendProvider {
         let url = format!("{}/api/v1/items/search", self.base_url);
         let (client, _) = self
             .mirror
-            .build_client_for(&url, Some(SEARCH_TIMEOUT))
+            .build_client_for(&url, Some(self.search_timeout))
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
         let page = query.page.max(1);

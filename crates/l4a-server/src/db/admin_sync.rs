@@ -75,7 +75,17 @@ impl ServerRepo {
                 }
             };
 
-            Self::upsert_item_tx(tx, &next_record, true, replace_deps, true, None, Some(true))?;
+            Self::upsert_item_tx(
+                tx,
+                &next_record,
+                true,
+                replace_deps,
+                true,
+                None,
+                None,
+                None,
+                Some(true),
+            )?;
             let reason = req
                 .reason
                 .filter(|s| !s.trim().is_empty())

@@ -36,6 +36,7 @@ impl ServerRepo {
                 fetched_at TEXT NOT NULL,
                 removed_at TEXT,
                 last_verified_at TEXT NOT NULL,
+                visibility_verified_at TEXT,
                 is_listed INTEGER,
                 steam_version INTEGER,
                 catalog_indexed INTEGER NOT NULL DEFAULT 0
@@ -115,6 +116,16 @@ impl ServerRepo {
                 [],
             )?;
         }
+        if !has_column(conn, "workshop_items", "visibility_verified_at")? {
+            conn.execute(
+                "ALTER TABLE workshop_items ADD COLUMN visibility_verified_at TEXT",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE workshop_items SET visibility_verified_at = last_verified_at WHERE is_listed IS NOT NULL",
+                [],
+            )?;
+        }
         if !has_column(conn, "workshop_items", "steam_version")? {
             conn.execute(
                 "ALTER TABLE workshop_items ADD COLUMN steam_version INTEGER",
@@ -144,10 +155,27 @@ impl ServerRepo {
                 ],
             )?;
         }
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public
-             ON workshop_items(catalog_indexed, is_listed, file_type, subscriptions DESC, workshop_id ASC)",
-            [],
+        conn.execute_batch(
+            r#"
+            DROP INDEX IF EXISTS idx_workshop_items_catalog_public;
+            CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_public_v2
+                ON workshop_items(
+                    catalog_indexed,
+                    is_listed,
+                    file_type,
+                    COALESCE(subscriptions, 0) DESC,
+                    workshop_id ASC
+                );
+            CREATE INDEX IF NOT EXISTS idx_workshop_items_catalog_relevance_v1
+                ON workshop_items(
+                    catalog_indexed,
+                    is_listed,
+                    file_type,
+                    COALESCE(subscriptions, 0) DESC,
+                    COALESCE(time_updated, 0) DESC,
+                    workshop_id ASC
+                );
+            "#,
         )?;
         if has_column(conn, "workshop_item_revisions", "trust_score")? {
             conn.execute(

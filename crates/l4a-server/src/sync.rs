@@ -636,7 +636,8 @@ impl CatalogSyncCoordinator {
 
         let next_cursor = page
             .next_cursor
-            .filter(|c| c != &cursor && c != "*" && !page.outcomes.is_empty())
+            .map(|c| c.trim().to_string())
+            .filter(|c| !is_terminal_or_stalled_cursor(c, &cursor))
             .unwrap_or_else(|| "DONE".to_string());
         let written = self
             .db_call(move |r| r.apply_backfill_page(&page.outcomes, &next_cursor, page.total))
@@ -757,6 +758,14 @@ impl CatalogSyncCoordinator {
 
 fn is_stale(last_verified_at: DateTime<Utc>, ttl_secs: u64) -> bool {
     (Utc::now() - last_verified_at).num_seconds().max(0) as u64 >= ttl_secs
+}
+
+fn is_terminal_or_stalled_cursor(next: &str, current: &str) -> bool {
+    next.is_empty()
+        || next == current
+        || next == "*"
+        || next.eq_ignore_ascii_case("done")
+        || next.eq_ignore_ascii_case("null")
 }
 
 pub(crate) fn with_catalog_source(mut record: WorkshopItemRecord) -> WorkshopItemRecord {

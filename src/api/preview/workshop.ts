@@ -77,30 +77,36 @@ export function searchPreviewWorkshop(query: SearchQuery): SearchResponse {
   const tag = query.tag?.trim().toLowerCase();
   const target = (query.searchTarget ?? 'all').trim().toLowerCase();
   const numericOnly = q.replace(/^#/, '');
-  const isDirectIdOrUrl =
+  const isPureUrl =
     /^https?:\/\/(www\.)?steamcommunity\.com\/(sharedfiles|workshop)\/filedetails\/?/i.test(
       rawQuery,
-    ) ||
-    /^steam:\/\/url\/CommunityFilePage\/\d+$/i.test(rawQuery) ||
-    (/^\d{6,}$/.test(numericOnly) && target !== 'description');
-  const effectiveFileType = query.fileType ?? (isDirectIdOrUrl ? undefined : 'item');
+    ) || /^steam:\/\/url\/CommunityFilePage\/\d+$/i.test(rawQuery);
+  const isTitleTarget = target === 'title' || target === '1';
+  const isDescTarget = target === 'description' || target === 'desc' || target === '2';
+  const isBareLongId = /^\d{6,}$/.test(numericOnly) && !isTitleTarget && !isDescTarget;
+  const effectiveFileType = query.fileType ?? (isPureUrl ? undefined : 'item');
 
   let items = PREVIEW_CATALOG.filter((item) => {
-    if (effectiveFileType && item.fileType !== effectiveFileType) {
+    const allowUntypedExact = !query.fileType && isBareLongId && item.workshopId === numericOnly;
+    if (effectiveFileType && !allowUntypedExact && item.fileType !== effectiveFileType) {
       return false;
     }
     if (q) {
-      const idMatch = item.workshopId === numericOnly || item.workshopId.includes(q);
-      const hit =
-        target === 'title' || target === '1'
+      if (isPureUrl) {
+        const urlId = rawQuery.match(/(?:[?&]id=|\/CommunityFilePage\/)(\d+)/i)?.[1];
+        if (!urlId || item.workshopId !== urlId) return false;
+      } else {
+        const idMatch = item.workshopId === numericOnly || item.workshopId.includes(q);
+        const hit = isTitleTarget
           ? item.title.toLowerCase().includes(q)
-          : target === 'description' || target === 'desc' || target === '2'
+          : isDescTarget
             ? (item.description ?? '').toLowerCase().includes(q)
             : item.title.toLowerCase().includes(q) ||
               idMatch ||
               (item.creatorName ?? '').toLowerCase().includes(q) ||
               (item.description ?? '').toLowerCase().includes(q);
-      if (!hit) return false;
+        if (!hit) return false;
+      }
     }
     if (tag && !item.tags.some((t) => t.toLowerCase() === tag)) {
       return false;

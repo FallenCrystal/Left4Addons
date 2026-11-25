@@ -36,7 +36,8 @@ impl ServerRepo {
                     time_created, time_updated, tags_json, collection_children_json,
                     subscriptions, favorites, is_admin_override, source,
                     fetched_at, removed_at, last_verified_at, steam_version,
-                    catalog_indexed, is_listed
+                    catalog_indexed, is_listed,
+                    COALESCE(visibility_verified_at, last_verified_at)
              FROM workshop_items WHERE workshop_id = ?1",
         )?;
 
@@ -54,6 +55,7 @@ impl ServerRepo {
                 let verified_str: String = r.get(20)?;
                 let catalog_indexed: i64 = r.get(22)?;
                 let is_listed: Option<i64> = r.get(23)?;
+                let vis_verified_str: String = r.get(24)?;
 
                 let record = WorkshopItemRecord {
                     workshop_id,
@@ -82,6 +84,9 @@ impl ServerRepo {
                     record,
                     is_admin_override: is_override != 0,
                     last_verified_at: verified_str.parse().unwrap_or(DateTime::UNIX_EPOCH),
+                    visibility_verified_at: vis_verified_str
+                        .parse()
+                        .unwrap_or(DateTime::UNIX_EPOCH),
                     removed_at: removed_str.as_deref().map(parse_rfc3339_or_now),
                     steam_version: r.get(21)?,
                     catalog_indexed: catalog_indexed != 0,
@@ -166,8 +171,9 @@ impl ServerRepo {
             for chunk in unique_i64.chunks(500) {
                 let placeholders = vec!["?"; chunk.len()].join(", ");
                 let sql = format!(
-                    "SELECT workshop_id, status, is_admin_override, last_verified_at,
-                            catalog_indexed, is_listed, creator_name
+                    "SELECT workshop_id, status, is_admin_override,
+                            COALESCE(visibility_verified_at, last_verified_at),
+                            steam_version, catalog_indexed, is_listed, creator_name
                      FROM workshop_items
                      WHERE workshop_id IN ({placeholders})"
                 );
@@ -177,15 +183,19 @@ impl ServerRepo {
                     let status_str: String = r.get(1)?;
                     let is_override: i64 = r.get(2)?;
                     let verified_str: String = r.get(3)?;
-                    let catalog_indexed: i64 = r.get(4)?;
-                    let is_listed: Option<i64> = r.get(5)?;
-                    let creator_name: Option<String> = r.get(6)?;
+                    let steam_version: Option<i64> = r.get(4)?;
+                    let catalog_indexed: i64 = r.get(5)?;
+                    let is_listed: Option<i64> = r.get(6)?;
+                    let creator_name: Option<String> = r.get(7)?;
                     Ok((
                         wid,
                         OverlayItemMeta {
                             status: parse_json_enum(&status_str, WorkshopItemStatus::Unknown),
                             is_admin_override: is_override != 0,
-                            last_verified_at: verified_str.parse().unwrap_or(DateTime::UNIX_EPOCH),
+                            visibility_verified_at: verified_str
+                                .parse()
+                                .unwrap_or(DateTime::UNIX_EPOCH),
+                            steam_version,
                             catalog_indexed: catalog_indexed != 0,
                             is_listed: is_listed.map(|v| v != 0),
                             creator_name,
@@ -245,11 +255,16 @@ impl ServerRepo {
                 replace_deps,
                 true,
                 (!is_admin_override).then_some(true),
+                (!is_admin_override).then_some(record.fetched_at),
+                (!is_admin_override)
+                    .then_some(record.time_updated)
+                    .flatten(),
                 Some(true),
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn upsert_item_tx(
         tx: &Connection,
         record: &WorkshopItemRecord,
@@ -257,6 +272,8 @@ impl ServerRepo {
         replace_deps: bool,
         record_revision: bool,
         listed: Option<bool>,
+        visibility_verified_at: Option<DateTime<Utc>>,
+        steam_version: Option<i64>,
         catalog_indexed: Option<bool>,
     ) -> anyhow::Result<()> {
         let wid = workshop_id_to_i64(record.workshop_id)?;
@@ -287,11 +304,11 @@ impl ServerRepo {
                 creator_name, preview_url, previews_json, file_url, file_size,
                 time_created, time_updated, tags_json, collection_children_json,
                 subscriptions, favorites, is_admin_override, source,
-                fetched_at, removed_at, last_verified_at, is_listed, steam_version,
-                catalog_indexed
+                fetched_at, removed_at, last_verified_at, visibility_verified_at,
+                is_listed, steam_version, catalog_indexed
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?20,
+                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?20, COALESCE(?25, ?20),
                 COALESCE(?22, ?18), ?23, COALESCE(?24, ?18)
             )
             ON CONFLICT(workshop_id) DO UPDATE SET
@@ -316,6 +333,7 @@ impl ServerRepo {
                 fetched_at = excluded.fetched_at,
                 removed_at = CASE WHEN excluded.status = 'active' THEN NULL ELSE COALESCE(workshop_items.removed_at, excluded.removed_at) END,
                 last_verified_at = excluded.last_verified_at,
+                visibility_verified_at = COALESCE(?25, workshop_items.visibility_verified_at, excluded.last_verified_at),
                 is_listed = COALESCE(?22, workshop_items.is_listed),
                 steam_version = COALESCE(excluded.steam_version, workshop_items.steam_version),
                 catalog_indexed = CASE
@@ -349,8 +367,9 @@ impl ServerRepo {
                 record.fetched_at.to_rfc3339(),
                 removed_at,
                 listed,
-                listed.and(record.time_updated),
+                steam_version,
                 catalog_indexed,
+                visibility_verified_at.map(|dt| dt.to_rfc3339()),
             ],
             |r| {
                 if searchable_fields_unchanged {

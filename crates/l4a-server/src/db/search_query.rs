@@ -48,10 +48,11 @@ struct SearchFilters {
     status: Option<String>,
     public_only: bool,
     file_type: Option<String>,
+    exact_untyped_id: Option<i64>,
 }
 
 impl SearchFilters {
-    fn new(query: &SearchQuery, public_only: bool) -> Self {
+    fn new(query: &SearchQuery, public_only: bool, exact_untyped_id: Option<WorkshopId>) -> Self {
         Self {
             tag: query
                 .tag
@@ -62,6 +63,7 @@ impl SearchFilters {
             status: query.status.map(|status| serialize_json_enum(&status)),
             public_only,
             file_type: query.file_type.map(|ft| serialize_json_enum(&ft)),
+            exact_untyped_id: exact_untyped_id.and_then(|wid| i64::try_from(wid.as_u64()).ok()),
         }
     }
 
@@ -73,7 +75,16 @@ impl SearchFilters {
         }
         if let Some(ref ft) = self.file_type {
             params.push(Value::Text(ft.clone()));
-            clauses.push(format!("w.file_type = ?{}", params.len()));
+            let ft_idx = params.len();
+            if let Some(exact_id) = self.exact_untyped_id {
+                params.push(Value::Integer(exact_id));
+                let id_idx = params.len();
+                clauses.push(format!(
+                    "(w.file_type = ?{ft_idx} OR w.workshop_id = ?{id_idx})"
+                ));
+            } else {
+                clauses.push(format!("w.file_type = ?{ft_idx}"));
+            }
         }
         if let Some(ref status) = self.status {
             params.push(Value::Text(status.clone()));
@@ -333,12 +344,29 @@ impl ServerRepo {
         public_only: bool,
         cancel: &QueryCancelToken,
     ) -> anyhow::Result<SearchResponse> {
+        self.search_cancellable_with_exact_untyped(query, public_only, None, cancel)
+    }
+
+    pub(crate) fn search_cancellable_with_exact_untyped(
+        &self,
+        query: &SearchQuery,
+        public_only: bool,
+        exact_untyped_id: Option<WorkshopId>,
+        cancel: &QueryCancelToken,
+    ) -> anyhow::Result<SearchResponse> {
         let page = query.page.max(1);
         let page_size = query.page_size.clamp(1, 100);
         let offset = u64::from(page - 1) * u64::from(page_size);
         self.with_cancellable_read_snapshot(cancel, |conn| {
-            let (total, matches) =
-                Self::ranked_matches(conn, query, public_only, offset, Some(page_size), cancel)?;
+            let (total, matches) = Self::ranked_matches(
+                conn,
+                query,
+                public_only,
+                exact_untyped_id,
+                offset,
+                Some(page_size),
+                cancel,
+            )?;
             let mut items = Vec::with_capacity(matches.len());
             for matched in matches {
                 if cancel.is_cancelled() {
@@ -359,13 +387,15 @@ impl ServerRepo {
     }
 
     /// Return compact matches for the hybrid merge, which loads full local records after paging.
-    pub(crate) fn catalog_search_matches_cancellable(
+    pub(crate) fn catalog_search_matches_with_exact_untyped(
         &self,
         query: &SearchQuery,
+        exact_untyped_id: Option<WorkshopId>,
         cancel: &QueryCancelToken,
     ) -> anyhow::Result<Vec<RankedCatalogMatch>> {
         self.with_cancellable_read_snapshot(cancel, |conn| {
-            let (_, matches) = Self::ranked_matches(conn, query, true, 0, None, cancel)?;
+            let (_, matches) =
+                Self::ranked_matches(conn, query, true, exact_untyped_id, 0, None, cancel)?;
             Ok(matches)
         })
     }
@@ -374,6 +404,7 @@ impl ServerRepo {
         conn: &Connection,
         query: &SearchQuery,
         public_only: bool,
+        exact_untyped_id: Option<WorkshopId>,
         offset: u64,
         limit: Option<u32>,
         cancel: &QueryCancelToken,
@@ -381,7 +412,7 @@ impl ServerRepo {
         if cancel.is_cancelled() {
             return Err(QueryAbortedError::Cancelled.into());
         }
-        let filters = SearchFilters::new(query, public_only);
+        let filters = SearchFilters::new(query, public_only, exact_untyped_id);
         let sort = SearchSort::from_name(query.sort.as_deref());
         let target = LocalSearchTarget::from_name(query.search_target.as_deref());
         let parsed = query.query.as_deref().and_then(search::parse_query);

@@ -205,13 +205,27 @@ impl Drop for ReaderGuard<'_> {
 pub struct ServerRepo {
     writer: Mutex<Connection>,
     readers: Option<ReaderPool>,
-    negative_cache: RwLock<HashMap<WorkshopId, NegativeObservation>>,
+    negative_cache: RwLock<HashMap<WorkshopId, RestrictionMarker>>,
 }
 
-#[derive(Clone, Copy)]
-struct NegativeObservation {
-    status: WorkshopItemStatus,
-    observed_at: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestrictionKind {
+    Removed,
+    PrivateOrUnavailable,
+    UnlistedSearchOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RestrictionMarker {
+    pub kind: RestrictionKind,
+    pub observed_at: DateTime<Utc>,
+    pub steam_version: Option<i64>,
+}
+
+pub(crate) fn is_stale_steam_version(cached: Option<i64>, incoming: Option<i64>) -> bool {
+    cached
+        .zip(incoming)
+        .is_some_and(|(cached_ver, incoming_ver)| incoming_ver < cached_ver)
 }
 
 #[derive(Debug, Clone)]
@@ -219,6 +233,7 @@ pub struct StoredItemMeta {
     pub record: WorkshopItemRecord,
     pub is_admin_override: bool,
     pub last_verified_at: DateTime<Utc>,
+    pub visibility_verified_at: DateTime<Utc>,
     pub removed_at: Option<DateTime<Utc>>,
     steam_version: Option<i64>,
     catalog_indexed: bool,
@@ -235,7 +250,8 @@ impl StoredItemMeta {
 pub(crate) struct OverlayItemMeta {
     pub status: WorkshopItemStatus,
     pub is_admin_override: bool,
-    pub last_verified_at: DateTime<Utc>,
+    pub visibility_verified_at: DateTime<Utc>,
+    pub steam_version: Option<i64>,
     pub catalog_indexed: bool,
     pub is_listed: Option<bool>,
     pub creator_name: Option<String>,
@@ -651,7 +667,7 @@ mod tests {
 
             let bounded = repo.search(&query, true).unwrap();
             let unbounded = repo
-                .catalog_search_matches_cancellable(&query, &QueryCancelToken::new())
+                .catalog_search_matches_with_exact_untyped(&query, None, &QueryCancelToken::new())
                 .unwrap();
             let bounded_ids: Vec<_> = bounded.items.iter().map(|it| it.workshop_id).collect();
             let unbounded_ids: Vec<_> = unbounded.iter().map(|m| m.id).collect();

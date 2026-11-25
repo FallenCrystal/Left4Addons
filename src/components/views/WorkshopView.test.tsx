@@ -209,4 +209,124 @@ describe('WorkshopView', () => {
     await screen.findByText('Search unavailable');
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
   });
+
+  it('lets users switch to collection search and resets pagination to page 1', async () => {
+    const calls: SearchQuery[] = [];
+    const onTrackCollection = vi.fn(async () => null);
+    const onSearch = vi.fn(async (query: SearchQuery): Promise<SearchResponse> => {
+      calls.push(query);
+      if (query.fileType === 'collection') {
+        return {
+          items: [
+            {
+              workshopId: '3499001245',
+              fileType: 'collection',
+              status: 'active',
+              title: 'Friday Coop Essential Pack',
+              description: 'Curated co-op campaigns.',
+              tags: ['Campaigns'],
+              previews: [],
+              dependencies: [],
+              collectionChildren: ['2814104912'],
+              source: 'catalog_server',
+              fetchedAt: '2026-11-24T00:00:00Z',
+            },
+          ],
+          total: 1,
+          page: query.page ?? 1,
+          pageSize: 24,
+          source: 'catalog_server',
+        };
+      }
+      return {
+        items: [sampleRecord(query.page ?? 1)],
+        total: 48,
+        page: query.page ?? 1,
+        pageSize: 24,
+        source: 'catalog_server',
+      };
+    });
+
+    render(
+      <WorkshopView
+        addons={[]}
+        collections={[]}
+        liveDownloads={{}}
+        onSearch={onSearch}
+        onFetchItem={async () => null}
+        onImportSubscribed={async () => null}
+        onDownload={async () => null}
+        onUpdate={async () => null}
+        onCancelDownload={() => {}}
+        onTrackCollection={onTrackCollection}
+        onOpenSourcesSettings={() => {}}
+        onOpenExternal={() => {}}
+        onInvalidId={() => {}}
+        onNotify={() => {}}
+      />,
+    );
+
+    await screen.findByText('Campaign 1');
+    expect(calls[0].fileType).toBeUndefined();
+
+    // Advance to page 2 on Items, then switch to Collection
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    await screen.findByText('Campaign 2');
+
+    const contentGroup = screen.getByRole('group', { name: 'Content type' });
+    const collectionBtn = Array.from(contentGroup.querySelectorAll('button')).find(
+      (btn) => btn.textContent === 'Collection',
+    )!;
+    fireEvent.click(collectionBtn);
+
+    await screen.findByText('Friday Coop Essential Pack');
+    expect(calls.at(-1)).toMatchObject({
+      fileType: 'collection',
+      page: 1,
+    });
+
+    // Switch back to Item and verify fileType omits explicit filter so bare collection IDs still work
+    const itemBtn = Array.from(contentGroup.querySelectorAll('button')).find(
+      (btn) => btn.textContent === 'Item',
+    )!;
+    fireEvent.click(itemBtn);
+    await screen.findByText('Campaign 1');
+    expect(calls.at(-1)?.fileType).toBeUndefined();
+    expect(calls.at(-1)?.page).toBe(1);
+  });
+
+  it('discovers collections by name when fileType=collection in preview Workshop search and honors title-only numeric queries', async () => {
+    const { searchPreviewWorkshop } = await import('../../api/preview/workshop');
+
+    // Default (no fileType) excludes collections on name search, while fileType=collection finds them
+    const defaultRes = searchPreviewWorkshop({ query: 'Friday Coop' });
+    expect(defaultRes.items.map((i) => i.workshopId)).toEqual([]);
+
+    const collectionRes = searchPreviewWorkshop({
+      query: 'Friday Coop',
+      fileType: 'collection',
+    });
+    expect(collectionRes.items.map((i) => i.workshopId)).toEqual(['3499001245']);
+
+    // Bare 6+ digit collection ID remains searchable without explicit fileType, unless fileType=item
+    expect(searchPreviewWorkshop({ query: '3499001245' }).items.map((i) => i.workshopId)).toEqual([
+      '3499001245',
+    ]);
+    expect(
+      searchPreviewWorkshop({ query: '3499001245', fileType: 'item' }).items.map(
+        (i) => i.workshopId,
+      ),
+    ).toEqual([]);
+
+    // Title-only numeric search does not match by Workshop ID when title lacks the number, while direct URL still works
+    expect(
+      searchPreviewWorkshop({ query: '2814104912', searchTarget: 'title' }).items,
+    ).toHaveLength(0);
+    expect(
+      searchPreviewWorkshop({
+        query: 'https://steamcommunity.com/sharedfiles/filedetails/?id=2814104912',
+        searchTarget: 'title',
+      }).items.map((i) => i.workshopId),
+    ).toEqual(['2814104912']);
+  });
 });

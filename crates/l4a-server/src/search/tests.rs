@@ -161,3 +161,25 @@ fn can_match_pinyin_precomputation_matches_query_shapes() {
         );
     }
 }
+
+#[test]
+fn preserves_all_terms_past_sixteen_for_final_scoring() {
+    let words: Vec<String> = (1..=20).map(|i| format!("kw{i:02}")).collect();
+    let full_query = words.join(" ");
+    assert!(full_query.chars().count() <= 512);
+
+    let parsed = parse_query(&full_query).unwrap();
+    assert_eq!(parsed.terms.len(), 20);
+
+    let first_16 = words[..16].join(" ");
+    let all_20 = words.join(" ");
+
+    assert!(score_primary_candidate(&parsed, 1001, &first_16, None).is_none());
+    assert!(score_primary_candidate(&parsed, 1002, &all_20, None).is_some());
+
+    assert!(score_title_only_candidate(&parsed, &first_16).is_none());
+    assert!(score_title_only_candidate(&parsed, &all_20).is_some());
+
+    assert!(score_desc_candidate(&parsed, &first_16).is_none());
+    assert!(score_desc_candidate(&parsed, &all_20).is_some());
+}

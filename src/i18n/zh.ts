@@ -329,6 +329,7 @@ export const zh = {
       removed: '已下架',
       private_or_unavailable: '不可用',
     },
+    contentType: '内容类型',
     type: {
       item: '组件',
       collection: '合集',

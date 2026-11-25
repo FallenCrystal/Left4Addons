@@ -1851,7 +1851,9 @@ async fn migration_keeps_legacy_rows_cache_only_until_rediscovered_by_a_feed() {
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
-            "DROP INDEX idx_workshop_items_catalog_public;
+            "DROP INDEX IF EXISTS idx_workshop_items_catalog_public;
+             DROP INDEX IF EXISTS idx_workshop_items_catalog_public_v2;
+             DROP INDEX IF EXISTS idx_workshop_items_catalog_relevance_v1;
              ALTER TABLE workshop_items DROP COLUMN catalog_indexed;",
         )
         .unwrap();
@@ -4226,4 +4228,590 @@ async fn hybrid_search_coalesces_concurrent_requests_and_isolates_leader_timeout
     assert_eq!(resp_b.total, 2);
     assert_eq!(resp_b.items[0].workshop_id, WorkshopId(9852));
     assert_eq!(upstream.recorded_searches().len(), 2);
+}
+
+#[tokio::test]
+async fn unlisted_observations_for_unknown_items_suppress_cached_search_hits_without_blocking_by_id_lookup(
+) {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_steam_results = false)
+        .unwrap();
+
+    let t0 = Utc::now();
+    let mut public_v1 = sample_item(
+        9901,
+        "Cached Public Hit 9901",
+        100,
+        Some("https://cdn.steamusercontent.com/ugc/9901_v1.vpk"),
+    );
+    public_v1.fetched_at = t0;
+
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("CachedPublicHit"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: public_v1,
+            })],
+        },
+    );
+
+    let app = build_router(state.clone());
+    // 1. Prime the Steam page cache without inserting 9901 into SQLite.
+    let (_, mode1, first) =
+        search_with_mode(&app, "/api/v1/items/search?q=CachedPublicHit", vec![]).await;
+    assert_eq!(mode1.as_deref(), Some("hybrid"));
+    assert_eq!(first.items.len(), 1);
+    assert!(state.repo.get_item(WorkshopId(9901)).unwrap().is_none());
+
+    // 2. Another search observes 9901 as unlisted at t1 > t0 (and revision 200).
+    let mut unlisted_v2 = sample_item(
+        9901,
+        "Cached Public Hit 9901",
+        200,
+        Some("https://cdn.steamusercontent.com/ugc/9901_v2.vpk"),
+    );
+    unlisted_v2.fetched_at = t0 + chrono::Duration::seconds(30);
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("ObserveUnlisted"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found {
+                    item: unlisted_v2.clone(),
+                },
+                listed: false,
+                consumer_appid: Some(550),
+            }],
+        },
+    );
+
+    let (_, _, second) =
+        search_with_mode(&app, "/api/v1/items/search?q=ObserveUnlisted", vec![]).await;
+    assert!(second.items.is_empty());
+    // Still no SQLite row created for unknown unlisted item:
+    assert!(state.repo.get_item(WorkshopId(9901)).unwrap().is_none());
+
+    // 3. Re-querying the cached first page must now suppress 9901 via the search-only marker.
+    let (_, mode3, cached_after_unlisted) =
+        search_with_mode(&app, "/api/v1/items/search?q=CachedPublicHit", vec![]).await;
+    assert_eq!(mode3.as_deref(), Some("hybrid"));
+    assert!(cached_after_unlisted.items.is_empty());
+    assert_eq!(upstream.recorded_searches().len(), 2);
+
+    // 4. A newer RPC returning an older Steam revision (v100 < v200) is also suppressed by the marker.
+    let mut lagging_public_v1 = sample_item(
+        9901,
+        "Cached Public Hit 9901",
+        100,
+        Some("https://cdn.steamusercontent.com/ugc/9901_v1.vpk"),
+    );
+    lagging_public_v1.fetched_at = t0 + chrono::Duration::seconds(60);
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("LaggingPublic"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: lagging_public_v1,
+            })],
+        },
+    );
+    let (_, _, lagging_res) =
+        search_with_mode(&app, "/api/v1/items/search?q=LaggingPublic", vec![]).await;
+    assert!(lagging_res.items.is_empty());
+
+    // 5. By-ID and batch lookup MUST NOT be blocked by the search-only unlisted marker!
+    upstream.insert_outcome(
+        WorkshopId(9901),
+        WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found { item: unlisted_v2 },
+            listed: false,
+            consumer_appid: Some(550),
+        },
+    );
+    let (get_status, get_bytes) =
+        json_request(&app, "GET", "/api/v1/items/9901", vec![], None).await;
+    assert_eq!(get_status, StatusCode::OK);
+    let by_id: WorkshopItemRecord = serde_json::from_slice(&get_bytes).unwrap();
+    assert_eq!(
+        by_id.file_url.as_deref(),
+        Some("https://cdn.steamusercontent.com/ugc/9901_v2.vpk")
+    );
+    assert_eq!(upstream.fetch_count(WorkshopId(9901)), 1);
+}
+
+#[tokio::test]
+async fn overlay_enforces_steam_revision_ordering_before_relisting_unlisted_or_restricted_items() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_ttl_secs = 0)
+        .unwrap();
+
+    let t0 = Utc::now();
+    let mut unlisted_v200 = sample_item(
+        9911,
+        "Unlisted V200",
+        200,
+        Some("https://cdn.steamusercontent.com/ugc/9911_v200.vpk"),
+    );
+    unlisted_v200.fetched_at = t0;
+    state
+        .repo
+        .apply_upstream_outcomes(&[WorkshopObservation {
+            outcome: WorkshopFetchOutcome::Found {
+                item: unlisted_v200,
+            },
+            listed: false,
+            consumer_appid: Some(550),
+        }])
+        .unwrap();
+
+    // A later search RPC (t0 + 60s) returns an older public revision (time_updated = 100 < 200).
+    let mut stale_public_v100 = sample_item(9911, "Public V100", 100, None);
+    stale_public_v100.fetched_at = t0 + chrono::Duration::seconds(60);
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("RevisionOrder"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: stale_public_v100,
+            })],
+        },
+    );
+
+    let app = build_router(state);
+    let (_, _, stale_resp) =
+        search_with_mode(&app, "/api/v1/items/search?q=RevisionOrder", vec![]).await;
+    assert!(
+        stale_resp.items.is_empty(),
+        "older Steam revision must not override newer unlisted state"
+    );
+
+    // Once Steam returns the current/newer revision (time_updated = 200) as public at t0 + 90s, search exposes it.
+    let mut relisted_v200 = sample_item(9911, "Public V200", 200, None);
+    relisted_v200.fetched_at = t0 + chrono::Duration::seconds(90);
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("RevisionOrder"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: None,
+            outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: relisted_v200,
+            })],
+        },
+    );
+    let (_, _, fresh_resp) =
+        search_with_mode(&app, "/api/v1/items/search?q=RevisionOrder", vec![]).await;
+    assert_eq!(fresh_resp.items.len(), 1);
+    assert_eq!(fresh_resp.items[0].workshop_id, WorkshopId(9911));
+}
+
+#[tokio::test]
+async fn visibility_only_update_does_not_reset_detail_ttl_for_single_or_batch_lookup() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_steam_results = false)
+        .unwrap();
+
+    let expired_at = Utc::now() - chrono::Duration::hours(2);
+    for id in [9921, 9922] {
+        let mut stale_cached = sample_item(
+            id,
+            &format!("Stale Download {id}"),
+            100,
+            Some(&format!("https://cdn.example.test/{id}_expired_v1.vpk")),
+        );
+        stale_cached.fetched_at = expired_at;
+        state.repo.upsert_item(&stale_cached, false, true).unwrap();
+    }
+
+    // Search marks both 9921 and 9922 unlisted right now without refreshing their details.
+    let now = Utc::now();
+    let unlisted_search_outcomes: Vec<_> = [9921, 9922]
+        .into_iter()
+        .map(|id| {
+            let mut obs_item = sample_item(id, &format!("Stale Download {id}"), 200, None);
+            obs_item.fetched_at = now;
+            WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found { item: obs_item },
+                listed: false,
+                consumer_appid: Some(550),
+            }
+        })
+        .collect();
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            30,
+            Some("MarkUnlistedOnly"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2,
+            next_cursor: None,
+            outcomes: unlisted_search_outcomes,
+        },
+    );
+
+    let app = build_router(state.clone());
+    let (_, _, search_resp) =
+        search_with_mode(&app, "/api/v1/items/search?q=MarkUnlistedOnly", vec![]).await;
+    assert!(search_resp.items.is_empty());
+
+    let meta_9921 = state.repo.get_item(WorkshopId(9921)).unwrap().unwrap();
+    assert_eq!(meta_9921.is_listed, Some(false));
+    assert_eq!(meta_9921.last_verified_at, expired_at);
+    assert!(meta_9921.visibility_verified_at >= now);
+
+    // Upstream holds fresh download URLs for both unlisted items.
+    for id in [9921, 9922] {
+        upstream.insert_outcome(
+            WorkshopId(id),
+            WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found {
+                    item: sample_item(
+                        id,
+                        &format!("Stale Download {id}"),
+                        200,
+                        Some(&format!("https://cdn.example.test/{id}_fresh_v2.vpk")),
+                    ),
+                },
+                listed: false,
+                consumer_appid: Some(550),
+            },
+        );
+    }
+
+    // Single by-ID lookup sees expired detail TTL and calls GetDetails immediately!
+    let (status_single, bytes_single) =
+        json_request(&app, "GET", "/api/v1/items/9921", vec![], None).await;
+    assert_eq!(status_single, StatusCode::OK);
+    let single_item: WorkshopItemRecord = serde_json::from_slice(&bytes_single).unwrap();
+    assert_eq!(
+        single_item.file_url.as_deref(),
+        Some("https://cdn.example.test/9921_fresh_v2.vpk")
+    );
+    assert_eq!(upstream.fetch_count(WorkshopId(9921)), 1);
+
+    // Batch lookup also sees expired detail TTL and calls GetDetails immediately!
+    let (status_batch, bytes_batch) = json_request(
+        &app,
+        "POST",
+        "/api/v1/items/batch",
+        vec![],
+        Some(json!({ "ids": ["9922"], "forceRefresh": false })),
+    )
+    .await;
+    assert_eq!(status_batch, StatusCode::OK);
+    let batch_resp: BatchItemsResponse = serde_json::from_slice(&bytes_batch).unwrap();
+    assert_eq!(batch_resp.items.len(), 1);
+    assert_eq!(
+        batch_resp.items[0].file_url.as_deref(),
+        Some("https://cdn.example.test/9922_fresh_v2.vpk")
+    );
+    assert_eq!(upstream.fetch_count(WorkshopId(9922)), 1);
+}
+
+#[tokio::test]
+async fn bare_collection_id_stays_searchable_after_indexing_and_title_only_numeric_skips_id_injection(
+) {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    // Indexed collection 349900, prefix item 3499001, and prefix collection 3499002.
+    let mut indexed_col = sample_item(349900, "Indexed Friday Collection", 300, None);
+    indexed_col.file_type = WorkshopFileType::Collection;
+    state.repo.upsert_item(&indexed_col, false, true).unwrap();
+
+    let prefix_item = sample_item(3499001, "Prefix Item", 200, None);
+    state.repo.upsert_item(&prefix_item, false, true).unwrap();
+
+    let mut prefix_col = sample_item(3499002, "Prefix Collection Excluded", 250, None);
+    prefix_col.file_type = WorkshopFileType::Collection;
+    state.repo.upsert_item(&prefix_col, false, true).unwrap();
+
+    // Unindexed item 610700 (title without number) vs indexed item 610701 (title with number).
+    upstream.insert_item(sample_item(610700, "Silent Forest", 400, None));
+    let titled_num = sample_item(610701, "Campaign 610700 Redux", 410, None);
+    state.repo.upsert_item(&titled_num, false, true).unwrap();
+
+    let app = build_router(state);
+
+    // 1. Bare 6+ digit collection ID matches after indexing in both hybrid and local-only sorts,
+    //    without widening numeric prefix search to prefix_col (3499002).
+    assert_eq!(
+        search_result_ids(&app, "q=349900").await,
+        (2, vec![349900, 3499001])
+    );
+    assert_eq!(
+        search_result_ids(&app, "q=349900&sort=title").await,
+        (2, vec![349900, 3499001])
+    );
+    // Explicit fileType=item still excludes the collection!
+    assert_eq!(
+        search_result_ids(&app, "q=349900&fileType=item").await,
+        (1, vec![3499001])
+    );
+    // Explicit tag mismatch still excludes the collection!
+    assert_eq!(
+        search_result_ids(&app, "q=349900&tag=Survivors").await,
+        (0, vec![])
+    );
+
+    // 2. searchTarget=title skips bare-ID GetDetails injection while matching titles with the number.
+    assert_eq!(
+        search_result_ids(&app, "q=610700&searchTarget=title").await,
+        (1, vec![610701])
+    );
+    assert_eq!(
+        search_result_ids(&app, "q=610700&searchTarget=title&sort=title").await,
+        (1, vec![610701])
+    );
+    assert_eq!(upstream.fetch_count(WorkshopId(610700)), 0);
+
+    // 3. Direct Workshop URL lookup still resolves 610700 even with searchTarget=title!
+    assert_eq!(
+        search_result_ids(
+            &app,
+            "q=https%3A%2F%2Fsteamcommunity.com%2Fsharedfiles%2Ffiledetails%2F%3Fid%3D610700&searchTarget=title"
+        )
+        .await,
+        (1, vec![610700])
+    );
+    assert_eq!(upstream.fetch_count(WorkshopId(610700)), 1);
+}
+
+#[tokio::test]
+async fn backfill_advances_across_empty_pages_and_stops_on_terminal_or_stalled_cursors() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    // Page 1 at "*" has 0 outcomes but supplies a valid new continuation cursor.
+    upstream.insert_query_page(
+        QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+        MATCHING_FILE_TYPE_ITEMS,
+        "*",
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: Some("cursor_page_empty_gap".into()),
+            outcomes: Vec::new(),
+        },
+    );
+    // Page 2 supplies an item and then stalls by repeating the same cursor.
+    upstream.insert_query_page(
+        QUERY_TYPE_RANKED_BY_PUBLICATION_DATE,
+        MATCHING_FILE_TYPE_ITEMS,
+        "cursor_page_empty_gap",
+        WorkshopQueryPage {
+            total: 1,
+            next_cursor: Some("cursor_page_empty_gap".into()),
+            outcomes: vec![WorkshopFetchOutcome::Found {
+                item: sample_item(7701, "After Empty Page", 500, None),
+            }
+            .into()],
+        },
+    );
+
+    assert_eq!(state.sync.run_backfill_step_once().await.unwrap(), 0);
+    let after_first = state.sync.status().await.unwrap();
+    assert_eq!(
+        after_first.backfill_cursor.as_deref(),
+        Some("cursor_page_empty_gap")
+    );
+    assert_eq!(after_first.remote_workshop_total, Some(1));
+
+    assert_eq!(state.sync.run_backfill_step_once().await.unwrap(), 1);
+    let after_second = state.sync.status().await.unwrap();
+    assert_eq!(after_second.backfill_cursor.as_deref(), Some("DONE"));
+    assert_eq!(after_second.backfill_synced_total, 1);
+
+    let app = build_router(state);
+    assert_eq!(search_result_ids(&app, "").await, (1, vec![7701]));
+}
+
+#[test]
+fn upgraded_v2_database_migrates_browse_expression_indexes_without_temp_btree_sort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2_upgrade.db");
+    {
+        let repo = ServerRepo::open(&path).unwrap();
+        for id in 1..=5u64 {
+            let mut item = sample_item(id, &format!("Browse {id}"), 100 + id as i64, None);
+            item.subscriptions = (id % 2 == 0).then_some(id * 100);
+            repo.upsert_item(&item, false, true).unwrap();
+        }
+    }
+    // Simulate a v2 database that already had the legacy two-column idx_workshop_items_catalog_public.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_workshop_items_catalog_public_v2;
+             DROP INDEX IF EXISTS idx_workshop_items_catalog_relevance_v1;
+             CREATE INDEX idx_workshop_items_catalog_public
+                 ON workshop_items(catalog_indexed, is_listed);",
+        )
+        .unwrap();
+    }
+
+    // Reopen to run migrate().
+    let reopened = ServerRepo::open(&path).unwrap();
+    assert_eq!(reopened.search(&Default::default(), true).unwrap().total, 5);
+    drop(reopened);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let legacy_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_workshop_items_catalog_public')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!legacy_exists, "legacy 2-column index should be dropped");
+
+    let explain = |order_by: &str| -> Vec<String> {
+        let sql = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
+                    COALESCE(w.time_updated, 0), COALESCE(w.time_created, 0),
+                    w.status = 'active', w.is_admin_override
+             FROM workshop_items w
+             WHERE w.catalog_indexed = 1 AND w.is_listed = 1 AND w.file_type = 'item'
+             ORDER BY {order_by}
+             LIMIT 30 OFFSET 0"
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+
+    let subs_plan = explain("COALESCE(w.subscriptions, 0) DESC, w.workshop_id ASC").join(" | ");
+    assert!(
+        subs_plan.contains("idx_workshop_items_catalog_public_v2"),
+        "expected v2 browse index in plan, got: {subs_plan}"
+    );
+    assert!(
+        !subs_plan.contains("TEMP B-TREE"),
+        "subscription browse must not sort with a temp B-tree: {subs_plan}"
+    );
+
+    let rel_plan = explain(
+        "COALESCE(w.subscriptions, 0) DESC, COALESCE(w.time_updated, 0) DESC, w.workshop_id ASC",
+    )
+    .join(" | ");
+    assert!(
+        rel_plan.contains("idx_workshop_items_catalog_relevance_v1"),
+        "expected relevance browse index in plan, got: {rel_plan}"
+    );
+    assert!(
+        !rel_plan.contains("TEMP B-TREE"),
+        "default relevance browse must not sort with a temp B-tree: {rel_plan}"
+    );
+}
+
+#[tokio::test]
+async fn search_preserves_terms_beyond_sixteen_across_hybrid_and_local_fallback() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+
+    let words: Vec<String> = (1..=19).map(|i| format!("term{i:02}")).collect();
+    let partial_16 = words[..16].join(" ");
+    let mut all_20_words = words;
+    all_20_words.push("finalkeyword".to_string());
+    let full_20 = all_20_words.join(" ");
+
+    let mut miss_tail = sample_item(9951, &partial_16, 100, None);
+    miss_tail.description = Some(partial_16);
+    state.repo.upsert_item(&miss_tail, false, true).unwrap();
+
+    let mut match_all = sample_item(9952, &full_20, 200, None);
+    match_all.description = None;
+    state.repo.upsert_item(&match_all, false, true).unwrap();
+
+    let app = build_router(state);
+    let encoded_q = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("q", &full_20)
+        .finish();
+
+    // Hybrid search (empty Steam results -> local supplementation) excludes 9951 and keeps 9952.
+    assert_eq!(search_result_ids(&app, &encoded_q).await, (1, vec![9952]));
+
+    // Local fallback when Steam fails also excludes 9951 and keeps 9952.
+    upstream.set_fail_searches(true);
+    let (_, mode, fb_resp) = search_with_mode(
+        &app,
+        &format!("/api/v1/items/search?{encoded_q}&language=zh-CN"),
+        vec![],
+    )
+    .await;
+    assert_eq!(mode.as_deref(), Some("local-fallback"));
+    assert_eq!(
+        fb_resp
+            .items
+            .iter()
+            .map(|i| i.workshop_id.0)
+            .collect::<Vec<_>>(),
+        vec![9952]
+    );
 }

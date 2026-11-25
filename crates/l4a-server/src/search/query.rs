@@ -123,13 +123,16 @@ pub fn build_title_only_fts_query(query: &ParsedQuery) -> Option<String> {
     build_primary_fts_query_inner(query, false)
 }
 
+const MAX_FTS_QUERY_TERMS: usize = 64;
+
 fn build_primary_fts_query_inner(query: &ParsedQuery, include_creator: bool) -> Option<String> {
     if query.terms.is_empty() {
         return None;
     }
 
-    let mut term_clauses = Vec::with_capacity(query.terms.len());
-    for term in &query.terms {
+    let fts_terms = &query.terms[..query.terms.len().min(MAX_FTS_QUERY_TERMS)];
+    let mut term_clauses = Vec::with_capacity(fts_terms.len());
+    for term in fts_terms {
         match term {
             QueryTerm::Cjk(chars) => {
                 let phrase = cjk_phrase(chars);
@@ -227,8 +230,9 @@ pub fn build_desc_fts_query(query: &ParsedQuery) -> Option<String> {
         return None;
     }
 
-    let mut term_clauses = Vec::with_capacity(query.terms.len());
-    for term in &query.terms {
+    let fts_terms = &query.terms[..query.terms.len().min(MAX_FTS_QUERY_TERMS)];
+    let mut term_clauses = Vec::with_capacity(fts_terms.len());
+    for term in fts_terms {
         match term {
             QueryTerm::Cjk(chars) => {
                 let phrase = cjk_phrase(chars);
@@ -326,8 +330,6 @@ fn parse_query_terms(raw: &str, exact_only_words: &HashSet<String>) -> Vec<Query
     }
     flush_cjk(&mut cjk_buf, &mut terms);
     flush_word(&mut word_buf, &mut terms, exact_only_words);
-    const MAX_QUERY_TERMS: usize = 16;
-    terms.truncate(MAX_QUERY_TERMS);
     terms
 }
 
