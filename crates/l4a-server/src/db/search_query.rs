@@ -2,7 +2,7 @@ use super::{
     parse_workshop_id_col, serialize_json_enum, QueryAbortedError, QueryCancelToken, ServerRepo,
 };
 use crate::search::{self, MatchRank, ParsedQuery};
-use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopId};
+use l4a_protocol::{MetadataSource, SearchQuery, SearchResponse, WorkshopFileType, WorkshopId};
 use rusqlite::{params_from_iter, types::Value, Connection, Row, Rows};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -11,7 +11,10 @@ const SEARCH_ORDER_COLUMNS: &str = "
     w.workshop_id, w.title, COALESCE(w.subscriptions, 0),
     COALESCE(w.time_updated, 0), COALESCE(w.time_created, 0),
     w.status = 'active', w.is_admin_override";
-const SEARCH_FTS_SOURCE: &str = "
+// Keep FTS5 on the outside of the join so SQLite runs MATCH once before looking up items.
+const FTS_FIRST_SOURCE: &str = "
+    FROM workshop_items_fts CROSS JOIN workshop_items w ON w.workshop_id = workshop_items_fts.rowid";
+const FTS_COLLECTION_SOURCE: &str = "
     FROM workshop_items_fts JOIN workshop_items w ON w.workshop_id = workshop_items_fts.rowid";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +50,7 @@ struct SearchFilters {
     tag: Option<String>,
     status: Option<String>,
     public_only: bool,
-    file_type: Option<String>,
+    file_type: Option<WorkshopFileType>,
     exact_untyped_id: Option<i64>,
 }
 
@@ -62,8 +65,17 @@ impl SearchFilters {
                 .map(str::to_ascii_lowercase),
             status: query.status.map(|status| serialize_json_enum(&status)),
             public_only,
-            file_type: query.file_type.map(|ft| serialize_json_enum(&ft)),
+            file_type: query.file_type,
             exact_untyped_id: exact_untyped_id.and_then(|wid| i64::try_from(wid.as_u64()).ok()),
+        }
+    }
+
+    fn fts_source(&self) -> &'static str {
+        if self.file_type == Some(WorkshopFileType::Collection) {
+            // For selective collection filters, let SQLite look up catalog rows first.
+            FTS_COLLECTION_SOURCE
+        } else {
+            FTS_FIRST_SOURCE
         }
     }
 
@@ -73,8 +85,8 @@ impl SearchFilters {
         if self.public_only {
             clauses.push("w.catalog_indexed = 1 AND w.is_listed = 1".to_string());
         }
-        if let Some(ref ft) = self.file_type {
-            params.push(Value::Text(ft.clone()));
+        if let Some(ft) = self.file_type {
+            params.push(Value::Text(serialize_json_enum(&ft)));
             let ft_idx = params.len();
             if let Some(exact_id) = self.exact_untyped_id {
                 params.push(Value::Integer(exact_id));
@@ -523,6 +535,7 @@ impl ServerRepo {
         page: &mut SearchPage,
         cancel: &QueryCancelToken,
     ) -> anyhow::Result<()> {
+        let fts_source = filters.fts_source();
         if target != LocalSearchTarget::DescriptionOnly {
             let fts_query = match target {
                 LocalSearchTarget::TitleOnly => search::build_title_only_fts_query(parsed),
@@ -576,7 +589,7 @@ impl ServerRepo {
                 } else {
                     format!(
                         "SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name
-                         {SEARCH_FTS_SOURCE}
+                         {fts_source}
                          WHERE workshop_items_fts MATCH ?{fts_idx} AND {where_clause}"
                     )
                 };
@@ -612,7 +625,7 @@ impl ServerRepo {
                 params.push(Value::Text(desc_query));
                 let fts_idx = params.len();
                 let mut stmt = conn.prepare_cached(&format!(
-                    "SELECT {SEARCH_ORDER_COLUMNS}, w.description {SEARCH_FTS_SOURCE}
+                    "SELECT {SEARCH_ORDER_COLUMNS}, w.description {fts_source}
                      WHERE workshop_items_fts MATCH ?{fts_idx} AND {where_clause}"
                 ))?;
                 let rows = stmt.query(params_from_iter(params.iter()))?;
@@ -668,5 +681,49 @@ impl ServerRepo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_text_search_uses_an_index_suited_to_the_file_type() {
+        let repo = ServerRepo::open_in_memory().unwrap();
+        for (file_type, expected_index) in [
+            (WorkshopFileType::Item, "workshop_items_fts"),
+            (WorkshopFileType::Collection, "file_type=?"),
+        ] {
+            let query = SearchQuery {
+                file_type: Some(file_type),
+                ..SearchQuery::default()
+            };
+            let filters = SearchFilters::new(&query, true, None);
+            let mut params = Vec::new();
+            let where_clause = filters.build_where(&mut params);
+            params.push(Value::Text(
+                "{title_tokens creator_tokens} : \"增 城\"".into(),
+            ));
+            let fts_source = filters.fts_source();
+            let sql = format!(
+                "EXPLAIN QUERY PLAN
+                 SELECT {SEARCH_ORDER_COLUMNS}, w.creator_name {fts_source}
+                 WHERE workshop_items_fts MATCH ?{} AND {where_clause}",
+                params.len()
+            );
+            let first_step = repo
+                .with_read_snapshot(|conn| {
+                    Ok(conn.query_row(&sql, params_from_iter(&params), |row| {
+                        row.get::<_, String>(3)
+                    })?)
+                })
+                .unwrap();
+
+            assert!(
+                first_step.contains(expected_index),
+                "{file_type:?}: {first_step}"
+            );
+        }
     }
 }
