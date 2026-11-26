@@ -2295,6 +2295,7 @@ pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterP
         (a, b) => a.or(b),
     };
     let mut fusion_prob = merged.fusion_score();
+    merged.corpse_image_indices.retain(|&index| index < count);
     let mut offset = count;
     for (count, part) in parts {
         fusion_prob = fusion_prob.max(part.fusion_score());
@@ -2543,6 +2544,45 @@ mod tests {
         assert_eq!(merged.nsfw_prob, 0.90);
         assert_eq!(merged.image_prob, Some(0.91));
         assert_eq!(merged.per_image_probs, vec![0.04, 0.12, 0.91]);
+    }
+
+    #[test]
+    fn merge_raw_max_keeps_corpse_floor_out_of_fusion_and_remaps_hits() {
+        let merged = merge_raw_max(vec![
+            (
+                2,
+                FilterProbabilities {
+                    prob: 0.20,
+                    fusion_prob: Some(0.05),
+                    corpse_prob: Some(0.41),
+                    corpse_pile_prob: Some(0.02),
+                    corpse_review_floor: Some(0.20),
+                    // Index 2 is outside this two-image sub-batch and must be dropped.
+                    corpse_image_indices: vec![1, 2],
+                    per_image_probs: vec![0.03, 0.05],
+                    ..Default::default()
+                },
+            ),
+            (
+                2,
+                FilterProbabilities {
+                    prob: 0.20,
+                    fusion_prob: Some(0.12),
+                    corpse_prob: Some(0.39),
+                    corpse_pile_prob: Some(0.25),
+                    corpse_review_floor: Some(0.20),
+                    corpse_image_indices: vec![0],
+                    per_image_probs: vec![0.12, 0.01],
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(merged.prob, 0.20);
+        assert_eq!(merged.fusion_score(), 0.12);
+        assert_eq!(merged.corpse_prob, Some(0.41));
+        assert_eq!(merged.corpse_pile_prob, Some(0.25));
+        assert_eq!(merged.corpse_image_indices, vec![1, 2]);
+        assert_eq!(merged.per_image_probs, vec![0.03, 0.05, 0.12, 0.01]);
     }
 
     #[cfg(unix)]

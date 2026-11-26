@@ -51,6 +51,8 @@ const UPSTREAM_HEALTH_TTL: Duration = Duration::from_secs(60);
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 const MAX_READY_LINE_BYTES: usize = 64 * 1024;
 const MAX_BACKEND_RESPONSE_BYTES: usize = 64 * 1024;
+const STOCK_LEFT4FILTERS_MODEL_NAME: &str = "Left4FiltersModel";
+const STOCK_CORPSE_SCORES_REVISION: &str = "left4filters-corpse-scores";
 
 #[derive(Debug, thiserror::Error)]
 pub enum FilterServiceError {
@@ -1396,35 +1398,60 @@ impl CatalogFilterService {
             .await
             .map_err(|e| format!("读取上游健康检查响应失败: {e}"))?;
         let mut model = serde_json::from_slice::<ModelIdentity>(&body).unwrap_or_default();
-        if model.name.as_deref() == Some("Left4FiltersModel")
+        if model.name.as_deref() == Some(STOCK_LEFT4FILTERS_MODEL_NAME)
             && model.version.is_none()
             && model.revision.is_none()
-            && self.upstream_has_corpse_scores(base_url).await
         {
-            model.revision = Some("left4filters-corpse-scores".into());
+            model.revision = match self.upstream_has_corpse_scores(base_url).await {
+                Some(true) => Some(STOCK_CORPSE_SCORES_REVISION.into()),
+                Some(false) => None,
+                // A transient probe failure must not change the scoring revision. Reuse the
+                // revision verified for the same endpoint and model, if there is one.
+                None => {
+                    let snap = self.runtime.read().unwrap();
+                    (snap.active_endpoint.as_deref() == Some(base_url)
+                        && snap.model.name == model.name
+                        && snap.model.version.is_none())
+                    .then(|| snap.model.revision.clone())
+                    .flatten()
+                }
+            };
         }
         Ok(model)
     }
 
     // Stock Left4Filters /health omits the version. An empty prediction checks
     // for the new output fields without running image or text inference.
-    async fn upstream_has_corpse_scores(&self, base_url: &str) -> bool {
+    // Returns `None` when the probe fails for a reason that may be transient.
+    async fn upstream_has_corpse_scores(&self, base_url: &str) -> Option<bool> {
         let response = self
             .backend_client
             .post(format!("{}/predict", base_url.trim_end_matches('/')))
             .timeout(HEALTH_CHECK_TIMEOUT)
             .json(&RawFilterPredictRequest::default())
             .send()
-            .await;
-        let Ok(response) = response.and_then(reqwest::Response::error_for_status) else {
-            return false;
-        };
-        let Ok(body) = read_bounded_response_bytes(response, MAX_BACKEND_RESPONSE_BYTES).await
-        else {
-            return false;
-        };
-        serde_json::from_slice::<FilterProbabilities>(&body)
-            .is_ok_and(|scores| scores.corpse_prob.is_some() && scores.corpse_pile_prob.is_some())
+            .await
+            .ok()?;
+        let status = response.status();
+        let transient_client_error = matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        );
+        if status.is_client_error() && !transient_client_error {
+            // Older nodes may reject an empty prediction. That answer is deterministic.
+            return Some(false);
+        }
+        if !status.is_success() {
+            return None;
+        }
+        let body = read_bounded_response_bytes(response, MAX_BACKEND_RESPONSE_BYTES)
+            .await
+            .ok()?;
+        Some(
+            serde_json::from_slice::<FilterProbabilities>(&body).is_ok_and(|scores| {
+                scores.corpse_prob.is_some() && scores.corpse_pile_prob.is_some()
+            }),
+        )
     }
 
     async fn call_backend_predict(
@@ -3071,6 +3098,73 @@ mod tests {
         assert!(prediction.fusion_score() < 0.04);
         assert_eq!(prediction.corpse_prob, Some(0.50));
         assert_eq!(prediction.corpse_image_indices, vec![1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stock_upstream_corpse_probe_failure_keeps_verified_revision() {
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::json;
+        use std::sync::atomic::AtomicU16;
+
+        // 200 answers with corpse scores, any other value is returned as the probe status.
+        let probe_status = Arc::new(AtomicU16::new(200));
+        let state = probe_status.clone();
+        let app = Router::new()
+            .route(
+                "/health",
+                get(|| async { Json(json!({"model": "Left4FiltersModel"})) }),
+            )
+            .route(
+                "/predict",
+                post(move || {
+                    let status = state.load(Ordering::Acquire);
+                    async move {
+                        let body = json!({
+                            "prob": 0.0, "gore_prob": 0.0, "nsfw_prob": 0.0,
+                            "corpse_prob": 0.0, "corpse_pile_prob": 0.0
+                        });
+                        (StatusCode::from_u16(status).unwrap(), Json(body))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = Arc::new(CatalogConfigStore::new(None, Default::default()));
+        store
+            .update(|cfg| {
+                cfg.filter.enabled = true;
+                cfg.filter.backend = CatalogFilterBackendKind::UpstreamHttp;
+                cfg.filter.upstream_url = Some(endpoint.clone());
+            })
+            .unwrap();
+        let service =
+            CatalogFilterService::new(store, Arc::new(ServerRepo::open_in_memory().unwrap()));
+        let verified = service.public_info().await;
+        assert!(verified.ready);
+        assert_eq!(
+            service.runtime.read().unwrap().model.revision.as_deref(),
+            Some(STOCK_CORPSE_SCORES_REVISION)
+        );
+
+        for transient in [503, 429] {
+            probe_status.store(transient, Ordering::Release);
+            service.runtime.write().unwrap().upstream_verified_at = None;
+            let refreshed = service.public_info().await;
+            assert!(refreshed.ready);
+            assert_eq!(refreshed.scoring_revision, verified.scoring_revision);
+        }
+
+        probe_status.store(400, Ordering::Release);
+        service.runtime.write().unwrap().upstream_verified_at = None;
+        let rejected = service.public_info().await;
+        assert!(rejected.ready);
+        assert_ne!(rejected.scoring_revision, verified.scoring_revision);
         server.abort();
     }
 
