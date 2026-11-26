@@ -3053,7 +3053,7 @@ async fn hybrid_search_uses_large_scan_pages_on_both_sides_of_the_old_cutoff() {
         .unwrap();
     let app = build_router(state);
 
-    for (query, total) in [("ScanA", 576_u64), ("ScanB", 577)] {
+    for (query, total) in [("ScanA", 576_u64), ("ScanB", 577), ("ScanLimit", 800)] {
         let outcomes: Vec<_> = (100_000..100_000 + total)
             .map(|id| {
                 WorkshopFetchOutcome::Found {
@@ -3086,34 +3086,34 @@ async fn hybrid_search_uses_large_scan_pages_on_both_sides_of_the_old_cutoff() {
             .into_iter()
             .filter(|req| req.search_text.as_deref() == Some(query))
             .collect();
-        assert_eq!(searches.len(), 7);
+        assert_eq!(searches.len() as u64, 1 + total.div_ceil(100));
         assert_eq!(searches[0].num_per_page, 24);
         assert!(searches[1..].iter().all(|req| req.num_per_page == 100));
     }
 }
 
 #[tokio::test]
-async fn hybrid_search_uses_native_paging_for_the_entire_broad_query() {
+async fn hybrid_search_uses_native_paging_above_the_merge_limit() {
     let upstream = Arc::new(MockWorkshopUpstream::new());
     let state =
         ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
-    let mut local = sample_item(9199, "Local Top Sub", 100, None);
+    let mut local = sample_item(9199, "Broad Local Map", 100, None);
     local.subscriptions = Some(90_000);
     state.repo.upsert_item(&local, false, true).unwrap();
 
     for (page, id) in [(1, 9201), (13, 9213)] {
         upstream.insert_search_page(
             steam_req(
-                QUERY_TYPE_RANKED_BY_TOTAL_UNIQUE_SUBSCRIPTIONS,
+                QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
                 MATCHING_FILE_TYPE_ITEMS,
                 page,
                 1,
-                None,
+                Some("Broad"),
                 None,
                 0,
             ),
             WorkshopQueryPage {
-                total: 2401,
+                total: 801,
                 next_cursor: None,
                 outcomes: vec![WorkshopObservation::from(WorkshopFetchOutcome::Found {
                     item: sample_item(id, &format!("Steam Map {id}"), 200, None),
@@ -3126,17 +3126,96 @@ async fn hybrid_search_uses_native_paging_for_the_entire_broad_query() {
     for (page, id) in [(1, 9201), (13, 9213)] {
         let (status, mode, resp) = search_with_mode(
             &app,
-            &format!("/api/v1/items/search?page={page}&pageSize=1"),
+            &format!("/api/v1/items/search?q=Broad&page={page}&pageSize=1"),
             vec![],
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(mode.as_deref(), Some("hybrid"));
-        assert_eq!(resp.total, 2401);
+        assert_eq!(resp.total, 801);
         assert_eq!(resp.items.len(), 1);
         assert_eq!(resp.items[0].workshop_id.0, id);
     }
     assert_eq!(upstream.recorded_searches().len(), 2);
+}
+
+#[tokio::test]
+async fn hybrid_search_preserves_exact_collections_with_broad_steam_results() {
+    let upstream = Arc::new(MockWorkshopUpstream::new());
+    let state =
+        ServerState::in_memory_with_upstream("test-admin-password", upstream.clone()).unwrap();
+    state
+        .config_store
+        .update(|cfg| cfg.search.cache_steam_results = false)
+        .unwrap();
+
+    let mut collection = sample_item(610801, "Exact Steam Collection", 200, None);
+    collection.file_type = WorkshopFileType::Collection;
+    upstream.insert_item(collection);
+    let outcomes: Vec<_> = (12000..12801)
+        .map(|id| {
+            WorkshopObservation::from(WorkshopFetchOutcome::Found {
+                item: sample_item(id, "Steam text result", 100, None),
+            })
+        })
+        .collect();
+    insert_steam_search_results(
+        &upstream,
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            2,
+            Some("610801"),
+            None,
+            0,
+        ),
+        &outcomes,
+    );
+
+    let mut indexed_collection = sample_item(610802, "Exact Indexed Collection", 200, None);
+    indexed_collection.file_type = WorkshopFileType::Collection;
+    state
+        .repo
+        .upsert_item(&indexed_collection, false, true)
+        .unwrap();
+    upstream.insert_search_page(
+        steam_req(
+            QUERY_TYPE_RANKED_BY_TEXT_SEARCH,
+            MATCHING_FILE_TYPE_ITEMS,
+            1,
+            2,
+            Some("610802"),
+            None,
+            0,
+        ),
+        WorkshopQueryPage {
+            total: 2401,
+            next_cursor: None,
+            outcomes: outcomes[..2].to_vec(),
+        },
+    );
+
+    let app = build_router(state);
+    for (params, total, ids) in [
+        ("q=610801&pageSize=2", 802, vec![610801, 12000]),
+        ("q=610801&pageSize=2&page=2", 802, vec![12001, 12002]),
+        ("q=610802&pageSize=2", 1, vec![610802]),
+        ("q=610802&pageSize=2&page=1500", 1, vec![]),
+        (
+            "q=610802&pageSize=2&fileType=item",
+            2401,
+            vec![12000, 12001],
+        ),
+    ] {
+        assert_eq!(
+            search_result_ids(&app, params).await,
+            (total, ids),
+            "{params}"
+        );
+    }
+    assert!(upstream.fetch_count(WorkshopId(610801)) > 0);
+    assert_eq!(upstream.fetch_count(WorkshopId(610802)), 0);
 }
 
 #[tokio::test]
@@ -3962,7 +4041,7 @@ async fn hybrid_search_admin_override_rescues_restricted_items_and_blocks_privat
         },
     );
 
-    // NativePage mode: total > 2400 with same observations
+    // NativePage mode: a broad query with the same observations
     upstream.insert_search_page(
         steam_req(
             QUERY_TYPE_RANKED_BY_TEXT_SEARCH,

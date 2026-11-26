@@ -28,9 +28,10 @@ const MAX_SEARCH_CACHE_ENTRIES: usize = 512;
 const MAX_INFLIGHT_SEARCHES: usize = 64;
 const MAX_WARM_QUEUE_BATCHES: usize = 16;
 const WARM_WRITE_CHUNK_SIZE: usize = 25;
-const MAX_STEAM_MERGE_PAGES: u64 = 24;
 const STEAM_SCAN_PAGE_SIZE: u32 = 100;
-const MAX_STEAM_MERGE_ITEMS: u64 = MAX_STEAM_MERGE_PAGES * STEAM_SCAN_PAGE_SIZE as u64;
+const MAX_STEAM_MERGE_ITEMS: u64 = 8 * STEAM_SCAN_PAGE_SIZE as u64;
+// Preserve full merges for ID lookups, where the exact hit may be absent from QueryFiles.
+const MAX_STEAM_ID_MERGE_ITEMS: u64 = 24 * STEAM_SCAN_PAGE_SIZE as u64;
 const MAX_CONCURRENT_PAGES_PER_SEARCH: usize = 4;
 const MAX_CONCURRENT_LOCAL_SEARCHES: usize = 4;
 const MAX_CONCURRENT_VISIBILITY_WRITES: usize = 2;
@@ -121,10 +122,7 @@ enum SteamSearchError {
 enum SteamResults {
     Complete(Vec<Arc<SharedSteamPage>>),
     NativePage {
-        page: Arc<SharedSteamPage>,
-        total: u64,
-    },
-    NativePageEmpty {
+        page: Option<Arc<SharedSteamPage>>,
         total: u64,
     },
 }
@@ -614,8 +612,13 @@ impl HybridSearchService {
 
         let force_native_paging =
             sort_plan.merge == MergeStrategy::SteamOrder && search_text.is_none();
+        let merge_limit = if bare_long_exact_id.is_some() {
+            MAX_STEAM_ID_MERGE_ITEMS
+        } else {
+            MAX_STEAM_MERGE_ITEMS
+        };
         let steam = self
-            .fetch_steam_results(&request, ctx, force_native_paging)
+            .fetch_steam_results(&request, ctx, force_native_paging, merge_limit)
             .await;
         let exact_query = if !explicit_file_type {
             let mut q = query.clone();
@@ -693,17 +696,44 @@ impl HybridSearchService {
                 .await
             }
             Ok(SteamResults::NativePage { page, total }) => {
-                let mut items = self
-                    .apply_local_overlay(&query, ctx.app_id, page.raw.outcomes.iter(), true)
+                let exact_collection = if exact_untyped_id.is_some() {
+                    self.load_exact_match(
+                        &exact_query,
+                        ctx.app_id,
+                        exact_observation.as_deref(),
+                        exact_untyped_id,
+                    )
                     .await?
-                    .items;
-                let mut seen = HashSet::new();
-                items.retain(|item| seen.insert(item.workshop_id));
-                // Preserve Steam's page boundaries and ranking, including exact IDs.
-                Ok(pagination.output(items, total, SearchExecutionMode::Hybrid))
-            }
-            Ok(SteamResults::NativePageEmpty { total }) => {
-                Ok(pagination.output(Vec::new(), total, SearchExecutionMode::Hybrid))
+                    .filter(|item| item.file_type == WorkshopFileType::Collection)
+                } else {
+                    None
+                };
+                if let Some(collection) = exact_collection.as_ref() {
+                    // The native item feed cannot contain this exact collection.
+                    self.local_with_exact(
+                        &query,
+                        exact_untyped_id,
+                        pagination,
+                        Some(collection),
+                        sort_plan.merge,
+                        SearchExecutionMode::Hybrid,
+                    )
+                    .await
+                } else {
+                    let mut items = self
+                        .apply_local_overlay(
+                            &query,
+                            ctx.app_id,
+                            page.iter().flat_map(|page| &page.raw.outcomes),
+                            true,
+                        )
+                        .await?
+                        .items;
+                    let mut seen = HashSet::new();
+                    items.retain(|item| seen.insert(item.workshop_id));
+                    // Keep the native page boundaries and ranking.
+                    Ok(pagination.output(items, total, SearchExecutionMode::Hybrid))
+                }
             }
             remaining => {
                 let mode = if let Err(SteamSearchError::Unavailable(err)) = remaining {
@@ -1117,13 +1147,14 @@ impl HybridSearchService {
         request: &SteamSearchRequest,
         ctx: SteamFetchCtx,
         force_native_paging: bool,
+        merge_limit: u64,
     ) -> Result<SteamResults, SteamSearchError> {
         let mut scan_request = request.clone();
         scan_request.page = 1;
         let mut first = self.fetch_steam_page_cached(&scan_request, ctx).await?;
         let mut total = steam_total(&first.raw);
         // For very broad searches or Steam-only browse sorts (trend/toprated), keep native Steam paging.
-        if total > MAX_STEAM_MERGE_ITEMS || (force_native_paging && total > 0) {
+        if total > merge_limit || (force_native_paging && total > 0) {
             return self.resolve_native_page(request, first, total, ctx).await;
         }
         if total == 0 {
@@ -1140,7 +1171,7 @@ impl HybridSearchService {
                     "Steam CM 检索结果在重新分页时发生变化".to_owned(),
                 ));
             }
-            if updated_total > MAX_STEAM_MERGE_ITEMS {
+            if updated_total > merge_limit {
                 return self
                     .resolve_native_page(request, first, updated_total, ctx)
                     .await;
@@ -1244,14 +1275,20 @@ impl HybridSearchService {
         ctx: SteamFetchCtx,
     ) -> Result<SteamResults, SteamSearchError> {
         if request.page == 1 {
-            return Ok(SteamResults::NativePage { page: first, total });
+            return Ok(SteamResults::NativePage {
+                page: Some(first),
+                total,
+            });
         }
         let offset = u64::from(request.page - 1).saturating_mul(u64::from(request.num_per_page));
         if offset >= total {
-            return Ok(SteamResults::NativePageEmpty { total });
+            return Ok(SteamResults::NativePage { page: None, total });
         }
         let page = self.fetch_steam_page_cached(request, ctx).await?;
-        Ok(SteamResults::NativePage { page, total })
+        Ok(SteamResults::NativePage {
+            page: Some(page),
+            total,
+        })
     }
 
     async fn apply_local_overlay<'a>(
