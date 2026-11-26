@@ -4,7 +4,6 @@ import {
   ArrowUpCircle,
   CloudOff,
   Download,
-  Eye,
   Folder,
   FolderOpen,
   Layers,
@@ -25,6 +24,7 @@ import {
 } from '../../../utils/contentFilter';
 import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, Checkbox, IconButton, LinearProgress, Switch } from '../../m3/primitives';
 import {
   isRemoteUnavailable,
@@ -100,7 +100,11 @@ function BundleGridCard({
   });
   const bundleDisplayName =
     coverPres.redactTitle || coverPres.blurWholeCard
-      ? formatRedactedAddonLabel(visibleSummary.firstWorkshopId ?? summary.firstWorkshopId, t)
+      ? formatRedactedAddonLabel(
+          visibleSummary.firstWorkshopId ?? summary.firstWorkshopId,
+          t,
+          coverPres.failureDisplay,
+        )
       : bundle.name;
   const authorText = coverPres.redactAuthor
     ? t('filter.redactedAuthor')
@@ -120,34 +124,18 @@ function BundleGridCard({
       data-blur-card={coverPres.blurWholeCard ? 'true' : 'false'}
       data-pending-eval={coverPres.pendingEvaluation ? 'true' : undefined}
     >
-      {coverPres.blurWholeCard &&
-        (coverPres.pendingEvaluation ? (
-          <div className="l4a-blur-card-overlay" data-pending="true" aria-hidden="true">
-            <span className="l4a-blur-card-chip">
-              <span>{t('filter.evaluatingMedia')}</span>
-            </span>
-          </div>
-        ) : (
-          <button
-            type="button"
-            className="l4a-blur-card-overlay"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (batchMode) {
-                onToggleSelectMany(visibleIds);
-              } else {
-                for (const m of visibleMembers) {
-                  revealCard(addonFilterKey(m.id));
-                }
-              }
-            }}
-          >
-            <span className="l4a-blur-card-chip">
-              <Eye size={14} />
-              <span>{t('filter.blurCardOverlay')}</span>
-            </span>
-          </button>
-        ))}
+      <FilterCardOverlay
+        state={coverPres}
+        onReveal={() => {
+          if (batchMode) {
+            onToggleSelectMany(visibleIds);
+          } else {
+            for (const member of visibleMembers) {
+              revealCard(addonFilterKey(member.id));
+            }
+          }
+        }}
+      />
 
       <div
         className="l4a-blur-card-inner"
@@ -166,9 +154,7 @@ function BundleGridCard({
               title={bundleDisplayName}
               category="Campaign"
               filterMode={coverPres.coverMode}
-              filterLabel={
-                coverPres.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-              }
+              evaluation={coverPres.coverEvaluation}
             />
           </div>
           <div className="l4a-cover-overlay-top">
@@ -183,6 +169,7 @@ function BundleGridCard({
               />
             </div>
             <div className="l4a-status-pills">
+              <FilterFailureBadge state={coverPres} />
               <span className="md-pill" data-tone="secondary">
                 <Layers size={12} />
                 {t('library.bundleParts', { count: allMembers.length })}
@@ -336,7 +323,7 @@ function AddonGridCard({
 
   const rawDisplayName = formatAddonDisplayName(addon, namePreference);
   const displayName = cardFilter.redactTitle
-    ? formatRedactedAddonLabel(addon.workshopId, t)
+    ? formatRedactedAddonLabel(addon.workshopId, t, cardFilter.failureDisplay)
     : rawDisplayName;
   const authorText = cardFilter.redactMeta
     ? t('filter.redactedAuthor')
@@ -360,29 +347,13 @@ function AddonGridCard({
       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
       data-pending-eval={cardFilter.pendingEvaluation ? 'true' : undefined}
     >
-      {cardFilter.blurWholeCard &&
-        (cardFilter.pendingEvaluation ? (
-          <div className="l4a-blur-card-overlay" data-pending="true" aria-hidden="true">
-            <span className="l4a-blur-card-chip">
-              <span>{t('filter.evaluatingMedia')}</span>
-            </span>
-          </div>
-        ) : (
-          <button
-            type="button"
-            className="l4a-blur-card-overlay"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (batchMode) onToggleSelect(addon.id);
-              else revealCard(cardKey);
-            }}
-          >
-            <span className="l4a-blur-card-chip">
-              <Eye size={14} />
-              <span>{t('filter.blurCardOverlay')}</span>
-            </span>
-          </button>
-        ))}
+      <FilterCardOverlay
+        state={cardFilter}
+        onReveal={() => {
+          if (batchMode) onToggleSelect(addon.id);
+          else revealCard(cardKey);
+        }}
+      />
 
       <div
         className="l4a-blur-card-inner"
@@ -401,9 +372,7 @@ function AddonGridCard({
               title={displayName}
               category={addon.categories[0]}
               filterMode={cardFilter.coverMode}
-              filterLabel={
-                cardFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-              }
+              evaluation={cardFilter}
             />
           </div>
           <div className="l4a-cover-overlay-top">
@@ -418,6 +387,7 @@ function AddonGridCard({
               />
             </div>
             <div className="l4a-status-pills">
+              <FilterFailureBadge state={cardFilter} />
               {cardFilter.exclusionActive &&
                 cardFilter.exclusionDisplayLevel &&
                 cardFilter.exclusionDisplayLevel !== 'normal' && (

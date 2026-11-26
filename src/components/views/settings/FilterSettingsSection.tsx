@@ -30,6 +30,7 @@ import {
   type ExclusionDisplayLevel,
   type FilterEvaluationTarget,
   type FilterExclusionRecord,
+  type FilterFailureDisplay,
   type FilterGalleryAggregation,
   type FilterItemVerdict,
   type FilterModelParams,
@@ -42,12 +43,14 @@ import {
   type UpsertFilterExclusionRequest,
 } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import type { FilterEvaluationLogEntry } from '../../../state/controller/useContentFilter';
 import {
   getPresetDefaultParams,
   getPresetRecommendedThresholds,
   isAddonTitleRedacted,
+  isAutomaticFilterTargetEnabled,
 } from '../../../utils/contentFilter';
-import { formatAddonDisplayName } from '../../../utils/format';
+import { formatAddonDisplayName, formatTimestamp } from '../../../utils/format';
 import {
   Button,
   IconButton,
@@ -64,7 +67,7 @@ export interface FilterSettingsSectionProps {
   filterStatusBusy: boolean;
   localStatus: LocalFilterDeploymentStatus | null;
   tokenStatus: FilterTokenStatus | null;
-  evalError: string | null;
+  evaluationLog: readonly FilterEvaluationLogEntry[];
   addons: AddonSummary[];
   namePreference: AddonNamePreference;
   exclusions: FilterExclusionRecord[];
@@ -80,7 +83,7 @@ export interface FilterSettingsSectionProps {
   onRefreshTokenStatus: () => Promise<FilterTokenStatus | null>;
   onSetLlmToken: (token: string | null) => Promise<FilterTokenStatus | null>;
   onClearFilterCache: () => Promise<number | null>;
-  onRetryFailedEvaluations?: () => void;
+  onRetryFailedEvaluations: () => void;
   onEvaluateSandbox: (target: FilterEvaluationTarget) => Promise<FilterItemVerdict | null>;
   onUpsertExclusion: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
   onDeleteExclusion: (addonId: AddonId) => Promise<boolean>;
@@ -230,7 +233,7 @@ export function FilterSettingsSection({
   filterStatusBusy,
   localStatus,
   tokenStatus,
-  evalError,
+  evaluationLog,
   addons,
   namePreference,
   exclusions,
@@ -256,6 +259,9 @@ export function FilterSettingsSection({
   const sandboxDescId = useId();
 
   const filter = effectiveConfig.filter;
+  const hasFailedTargets = Array.from(filterCtx.failedTargetKeys).some((targetKey) =>
+    isAutomaticFilterTargetEnabled(targetKey, filterCtx.filterConfig),
+  );
   const filterRef = useRef(filter);
   useEffect(() => {
     filterRef.current = filter;
@@ -411,8 +417,6 @@ export function FilterSettingsSection({
     }
   };
 
-  const handleRetryEval = onRetryFailedEvaluations ?? filterCtx.retryFailedEvaluations;
-
   return (
     <>
       {/* 1. Master Switch, Scope & Source */}
@@ -425,23 +429,6 @@ export function FilterSettingsSection({
             onChange={(next) => onUpdateFilter((curr) => ({ ...curr, enabled: next }))}
           />
         </div>
-
-        {evalError && filter.enabled && (
-          <div className="l4a-callout" data-tone="error" style={{ alignItems: 'center' }}>
-            <AlertCircle size={15} style={{ flexShrink: 0 }} />
-            <span className="md-body-small selectable" style={{ flex: 1 }}>
-              {evalError}
-            </span>
-            <Button
-              variant="tonal"
-              size="sm"
-              icon={<RefreshCw size={13} />}
-              onClick={handleRetryEval}
-            >
-              {t('common.retry')}
-            </Button>
-          </div>
-        )}
 
         <div className="l4a-divider" />
 
@@ -505,6 +492,41 @@ export function FilterSettingsSection({
             </span>
           </div>
         )}
+
+        <div className="l4a-divider" />
+
+        <details className="l4a-filter-log">
+          <summary className="md-title-small">{t('filter.settings.logsTitle')}</summary>
+          <div className="l4a-filter-log-body">
+            {evaluationLog.length > 0 ? (
+              <ul className="l4a-filter-log-entries">
+                {evaluationLog.map((entry) => (
+                  <li key={entry.id} className="md-body-small selectable">
+                    <div className="l4a-row-wrap md-mono">
+                      <time dateTime={entry.at}>{formatTimestamp(entry.at)}</time>
+                      <span>{entry.targetKey}</span>
+                    </div>
+                    {entry.status === 'incomplete'
+                      ? t('filter.evalIncompleteDetail')
+                      : entry.error || t('filter.evalFailed')}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <span className="md-body-small">{t('filter.settings.logsEmpty')}</span>
+            )}
+            {hasFailedTargets && (
+              <Button
+                variant="text"
+                size="sm"
+                disabled={busy || filterStatusBusy}
+                onClick={onRetryFailedEvaluations}
+              >
+                {t('filter.settings.recheckFailed')}
+              </Button>
+            )}
+          </div>
+        </details>
       </section>
 
       {/* 2. Local Model One-Click Deployment (Left4Filters) */}
@@ -1218,6 +1240,21 @@ export function FilterSettingsSection({
         >
           {t('filter.settings.detailAlwaysBlurNote')}
         </span>
+
+        <div className="l4a-divider" />
+
+        <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+          <span className="md-title-small">{t('filter.settings.failureDisplay')}</span>
+          <Select<FilterFailureDisplay>
+            ariaLabel={t('filter.settings.failureDisplay')}
+            value={filter.failureDisplay ?? 'notice'}
+            onChange={(next) => onUpdateFilter((curr) => ({ ...curr, failureDisplay: next }))}
+            options={[
+              { value: 'notice', label: t('filter.settings.failureOptions.notice') },
+              { value: 'as_flagged', label: t('filter.settings.failureOptions.as_flagged') },
+            ]}
+          />
+        </div>
 
         <div className="l4a-divider" />
 

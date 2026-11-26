@@ -203,10 +203,8 @@ export function App() {
       exclusionsByAddonId: ctrl.exclusionsByAddonId,
       revealedCardIds: ctrl.revealedCardIds,
       failedTargetKeys: ctrl.failedTargetKeys,
-      evalError: ctrl.filterEvalError,
       revealCard: ctrl.revealCard,
       registerWorkshopItems: ctrl.registerWorkshopItems,
-      retryFailedEvaluations: ctrl.retryFailedEvaluations,
       upsertFilterExclusion: ctrl.upsertFilterExclusion,
       deleteFilterExclusion: ctrl.deleteFilterExclusion,
       onOpenFilterSettings: openFilterSettings,
@@ -217,10 +215,8 @@ export function App() {
       ctrl.exclusionsByAddonId,
       ctrl.failedTargetKeys,
       ctrl.filterConfig,
-      ctrl.filterEvalError,
       ctrl.filterVerdicts,
       ctrl.registerWorkshopItems,
-      ctrl.retryFailedEvaluations,
       ctrl.revealCard,
       ctrl.revealedCardIds,
       ctrl.upsertFilterExclusion,
@@ -418,7 +414,7 @@ export function App() {
             localFilterStatus={ctrl.localFilterStatus}
             filterStatusBusy={ctrl.filterStatusBusy}
             filterTokenStatus={ctrl.filterTokenStatus}
-            filterEvalError={ctrl.filterEvalError}
+            filterEvaluationLog={ctrl.filterEvaluationLog}
             onSaveConfig={ctrl.saveConfig}
             onDetectPath={ctrl.detectGamePath}
             onOpenInFileManager={handleOpenInFileManager}

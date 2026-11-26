@@ -7,6 +7,7 @@ import {
   buildAddonFilterTarget,
   computeFilterPolicySignature,
   FILTER_REMOTE_VERDICT_MAX_AGE_MS,
+  resolveDetailFilterState,
 } from '../../utils/contentFilter';
 import { getClient, type DesktopClient } from './types';
 import { useContentFilter } from './useContentFilter';
@@ -157,6 +158,61 @@ describe('automatic content filter lifecycle', () => {
     await act(async () => { await result.current.clearFilterCache(); });
     act(() => result.current.handleFilterVerdictsUpdated([safeVerdict(target)], sig, 0));
     expect(result.current.filterVerdicts[target.targetKey]).toBeUndefined();
+  });
+
+  it('retains partial image findings in details while rechecking the target', async () => {
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.flaggedAction = 'mark_only';
+    snapshot.addons = [snapshot.addons[0]];
+    const target = buildAddonFilterTarget(snapshot.addons[0]);
+    const { targetKey } = target;
+    const sig = policy(snapshot);
+    const partial: FilterItemVerdict = {
+      ...safeVerdict(target),
+      flagged: true,
+      decisionSource: 'model_direct_flag',
+      imageSensitive: true,
+      evaluatedImageIndices: [0, 1],
+      sensitiveImageIndices: [0],
+    };
+    const evaluate = vi.fn<DesktopClient['evaluateFilterItems']>()
+      .mockResolvedValueOnce({
+        policySignature: sig,
+        items: [{ targetKey, status: 'completed', complete: false, verdict: partial }],
+      })
+      .mockResolvedValueOnce({
+        policySignature: sig,
+        items: [{ targetKey, status: 'completed', complete: true, verdict: safeVerdict(target) }],
+      });
+    const { result } = setup(snapshot, { evaluateFilterItems: evaluate });
+    const detail = () => resolveDetailFilterState({
+      config: snapshot.config.filter,
+      scope: 'library',
+      verdict: result.current.filterVerdicts[targetKey],
+      hasTargetFailed: result.current.failedTargetKeys.has(targetKey),
+    });
+
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    expect(result.current.filterVerdicts[targetKey].complete).toBe(false);
+    expect(result.current.evaluatedRevisions[targetKey]).toBeUndefined();
+    expect(detail()).toMatchObject({ failureDisplay: 'notice', flagged: false, coverMode: 'blur' });
+    expect(detail().imageModeAt(1)).toBe('none');
+    expect(detail().imageModeAt(2)).toBe('blur');
+
+    act(() => result.current.retryFailedEvaluations());
+    expect(detail()).toMatchObject({ pendingEvaluation: true, coverMode: 'blur' });
+    await act(() => vi.advanceTimersByTimeAsync(50));
+    expect(evaluate).toHaveBeenCalledTimes(2);
+    expect(result.current.evaluatedRevisions[targetKey]).toBe(target.revisionHint);
+    expect(detail()).toMatchObject({ pendingEvaluation: false, coverMode: 'none' });
+
+    act(() => result.current.handleFilterVerdictsUpdated([{
+      ...partial,
+      complete: false,
+      evaluatedAt: new Date().toISOString(),
+    }], sig));
+    expect(result.current.filterVerdicts[targetKey].complete).toBe(true);
   });
 
   it('clears failedTargetKeys and revealedCardIds for an addon when its revision changes', async () => {

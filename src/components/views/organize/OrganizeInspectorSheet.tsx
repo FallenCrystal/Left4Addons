@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Download,
   ExternalLink,
-  Eye,
   EyeOff,
   Pencil,
   Play,
@@ -27,6 +26,7 @@ import {
   resolveLibraryAddonCardFilter,
 } from '../../../utils/contentFilter';
 import { formatBytes } from '../../../utils/format';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, SideSheet, Switch } from '../../m3/primitives';
 import type { ExternalAddonFilter } from '../LibraryView';
 import { BundleInspectorSheet } from './BundleInspectorSheet';
@@ -302,33 +302,9 @@ export function OrganizeInspectorSheet({
                       style={{ cursor: local ? 'pointer' : 'default' }}
                       data-blur-card={localFilter?.blurWholeCard ? 'true' : 'false'}
                     >
-                      {localFilter?.blurWholeCard &&
-                        localKey &&
-                        (localFilter.pendingEvaluation ? (
-                          <div
-                            className="l4a-blur-card-overlay"
-                            data-pending="true"
-                            aria-hidden="true"
-                          >
-                            <span className="l4a-blur-card-chip">
-                              <span>{t('filter.evaluatingMedia')}</span>
-                            </span>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className="l4a-blur-card-overlay"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              revealCard(localKey);
-                            }}
-                          >
-                            <span className="l4a-blur-card-chip">
-                              <Eye size={13} />
-                              <span>{t('filter.blurCardOverlay')}</span>
-                            </span>
-                          </button>
-                        ))}
+                      {localFilter && localKey && (
+                        <FilterCardOverlay state={localFilter} onReveal={() => revealCard(localKey)} />
+                      )}
                       <div
                         className="l4a-blur-row-inner"
                         inert={localFilter?.blurWholeCard || undefined}
@@ -342,6 +318,7 @@ export function OrganizeInspectorSheet({
                           >
                             <div className="l4a-row-wrap" style={{ gap: 6 }}>
                               <span className="md-title-small l4a-truncate">{localLabel}</span>
+                              {localFilter && <FilterFailureBadge state={localFilter} />}
                               {localFilter?.exclusionActive &&
                                 localFilter.exclusionDisplayLevel &&
                                 localFilter.exclusionDisplayLevel !== 'normal' && (

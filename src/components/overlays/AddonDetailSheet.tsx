@@ -45,6 +45,7 @@ import {
   resolveAddonMetadataTitle,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
+import { FilterFailureBadge } from '../m3/ContentFilterIndicators';
 import { Button, FilterChip, IconButton, Select, SideSheet, Switch, Tabs } from '../m3/primitives';
 
 export interface AddonDetailSheetProps {
@@ -176,7 +177,7 @@ export function AddonDetailSheet({
 
   const rawDisplayName = formatAddonDisplayName(addon, namePreference);
   const displayName = detailFilter.redactText
-    ? formatRedactedAddonLabel(addon.workshopId, t)
+    ? formatRedactedAddonLabel(addon.workshopId, t, detailFilter.failureDisplay)
     : rawDisplayName;
 
   const titleRedactedForTasks =
@@ -307,13 +308,12 @@ export function AddonDetailSheet({
                 title={displayName}
                 category={addon.categories[0]}
                 filterMode={detailFilter.coverMode}
-                filterLabel={
-                  detailFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-                }
+                evaluation={detailFilter}
                 allowPeek={detailFilter.coverMode === 'blur'}
               />
               <div className="l4a-cover-overlay-top">
                 <div className="l4a-status-pills">
+                  <FilterFailureBadge state={detailFilter} />
                   {addon.primaryDir && (
                     <span className="md-pill" data-tone="surface">
                       {addon.primaryDir === 'loading' ? (
@@ -750,7 +750,9 @@ export function AddonDetailSheet({
                   {memberBundles.map((b) => (
                     <span key={b.id} className="md-pill" data-tone="primary">
                       <Layers size={12} />
-                      {titleRedactedForTasks ? t('filter.redactedTitle') : b.name}
+                      {titleRedactedForTasks
+                        ? formatRedactedAddonLabel(undefined, t, detailFilter.failureDisplay)
+                        : b.name}
                     </span>
                   ))}
                 </div>
@@ -879,11 +881,7 @@ export function AddonDetailSheet({
                         title={mapLabel}
                         category="Map"
                         filterMode={mapImgMode}
-                        filterLabel={
-                          detailFilter.pendingEvaluation
-                            ? t('filter.evaluatingMedia')
-                            : undefined
-                        }
+                        evaluation={detailFilter}
                       />
                     </div>
                   )}

@@ -30,6 +30,7 @@ import type {
   SteamCapabilities,
   UpsertFilterExclusionRequest,
 } from '../../api/ipc';
+import type { FilterEvaluationLogEntry } from '../../state/controller/useContentFilter';
 import { previewFilenameByRules } from '../../utils/format';
 import { THEME_SEEDS, type ThemeMode, type ThemePreference } from '../../utils/theme';
 import {
@@ -64,7 +65,7 @@ export interface SettingsViewProps {
   localFilterStatus?: LocalFilterDeploymentStatus | null;
   filterStatusBusy?: boolean;
   filterTokenStatus?: FilterTokenStatus | null;
-  filterEvalError?: string | null;
+  filterEvaluationLog?: readonly FilterEvaluationLogEntry[];
   onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<AppConfig | null>;
   onDetectPath: () => Promise<string | null>;
   onOpenInFileManager: (path: string) => void;
@@ -109,7 +110,7 @@ export function SettingsView({
   localFilterStatus = null,
   filterStatusBusy = false,
   filterTokenStatus = null,
-  filterEvalError = null,
+  filterEvaluationLog = [],
   onSaveConfig,
   onDetectPath,
   onOpenInFileManager,
@@ -604,7 +605,7 @@ export function SettingsView({
               filterStatusBusy={filterStatusBusy}
               localStatus={localFilterStatus}
               tokenStatus={filterTokenStatus}
-              evalError={filterEvalError}
+              evaluationLog={filterEvaluationLog}
               addons={addons}
               namePreference={effective.addonNamePreference ?? 'workshop_title'}
               exclusions={exclusions}

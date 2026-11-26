@@ -6,7 +6,6 @@ import {
   ArrowUpCircle,
   Copy,
   Download,
-  Eye,
   EyeOff,
   FolderOpen,
   Layers,
@@ -33,6 +32,7 @@ import {
 } from '../../../utils/contentFilter';
 import { formatBundleMemberLabel, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, IconButton, SideSheet, Switch, Tabs } from '../../m3/primitives';
 import {
   isRemoteUnavailable,
@@ -121,6 +121,7 @@ export function BundleDetailSheet({
       ? formatRedactedAddonLabel(
           summary?.firstWorkshopId ?? allMembers.find((m) => m.workshopId)?.workshopId,
           t,
+          coverPres.failureDisplay,
         )
       : bundle.name
     : '';
@@ -280,7 +281,7 @@ export function BundleDetailSheet({
                       bundle.name,
                     );
                     const memberLabel = cardFilter.redactTitle
-                      ? formatRedactedAddonLabel(member.workshopId, t)
+                      ? formatRedactedAddonLabel(member.workshopId, t, cardFilter.failureDisplay)
                       : rawLabel;
                     const description =
                       member.addonInfo.addondescription ?? member.addonInfo.description;
@@ -292,32 +293,7 @@ export function BundleDetailSheet({
                         data-muted={installed && !member.enabled ? 'true' : 'false'}
                         data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
                       >
-                        {cardFilter.blurWholeCard &&
-                          (cardFilter.pendingEvaluation ? (
-                            <div
-                              className="l4a-blur-card-overlay"
-                              data-pending="true"
-                              aria-hidden="true"
-                            >
-                              <span className="l4a-blur-card-chip">
-                                <span>{t('filter.evaluatingMedia')}</span>
-                              </span>
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              className="l4a-blur-card-overlay"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                revealCard(key);
-                              }}
-                            >
-                              <span className="l4a-blur-card-chip">
-                                <Eye size={13} />
-                                <span>{t('filter.blurCardOverlay')}</span>
-                              </span>
-                            </button>
-                          ))}
+                        <FilterCardOverlay state={cardFilter} onReveal={() => revealCard(key)} />
                         <div
                           className="l4a-blur-row-inner"
                           inert={cardFilter.blurWholeCard || undefined}
@@ -331,11 +307,7 @@ export function BundleDetailSheet({
                               title={memberLabel}
                               category={member.categories[0]}
                               filterMode={cardFilter.coverMode}
-                              filterLabel={
-                                cardFilter.pendingEvaluation
-                                  ? t('filter.evaluatingMedia')
-                                  : undefined
-                              }
+                              evaluation={cardFilter}
                             />
                           </div>
                           <button
@@ -351,6 +323,7 @@ export function BundleDetailSheet({
                                 #{idx + 1}
                               </span>
                               <span className="md-title-small l4a-truncate">{memberLabel}</span>
+                              <FilterFailureBadge state={cardFilter} />
                               {cardFilter.exclusionActive &&
                                 cardFilter.exclusionDisplayLevel &&
                                 cardFilter.exclusionDisplayLevel !== 'normal' && (
@@ -475,7 +448,8 @@ export function BundleDetailSheet({
               </>
             ) : (
               <div className="l4a-list">
-                {filteredMaps.map(({ map: m, coverMode, pendingEvaluation, redactText }) => {
+                {filteredMaps.map((entry) => {
+                  const { map: m, coverMode, redactText } = entry;
                   const mapTitle = redactText ? m.code : m.name;
                   return (
                     <div
@@ -491,9 +465,7 @@ export function BundleDetailSheet({
                             title={mapTitle}
                             category="Map"
                             filterMode={coverMode}
-                            filterLabel={
-                              pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-                            }
+                            evaluation={entry}
                           />
                         </div>
                       )}

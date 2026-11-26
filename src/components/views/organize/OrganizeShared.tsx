@@ -1,5 +1,5 @@
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Eye, FolderOpen, Map as MapIcon, X } from 'lucide-react';
+import { AlertTriangle, FolderOpen, Map as MapIcon, X } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import {
@@ -11,6 +11,7 @@ import {
 } from '../../../utils/contentFilter';
 import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { IconButton, Switch } from '../../m3/primitives';
 import type { GroupMemberSummary, MemberRowBadge } from './helpers';
 
@@ -96,7 +97,7 @@ export function OrganizeMemberRow({
     (includeHiddenAsRedacted && (cardFilter.hiddenCard || cardFilter.blurWholeCard));
   const redactAuthor = cardFilter.redactMeta || (includeHiddenAsRedacted && cardFilter.hiddenCard);
   const resolvedLabel = redactLabel
-    ? formatRedactedAddonLabel(addon.workshopId, t)
+    ? formatRedactedAddonLabel(addon.workshopId, t, cardFilter.failureDisplay)
     : rawLabel;
   const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
 
@@ -106,28 +107,7 @@ export function OrganizeMemberRow({
       data-muted={installed && !addon.enabled ? 'true' : 'false'}
       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
     >
-      {cardFilter.blurWholeCard &&
-        (cardFilter.pendingEvaluation ? (
-          <div className="l4a-blur-card-overlay" data-pending="true" aria-hidden="true">
-            <span className="l4a-blur-card-chip">
-              <span>{t('filter.evaluatingMedia')}</span>
-            </span>
-          </div>
-        ) : (
-          <button
-            type="button"
-            className="l4a-blur-card-overlay"
-            onClick={(e) => {
-              e.stopPropagation();
-              revealCard(cardKey);
-            }}
-          >
-            <span className="l4a-blur-card-chip">
-              <Eye size={13} />
-              <span>{t('filter.blurCardOverlay')}</span>
-            </span>
-          </button>
-        ))}
+      <FilterCardOverlay state={cardFilter} onReveal={() => revealCard(cardKey)} />
 
       <div
         className="l4a-blur-row-inner"
@@ -142,9 +122,7 @@ export function OrganizeMemberRow({
             title={resolvedLabel}
             category={addon.categories[0]}
             filterMode={cardFilter.coverMode}
-            filterLabel={
-              cardFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-            }
+            evaluation={cardFilter}
           />
         </div>
         <button
@@ -159,6 +137,7 @@ export function OrganizeMemberRow({
               </span>
             )}
             <span className="md-title-small l4a-truncate">{resolvedLabel}</span>
+            <FilterFailureBadge state={cardFilter} />
             {cardFilter.exclusionActive &&
               cardFilter.exclusionDisplayLevel &&
               cardFilter.exclusionDisplayLevel !== 'normal' && (

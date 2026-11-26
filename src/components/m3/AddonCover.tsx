@@ -15,7 +15,8 @@ import {
   User,
 } from 'lucide-react';
 import { isTauriRuntime, readCachedImage, workshopCoverUrl } from '../../api/ipc';
-import type { CoverFilterMode } from '../../utils/contentFilter';
+import type { CoverFilterMode, FilterEvaluationDisplay } from '../../utils/contentFilter';
+import { FilterProgress } from './ContentFilterIndicators';
 
 export type { CoverFilterMode };
 
@@ -122,7 +123,7 @@ export interface AddonCoverProps {
   category?: string;
   compact?: boolean;
   filterMode?: CoverFilterMode;
-  filterLabel?: string;
+  evaluation?: FilterEvaluationDisplay & { blurWholeCard?: boolean };
   allowPeek?: boolean;
 }
 
@@ -133,7 +134,7 @@ export function AddonCover({
   category,
   compact = false,
   filterMode = 'none',
-  filterLabel,
+  evaluation,
   allowPeek = false,
 }: AddonCoverProps) {
   const { t } = useTranslation();
@@ -177,6 +178,7 @@ export function AddonCover({
   const isLazyDeferred = filterMode === 'lazy' && hasValidCandidate && !lazyLoaded;
   const skipImageLoad = filterMode === 'hide' || isLazyDeferred;
   const isPeeked = allowPeek && peeked;
+  const showFailureNotice = evaluation?.failureDisplay === 'notice';
 
   const activeSrc = skipImageLoad ? undefined : nonFailedCandidates[0];
 
@@ -212,16 +214,24 @@ export function AddonCover({
         data-filter-mode="hide"
         data-compact={compact ? 'true' : 'false'}
       >
-        <EyeOff size={compact ? 15 : 22} strokeWidth={1.8} />
-        {!compact && (
-          <span className="l4a-cover-filter-label">{filterLabel ?? t('filter.imageHidden')}</span>
+        {evaluation?.pendingEvaluation ? (
+          !evaluation.blurWholeCard && <FilterProgress size={compact ? 15 : 22} />
+        ) : (
+          <>
+            <EyeOff size={compact ? 15 : 22} strokeWidth={1.8} />
+            {!compact && (
+              <span className="l4a-cover-filter-label">
+                {t(showFailureNotice ? 'filter.unverifiedImageHidden' : 'filter.imageHidden')}
+              </span>
+            )}
+          </>
         )}
       </div>
     );
   }
 
   if (isLazyDeferred) {
-    const lazyText = filterLabel ?? t('filter.lazyLoadPreview');
+    const lazyText = t('filter.lazyLoadPreview');
     return (
       <div
         className="l4a-cover-filtered"
@@ -310,7 +320,7 @@ export function AddonCover({
           ) : blurred ? (
             <span className="md-pill" data-tone="surface">
               <EyeOff size={12} />
-              {!compact && (filterLabel ?? t('filter.blurredImage'))}
+              {!compact && t(showFailureNotice ? 'filter.unverifiedImageBlurred' : 'filter.blurredImage')}
             </span>
           ) : null}
         </div>

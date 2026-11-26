@@ -164,7 +164,7 @@ export function LibraryView({
   );
 
   const filterCtx = useContentFilterContext();
-  const { filterConfig, evalError, retryFailedEvaluations } = filterCtx;
+  const { filterConfig } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
 
   const extFilterKey = externalFilter
@@ -358,8 +358,6 @@ export function LibraryView({
         filteredOutCount={filteredOutCount}
         showingFilteredCards={showingFilteredCards}
         onToggleShowFilteredCards={() => setShowingFilteredCards((v) => !v)}
-        evalError={filterConfig.enabled && filterConfig.applyToLibrary ? evalError : null}
-        onRetryEval={retryFailedEvaluations}
       />
 
       {showBatchBar && (

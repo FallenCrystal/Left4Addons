@@ -52,6 +52,7 @@ import {
   formatTimestamp,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../m3/ContentFilterIndicators';
 import {
   Button,
   Dialog,
@@ -215,10 +216,8 @@ export function WorkshopView({
     evaluatedRevisions,
     revealedCardIds,
     failedTargetKeys,
-    evalError,
     revealCard,
     registerWorkshopItems,
-    retryFailedEvaluations,
   } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
 
@@ -323,12 +322,14 @@ export function WorkshopView({
   );
   const activeKey = activeItem ? workshopFilterKey(activeItem.workshopId) : undefined;
   const activeVerdict = activeItem ? resolveWorkshopVerdict(activeItem, filterCtx) : undefined;
+  const activeRevealed = activeKey !== undefined && revealedCardIds.has(activeKey);
   const activeDetailFilter = useMemo(
     () =>
       resolveDetailFilterState({
         config: filterConfig,
         scope: 'workshop',
         verdict: activeVerdict,
+        revealed: activeRevealed,
         totalImages: activeGalleryUrls.length,
         hasTargetFailed: activeKey ? failedTargetKeys.has(activeKey) : false,
         hasContent: activeItem ? hasFilterableWorkshopContent(activeItem) : false,
@@ -336,6 +337,7 @@ export function WorkshopView({
     [
       filterConfig,
       activeKey,
+      activeRevealed,
       activeVerdict,
       activeGalleryUrls.length,
       failedTargetKeys,
@@ -349,7 +351,7 @@ export function WorkshopView({
             config: filterConfig,
             scope: 'workshop',
             verdict: activeVerdict,
-            revealed: revealedCardIds.has(activeKey),
+            revealed: activeRevealed,
             forceShowHiddenCards: showingFilteredCards,
             hasTargetFailed: failedTargetKeys.has(activeKey),
             hasContent: hasFilterableWorkshopContent(activeItem),
@@ -358,33 +360,23 @@ export function WorkshopView({
     [
       activeItem,
       activeKey,
+      activeRevealed,
       activeVerdict,
       failedTargetKeys,
       filterConfig,
-      revealedCardIds,
       showingFilteredCards,
     ],
   );
-  const activeRevealed = Boolean(activeKey && revealedCardIds.has(activeKey));
-  const activeDetailUnverifiedShield = Boolean(
+  const activeDetailTextShielded = Boolean(
     activeCardFilter &&
-      !activeCardFilter.flagged &&
       !activeRevealed &&
       (activeCardFilter.blurWholeCard ||
         activeCardFilter.hiddenCard ||
-        activeCardFilter.redactTitle),
+        (!activeCardFilter.flagged && activeCardFilter.redactTitle)),
   );
-  const activeDetailFlaggedUnrevealed = Boolean(
-    activeCardFilter &&
-      activeCardFilter.flagged &&
-      !activeRevealed &&
-      (activeCardFilter.blurWholeCard || activeCardFilter.hiddenCard),
-  );
-  const activeDetailTextShielded =
-    activeDetailUnverifiedShield || activeDetailFlaggedUnrevealed;
   const activeDisplayTitle = activeItem
     ? activeDetailTextShielded
-      ? formatRedactedAddonLabel(activeItem.workshopId, t)
+      ? formatRedactedAddonLabel(activeItem.workshopId, t, activeDetailFilter.failureDisplay)
       : activeItem.title
     : '';
 
@@ -756,14 +748,6 @@ export function WorkshopView({
             onRemove={showingFilteredCards ? () => setShowingFilteredCards(false) : undefined}
           />
         )}
-        {filterConfig.enabled && filterConfig.applyToWorkshop && evalError && (
-          <FilterChip
-            label={t('filter.evalFailedRetry')}
-            tone="error"
-            icon={<RefreshCw size={13} />}
-            onClick={retryFailedEvaluations}
-          />
-        )}
         <div className="l4a-spacer" />
         {loading && response && <LoadingIndicator size="sm" label={t('common.search')} />}
         {response && (
@@ -844,7 +828,7 @@ export function WorkshopView({
                     hasContent: hasFilterableWorkshopContent(item),
                   });
                   const displayTitle = cardFilter.redactTitle
-                    ? t('filter.redactedTitleWithId', { id: item.workshopId })
+                    ? formatRedactedAddonLabel(item.workshopId, t, cardFilter.failureDisplay)
                     : item.title;
 
                   return (
@@ -855,32 +839,7 @@ export function WorkshopView({
                       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
                       data-pending-eval={cardFilter.pendingEvaluation ? 'true' : undefined}
                     >
-                      {cardFilter.blurWholeCard &&
-                        (cardFilter.pendingEvaluation ? (
-                          <div
-                            className="l4a-blur-card-overlay"
-                            data-pending="true"
-                            aria-hidden="true"
-                          >
-                            <span className="l4a-blur-card-chip">
-                              <span>{t('filter.evaluatingMedia')}</span>
-                            </span>
-                          </div>
-                        ) : (
-                          <button
-                            type="button"
-                            className="l4a-blur-card-overlay"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              revealCard(cardKey);
-                            }}
-                          >
-                            <span className="l4a-blur-card-chip">
-                              <Eye size={14} />
-                              <span>{t('filter.blurCardOverlay')}</span>
-                            </span>
-                          </button>
-                        ))}
+                      <FilterCardOverlay state={cardFilter} onReveal={() => revealCard(cardKey)} />
 
                       <div
                         className="l4a-blur-card-inner"
@@ -898,11 +857,7 @@ export function WorkshopView({
                               title={displayTitle}
                               category={item.tags[0]}
                               filterMode={cardFilter.coverMode}
-                              filterLabel={
-                                cardFilter.pendingEvaluation
-                                  ? t('filter.evaluatingMedia')
-                                  : undefined
-                              }
+                              evaluation={cardFilter}
                             />
                           </div>
                           <div className="l4a-cover-overlay-top">
@@ -910,6 +865,7 @@ export function WorkshopView({
                               {t(`workshop.type.${item.fileType}`)}
                             </span>
                             <div className="l4a-status-pills">
+                              <FilterFailureBadge state={cardFilter} />
                               {cardFilter.showDiagnosticBadge && verdict && (
                                 <span className="md-pill" data-tone="tertiary">
                                   {formatDiagnosticVerdictBadge(verdict, cardFilter, {
@@ -1131,19 +1087,22 @@ export function WorkshopView({
                       gore: activeVerdict.probabilities.goreProb.toFixed(2),
                     })}
                   </span>
-                  {activeDetailFlaggedUnrevealed && activeKey && (
-                    <div style={{ marginTop: 4 }}>
-                      <Button
-                        variant="tonal"
-                        size="sm"
-                        icon={<Eye size={14} />}
-                        onClick={() => revealCard(activeKey)}
-                      >
-                        {t('filter.blurCardOverlay')}
-                      </Button>
-                    </div>
-                  )}
                 </div>
+              </div>
+            )}
+
+            {activeKey && activeDetailTextShielded && !activeDetailFilter.pendingEvaluation && (
+              <div className="l4a-row-wrap">
+                <Button
+                  variant="tonal"
+                  size="sm"
+                  icon={<Eye size={14} />}
+                  onClick={() => revealCard(activeKey)}
+                >
+                  {t(activeDetailFilter.failureDisplay === 'notice'
+                    ? 'filter.evalFailedReveal'
+                    : 'filter.blurCardOverlay')}
+                </Button>
               </div>
             )}
 
@@ -1156,11 +1115,14 @@ export function WorkshopView({
                 title={activeDisplayTitle}
                 category={activeDetailTextShielded ? undefined : activeItem.tags[0]}
                 filterMode={activeDetailFilter.imageModeAt(0)}
-                filterLabel={
-                  activeDetailFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-                }
+                evaluation={activeDetailFilter}
                 allowPeek={activeDetailFilter.imageModeAt(0) === 'blur'}
               />
+              {activeDetailFilter.failureDisplay && (
+                <div className="l4a-cover-overlay-top">
+                  <FilterFailureBadge state={activeDetailFilter} />
+                </div>
+              )}
             </div>
 
             {activeGalleryUrls.length > 1 && (
@@ -1182,11 +1144,7 @@ export function WorkshopView({
                           title={`${activeDisplayTitle} #${imageIdx + 1}`}
                           category={activeDetailTextShielded ? undefined : activeItem.tags[0]}
                           filterMode={imgMode}
-                          filterLabel={
-                            activeDetailFilter.pendingEvaluation
-                              ? t('filter.evaluatingMedia')
-                              : undefined
-                          }
+                          evaluation={activeDetailFilter}
                           allowPeek={imgMode === 'blur'}
                         />
                       </div>

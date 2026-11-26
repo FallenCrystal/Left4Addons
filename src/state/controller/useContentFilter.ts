@@ -29,6 +29,32 @@ import type { DesktopClient, NotifyFn, TranslateFn } from './types';
 const EVAL_BATCH_CHUNK_SIZE = 16;
 const MAX_CONCURRENT_EVAL_BATCHES = 1;
 const EVAL_DEBOUNCE_MS = 50;
+const MAX_EVALUATION_LOG_ENTRIES = 100;
+
+type FilterEvaluationIssue =
+  | { targetKey: string; status: 'failed'; error?: string }
+  | { targetKey: string; status: 'incomplete' };
+
+export type FilterEvaluationLogEntry = FilterEvaluationIssue & {
+  id: number;
+  at: string;
+};
+
+interface FilterTargetKeys {
+  policySig: string;
+  keys: Set<string>;
+}
+
+function removeTargetKeys(
+  state: FilterTargetKeys,
+  policySig: string,
+  staleKeys: ReadonlySet<string>,
+): FilterTargetKeys {
+  if (state.policySig !== policySig || state.keys.size === 0) return state;
+  const keys = new Set(state.keys);
+  for (const key of staleKeys) keys.delete(key);
+  return keys.size === state.keys.size ? state : { policySig, keys };
+}
 
 export interface UseContentFilterParams {
   client: DesktopClient;
@@ -103,15 +129,14 @@ export function useContentFilter({
   );
   const [filterStatusBusy, setFilterStatusBusy] = useState(false);
   const [filterTokenStatus, setFilterTokenStatus] = useState<FilterTokenStatus | null>(null);
-  const [filterEvalError, setFilterEvalError] = useState<string | null>(null);
-  const [revealedStore, setRevealedStore] = useState<{
-    policySig: string;
-    keys: Set<string>;
-  }>(() => ({ policySig: policySignature, keys: new Set() }));
-  const [failedStore, setFailedStore] = useState<{
-    policySig: string;
-    keys: Set<string>;
-  }>(() => ({ policySig: policySignature, keys: new Set() }));
+  const [filterEvaluationLog, setFilterEvaluationLog] = useState<FilterEvaluationLogEntry[]>([]);
+  const evaluationLogId = useRef(0);
+  const [revealedStore, setRevealedStore] = useState<FilterTargetKeys>(
+    () => ({ policySig: policySignature, keys: new Set() }),
+  );
+  const [failedStore, setFailedStore] = useState<FilterTargetKeys>(
+    () => ({ policySig: policySignature, keys: new Set() }),
+  );
   const [evalRetryNonce, setEvalRetryNonce] = useState(0);
 
   const [hydrationTracker, setHydrationTracker] = useState<{
@@ -157,24 +182,8 @@ export function useContentFilter({
     });
 
     if (staleAddonKeys.size > 0) {
-      setFailedStore((prev) => {
-        if (prev.policySig !== policySignature) return prev;
-        let removed = false;
-        const next = new Set(prev.keys);
-        for (const key of staleAddonKeys) {
-          if (next.delete(key)) removed = true;
-        }
-        return removed ? { policySig: prev.policySig, keys: next } : prev;
-      });
-      setRevealedStore((prev) => {
-        if (prev.policySig !== policySignature) return prev;
-        let removed = false;
-        const next = new Set(prev.keys);
-        for (const key of staleAddonKeys) {
-          if (next.delete(key)) removed = true;
-        }
-        return removed ? { policySig: prev.policySig, keys: next } : prev;
-      });
+      setFailedStore((prev) => removeTargetKeys(prev, policySignature, staleAddonKeys));
+      setRevealedStore((prev) => removeTargetKeys(prev, policySignature, staleAddonKeys));
     }
 
     const cached =
@@ -224,7 +233,7 @@ export function useContentFilter({
         if (currentRev === undefined || v.revisionHint !== currentRev) {
           continue;
         }
-        if (!nextMap[v.targetKey]) {
+        if (!nextMap[v.targetKey] || nextMap[v.targetKey].complete === false) {
           nextMap[v.targetKey] = v;
           changed = true;
         }
@@ -273,12 +282,41 @@ export function useContentFilter({
   const pendingTargetsRef = useRef<Map<string, FilterEvaluationTarget>>(new Map());
   const inFlightSigsRef = useRef<Set<string>>(new Set());
   const failedSigsRef = useRef<Set<string>>(new Set());
-  const failedTargetKeysRef = useRef<Set<string>>(new Set());
   const evaluatedRevisionsRef = useRef<Record<string, string>>({});
   const filterVerdictsRef = useRef<Record<string, FilterItemVerdict>>({});
   const workshopRegistryRef = useRef<Map<string, FilterEvaluationTarget>>(new Map());
   const flushTimerRef = useRef<number | null>(null);
   const prevServiceStateRef = useRef<string | undefined>(undefined);
+
+  const appendEvaluationLog = useCallback((issues: FilterEvaluationIssue[]) => {
+    if (issues.length === 0) return;
+    const at = new Date().toISOString();
+    const entries = issues.map((issue) => ({ ...issue, at, id: ++evaluationLogId.current }));
+    setFilterEvaluationLog((prev) => [...entries, ...prev].slice(0, MAX_EVALUATION_LOG_ENTRIES));
+  }, []);
+
+  const updateFailedTargets = useCallback((
+    sig: string,
+    issues: FilterEvaluationIssue[],
+    completedKeys: string[] = [],
+  ) => {
+    if (issues.length === 0 && completedKeys.length === 0) return;
+    setFailedStore((prev) => {
+      const next = new Set(prev.policySig === sig ? prev.keys : []);
+      let changed = prev.policySig !== sig;
+      for (const key of completedKeys) {
+        if (next.delete(key)) changed = true;
+      }
+      for (const { targetKey } of issues) {
+        if (!next.has(targetKey)) {
+          next.add(targetKey);
+          changed = true;
+        }
+      }
+      return changed ? { policySig: sig, keys: next } : prev;
+    });
+    appendEvaluationLog(issues);
+  }, [appendEvaluationLog]);
 
   useEffect(() => {
     basePolicySigRef.current = basePolicySignature;
@@ -304,9 +342,6 @@ export function useContentFilter({
       }
     }
     if (staleKeys.size > 0) {
-      for (const key of staleKeys) {
-        failedTargetKeysRef.current.delete(key);
-      }
       for (const sigEntry of Array.from(failedSigsRef.current)) {
         const parts = sigEntry.split('::');
         if (parts.length >= 2 && staleKeys.has(parts[1])) {
@@ -326,29 +361,24 @@ export function useContentFilter({
       pendingTargetsRef.current.clear();
       inFlightSigsRef.current.clear();
       failedSigsRef.current.clear();
-      failedTargetKeysRef.current = new Set();
       evaluatedRevisionsRef.current = {};
       filterVerdictsRef.current = {};
       setFailedStore({ policySig: policySignature, keys: new Set() });
       setRevealedStore({ policySig: policySignature, keys: new Set() });
-      setFilterEvalError(null);
     }
   }, [policySignature, cacheGeneration]);
 
   useEffect(() => {
     evaluatedRevisionsRef.current = { ...evaluatedRevisions };
     filterVerdictsRef.current = { ...filterVerdicts };
-    failedTargetKeysRef.current = new Set(failedTargetKeys);
-  }, [evaluatedRevisions, failedTargetKeys, filterVerdicts]);
+  }, [evaluatedRevisions, filterVerdicts]);
 
   useEffect(() => {
     const wasEnabled = prevEnabledRef.current;
     prevEnabledRef.current = filterConfig.enabled;
     if (filterConfig.enabled && !wasEnabled) {
       failedSigsRef.current.clear();
-      failedTargetKeysRef.current = new Set();
       setFailedStore({ policySig: policySigRef.current, keys: new Set() });
-      setFilterEvalError(null);
       setEvalRetryNonce((n) => n + 1);
     }
   }, [filterConfig.enabled]);
@@ -368,7 +398,6 @@ export function useContentFilter({
     policySigRef.current = nextSig;
     pendingTargetsRef.current.clear();
     failedSigsRef.current.clear();
-    failedTargetKeysRef.current = new Set();
     evaluatedRevisionsRef.current = {};
     filterVerdictsRef.current = {};
     setRuntimePolicyOverride({ baseSig: basePolicySigRef.current, sig: nextSig });
@@ -380,14 +409,11 @@ export function useContentFilter({
     });
     setRevealedStore({ policySig: nextSig, keys: new Set() });
     setFailedStore({ policySig: nextSig, keys: new Set() });
-    setFilterEvalError(null);
   }, []);
 
   const retryFailedEvaluations = useCallback(() => {
     failedSigsRef.current.clear();
-    failedTargetKeysRef.current = new Set();
     setFailedStore({ policySig: policySigRef.current, keys: new Set() });
-    setFilterEvalError(null);
     setEvalRetryNonce((n) => n + 1);
   }, []);
 
@@ -422,14 +448,18 @@ export function useContentFilter({
     const accepted: FilterItemVerdict[] = [];
     for (const verdict of relevant) {
       const existing = filterVerdictsRef.current[verdict.targetKey];
-      if (
-        existing &&
-        existing.revisionHint === verdict.revisionHint &&
-        Date.parse(existing.evaluatedAt) > Date.parse(verdict.evaluatedAt)
-      ) continue;
+      const complete = verdict.complete !== false;
+      if (existing && existing.revisionHint === verdict.revisionHint) {
+        const existingComplete = existing.complete !== false;
+        if (existingComplete && !complete && filterVerdictExpiresAt(existing, mode) > now) continue;
+        if (
+          existingComplete === complete &&
+          Date.parse(existing.evaluatedAt) > Date.parse(verdict.evaluatedAt)
+        ) continue;
+      }
       filterVerdictsRef.current[verdict.targetKey] = verdict;
       accepted.push(verdict);
-      if (verdict.complete !== false && verdict.revisionHint != null) {
+      if (complete && verdict.revisionHint != null) {
         evaluatedRevisionsRef.current[verdict.targetKey] = verdict.revisionHint;
       } else {
         delete evaluatedRevisionsRef.current[verdict.targetKey];
@@ -457,7 +487,8 @@ export function useContentFilter({
   const isCurrentEvaluation = useCallback((targetKey: string, revision: string) => {
     const verdict = filterVerdictsRef.current[targetKey];
     return evaluatedRevisionsRef.current[targetKey] === revision &&
-      verdict && filterVerdictExpiresAt(verdict, filterConfigRef.current.mode) > Date.now();
+      verdict && verdict.complete !== false &&
+      filterVerdictExpiresAt(verdict, filterConfigRef.current.mode) > Date.now();
   }, []);
 
   useEffect(() => {
@@ -477,6 +508,8 @@ export function useContentFilter({
       setVerdictsExpiredThrough(now);
       const sig = policySigRef.current;
       const generation = cacheGenerationRef.current;
+      const expiredKeys = new Set(expired);
+      setFailedStore((prev) => removeTargetKeys(prev, sig, expiredKeys));
       setVerdictStore((prev) => {
         if (prev.policySig !== sig || prev.cacheGeneration !== generation) return prev;
         const map = { ...prev.map };
@@ -565,93 +598,53 @@ export function useContentFilter({
             }
             const sig = policySigRef.current;
 
-            const completedVerdicts: FilterItemVerdict[] = [];
+            const verdicts: FilterItemVerdict[] = [];
             const clearedKeys: string[] = [];
-            const failedKeys: string[] = [];
-            let explicitFailureMsg: string | null = null;
-            let incompleteNoticeMsg: string | null = null;
+            const issues: FilterEvaluationIssue[] = [];
 
             for (const item of response.items) {
-              const reqRev = requestedRevByKey.get(item.targetKey) ?? '';
-              if (!targetStillEligible(item.targetKey, reqRev)) continue;
+              const reqRev = requestedRevByKey.get(item.targetKey);
+              if (reqRev === undefined || !targetStillEligible(item.targetKey, reqRev)) continue;
               const itemSig = `${sig}::${item.targetKey}::${reqRev}`;
               const dispatchItemSig = `${dispatchSig}::${item.targetKey}::${reqRev}`;
 
-              if (item.status === 'completed') {
-                const isComplete = item.complete !== false && item.verdict.complete !== false;
-                if (isComplete) {
-                  completedVerdicts.push(item.verdict);
-                  failedSigsRef.current.delete(itemSig);
-                  failedSigsRef.current.delete(dispatchItemSig);
-                  clearedKeys.push(item.targetKey);
-                } else {
-                  failedSigsRef.current.add(itemSig);
-                  if (item.verdict.flagged) {
-                    completedVerdicts.push(item.verdict);
-                  }
-                  failedKeys.push(item.targetKey);
-                  incompleteNoticeMsg ??= tRef.current('filter.evalIncompleteRetry');
-                }
+              if (
+                item.status === 'completed' &&
+                item.complete !== false &&
+                item.verdict.complete !== false
+              ) {
+                verdicts.push(item.verdict);
+                failedSigsRef.current.delete(itemSig);
+                failedSigsRef.current.delete(dispatchItemSig);
+                clearedKeys.push(item.targetKey);
+                continue;
+              }
+
+              failedSigsRef.current.add(itemSig);
+              if (item.status === 'failed') {
+                issues.push({ targetKey: item.targetKey, status: 'failed', error: item.error });
               } else {
-                failedSigsRef.current.add(itemSig);
-                failedKeys.push(item.targetKey);
-                if (!explicitFailureMsg) {
-                  explicitFailureMsg = item.error || tRef.current('filter.evalFailedRetry');
+                issues.push({ targetKey: item.targetKey, status: 'incomplete' });
+                if (item.verdict.flagged) {
+                  verdicts.push({ ...item.verdict, complete: false });
                 }
               }
             }
-            const batchErrorMsg = explicitFailureMsg ?? incompleteNoticeMsg;
 
-            if (clearedKeys.length > 0 || failedKeys.length > 0) {
-              const refNext = new Set(failedTargetKeysRef.current);
-              for (const k of clearedKeys) refNext.delete(k);
-              for (const k of failedKeys) refNext.add(k);
-              failedTargetKeysRef.current = refNext;
-              setFailedStore((prev) => {
-                const base = prev.policySig === sig ? prev.keys : new Set<string>();
-                const next = new Set(base);
-                let changed = prev.policySig !== sig;
-                for (const k of clearedKeys) {
-                  if (next.delete(k)) changed = true;
-                }
-                for (const k of failedKeys) {
-                  if (!next.has(k)) {
-                    next.add(k);
-                    changed = true;
-                  }
-                }
-                return changed ? { policySig: sig, keys: next } : prev;
-              });
-            }
-
-            if (batchErrorMsg) {
-              setFilterEvalError(batchErrorMsg);
-            } else if (failedTargetKeysRef.current.size === 0) {
-              setFilterEvalError(null);
-            }
-
-            mergeVerdicts(completedVerdicts);
+            updateFailedTargets(sig, issues, clearedKeys);
+            mergeVerdicts(verdicts);
           })
           .catch((err) => {
             if (evalEpochRef.current !== epoch) return;
             const sig = policySigRef.current;
-            const newlyFailed: string[] = [];
+            const error = err instanceof Error ? err.message : String(err);
+            const issues: FilterEvaluationIssue[] = [];
             for (const t of chunk) {
               if (!targetStillEligible(t.targetKey, t.revisionHint)) continue;
               failedSigsRef.current.add(`${sig}::${t.targetKey}::${t.revisionHint ?? ''}`);
-              newlyFailed.push(t.targetKey);
+              issues.push({ targetKey: t.targetKey, status: 'failed', error });
             }
-            if (newlyFailed.length === 0) return;
-            const refNext = new Set(failedTargetKeysRef.current);
-            for (const k of newlyFailed) refNext.add(k);
-            failedTargetKeysRef.current = refNext;
-            setFailedStore((prev) => {
-              const base = prev.policySig === sig ? prev.keys : new Set<string>();
-              const next = new Set(base);
-              for (const k of newlyFailed) next.add(k);
-              return { policySig: sig, keys: next };
-            });
-            setFilterEvalError(err instanceof Error ? err.message : String(err));
+            updateFailedTargets(sig, issues);
           })
           .finally(() => {
             if (evalEpochRef.current === epoch) {
@@ -672,7 +665,8 @@ export function useContentFilter({
 
     pump();
   }, [
-    adoptRuntimePolicySignature, client, isCurrentEvaluation, mergeVerdicts, tRef, targetStillEligible,
+    adoptRuntimePolicySignature, client, isCurrentEvaluation, mergeVerdicts, targetStillEligible,
+    updateFailedTargets,
   ]);
 
   const enqueueTargets = useCallback(
@@ -750,14 +744,25 @@ export function useContentFilter({
     (items: WorkshopItemRecord[], options?: { onlyIfMissing?: boolean }) => {
       if (items.length === 0) return;
       const onlyIfMissing = options?.onlyIfMissing ?? false;
+      const sig = policySigRef.current;
+      const staleKeys = new Set<string>();
       const targets: FilterEvaluationTarget[] = [];
       for (const item of items) {
         const target = buildWorkshopFilterTarget(item);
-        if (onlyIfMissing && workshopRegistryRef.current.has(target.targetKey)) {
-          continue;
+        const previous = workshopRegistryRef.current.get(target.targetKey);
+        if (previous) {
+          if (onlyIfMissing) continue;
+          if (previous.revisionHint !== target.revisionHint) {
+            staleKeys.add(target.targetKey);
+            failedSigsRef.current.delete(`${sig}::${target.targetKey}::${previous.revisionHint ?? ''}`);
+          }
         }
         workshopRegistryRef.current.set(target.targetKey, target);
         targets.push(target);
+      }
+      if (staleKeys.size > 0) {
+        setFailedStore((prev) => removeTargetKeys(prev, sig, staleKeys));
+        setRevealedStore((prev) => removeTargetKeys(prev, sig, staleKeys));
       }
       if (workshopRegistryRef.current.size > 160) {
         const keys = Array.from(workshopRegistryRef.current.keys());
@@ -814,10 +819,8 @@ export function useContentFilter({
     pendingTargetsRef.current.clear();
     inFlightSigsRef.current.clear();
     failedSigsRef.current.clear();
-    failedTargetKeysRef.current = new Set();
     evaluatedRevisionsRef.current = {};
     filterVerdictsRef.current = {};
-    setFilterEvalError(null);
     setVerdictStore({
       policySig: policySigRef.current,
       cacheGeneration: cacheGenerationRef.current,
@@ -986,16 +989,24 @@ export function useContentFilter({
         const first = response.items[0];
         if (!first) return null;
         if (first.status === 'failed') {
+          appendEvaluationLog([{ targetKey: target.targetKey, status: 'failed', error: first.error }]);
           notify(first.error, { tone: 'error' });
+          return null;
+        }
+        if (first.complete === false || first.verdict.complete === false) {
+          appendEvaluationLog([{ targetKey: target.targetKey, status: 'incomplete' }]);
+          notify(tRef.current('filter.evalIncompleteDetail'), { tone: 'error' });
           return null;
         }
         return first.verdict;
       } catch (err) {
-        notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
+        const error = err instanceof Error ? err.message : String(err);
+        appendEvaluationLog([{ targetKey: target.targetKey, status: 'failed', error }]);
+        notify(error, { tone: 'error' });
         return null;
       }
     },
-    [client, notify],
+    [appendEvaluationLog, client, notify, tRef],
   );
 
   const upsertFilterExclusion = useCallback(
@@ -1045,7 +1056,7 @@ export function useContentFilter({
     localFilterStatus,
     filterStatusBusy,
     filterTokenStatus,
-    filterEvalError,
+    filterEvaluationLog,
     revealedCardIds,
     failedTargetKeys,
     revealCard,

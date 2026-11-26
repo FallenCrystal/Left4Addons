@@ -402,7 +402,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     localFilterStatus: contentFilter.localFilterStatus,
     filterStatusBusy: contentFilter.filterStatusBusy,
     filterTokenStatus: contentFilter.filterTokenStatus,
-    filterEvalError: contentFilter.filterEvalError,
+    filterEvaluationLog: contentFilter.filterEvaluationLog,
     revealedCardIds: contentFilter.revealedCardIds,
     failedTargetKeys: contentFilter.failedTargetKeys,
     revealCard: contentFilter.revealCard,

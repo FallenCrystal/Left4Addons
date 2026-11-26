@@ -1,7 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import {
   ExternalLink,
-  Eye,
   FolderOpen,
   Layers,
   Lock,
@@ -20,6 +19,7 @@ import {
 } from '../../../utils/contentFilter';
 import { formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, EmptyState, IconButton, Switch } from '../../m3/primitives';
 import type { ExternalAddonFilter } from '../LibraryView';
 import { summarizeGroupMembers } from './helpers';
@@ -90,7 +90,11 @@ export function BundlesTab({
         });
         const bundleDisplayName =
           coverPres.redactTitle || coverPres.blurWholeCard
-            ? formatRedactedAddonLabel(visibleMembers.find((m) => m.workshopId)?.workshopId, t)
+            ? formatRedactedAddonLabel(
+                visibleMembers.find((m) => m.workshopId)?.workshopId,
+                t,
+                coverPres.failureDisplay,
+              )
             : bundle.name;
 
         return (
@@ -102,30 +106,14 @@ export function BundlesTab({
             data-blur-card={coverPres.blurWholeCard ? 'true' : 'false'}
             data-pending-eval={coverPres.pendingEvaluation ? 'true' : undefined}
           >
-            {coverPres.blurWholeCard &&
-              (coverPres.pendingEvaluation ? (
-                <div className="l4a-blur-card-overlay" data-pending="true" aria-hidden="true">
-                  <span className="l4a-blur-card-chip">
-                    <span>{t('filter.evaluatingMedia')}</span>
-                  </span>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="l4a-blur-card-overlay"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    for (const m of visibleMembers) {
-                      revealCard(addonFilterKey(m.id));
-                    }
-                  }}
-                >
-                  <span className="l4a-blur-card-chip">
-                    <Eye size={14} />
-                    <span>{t('filter.blurCardOverlay')}</span>
-                  </span>
-                </button>
-              ))}
+            <FilterCardOverlay
+              state={coverPres}
+              onReveal={() => {
+                for (const member of visibleMembers) {
+                  revealCard(addonFilterKey(member.id));
+                }
+              }}
+            />
 
             <div
               className="l4a-blur-card-inner"
@@ -144,9 +132,7 @@ export function BundlesTab({
                     title={bundleDisplayName}
                     category="Campaign"
                     filterMode={coverPres.coverMode}
-                    filterLabel={
-                      coverPres.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-                    }
+                    evaluation={coverPres.coverEvaluation}
                   />
                 </div>
                 <div className="l4a-cover-overlay-top">
@@ -154,6 +140,7 @@ export function BundlesTab({
                     {t(`organize.bundleKind.${bundle.kind}`)}
                   </span>
                   <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                    <FilterFailureBadge state={coverPres} />
                     <GroupStatusPill summary={summary} />
                     <IconButton
                       size="sm"

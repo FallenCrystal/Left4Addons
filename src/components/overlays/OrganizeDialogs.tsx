@@ -21,6 +21,7 @@ import {
   matchesAddonSearch,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
+import { FilterFailureBadge } from '../m3/ContentFilterIndicators';
 import { Button, Checkbox, Dialog, FilterChip, IconButton, Switch, TextField } from '../m3/primitives';
 
 const GROUP_COLORS = ['#246A4D', '#006399', '#964422', '#6750A4', '#8B5E00', '#AD2E56', '#3D6373'];
@@ -162,9 +163,8 @@ function AddonPicker({
               searchRedaction.redactMeta || cardFilter.blurWholeCard
                 ? t('filter.redactedAuthor')
                 : addon.author || t('common.unknown');
-            const coverLabel = cardFilter.pendingEvaluation
-              ? t('filter.evaluatingMedia')
-              : undefined;
+            const { pendingEvaluation, failureDisplay, coverMode } = cardFilter;
+            const evaluation = { pendingEvaluation, failureDisplay, coverMode };
             return (
               <div
                 key={addon.id}
@@ -184,8 +184,8 @@ function AddonPicker({
                     fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
                     title={displayName}
                     category={addon.categories[0]}
-                    filterMode={cardFilter.coverMode}
-                    filterLabel={coverLabel}
+                    filterMode={coverMode}
+                    evaluation={evaluation}
                   />
                 </div>
                 <div className="l4a-list-main">
@@ -194,6 +194,7 @@ function AddonPicker({
                     <span className="l4a-truncate">{authorText}</span>
                     <span>·</span>
                     <span>{formatBytes(addon.fileSize)}</span>
+                    <FilterFailureBadge state={evaluation} />
                   </div>
                 </div>
                 {addon.primaryDir && (

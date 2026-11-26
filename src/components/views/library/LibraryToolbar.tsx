@@ -55,8 +55,6 @@ export interface LibraryToolbarProps {
   filteredOutCount?: number;
   showingFilteredCards?: boolean;
   onToggleShowFilteredCards?: () => void;
-  evalError?: string | null;
-  onRetryEval?: () => void;
 }
 
 export function LibraryToolbar({
@@ -87,8 +85,6 @@ export function LibraryToolbar({
   filteredOutCount = 0,
   showingFilteredCards = false,
   onToggleShowFilteredCards,
-  evalError = null,
-  onRetryEval,
 }: LibraryToolbarProps) {
   const { t } = useTranslation();
 
@@ -225,15 +221,6 @@ export function LibraryToolbar({
             icon={<EyeOff size={14} />}
             onClick={onToggleShowFilteredCards}
             onRemove={showingFilteredCards ? onToggleShowFilteredCards : undefined}
-          />
-        )}
-
-        {evalError && onRetryEval && (
-          <FilterChip
-            label={t('filter.evalFailedRetry')}
-            tone="error"
-            icon={<RefreshCw size={13} />}
-            onClick={onRetryEval}
           />
         )}
 

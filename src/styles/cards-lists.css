@@ -543,6 +543,17 @@
   pointer-events: auto;
 }
 
+.l4a-filter-progress {
+  display: inline-flex;
+  color: var(--md-sys-color-primary);
+}
+
+.l4a-blur-card-overlay .l4a-filter-progress {
+  padding: 6px;
+  border-radius: var(--md-sys-shape-corner-full);
+  background-color: var(--md-sys-color-surface-container-highest);
+}
+
 .l4a-blur-card-overlay:not([data-pending='true']):hover .l4a-blur-card-chip {
   background-color: var(--md-sys-color-secondary-container);
   color: var(--md-sys-color-on-secondary-container);

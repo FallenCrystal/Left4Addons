@@ -11,6 +11,7 @@ import {
   type ExclusionDisplayLevel,
   type FilterEvaluationTarget,
   type FilterExclusionRecord,
+  type FilterFailureDisplay,
   type FilterGalleryAggregation,
   type FilterItemVerdict,
   type FilterModelParams,
@@ -59,9 +60,13 @@ export interface EffectiveModalities {
   sensitiveImageIndices: number[];
 }
 
-export interface CardFilterState extends EffectiveModalities {
-  scopeEnabled: boolean;
+export interface FilterEvaluationDisplay {
   pendingEvaluation: boolean;
+  failureDisplay?: FilterFailureDisplay;
+}
+
+export interface CardFilterState extends EffectiveModalities, FilterEvaluationDisplay {
+  scopeEnabled: boolean;
   flagged: boolean;
   hiddenCard: boolean;
   coverMode: CoverFilterMode;
@@ -76,9 +81,8 @@ export interface CardFilterState extends EffectiveModalities {
   exclusionInvalidated: boolean;
 }
 
-export interface DetailFilterState extends EffectiveModalities {
+export interface DetailFilterState extends EffectiveModalities, FilterEvaluationDisplay {
   scopeEnabled: boolean;
-  pendingEvaluation: boolean;
   flagged: boolean;
   coverMode: CoverFilterMode;
   mapCoverMode: CoverFilterMode;
@@ -195,6 +199,7 @@ export function createDefaultFilterConfig(): ClientFilterConfig {
     llmTokenSource: 'env_var',
     llmTokenEnvVar: DEFAULT_LLM_TOKEN_ENV_VAR,
     flaggedAction: 'blur_card',
+    failureDisplay: 'notice',
     subdivideModalities: true,
     modalityThreshold: 0.3,
   };
@@ -649,11 +654,34 @@ function exclusionLevelToCoverMode(level: ExclusionDisplayLevel): CoverFilterMod
   }
 }
 
+type FilterDisplayConfig = Pick<
+  ClientFilterConfig,
+  | 'enabled'
+  | 'applyToLibrary'
+  | 'applyToWorkshop'
+  | 'flaggedAction'
+  | 'subdivideModalities'
+  | 'failureDisplay'
+>;
+
+function resolveEvaluationDisplay(
+  verdict: FilterItemVerdict | null | undefined,
+  hasTargetFailed: boolean | undefined,
+  hasContent: boolean,
+  failureDisplay: FilterFailureDisplay,
+): FilterEvaluationDisplay {
+  if (hasContent && (verdict === undefined || verdict?.complete === false)) {
+    // A retry clears the failure state while retaining previous image findings.
+    const failed = hasTargetFailed ?? (verdict?.complete === false);
+    return failed
+      ? { pendingEvaluation: false, failureDisplay: failureDisplay ?? 'notice' }
+      : { pendingEvaluation: true };
+  }
+  return { pendingEvaluation: false };
+}
+
 export interface ResolveCardFilterOptions {
-  config: Pick<
-    ClientFilterConfig,
-    'enabled' | 'applyToLibrary' | 'applyToWorkshop' | 'flaggedAction' | 'subdivideModalities'
-  >;
+  config: FilterDisplayConfig;
   scope: 'library' | 'workshop';
   verdict?: FilterItemVerdict | null;
   exclusion?: FilterExclusionRecord | null;
@@ -672,7 +700,7 @@ export function resolveCardFilterState({
   revealed = false,
   totalImages,
   forceShowHiddenCards = false,
-  hasTargetFailed = false,
+  hasTargetFailed,
   hasContent = true,
 }: ResolveCardFilterOptions): CardFilterState {
   const scopeEnabled =
@@ -724,50 +752,38 @@ export function resolveCardFilterState({
     };
   }
 
-  const isPendingEvaluation = verdict === undefined && !hasTargetFailed && hasContent;
-  if (isPendingEvaluation) {
+  const evaluation = resolveEvaluationDisplay(
+    verdict, hasTargetFailed, hasContent, config.failureDisplay,
+  );
+  if (evaluation.pendingEvaluation || evaluation.failureDisplay) {
     if (config.flaggedAction === 'mark_only') {
       return {
         ...neutral,
-        exclusionInvalidated,
-        pendingEvaluation: true,
-      };
-    }
-    const isHideImage = config.flaggedAction === 'hide_image';
-    return {
-      ...neutral,
-      exclusionInvalidated,
-      pendingEvaluation: true,
-      coverMode: 'hide',
-      redactTitle: isHideImage,
-      redactDescription: isHideImage,
-      blurWholeCard:
-        config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card',
-    };
-  }
-
-  if (verdict === undefined && hasTargetFailed && hasContent) {
-    if (config.flaggedAction === 'mark_only') {
-      return {
-        ...neutral,
+        ...evaluation,
         exclusionInvalidated,
       };
     }
     const isHideImage = config.flaggedAction === 'hide_image';
-    const shouldBlur =
-      config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card';
+    const hiddenCard =
+      evaluation.failureDisplay === 'as_flagged' &&
+      config.flaggedAction === 'hide_card' &&
+      !forceShowHiddenCards;
+    const blurCard = !hiddenCard && !isHideImage;
+    const canReveal = !evaluation.pendingEvaluation && revealed;
     return {
       ...neutral,
+      ...evaluation,
       exclusionInvalidated,
+      hiddenCard,
       coverMode: 'hide',
       redactTitle: isHideImage,
       redactDescription: isHideImage,
-      blurWholeCard: shouldBlur && !revealed,
-      isBlurCardRevealed: shouldBlur && revealed,
+      blurWholeCard: blurCard && !canReveal,
+      isBlurCardRevealed: blurCard && canReveal,
     };
   }
 
-  if (!verdict?.flagged) {
+  if (!verdict?.flagged || verdict.complete === false) {
     return {
       ...neutral,
       exclusionInvalidated,
@@ -829,10 +845,7 @@ export function resolveCardFilterState({
 }
 
 export interface ResolveDetailFilterOptions {
-  config: Pick<
-    ClientFilterConfig,
-    'enabled' | 'applyToLibrary' | 'applyToWorkshop' | 'subdivideModalities'
-  > & { flaggedAction?: FlaggedItemAction };
+  config: Omit<FilterDisplayConfig, 'flaggedAction'> & { flaggedAction?: FlaggedItemAction };
   scope: 'library' | 'workshop';
   verdict?: FilterItemVerdict | null;
   exclusion?: FilterExclusionRecord | null;
@@ -849,7 +862,7 @@ export function resolveDetailFilterState({
   exclusion,
   revealed = false,
   totalImages,
-  hasTargetFailed = false,
+  hasTargetFailed,
   hasContent = true,
 }: ResolveDetailFilterOptions): DetailFilterState {
   const scopeEnabled =
@@ -903,50 +916,24 @@ export function resolveDetailFilterState({
     };
   }
 
-  const isPendingEvaluation = verdict === undefined && !hasTargetFailed && hasContent;
-  if (isPendingEvaluation) {
-    if (config.flaggedAction === 'mark_only') {
-      return {
-        ...neutral,
-        exclusionInvalidated,
-        pendingEvaluation: true,
-      };
-    }
-    return {
-      ...neutral,
-      exclusionInvalidated,
-      pendingEvaluation: true,
-      coverMode: 'hide',
-      mapCoverMode: 'hide',
-      redactText: true,
-      isImageIndexSensitive: () => true,
-      imageModeAt: () => 'hide',
-    };
-  }
+  const evaluation = resolveEvaluationDisplay(
+    verdict, hasTargetFailed, hasContent, config.failureDisplay,
+  );
+  const unverifiedCoverMode: CoverFilterMode = config.flaggedAction === 'mark_only'
+    ? 'none'
+    : evaluation.pendingEvaluation ? 'hide' : evaluation.failureDisplay ? 'blur' : 'none';
+  const state: DetailFilterState = {
+    ...neutral,
+    ...evaluation,
+    exclusionInvalidated,
+    coverMode: unverifiedCoverMode,
+    mapCoverMode: unverifiedCoverMode,
+    redactText: unverifiedCoverMode === 'hide' || (unverifiedCoverMode === 'blur' && !revealed),
+    imageModeAt: () => unverifiedCoverMode,
+  };
 
-  if (verdict === undefined && hasTargetFailed && hasContent) {
-    if (config.flaggedAction === 'mark_only') {
-      return {
-        ...neutral,
-        exclusionInvalidated,
-      };
-    }
-    return {
-      ...neutral,
-      exclusionInvalidated,
-      coverMode: 'blur',
-      mapCoverMode: 'blur',
-      redactText: !revealed,
-      isImageIndexSensitive: () => true,
-      imageModeAt: () => 'blur',
-    };
-  }
-
-  if (!verdict?.flagged) {
-    return {
-      ...neutral,
-      exclusionInvalidated,
-    };
+  if (!verdict?.flagged || (verdict.complete === false && !hasContent)) {
+    return state;
   }
 
   const modalities = resolveEffectiveModalities(verdict, config.subdivideModalities, totalImages);
@@ -969,27 +956,26 @@ export function resolveDetailFilterState({
     }
     return false;
   };
-  const imageModeAt = (index: number): CoverFilterMode =>
-    isImageIndexSensitive(index) ? 'blur' : 'none';
+  const imageModeAt = (index: number): CoverFilterMode => {
+    if (unverifiedCoverMode !== 'none') return unverifiedCoverMode;
+    return isImageIndexSensitive(index) ? 'blur' : 'none';
+  };
 
   return {
-    ...neutral,
+    ...state,
     ...modalities,
-    flagged: true,
-    exclusionInvalidated,
+    flagged: verdict.complete !== false,
     coverMode: imageModeAt(0),
-    mapCoverMode: modalities.imageSensitive ? 'blur' : 'none',
-    redactText: false,
+    mapCoverMode: unverifiedCoverMode === 'none' && modalities.imageSensitive
+      ? 'blur'
+      : unverifiedCoverMode,
     isImageIndexSensitive,
     imageModeAt,
   };
 }
 
 export interface FilterLookupSource {
-  filterConfig: Pick<
-    ClientFilterConfig,
-    'enabled' | 'applyToLibrary' | 'applyToWorkshop' | 'flaggedAction' | 'subdivideModalities'
-  >;
+  filterConfig: FilterDisplayConfig;
   verdicts: Record<string, FilterItemVerdict>;
   evaluatedRevisions?: Record<string, string>;
   exclusionsByAddonId: ReadonlyMap<string, FilterExclusionRecord>;
@@ -1057,7 +1043,7 @@ export function resolveLibraryAddonCardFilter(
     exclusion: filterCtx.exclusionsByAddonId.get(addon.id),
     revealed: filterCtx.revealedCardIds?.has(key) ?? false,
     forceShowHiddenCards: options?.forceShowHiddenCards ?? false,
-    hasTargetFailed: filterCtx.failedTargetKeys?.has(key) ?? false,
+    hasTargetFailed: filterCtx.failedTargetKeys?.has(key),
     hasContent: hasFilterableAddonContent(addon),
   });
 }
@@ -1075,7 +1061,7 @@ export function resolveLibraryAddonDetailFilter(
     exclusion: filterCtx.exclusionsByAddonId.get(addon.id),
     revealed: filterCtx.revealedCardIds?.has(key) ?? false,
     totalImages: imageSources.length,
-    hasTargetFailed: filterCtx.failedTargetKeys?.has(key) ?? false,
+    hasTargetFailed: filterCtx.failedTargetKeys?.has(key),
     hasContent: hasFilterableAddonContent(addon),
   });
 }
@@ -1104,7 +1090,10 @@ export function getAddonSearchRedaction(
   addon: AddonSummary,
   filterCtx: FilterLookupSource,
 ): AddonSearchRedactionOptions {
-  const state = resolveLibraryAddonCardFilter(addon, filterCtx);
+  return getCardSearchRedaction(resolveLibraryAddonCardFilter(addon, filterCtx));
+}
+
+function getCardSearchRedaction(state: CardFilterState): AddonSearchRedactionOptions {
   const unverifiedCardShielded =
     (state.blurWholeCard || state.hiddenCard) && !state.flagged && !state.isBlurCardRevealed;
   const unverifiedTitleShielded = !state.flagged && state.redactTitle;
@@ -1138,7 +1127,7 @@ export function isWorkshopKeyTitleRedacted(
     scope: 'workshop',
     verdict: resolveLookupVerdict(wsKey, filterCtx),
     revealed: filterCtx.revealedCardIds?.has(wsKey) ?? false,
-    hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey) ?? false,
+    hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey),
     hasContent: Boolean(rawTitle?.trim()),
   });
   const unverifiedCardShielded =
@@ -1227,7 +1216,7 @@ export function isLinkedWorkshopTitleRedacted(
       scope: 'workshop',
       verdict: wsVerdict,
       revealed: filterCtx.revealedCardIds?.has(wsKey) ?? false,
-      hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey) ?? false,
+      hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey),
       hasContent: Boolean((rawTitle ?? addon.title).trim()),
     });
     return (
@@ -1242,7 +1231,13 @@ export function isLinkedWorkshopTitleRedacted(
 export function formatRedactedAddonLabel(
   workshopId: string | undefined,
   t: FilterTranslateFn,
+  failureDisplay?: FilterFailureDisplay,
 ): string {
+  if (failureDisplay === 'notice') {
+    return workshopId
+      ? t('filter.unverifiedTitleWithId', { id: workshopId })
+      : t('filter.unverifiedTitle');
+  }
   return workshopId
     ? t('filter.redactedTitleWithId', { id: workshopId })
     : t('filter.redactedTitle');
@@ -1254,8 +1249,9 @@ export function formatFilteredAddonTitle(
   filterCtx: FilterLookupSource,
   t: FilterTranslateFn,
 ): string {
-  if (isAddonTitleRedacted(addon, filterCtx)) {
-    return formatRedactedAddonLabel(addon.workshopId, t);
+  const state = resolveLibraryAddonCardFilter(addon, filterCtx);
+  if (getCardSearchRedaction(state).redactTitle) {
+    return formatRedactedAddonLabel(addon.workshopId, t, state.failureDisplay);
   }
   return formatAddonDisplayName(addon, namePreference);
 }
@@ -1268,18 +1264,19 @@ export function formatFilteredBundleMemberLabel(
   filterCtx: FilterLookupSource,
   t: FilterTranslateFn,
 ): string {
-  if (isAddonTitleRedacted(addon, filterCtx)) {
-    return formatRedactedAddonLabel(addon.workshopId, t);
+  const state = resolveLibraryAddonCardFilter(addon, filterCtx);
+  if (getCardSearchRedaction(state).redactTitle) {
+    return formatRedactedAddonLabel(addon.workshopId, t, state.failureDisplay);
   }
   return formatBundleMemberLabel(addon, siblings, namePreference, bundleName);
 }
 
-export interface BundleCoverPresentation {
+export interface BundleCoverPresentation extends FilterEvaluationDisplay {
   ownerMember?: AddonSummary;
   src?: string;
   fallbackSrc?: string;
   coverMode: CoverFilterMode;
-  pendingEvaluation: boolean;
+  coverEvaluation: FilterEvaluationDisplay & { blurWholeCard: boolean };
   redactTitle: boolean;
   redactAuthor: boolean;
   author?: string;
@@ -1351,6 +1348,7 @@ export function resolveBundleCoverPresentation(
     eligible.length > 0 && eligible.every((e) => e.state.blurWholeCard);
   const anyPendingBlur =
     effectiveBlurWholeCard && eligible.some((e) => e.state.pendingEvaluation);
+  const memberFailureDisplay = eligible.find((e) => e.state.failureDisplay)?.state.failureDisplay;
 
   const withCover = eligible.filter((e) =>
     Boolean(e.member.coverImage?.trim() || e.member.localCoverImage?.trim()),
@@ -1361,17 +1359,32 @@ export function resolveBundleCoverPresentation(
     withCover.find((e) => e.member.maps.length > 0) ??
     withCover[0];
 
-  if (ownerEntry) {
+  const presentationForCover = (ownerState?: CardFilterState) => {
+    const coverMode: CoverFilterMode =
+      effectiveBlurWholeCard ? 'hide' : (ownerState?.coverMode ?? 'none');
+    const coverPendingEvaluation = ownerState?.pendingEvaluation ?? false;
     return {
-      ownerMember: ownerEntry.member,
-      src: ownerEntry.member.coverImage,
-      fallbackSrc: getFilteredAddonFallbackCover(ownerEntry.member, filterCtx),
-      coverMode: effectiveBlurWholeCard ? 'hide' : ownerEntry.state.coverMode,
-      pendingEvaluation: effectiveBlurWholeCard ? anyPendingBlur : ownerEntry.state.pendingEvaluation,
+      coverMode,
+      pendingEvaluation: effectiveBlurWholeCard ? anyPendingBlur : coverPendingEvaluation,
+      failureDisplay: memberFailureDisplay ?? ownerState?.failureDisplay,
+      coverEvaluation: {
+        pendingEvaluation: coverPendingEvaluation,
+        failureDisplay: ownerState?.failureDisplay,
+        blurWholeCard: effectiveBlurWholeCard,
+      },
       redactTitle,
       redactAuthor,
       author,
       blurWholeCard: effectiveBlurWholeCard,
+    };
+  };
+
+  if (ownerEntry) {
+    return {
+      ...presentationForCover(ownerEntry.state),
+      ownerMember: ownerEntry.member,
+      src: ownerEntry.member.coverImage,
+      fallbackSrc: getFilteredAddonFallbackCover(ownerEntry.member, filterCtx),
     };
   }
 
@@ -1389,42 +1402,27 @@ export function resolveBundleCoverPresentation(
       });
       if (!bundleOwnerState.hiddenCard || options?.forceShowHiddenCards) {
         return {
+          ...presentationForCover(bundleOwnerState),
           ownerMember: bundleOwner,
           src: fallbackBundleCover,
           fallbackSrc:
             bundleOwner.localCoverImage?.trim() !== fallbackBundleCover
               ? getFilteredAddonFallbackCover(bundleOwner, filterCtx)
               : undefined,
-          coverMode: effectiveBlurWholeCard ? 'hide' : bundleOwnerState.coverMode,
-          pendingEvaluation: effectiveBlurWholeCard
-            ? anyPendingBlur
-            : bundleOwnerState.pendingEvaluation,
-          redactTitle,
-          redactAuthor,
-          author,
-          blurWholeCard: effectiveBlurWholeCard,
         };
       }
     }
   }
 
   return {
+    ...presentationForCover(),
     ownerMember: eligible[0]?.member,
-    src: undefined,
-    fallbackSrc: undefined,
-    coverMode: effectiveBlurWholeCard ? 'hide' : 'none',
-    pendingEvaluation: anyPendingBlur,
-    redactTitle,
-    redactAuthor,
-    author,
-    blurWholeCard: effectiveBlurWholeCard,
   };
 }
 
-export interface FilteredBundleMapItem {
+export interface FilteredBundleMapItem extends FilterEvaluationDisplay {
   map: MapEntry;
   coverMode: CoverFilterMode;
-  pendingEvaluation: boolean;
   redactText: boolean;
 }
 
@@ -1457,6 +1455,7 @@ export function buildFilteredBundleMaps(
           map,
           coverMode,
           pendingEvaluation: detail.pendingEvaluation,
+          failureDisplay: detail.failureDisplay,
           redactText: detail.redactText,
         });
       }
@@ -1470,6 +1469,7 @@ export function buildFilteredBundleMaps(
       map,
       coverMode: map.imagePath?.trim() ? detail.mapCoverMode : 'none',
       pendingEvaluation: detail.pendingEvaluation,
+      failureDisplay: detail.failureDisplay,
       redactText: detail.redactText,
     }));
   }

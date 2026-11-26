@@ -766,6 +766,14 @@ pub enum FlaggedItemAction {
     HideCard,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FilterFailureDisplay {
+    #[default]
+    Notice,
+    AsFlagged,
+}
+
 /// Progressive display levels for Library Exclusions (`排除项展示页面等级`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -833,6 +841,8 @@ pub struct ClientFilterConfig {
     // Flagged UI actions & unimodal subdivision
     #[serde(default)]
     pub flagged_action: FlaggedItemAction,
+    #[serde(default)]
+    pub failure_display: FilterFailureDisplay,
     #[serde(default = "default_true")]
     pub subdivide_modalities: bool,
     #[serde(default = "default_modality_threshold")]
@@ -865,6 +875,7 @@ impl Default for ClientFilterConfig {
             llm_token_source: LlmTokenSource::EnvVar,
             llm_token_env_var: default_llm_env_var(),
             flagged_action: FlaggedItemAction::BlurCard,
+            failure_display: FilterFailureDisplay::default(),
             subdivide_modalities: true,
             modality_threshold: default_modality_threshold(),
         }
@@ -1319,6 +1330,20 @@ mod tests {
         let sig_a = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r1"));
         let sig_b = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r2"));
         assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn failure_display_defaults_to_notice_and_does_not_change_the_policy() {
+        let mut cfg: ClientFilterConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg.failure_display, FilterFailureDisplay::Notice);
+        let signature = cfg.canonical_policy_signature(None, true, None);
+
+        cfg.failure_display = FilterFailureDisplay::AsFlagged;
+        assert_eq!(cfg.canonical_policy_signature(None, true, None), signature);
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["failureDisplay"],
+            "as_flagged"
+        );
     }
 
     #[test]

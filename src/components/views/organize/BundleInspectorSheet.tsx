@@ -86,6 +86,7 @@ export function BundleInspectorSheet({
           visibleMembers.find((m) => m.workshopId)?.workshopId ??
             allMembers.find((m) => m.workshopId)?.workshopId,
           t,
+          coverPres.failureDisplay,
         )
       : inspectedBundle.name
     : '';
@@ -247,7 +248,8 @@ export function BundleInspectorSheet({
               </>
             ) : (
               <div className="l4a-list">
-                {filteredMaps.map(({ map: m, coverMode, pendingEvaluation, redactText }) => {
+                {filteredMaps.map((entry) => {
+                  const { map: m, coverMode, redactText } = entry;
                   const mapTitle = redactText ? m.code : m.name;
                   return (
                     <div
@@ -263,9 +265,7 @@ export function BundleInspectorSheet({
                             title={mapTitle}
                             category="Map"
                             filterMode={coverMode}
-                            filterLabel={
-                              pendingEvaluation ? t('filter.evaluatingMedia') : undefined
-                            }
+                            evaluation={entry}
                           />
                         </div>
                       )}

@@ -1203,7 +1203,7 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     ).toBe(true);
   });
 
-  it('ignores stale cachedFilterVerdicts revisions, bounds batch concurrency, keeps failed and incomplete items retryable, and accepts native pol_ verdict events', async () => {
+  it('shows evaluation progress, logs failed and incomplete checks, and rechecks them from settings', async () => {
     setTauriMode(true);
     const snapshot = await previewEngine.getDashboardSnapshot();
     snapshot.config.collapseCampaignBundles = false;
@@ -1278,7 +1278,27 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     let releaseFirstBatch: (() => void) | null = null;
 
     invokeMock.mockImplementation(
-      async (cmd: string, args?: { targets?: FilterEvaluationTarget[] }) => {
+      async (cmd: string, args?: { targets?: FilterEvaluationTarget[]; config?: AppConfig }) => {
+        if (cmd === 'save_config' && args?.config) {
+          snapshot.config = structuredClone(args.config);
+          return snapshot.config;
+        }
+        if (cmd === 'get_local_filter_status') {
+          return {
+            env: { gitAvailable: true, pythonAvailable: true, venvAvailable: true },
+            deployed: false,
+            serviceState: 'stopped',
+            updateAvailable: false,
+            recentCommits: [],
+          };
+        }
+        if (cmd === 'get_filter_token_status') {
+          return {
+            hasEncryptedToken: false,
+            envVarName: 'L4A_LLM_API_KEY',
+            envVarPresent: false,
+          };
+        }
         if (cmd === 'evaluate_filter_items') {
           const targets = args?.targets ?? [];
           evaluatedTargetBatches.push(targets.map((t) => t.targetKey));
@@ -1304,10 +1324,10 @@ describe('Left4Addons v2 Material 3 frontend', () => {
                   verdict: {
                     targetKey: t.targetKey,
                     revisionHint: t.revisionHint,
-                    flagged: false,
-                    decisionSource: 'model_safe' as const,
-                    evaluatedScore: 0.03,
-                    probabilities: { prob: 0.03, goreProb: 0.01, nsfwProb: 0.02 },
+                    flagged: true,
+                    decisionSource: 'model_direct_flag' as const,
+                    evaluatedScore: 0.93,
+                    probabilities: { prob: 0.93, goreProb: 0.01, nsfwProb: 0.92 },
                     textSensitive: false,
                     titleSensitive: false,
                     descriptionSensitive: false,
@@ -1362,6 +1382,11 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     });
     expect(evaluatedTargetBatches[0].length).toBe(16);
     expect(inFlightEvalCount).toBe(1);
+    const pendingCard = screen.getByText('Chernobyl: Chapter One').closest('article')!;
+    expect(
+      within(pendingCard).getByRole('progressbar', { name: 'Evaluating content safety…' }),
+    ).toBeTruthy();
+    expect(within(pendingCard).queryByText('Evaluating content safety…')).toBeNull();
 
     // Release chunk 1 -> chunk 2 pumps sequentially after chunk 1 settles
     await act(async () => {
@@ -1377,28 +1402,55 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(allFirstPassTargets).toContain('addon:ws:2814104912');
     expect(allFirstPassTargets).not.toContain('addon:ws:2814105100');
 
-    // Failed & incomplete (complete: false) items keep conservative blur and surface Retry chip!
-    const retryChip = await screen.findByRole('button', { name: 'Filter failed · Retry' });
-    expect(retryChip).toBeTruthy();
     const chernobylCard = screen.getByText('Chernobyl: Chapter One').closest('article')!;
     const yamaCard = screen.getByText('Yama Campaign Remastered').closest('article')!;
-    expect(chernobylCard.getAttribute('data-blur-card')).toBe('true');
-    expect(yamaCard.getAttribute('data-blur-card')).toBe('true');
+    for (const card of [chernobylCard, yamaCard]) {
+      expect(
+        within(card).getByRole('button', { name: 'Content check failed · Show text' }),
+      ).toBeTruthy();
+      expect(within(card).queryByRole('button', { name: /Sensitive/ })).toBeNull();
+      expect(card.querySelector('img')).toBeNull();
+    }
+    expect(screen.queryByRole('button', { name: /Retry|Recheck failed items/ })).toBeNull();
 
-    // Clicking Retry re-evaluates ONLY the incomplete (ws:2814104912) and failed (ws:3011942811) items!
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+    const displaySelect = screen.getByRole('combobox', { name: 'Display After a Failed Check' });
+    expect(displaySelect.textContent).toBe('Show Failure Notice');
+    fireEvent.click(displaySelect);
+    fireEvent.click(screen.getByRole('option', { name: 'Use Sensitive Content Display' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(snapshot.config.filter.failureDisplay).toBe('as_flagged'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    const sensitiveDisplayCard = screen.getByText('Yama Campaign Remastered').closest('article')!;
+    expect(
+      within(sensitiveDisplayCard).getByRole('button', { name: 'Sensitive · Click to show text' }),
+    ).toBeTruthy();
+    expect(evaluatedTargetBatches).toHaveLength(2);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(screen.getByText('Filter Logs'));
+    expect(screen.getByText('Preview image fetch failed')).toBeTruthy();
+    expect(screen.getByText('Some preview images could not be loaded for safety evaluation')).toBeTruthy();
     evalRound = 1;
-    fireEvent.click(retryChip);
+    fireEvent.click(screen.getByRole('button', { name: 'Recheck failed items' }));
 
     await waitFor(() => {
       expect(evaluatedTargetBatches.length).toBe(3);
-      expect(chernobylCard.getAttribute('data-blur-card')).toBe('false');
-      expect(yamaCard.getAttribute('data-blur-card')).toBe('false');
+      expect(screen.queryByRole('button', { name: 'Recheck failed items' })).toBeNull();
     });
     expect([...evaluatedTargetBatches[2]].sort()).toEqual([
       'addon:ws:2814104912',
       'addon:ws:3011942811',
     ]);
-    expect(screen.queryByRole('button', { name: 'Filter failed · Retry' })).toBeNull();
+    expect(screen.getByText('Preview image fetch failed')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Library' }));
+    await waitFor(() => {
+      for (const title of ['Chernobyl: Chapter One', 'Yama Campaign Remastered']) {
+        expect(screen.getByText(title).closest('article')?.getAttribute('data-blur-card')).toBe('false');
+      }
+    });
 
     // Native CoreEvent filter_verdicts_updated with canonical pol_... policySignature is accepted!
     await act(async () => {
@@ -1986,6 +2038,66 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(within(sheet).queryByText('Unverified Explicit Mod Title')).toBeNull();
     expect(within(sheet).queryByText('SecretAuthorName')).toBeNull();
     expect(within(sheet).queryByText('Unverified Explicit Description Body')).toBeNull();
+    expect(within(sheet).queryByRole('button', { name: /show text/i })).toBeNull();
+  });
+
+  it.each([
+    ['notice', 'Content check failed · Show text'],
+    ['as_flagged', 'Sensitive · Click to show text'],
+  ] as const)('reveals directly inspected Workshop text after a partial check (%s)', async (
+    failureDisplay,
+    revealLabel,
+  ) => {
+    const { config } = await previewEngine.getDashboardSnapshot();
+    await previewEngine.saveConfig({
+      ...config,
+      filter: {
+        ...config.filter,
+        enabled: true,
+        applyToLibrary: false,
+        flaggedAction: 'blur_card',
+        failureDisplay,
+      },
+    });
+    const workshopId = '66778899';
+    const title = 'Direct Inspect Preview';
+    const description = 'Description for the directly inspected item';
+    const fetchItem = vi.spyOn(previewEngine, 'fetchWorkshopItem').mockResolvedValue({
+      workshopId,
+      fileType: 'item',
+      status: 'active',
+      title,
+      description,
+      previewUrl: 'https://example.test/gore-cover.jpg',
+      previews: [{ previewType: 0, url: 'error://gallery-unavailable' }],
+      tags: [],
+      dependencies: [],
+      collectionChildren: [],
+      source: 'catalog_server',
+      fetchedAt: '2026-11-26T00:00:00Z',
+    });
+
+    try {
+      render(<App />);
+      await screen.findByText('Chernobyl: Chapter One');
+      fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
+      const directInput = await screen.findByPlaceholderText('Workshop ID or URL');
+      fireEvent.change(directInput, { target: { value: workshopId } });
+      fireEvent.keyDown(directInput, { key: 'Enter' });
+
+      const sheet = within(await screen.findByRole('dialog'));
+      const reveal = await sheet.findByRole('button', { name: revealLabel });
+      expect(sheet.queryByText(title)).toBeNull();
+      expect(sheet.queryByText(description)).toBeNull();
+      expect(sheet.queryByText('Flagged Sensitive Content')).toBeNull();
+
+      fireEvent.click(reveal);
+      expect(sheet.getByRole('heading', { name: title })).toBeTruthy();
+      expect(sheet.getByText(description)).toBeTruthy();
+      expect(sheet.getByAltText(title).closest('[data-blurred="true"]')).toBeTruthy();
+    } finally {
+      fetchItem.mockRestore();
+    }
   });
 
   it('shields flagged Direct Inspect text in WorkshopView until explicitly revealed and redacts AddonPicker author under blur_card', async () => {

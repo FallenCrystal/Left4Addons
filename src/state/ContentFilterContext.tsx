@@ -16,13 +16,11 @@ export interface ContentFilterContextValue {
   exclusionsByAddonId: ReadonlyMap<string, FilterExclusionRecord>;
   revealedCardIds: ReadonlySet<string>;
   failedTargetKeys: ReadonlySet<string>;
-  evalError: string | null;
   revealCard: (cardKey: string) => void;
   registerWorkshopItems: (
     items: WorkshopItemRecord[],
     options?: { onlyIfMissing?: boolean },
   ) => void;
-  retryFailedEvaluations: () => void;
   upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
   deleteFilterExclusion: (addonId: AddonId) => Promise<boolean>;
   onOpenFilterSettings?: () => void;
@@ -35,10 +33,8 @@ const DEFAULT_CONTEXT: ContentFilterContextValue = {
   exclusionsByAddonId: new Map(),
   revealedCardIds: new Set(),
   failedTargetKeys: new Set(),
-  evalError: null,
   revealCard: () => {},
   registerWorkshopItems: () => {},
-  retryFailedEvaluations: () => {},
   upsertFilterExclusion: async () => false,
   deleteFilterExclusion: async () => false,
 };

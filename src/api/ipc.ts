@@ -236,6 +236,7 @@ export type ClientFilterSourceMode = 'local' | 'catalog' | 'custom_endpoint';
 export type FilterScoreTarget = 'overall' | 'gore' | 'nsfw' | 'max_category';
 export type LlmTokenSource = 'env_var' | 'encrypted_local';
 export type FlaggedItemAction = 'mark_only' | 'hide_image' | 'blur_card' | 'hide_card';
+export type FilterFailureDisplay = 'notice' | 'as_flagged';
 
 export type ExclusionDisplayLevel =
   | 'normal'
@@ -309,6 +310,7 @@ export interface ClientFilterConfig {
   llmTokenSource: LlmTokenSource;
   llmTokenEnvVar: string;
   flaggedAction: FlaggedItemAction;
+  failureDisplay: FilterFailureDisplay;
   subdivideModalities: boolean;
   modalityThreshold: number;
 }

@@ -278,7 +278,6 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(settledSafe.coverMode).toBe('none');
     expect(settledSafe.blurWholeCard).toBe(false);
 
-    // Failed / incomplete target (verdict === undefined, hasTargetFailed === true) stays conservative (never flashes raw cover) while clearing pendingEvaluation
     const failedBlurCard = resolveCardFilterState({
       config: makeEnabledConfig({ flaggedAction: 'blur_card' }),
       scope: 'library',
@@ -287,6 +286,8 @@ describe('contentFilter pure resolution & calibration logic', () => {
       hasContent: true,
     });
     expect(failedBlurCard.pendingEvaluation).toBe(false);
+    expect(failedBlurCard.failureDisplay).toBe('notice');
+    expect(failedBlurCard.flagged).toBe(false);
     expect(failedBlurCard.coverMode).toBe('hide');
     expect(failedBlurCard.blurWholeCard).toBe(true);
 
@@ -298,8 +299,34 @@ describe('contentFilter pure resolution & calibration logic', () => {
       hasContent: true,
     });
     expect(failedDetail.pendingEvaluation).toBe(false);
+    expect(failedDetail.failureDisplay).toBe('notice');
+    expect(failedDetail.flagged).toBe(false);
     expect(failedDetail.coverMode).toBe('blur');
     expect(failedDetail.imageModeAt(0)).toBe('blur');
+  });
+
+  it('hides failed cards only when they are configured to follow the hide-card action', () => {
+    const options = {
+      scope: 'library' as const,
+      verdict: makeFlaggedVerdict({ complete: false }),
+    };
+    const config = makeEnabledConfig({ flaggedAction: 'hide_card' });
+
+    expect(resolveCardFilterState({ ...options, config })).toMatchObject({
+      flagged: false,
+      hiddenCard: false,
+      blurWholeCard: true,
+      failureDisplay: 'notice',
+    });
+
+    const asFlagged = makeEnabledConfig({ flaggedAction: 'hide_card', failureDisplay: 'as_flagged' });
+    expect(resolveCardFilterState({ ...options, config: asFlagged })).toMatchObject({
+      flagged: false,
+      hiddenCard: true,
+      failureDisplay: 'as_flagged',
+    });
+    expect(resolveCardFilterState({ ...options, config: asFlagged, forceShowHiddenCards: true }))
+      .toMatchObject({ hiddenCard: false, blurWholeCard: true });
   });
 
   it('enforces image-only blurring in Detail view, maps evaluatedImageIndices to original gallery slots, and blurs unscanned or failed-to-load slots', () => {
@@ -523,6 +550,22 @@ describe('contentFilter pure resolution & calibration logic', () => {
     );
     expect(presWithMemberCover.coverMode).toBe('hide');
     expect(presWithMemberCover.redactTitle).toBe(true);
+
+    const bundleWithFailedMember = resolveBundleCoverPresentation(
+      [memberWithCover, safeMemberWithoutCover],
+      {
+        filterConfig: makeEnabledConfig({ flaggedAction: 'hide_image' }),
+        verdicts: { 'addon:ws:100': flaggedVerdict100 },
+        failedTargetKeys: new Set(['addon:ws:200']),
+        exclusionsByAddonId: new Map(),
+      },
+    );
+    expect(bundleWithFailedMember).toMatchObject({
+      ownerMember: memberWithCover,
+      coverMode: 'hide',
+      failureDisplay: 'notice',
+      coverEvaluation: { pendingEvaluation: false, failureDisplay: undefined },
+    });
 
     // Case 2: bundle.coverImage belongs to a hiddenCard member -> omitted completely!
     const presHiddenOwner = resolveBundleCoverPresentation(
@@ -766,6 +809,17 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(mixedBundle.blurWholeCard).toBe(true);
     expect(mixedBundle.pendingEvaluation).toBe(true);
     expect(mixedBundle.coverMode).toBe('hide');
+
+    const checkedBundle = resolveBundleCoverPresentation([flaggedAddon, pendingAddon], {
+      ...failedCtx,
+      verdicts: { [addonFilterKey(flaggedAddon.id)]: { ...flaggedVerdict, flagged: false } },
+    });
+    expect(checkedBundle).toMatchObject({
+      blurWholeCard: false,
+      coverMode: 'none',
+      redactTitle: true,
+      failureDisplay: 'notice',
+    });
   });
 
   it('handles optional lookup sets and linked workshop/library redaction transitions safely', () => {
