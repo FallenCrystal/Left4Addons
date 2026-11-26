@@ -355,6 +355,9 @@ it('preserves filter draft and sandbox inputs across tab switches, supports natu
           prob: 0.42,
           goreProb: 0.1,
           nsfwProb: 0.4,
+          corpseProb: 0.5,
+          corpsePileProb: 0.21,
+          corpseReviewFloor: 0.2,
         }),
       );
     }
@@ -464,6 +467,9 @@ it('preserves filter draft and sandbox inputs across tab switches, supports natu
     ],
   });
   expect(screen.getByText('Left4Filters (2.3.0-fresh)')).toBeTruthy();
+  expect(screen.getByText('可见尸体概率 (corpseProb)')).toBeTruthy();
+  expect(screen.getByText('尸堆概率 (corpsePileProb)')).toBeTruthy();
+  expect(screen.getByText('尸体复核下限 (corpseReviewFloor)')).toBeTruthy();
 
   // Now resolve the stale overview poll: overviewEpochRef must discard it!
   await act(async () => {

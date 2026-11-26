@@ -219,7 +219,7 @@ export const DEFAULT_LLM_ENDPOINT = 'https://api.openai.com/v1';
 export const DEFAULT_LLM_MODEL = 'gpt-4o-mini';
 export const DEFAULT_LLM_TOKEN_ENV_VAR = 'L4A_LLM_API_KEY';
 export const DEFAULT_LLM_SYSTEM_PROMPT =
-  'You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins.';
+  'You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins. Also flag clearly visible corpses or piles of bodies in preview images, including corpses without visible blood.';
 
 export type FilterGalleryAggregation = 'max' | 'top2_mean' | 'mean';
 
@@ -268,6 +268,11 @@ export interface FilterProbabilities {
   prob: number;
   goreProb: number;
   nsfwProb: number;
+  corpseProb?: number;
+  corpsePileProb?: number;
+  corpseReviewFloor?: number;
+  fusionProb?: number;
+  corpseImageIndices?: number[];
   textProb?: number;
   textGoreProb?: number;
   textNsfwProb?: number;

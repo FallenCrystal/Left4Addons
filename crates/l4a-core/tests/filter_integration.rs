@@ -1110,6 +1110,19 @@ async fn llm_judge_safe_json_think_tags_content_filter_and_direct_flag_disabled(
             "/api/v1/filter/predict",
             post(|Json(req): Json<FilterPredictRequest>| async move {
                 let title = req.title.unwrap_or_default();
+                if title.contains("[CORPSE_REVIEW]") {
+                    assert_eq!(req.images_base64.len(), 2);
+                    return Json(FilterProbabilities {
+                        prob: 0.20,
+                        fusion_prob: Some(0.08),
+                        corpse_prob: Some(0.43),
+                        corpse_review_floor: Some(0.20),
+                        corpse_image_indices: vec![1],
+                        text_prob: Some(0.40),
+                        per_image_probs: vec![0.01, 0.08],
+                        ..Default::default()
+                    });
+                }
                 let prob = if title.contains("[DIRECT_OFF]") {
                     0.96
                 } else {
@@ -1346,6 +1359,38 @@ async fn llm_judge_safe_json_think_tags_content_filter_and_direct_flag_disabled(
     );
     assert!(captured_body.get("temperature").is_none());
     assert_eq!(captured_body["max_completion_tokens"], 512);
+
+    let mut cfg = engine.config();
+    cfg.filter.flag_threshold = 0.19;
+    engine.save_config_async(cfg).await.unwrap();
+    let preview = |r| {
+        format!(
+            "data:image/jpeg;base64,{}",
+            STANDARD.encode(make_tiny_jpeg(r, 20, 20))
+        )
+    };
+    let reviewed = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:2006".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[CORPSE_REVIEW] [THINK_TRUE] Gameplay preview".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![preview(20), String::new(), preview(30)],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        reviewed[0].decision_source,
+        FilterDecisionSource::LlmFlaggedTrue
+    );
+    assert_eq!(reviewed[0].evaluated_score, 0.20);
+    assert_eq!(reviewed[0].sensitive_image_indices, vec![2]);
 }
 
 #[tokio::test]

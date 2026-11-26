@@ -56,7 +56,7 @@
 }
 ```
 - 当服务端关闭图片模态 (`enable_image = false`) 时，`maxImages` 返回 `0`。
-- `scoringRevision` 为当前服务端评分配置与模型版本的摘要标识，后端未就绪或禁用时省略。
+- `scoringRevision` 为当前服务端评分配置与模型标识的摘要。外接节点可通过 `/health` 提供 `version` 或 `scoringRevision`。对于未报告版本的官方 Left4Filters 服务，Catalog 检查其是否提供尸体识别分数。后端未就绪或禁用时省略 `scoringRevision`。
 
 ### `POST /api/v1/filter/predict`
 对创意工坊条目或给定多模态输入执行敏感度概率评估 (`FilterPredictRequest` -> `FilterProbabilities`)：
@@ -71,6 +71,7 @@
 }
 ```
 - **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb`、`scoringRevision` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
+- 支持尸体识别的模型可返回 `corpseProb` 和 `corpsePileProb`。任意输入图片达到识别阈值时，`corpseReviewFloor` 给出整体路由分数 `prob` 的复核下限。`prob` 位于该下限时，`fusionProb` 给出直判采用的融合分数。外接节点若只报告等于下限的整体路由分数，直判采用保守值 `0`。`corpseImageIndices` 给出已定位的命中图片下标，从 0 开始，按服务实际评分的图片顺序排列。血腥权重为零时停用尸体复核。
 - **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
 - 公开预测和管理员试算共用并发配额，JSON 请求体上限为 48 MiB。读取超时返回 `408 Request Timeout`，配额已满时返回 `429 Too Many Requests`。管理员试算在读取请求体前验证身份。
 - **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。

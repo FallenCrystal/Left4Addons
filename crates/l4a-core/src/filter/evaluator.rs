@@ -16,7 +16,7 @@ use l4a_protocol::{
     AddonId, AddonSummary, AppConfig, CatalogFilterPublicInfo, ClientFilterConfig,
     ClientFilterSourceMode, CoreEvent, FilterDecisionSource, FilterEvaluationBatchResponse,
     FilterEvaluationItemResult, FilterEvaluationTarget, FilterItemVerdict, FilterPredictRequest,
-    FilterProbabilities, FilterTargetOutcome, RawFilterPredictRequest,
+    FilterProbabilities, FilterScoreTarget, FilterTargetOutcome, RawFilterPredictRequest,
     CATALOG_FILTER_IMAGE_FETCH_FAILED, CATALOG_FILTER_MAX_BODY_BYTES,
     FILTER_REMOTE_VERDICT_MAX_AGE_SECS,
 };
@@ -928,6 +928,10 @@ async fn evaluate_single_target(
     };
 
     let evaluated_score = probs.score_for(cfg.score_target);
+    let direct_flag_score = match cfg.score_target {
+        FilterScoreTarget::Overall => probs.fusion_score(),
+        _ => evaluated_score,
+    };
     let flag_threshold = if cfg.flag_threshold.is_finite() {
         cfg.flag_threshold.clamp(0.0, 1.0)
     } else {
@@ -939,8 +943,8 @@ async fn evaluate_single_target(
         0.20
     };
 
-    let (flagged, decision_source) = if cfg.enable_direct_flag && evaluated_score >= flag_threshold
-    {
+    let direct_flag = cfg.enable_direct_flag && direct_flag_score >= flag_threshold;
+    let (flagged, decision_source) = if direct_flag {
         (true, FilterDecisionSource::ModelDirectFlag)
     } else if cfg.llm_enabled && evaluated_score >= llm_threshold {
         if cfg.mode == ClientFilterSourceMode::Catalog
@@ -1640,7 +1644,8 @@ async fn post_raw_predict_subbatched(
             image_base64: None,
             images_base64: sub_imgs,
         };
-        let probs = post_predict_request(engine, url, &req).await?;
+        let mut probs = post_predict_request(engine, url, &req).await?;
+        probs.infer_stock_corpse_review(count);
         parts.push((count, probs));
     }
     Ok(merge_raw_max(parts))
@@ -1765,7 +1770,9 @@ async fn post_unimodal_predict(
             image_base64: None,
             images_base64,
         };
-        post_predict_request(engine, &ep.url, &req).await
+        let mut probs = post_predict_request(engine, &ep.url, &req).await?;
+        probs.infer_stock_corpse_review(req.images_base64.len());
+        Ok(probs)
     } else {
         let req = FilterPredictRequest {
             workshop_id: None,
@@ -1871,15 +1878,20 @@ async fn populate_missing_unimodal_scores(
         let mut max_ov = 0.0_f32;
         let mut max_gore = 0.0_f32;
         let mut max_nsfw = 0.0_f32;
+        let mut corpse_indices = Vec::new();
         let mut all_ok = true;
-        for b64 in images_b64 {
+        for (index, b64) in images_b64.iter().enumerate() {
             match post_unimodal_predict(engine, ep, None, None, Vec::new(), vec![b64.clone()]).await
             {
                 Ok(ir) => {
-                    per_img.push(ir.prob);
-                    max_ov = max_ov.max(ir.prob);
+                    let score = ir.fusion_score();
+                    per_img.push(score);
+                    max_ov = max_ov.max(score);
                     max_gore = max_gore.max(ir.gore_prob);
                     max_nsfw = max_nsfw.max(ir.nsfw_prob);
+                    if ir.corpse_review_floor.is_some() {
+                        corpse_indices.push(index);
+                    }
                 }
                 Err(_) => {
                     all_ok = false;
@@ -1895,6 +1907,9 @@ async fn populate_missing_unimodal_scores(
             }
             if probs.per_image_probs.is_empty() {
                 probs.per_image_probs = per_img;
+            }
+            if probs.corpse_review_floor.is_some() && probs.corpse_image_indices.is_empty() {
+                probs.corpse_image_indices = corpse_indices;
             }
         }
     }
@@ -1971,6 +1986,16 @@ fn compute_modality_subdivision_inner(
         .enumerate()
         .filter_map(|(idx, &p)| (p >= m_t).then(|| map_slot(idx)).flatten())
         .collect();
+    if cfg.score_target == FilterScoreTarget::Overall {
+        sensitive_image_indices.extend(
+            probs
+                .corpse_image_indices
+                .iter()
+                .filter_map(|&i| map_slot(i)),
+        );
+        sensitive_image_indices.sort_unstable();
+        sensitive_image_indices.dedup();
+    }
 
     let mut image_sensitive = n_imgs > 0
         && (probs.image_prob.is_some_and(|p| p >= m_t) || !sensitive_image_indices.is_empty());

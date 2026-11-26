@@ -29,6 +29,38 @@ const REQUIRED_DEPLOY_FILES: &[&str] = &[
     "requirements.txt",
 ];
 
+fn validate_deploy_assets(deploy_dir: &Path) -> Result<(), CoreError> {
+    for name in REQUIRED_DEPLOY_FILES {
+        if !deploy_dir.join(name).is_file() {
+            return Err(CoreError::InvalidInput(format!(
+                "模型仓库缺少必要的部署文件: deploy/{name}"
+            )));
+        }
+    }
+
+    let config_path = deploy_dir.join("model_config.json");
+    let has_corpse_head = deploy_dir.join("corpse_head.onnx").is_file();
+    if config_path.is_file() {
+        let config: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(&config_path)?)
+                .map_err(|err| CoreError::InvalidInput(format!("模型部署配置无效: {err}")))?;
+        if config
+            .get("corpse_detection")
+            .is_some_and(|value| !value.is_null())
+            && !has_corpse_head
+        {
+            return Err(CoreError::InvalidInput(
+                "模型仓库缺少必要的部署文件: deploy/corpse_head.onnx".into(),
+            ));
+        }
+    } else if has_corpse_head {
+        return Err(CoreError::InvalidInput(
+            "尸体识别模型缺少部署配置: deploy/model_config.json".into(),
+        ));
+    }
+    Ok(())
+}
+
 const MAX_READY_BANNER_BYTES: usize = 64 * 1024;
 const MAX_STDERR_TAIL_BYTES: usize = 4096;
 const CONFIGURE_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -525,13 +557,8 @@ impl LocalFilterManager {
             return false;
         }
         let deploy_dir = repo_dir.join("deploy");
-        if !REQUIRED_DEPLOY_FILES
-            .iter()
-            .all(|name| deploy_dir.join(name).is_file())
-        {
-            return false;
-        }
-        is_executable_file(&venv_python_path(&self.paths.filter_venv_dir))
+        validate_deploy_assets(&deploy_dir).is_ok()
+            && is_executable_file(&venv_python_path(&self.paths.filter_venv_dir))
             && self.paths.filter_runner_path.is_file()
     }
 
@@ -911,13 +938,7 @@ impl LocalFilterManager {
 
         let post_checkout = async {
             let deploy_dir = repo_dir.join("deploy");
-            for req_file in REQUIRED_DEPLOY_FILES {
-                if !deploy_dir.join(req_file).is_file() {
-                    return Err(CoreError::InvalidInput(format!(
-                        "模型仓库缺少必要的部署文件: deploy/{req_file}"
-                    )));
-                }
-            }
+            validate_deploy_assets(&deploy_dir)?;
 
             let (cur_commit, rem_commit, recent_commits) =
                 inspect_local_repo_async(&self.shutdown_token, repo_dir).await?;
@@ -1603,15 +1624,12 @@ impl LocalFilterManager {
     ) -> Result<(), CoreError> {
         let deploy_dir = self.paths.filter_repo_dir.join("deploy");
         let venv_py = venv_python_path(&self.paths.filter_venv_dir);
-        if !REQUIRED_DEPLOY_FILES
-            .iter()
-            .all(|f| deploy_dir.join(f).is_file())
-            || !is_executable_file(&venv_py)
-        {
+        if !is_executable_file(&venv_py) {
             return Err(CoreError::InvalidInput(
                 "本地过滤模型尚未完成部署，请先执行一键部署".into(),
             ));
         }
+        validate_deploy_assets(&deploy_dir)?;
 
         fs::create_dir_all(&self.paths.filters_dir)?;
         let need_write_runner = fs::read_to_string(&self.paths.filter_runner_path)
@@ -2276,8 +2294,12 @@ pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterP
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
     };
+    let mut fusion_prob = merged.fusion_score();
+    let mut offset = count;
     for (count, part) in parts {
-        merged.prob = merged.prob.max(part.prob);
+        fusion_prob = fusion_prob.max(part.fusion_score());
+        merged.merge_corpse_scores(&part, offset, count);
+        offset += count;
         merged.gore_prob = merged.gore_prob.max(part.gore_prob);
         merged.nsfw_prob = merged.nsfw_prob.max(part.nsfw_prob);
         merged.image_prob = max_optional(merged.image_prob, part.image_prob);
@@ -2289,6 +2311,7 @@ pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterP
     if !aligned {
         merged.per_image_probs.clear();
     }
+    merged.set_fusion_score(fusion_prob);
     merged
 }
 

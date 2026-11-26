@@ -316,7 +316,13 @@ export function adjustProbabilities(
   if (isIdentityCalibration(params)) {
     return structuredClone(raw);
   }
-  const [prob, goreProb, nsfwProb] = adjustTriplet(params, raw.prob, raw.goreProb, raw.nsfwProb);
+  const rawFusion = raw.fusionProb ?? (
+    raw.corpseReviewFloor !== undefined && raw.prob <= raw.corpseReviewFloor ? 0 : raw.prob
+  );
+  const [fusion, goreProb, nsfwProb] = adjustTriplet(params, rawFusion, raw.goreProb, raw.nsfwProb);
+  const corpseEnabled = sanitizeModelParams(params).goreWeight > 1e-6;
+  const corpseReviewFloor = corpseEnabled ? raw.corpseReviewFloor : undefined;
+  const prob = Math.max(fusion, corpseReviewFloor ?? 0);
 
   let textProb = raw.textProb;
   let textGoreProb = raw.textGoreProb;
@@ -347,9 +353,13 @@ export function adjustProbabilities(
   }
 
   return {
+    ...raw,
     prob,
     goreProb,
     nsfwProb,
+    fusionProb: corpseReviewFloor !== undefined && fusion <= corpseReviewFloor ? fusion : undefined,
+    corpseReviewFloor,
+    corpseImageIndices: corpseEnabled ? raw.corpseImageIndices : undefined,
     textProb,
     textGoreProb,
     textNsfwProb,
@@ -360,7 +370,6 @@ export function adjustProbabilities(
     imageGoreProb,
     imageNsfwProb,
     perImageProbs: raw.perImageProbs?.map((v) => adjustScalar(params, v)),
-    ...(raw.scoringRevision !== undefined ? { scoringRevision: raw.scoringRevision } : {}),
   };
 }
 
@@ -588,7 +597,7 @@ export function computeFilterPolicySignature(
     ? `1:t=${fmtF32Fixed4(filter.llmThreshold)}:ep=${trimTrailingSlashes(filter.llmEndpoint)}:m=${filter.llmModel.trim()}:img=${filter.llmSendImages}:sys=${fnv1aHex(filter.llmSystemPrompt.trim())}:token=${filter.llmTokenSource}:env=${filter.llmTokenSource === 'env_var' ? filter.llmTokenEnvVar.trim() : ''}`
     : '0';
 
-  const raw = `v3|${modePart}|st=${rustDebugScoreTarget(filter.scoreTarget)}|df=${filter.enableDirectFlag}:${fmtF32Fixed4(filter.flagThreshold)}|llm=${llmPart}|sub=${filter.subdivideModalities}:${fmtF32Fixed4(filter.modalityThreshold)}`;
+  const raw = `v4|${modePart}|st=${rustDebugScoreTarget(filter.scoreTarget)}|df=${filter.enableDirectFlag}:${fmtF32Fixed4(filter.flagThreshold)}|llm=${llmPart}|sub=${filter.subdivideModalities}:${fmtF32Fixed4(filter.modalityThreshold)}`;
   return `pol_${fnv1aHex(raw)}`;
 }
 

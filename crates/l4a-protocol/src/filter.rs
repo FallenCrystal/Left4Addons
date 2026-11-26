@@ -9,7 +9,14 @@ pub const FILTER_REMOTE_VERDICT_MAX_AGE_SECS: i64 = 3_600;
 pub const DEFAULT_LLM_ENDPOINT: &str = "https://api.openai.com/v1";
 pub const DEFAULT_LLM_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_LLM_TOKEN_ENV_VAR: &str = "L4A_LLM_API_KEY";
-pub const DEFAULT_LLM_SYSTEM_PROMPT: &str = "You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins.";
+pub const LEGACY_LLM_SYSTEM_PROMPT: &str = "You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins.";
+pub const DEFAULT_LLM_SYSTEM_PROMPT: &str = "You are a strict content moderation reviewer for Left 4 Dead 2 Steam Workshop addons. Flag items that contain explicit NSFW/sexualized content (nudity, lingerie/bikini fetishes, explicit sexual poses, R18 adult mods) or extreme/graphic gore closeup imagery/text beyond ordinary L4D2 gameplay UI, red fonts, maps, scripts, or standard clothed anime/survivor skins. Also flag clearly visible corpses or piles of bodies in preview images, including corpses without visible blood.";
+
+// Stock Left4Filters 1.1 reports corpse scores and the routed overall score.
+// Its default thresholds are needed when it supplies no separate routing metadata.
+const STOCK_CORPSE_THRESHOLD: f32 = 0.3854;
+const STOCK_CORPSE_PILE_THRESHOLD: f32 = 0.1985;
+const STOCK_CORPSE_REVIEW_FLOOR: f32 = 0.20;
 
 fn default_true() -> bool {
     true
@@ -277,8 +284,8 @@ impl FilterModelParams {
         if self.is_identity_calibration() {
             return raw.clone();
         }
-        let (prob, gore_prob, nsfw_prob) =
-            self.adjust_triplet(raw.prob, raw.gore_prob, raw.nsfw_prob);
+        let (fusion_prob, gore_prob, nsfw_prob) =
+            self.adjust_triplet(raw.fusion_score(), raw.gore_prob, raw.nsfw_prob);
 
         let (text_prob, text_gore_prob, text_nsfw_prob) =
             match (raw.text_prob, raw.text_gore_prob, raw.text_nsfw_prob) {
@@ -300,8 +307,7 @@ impl FilterModelParams {
                 _ => (None, None, None),
             };
 
-        FilterProbabilities {
-            prob,
+        let mut adjusted = FilterProbabilities {
             gore_prob,
             nsfw_prob,
             text_prob,
@@ -317,8 +323,14 @@ impl FilterModelParams {
                 .iter()
                 .map(|v| self.adjust_scalar(*v))
                 .collect(),
-            scoring_revision: raw.scoring_revision.clone(),
+            ..raw.clone()
+        };
+        if self.sanitized().gore_weight <= 1e-6 {
+            adjusted.corpse_review_floor = None;
+            adjusted.corpse_image_indices.clear();
         }
+        adjusted.set_fusion_score(fusion_prob);
+        adjusted
     }
 }
 
@@ -361,6 +373,36 @@ pub struct FilterProbabilities {
     pub gore_prob: f32,
     #[serde(alias = "nsfw_prob", default)]
     pub nsfw_prob: f32,
+    #[serde(
+        alias = "corpse_prob",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub corpse_prob: Option<f32>,
+    #[serde(
+        alias = "corpse_pile_prob",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub corpse_pile_prob: Option<f32>,
+    #[serde(
+        alias = "corpse_review_floor",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub corpse_review_floor: Option<f32>,
+    #[serde(
+        alias = "fusion_prob",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub fusion_prob: Option<f32>,
+    #[serde(
+        alias = "corpse_image_indices",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub corpse_image_indices: Vec<usize>,
     #[serde(alias = "text_prob", default, skip_serializing_if = "Option::is_none")]
     pub text_prob: Option<f32>,
     #[serde(
@@ -458,16 +500,16 @@ pub fn merge_managed_predictions(
     }
     let mut image_rows = Vec::new();
     let mut joint_rows = Vec::new();
-    for (_, part) in parts {
+    for (count, part) in parts {
+        probabilities.merge_corpse_scores(&part.probabilities, image_rows.len(), count);
         image_rows.extend(part.image_rows);
         joint_rows.extend(part.joint_rows);
     }
     let [ov, g, n] = aggregate_gallery_triplets(&joint_rows, params.gallery_aggregation);
-    (
-        probabilities.prob,
-        probabilities.gore_prob,
-        probabilities.nsfw_prob,
-    ) = params.adjust_triplet(ov, g, n);
+    let (fusion_prob, gore_prob, nsfw_prob) = params.adjust_triplet(ov, g, n);
+    probabilities.gore_prob = gore_prob;
+    probabilities.nsfw_prob = nsfw_prob;
+    probabilities.set_fusion_score(fusion_prob);
     let [ov, g, n] = aggregate_gallery_triplets(&image_rows, params.gallery_aggregation);
     let (ov, g, n) = params.adjust_triplet(ov, g, n);
     probabilities.image_prob = Some(ov);
@@ -481,6 +523,72 @@ pub fn merge_managed_predictions(
 }
 
 impl FilterProbabilities {
+    pub fn fusion_score(&self) -> f32 {
+        self.fusion_prob.unwrap_or_else(|| {
+            if self
+                .corpse_review_floor
+                .is_some_and(|floor| self.prob <= floor)
+            {
+                // A stock endpoint only reports the routed score. A score at the
+                // floor provides no independent evidence for a direct flag.
+                0.0
+            } else {
+                self.prob
+            }
+        })
+    }
+
+    pub fn set_fusion_score(&mut self, score: f32) {
+        self.prob = self
+            .corpse_review_floor
+            .map_or(score, |floor| score.max(floor));
+        self.fusion_prob = self
+            .corpse_review_floor
+            .filter(|&floor| score <= floor)
+            .map(|_| score);
+    }
+
+    pub fn infer_stock_corpse_review(&mut self, image_count: usize) {
+        let floor = STOCK_CORPSE_REVIEW_FLOOR;
+        if image_count > 0
+            && self.corpse_review_floor.is_none()
+            && self.fusion_prob.is_none()
+            && self.text_prob.is_none()
+            && self.image_prob.is_none()
+            && self.per_image_probs.is_empty()
+            && self.prob >= floor
+            && matches!((self.corpse_prob, self.corpse_pile_prob), (Some(corpse), Some(pile))
+                if corpse >= STOCK_CORPSE_THRESHOLD || pile >= STOCK_CORPSE_PILE_THRESHOLD)
+        {
+            self.corpse_review_floor = Some(floor);
+        }
+        if image_count == 1
+            && self.corpse_review_floor.is_some()
+            && self.corpse_image_indices.is_empty()
+        {
+            self.corpse_image_indices.push(0);
+        }
+    }
+
+    pub fn merge_corpse_scores(&mut self, part: &Self, image_offset: usize, image_count: usize) {
+        fn max_optional(a: Option<f32>, b: Option<f32>) -> Option<f32> {
+            match (a, b) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            }
+        }
+
+        self.corpse_prob = max_optional(self.corpse_prob, part.corpse_prob);
+        self.corpse_pile_prob = max_optional(self.corpse_pile_prob, part.corpse_pile_prob);
+        self.corpse_review_floor = max_optional(self.corpse_review_floor, part.corpse_review_floor);
+        self.corpse_image_indices.extend(
+            part.corpse_image_indices
+                .iter()
+                .filter(|&&index| index < image_count)
+                .map(|index| image_offset + index),
+        );
+    }
+
     pub fn score_for(&self, target: FilterScoreTarget) -> f32 {
         match target {
             FilterScoreTarget::Overall => self.prob,
@@ -1040,7 +1148,7 @@ impl ClientFilterConfig {
             "0".to_string()
         };
         let raw = format!(
-            "v3|{mode_part}|st={:?}|df={}:{:.4}|llm={llm_part}|sub={}:{:.4}",
+            "v4|{mode_part}|st={:?}|df={}:{:.4}|llm={llm_part}|sub={}:{:.4}",
             self.score_target,
             self.enable_direct_flag,
             self.flag_threshold,
@@ -1085,6 +1193,7 @@ mod tests {
             image_nsfw_prob: Some(0.715),
             per_image_probs: vec![0.719, 0.018],
             scoring_revision: Some("rev1".into()),
+            ..Default::default()
         };
         let adj = params.adjust_probabilities(&raw);
         assert_eq!(adj, raw);
@@ -1105,6 +1214,77 @@ mod tests {
         assert_eq!(g2, 0.0);
         assert!(n2 > 0.85);
         assert_eq!(ov2, n2);
+    }
+
+    #[test]
+    fn managed_gallery_preserves_corpse_gate_and_remaps_hit_across_batches() {
+        let params = FilterModelParams {
+            gallery_aggregation: FilterGalleryAggregation::Mean,
+            bias: -1.0,
+            ..Default::default()
+        };
+        let first = ManagedFilterPrediction {
+            probabilities: FilterProbabilities {
+                corpse_prob: Some(0.10),
+                corpse_pile_prob: Some(0.09),
+                ..Default::default()
+            },
+            image_rows: vec![[0.01, 0.02, 0.01]],
+            joint_rows: vec![[0.01, 0.02, 0.01]],
+        };
+        let second = ManagedFilterPrediction {
+            probabilities: FilterProbabilities {
+                prob: 0.20,
+                corpse_prob: Some(0.42),
+                corpse_pile_prob: Some(0.04),
+                corpse_review_floor: Some(0.20),
+                corpse_image_indices: vec![0],
+                ..Default::default()
+            },
+            image_rows: vec![[0.03, 0.03, 0.01]],
+            joint_rows: vec![[0.03, 0.03, 0.01]],
+        };
+
+        let mut merged = merge_managed_predictions(vec![(1, first), (1, second)], &params).unwrap();
+        assert_eq!(merged.prob, 0.20);
+        assert_eq!(
+            merged.fusion_prob,
+            Some(params.adjust_triplet(0.02, 0.025, 0.01).0)
+        );
+        assert_eq!(merged.corpse_prob, Some(0.42));
+        assert_eq!(merged.corpse_pile_prob, Some(0.09));
+        assert_eq!(merged.corpse_image_indices, vec![1]);
+        merged.set_fusion_score(0.20);
+        assert_eq!(merged.fusion_score(), 0.20);
+    }
+
+    #[test]
+    fn stock_corpse_floor_is_kept_out_of_fusion_calibration() {
+        let mut raw: FilterProbabilities = serde_json::from_value(serde_json::json!({
+            "prob": 0.20,
+            "gore_prob": 0.01,
+            "nsfw_prob": 0.02,
+            "corpse_prob": 0.35,
+            "corpse_pile_prob": 0.21
+        }))
+        .unwrap();
+        raw.infer_stock_corpse_review(1);
+        let params = FilterModelParams {
+            bias: 3.0,
+            ..Default::default()
+        };
+        let adjusted = params.adjust_probabilities(&raw);
+        assert_eq!(adjusted.prob, 0.20);
+        assert!(adjusted.fusion_score() < 0.001);
+        assert_eq!(adjusted.corpse_image_indices, vec![0]);
+
+        let nsfw_only = FilterPresetId::NsfwOnly
+            .default_params()
+            .adjust_probabilities(&raw);
+        assert_eq!(nsfw_only.corpse_review_floor, None);
+        assert!(nsfw_only.corpse_image_indices.is_empty());
+        assert_eq!(nsfw_only.corpse_pile_prob, Some(0.21));
+        assert_eq!(nsfw_only.prob, 0.02);
     }
 
     #[test]

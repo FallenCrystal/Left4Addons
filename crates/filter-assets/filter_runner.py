@@ -21,6 +21,8 @@ import os
 import re
 import sys
 import threading
+from collections import OrderedDict
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Sequence
@@ -39,6 +41,7 @@ MAX_TITLE_CHARS = 4096
 MAX_DESC_CHARS = 65536
 MAX_TAGS_COUNT = 64
 MAX_TAG_CHARS = 256
+VISION_CACHE_SIZE = 256
 _CHUNK_SIZE_RE = re.compile(rb"^[0-9a-fA-F]{1,16}$")
 _CONTENT_LENGTH_RE = re.compile(r"^[0-9]{1,16}$")
 
@@ -207,6 +210,10 @@ class RunnerEngine:
         self._lf = lf
         self._lock = threading.RLock()
         self._sem = threading.BoundedSemaphore(max(1, min(16, int(max_concurrency))))
+        # The managed runner uses bounded preprocessing and caches its feature batches.
+        self._vision_cache: OrderedDict[tuple[bytes, ...], tuple[np.ndarray, np.ndarray]] = OrderedDict()
+        if (deploy_dir / "corpse_head.onnx").is_file() and not (deploy_dir / "model_config.json").is_file():
+            raise FileNotFoundError("model_config.json is required for corpse_head.onnx")
         self.params = self._normalize_params(initial_params)
         self.clf = lf.Left4Filter(str(deploy_dir), num_threads=self.params["threads"])
 
@@ -248,6 +255,7 @@ class RunnerEngine:
                 new_clf = self._lf.Left4Filter(str(self.deploy_dir), num_threads=normalized["threads"])
                 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
                 self.clf = new_clf
+                self._vision_cache.clear()
             self.params = normalized
             return dict(self.params)
 
@@ -333,6 +341,49 @@ class RunnerEngine:
             },
         )[0][0]
 
+    def _image_features(self, clf: Any, lf: Any, imgs: list[bytes]) -> tuple[np.ndarray, np.ndarray]:
+        # Keep the batch order because the vision encoder receives the entire batch.
+        key = tuple(sha256(raw).digest() for raw in imgs)
+        with self._lock:
+            if clf is self.clf and key in self._vision_cache:
+                self._vision_cache.move_to_end(key)
+                return self._vision_cache[key]
+
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+        pixels, priors = [], []
+        for raw in imgs:
+            with Image.open(io.BytesIO(raw)) as source:
+                check_image_dimensions(source)
+                with source.convert("RGB") as image:
+                    pixels.append(preprocess_bounded(image, clf.img_size))
+                    priors.append(lf.extract_visual_priors(image))
+        embeddings = clf.vis_sess.run(["img_emb"], {"pixel_values": np.stack(pixels)})[0]
+        features = (embeddings, np.stack(priors))
+        with self._lock:
+            if clf is self.clf:
+                self._vision_cache[key] = features
+                self._vision_cache.move_to_end(key)
+                if len(self._vision_cache) > VISION_CACHE_SIZE:
+                    self._vision_cache.popitem(last=False)
+        return features
+
+    def _corpse_fields(self, clf: Any, p: dict[str, Any], embeddings: np.ndarray | None) -> dict[str, Any]:
+        session = getattr(clf, "corpse_sess", None)
+        if session is None:
+            return {}
+        if embeddings is None:
+            return {"corpseProb": 0.0, "corpsePileProb": 0.0}
+
+        scores = session.run(["corpse_probs"], {"img_emb": embeddings})[0]
+        corpse, pile = scores.max(axis=0)
+        result: dict[str, Any] = {"corpseProb": round_prob(corpse), "corpsePileProb": round_prob(pile)}
+        if p["gore_weight"] > 1e-6:
+            hits = np.flatnonzero(np.any(scores >= clf.corpse_thresholds, axis=1)).tolist()
+            if hits:
+                result["corpseImageIndices"] = hits
+                result["corpseReviewFloor"] = round_prob(clf.review_threshold)
+        return result
+
     def _predict_fast(
         self,
         clf: Any,
@@ -378,6 +429,7 @@ class RunnerEngine:
         if not imgs:
             assert text_trip is not None
             return {
+                **self._corpse_fields(clf, p, None),
                 "prob": text_trip[0],
                 "goreProb": text_trip[1],
                 "nsfwProb": text_trip[2],
@@ -392,17 +444,8 @@ class RunnerEngine:
                 "perImageProbs": [],
             }
 
-        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-        pixels, priors = [], []
-        for raw in imgs:
-            with Image.open(io.BytesIO(raw)) as source:
-                check_image_dimensions(source)
-                with source.convert("RGB") as image:
-                    pixels.append(preprocess_bounded(image, clf.img_size))
-                    priors.append(lf.extract_visual_priors(image))
-        px_batch = np.stack(pixels, axis=0)
-        pri_batch = np.stack(priors, axis=0)
-        emb_batch = clf.vis_sess.run(["img_emb"], {"pixel_values": px_batch})[0]
+        emb_batch, pri_batch = self._image_features(clf, lf, imgs)
+        corpse_fields = self._corpse_fields(clf, p, emb_batch)
 
         n = len(imgs)
         zero_th = np.zeros((n, clf.txt_dim), dtype=np.float32)
@@ -445,8 +488,12 @@ class RunnerEngine:
             joint_rows = img_only_rows
             joint_trip = img_trip
 
+        fusion_prob = joint_trip[0]
+        review_floor = corpse_fields.get("corpseReviewFloor")
         return {
-            "prob": joint_trip[0],
+            **corpse_fields,
+            "prob": max(fusion_prob, review_floor or 0.0),
+            "fusionProb": fusion_prob if review_floor is not None and fusion_prob <= review_floor else None,
             "goreProb": joint_trip[1],
             "nsfwProb": joint_trip[2],
             "textProb": text_trip[0] if text_trip else None,

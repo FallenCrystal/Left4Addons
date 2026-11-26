@@ -933,22 +933,24 @@ export function FilterPanel({
 
               {(
                 [
-                  { label: '综合敏感概率 (prob)', value: testResult.prob },
+                  { label: '整体路由分数 (prob)', value: testResult.prob },
                   { label: '擦边成人概率 (nsfwProb)', value: testResult.nsfwProb },
                   { label: '血腥重口概率 (goreProb)', value: testResult.goreProb },
+                  { label: '可见尸体概率 (corpseProb)', value: testResult.corpseProb },
+                  { label: '尸堆概率 (corpsePileProb)', value: testResult.corpsePileProb },
                 ] as const
-              ).map((item) => (
-                <div key={item.label} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              ).map(({ label, value }) => value === undefined ? null : (
+                <div key={label} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                   <div className="cat-row" style={{ justifyContent: 'space-between', fontSize: 12.5 }}>
-                    <span>{item.label}</span>
-                    <span className="cat-mono">{formatProb(item.value)}</span>
+                    <span>{label}</span>
+                    <span className="cat-mono">{formatProb(value)}</span>
                   </div>
                   <div className="cat-progress-track">
                     <div
                       className="cat-progress-fill"
                       style={{
-                        width: `${Math.min(100, Math.max(0, item.value * 100))}%`,
-                        background: probBarColor(item.value),
+                        width: `${Math.min(100, Math.max(0, value * 100))}%`,
+                        background: probBarColor(value),
                       }}
                     />
                   </div>
@@ -956,6 +958,12 @@ export function FilterPanel({
               ))}
 
               <div className="cat-kv-list" style={{ paddingTop: 4 }}>
+                {testResult.corpseReviewFloor !== undefined && (
+                  <div className="cat-kv">
+                    <span className="cat-kv-k">尸体复核下限 (corpseReviewFloor)</span>
+                    <span className="cat-kv-v cat-mono">{formatProb(testResult.corpseReviewFloor)}</span>
+                  </div>
+                )}
                 <div className="cat-kv">
                   <span className="cat-kv-k">文本模态 (textProb)</span>
                   <span className="cat-kv-v cat-mono">{formatProb(testResult.textProb)}</span>

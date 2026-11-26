@@ -170,6 +170,11 @@ export interface FilterProbabilities {
   prob: number;
   goreProb: number;
   nsfwProb: number;
+  corpseProb?: number;
+  corpsePileProb?: number;
+  corpseReviewFloor?: number;
+  fusionProb?: number;
+  corpseImageIndices?: number[];
   textProb?: number;
   textGoreProb?: number;
   textNsfwProb?: number;

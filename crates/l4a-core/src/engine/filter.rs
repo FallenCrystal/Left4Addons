@@ -9,7 +9,7 @@ use l4a_protocol::{
     FilterCacheClearResult, FilterEvaluationBatchResponse, FilterEvaluationTarget,
     FilterTokenStatus, LocalFilterDeploymentStatus, UpsertFilterExclusionRequest,
     DEFAULT_FILTER_REPO_URL, DEFAULT_LLM_ENDPOINT, DEFAULT_LLM_MODEL, DEFAULT_LLM_SYSTEM_PROMPT,
-    DEFAULT_LLM_TOKEN_ENV_VAR,
+    DEFAULT_LLM_TOKEN_ENV_VAR, LEGACY_LLM_SYSTEM_PROMPT,
 };
 
 fn sanitize_filter_basics(cfg: &mut ClientFilterConfig) {
@@ -59,7 +59,8 @@ fn sanitize_filter_basics(cfg: &mut ClientFilterConfig) {
         trimmed_model.to_string()
     };
 
-    if cfg.llm_system_prompt.trim().is_empty() {
+    let prompt = cfg.llm_system_prompt.trim();
+    if prompt.is_empty() || prompt == LEGACY_LLM_SYSTEM_PROMPT {
         cfg.llm_system_prompt = DEFAULT_LLM_SYSTEM_PROMPT.to_string();
     }
 }

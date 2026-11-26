@@ -1355,6 +1355,12 @@ export function FilterSettingsSection({
                     `prob=${sandboxResult.probabilities.prob.toFixed(3)}`,
                     `nsfw=${sandboxResult.probabilities.nsfwProb.toFixed(3)}`,
                     `gore=${sandboxResult.probabilities.goreProb.toFixed(3)}`,
+                    sandboxResult.probabilities.corpseProb !== undefined
+                      ? `corpse=${sandboxResult.probabilities.corpseProb.toFixed(3)}`
+                      : null,
+                    sandboxResult.probabilities.corpsePileProb !== undefined
+                      ? `corpsePile=${sandboxResult.probabilities.corpsePileProb.toFixed(3)}`
+                      : null,
                     sandboxResult.probabilities.textProb !== undefined
                       ? `text=${sandboxResult.probabilities.textProb.toFixed(3)}`
                       : null,

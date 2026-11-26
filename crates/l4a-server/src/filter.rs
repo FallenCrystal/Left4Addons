@@ -87,8 +87,7 @@ struct RuntimeSnapshot {
     ready: bool,
     running_pid: Option<u32>,
     active_endpoint: Option<String>,
-    model_name: Option<String>,
-    model_version: Option<String>,
+    model: ModelIdentity,
     last_error: Option<String>,
 }
 
@@ -116,8 +115,7 @@ struct ManagedPythonHandle {
     pid: Option<u32>,
     deploy_dir: PathBuf,
     python_bin: Option<String>,
-    model_name: Option<String>,
-    model_version: Option<String>,
+    model: ModelIdentity,
     stderr_buf: Arc<StdMutex<String>>,
 }
 
@@ -136,12 +134,20 @@ impl Drop for ManagedPythonHandle {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RunnerHealthPayload {
-    #[serde(alias = "modelName", alias = "model_name")]
-    model: Option<String>,
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct ModelIdentity {
+    #[serde(rename = "model", alias = "modelName", alias = "model_name")]
+    name: Option<String>,
     #[serde(alias = "modelVersion", alias = "model_version")]
     version: Option<String>,
+    #[serde(rename = "scoringRevision", alias = "scoring_revision")]
+    revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunnerHealthPayload {
+    #[serde(flatten)]
+    model: ModelIdentity,
     host: Option<String>,
     port: Option<u16>,
 }
@@ -311,18 +317,12 @@ impl CatalogFilterService {
         }
         let snap = self.runtime.read().unwrap().clone();
         let ready = snap.ready && snap.initialized_config.as_ref() == Some(&cfg);
-        let scoring_revision = ready.then(|| {
-            compute_scoring_revision(
-                &cfg,
-                snap.model_name.as_deref(),
-                snap.model_version.as_deref(),
-            )
-        });
+        let scoring_revision = ready.then(|| compute_scoring_revision(&cfg, &snap.model));
         CatalogFilterPublicInfo {
             enabled: true,
             ready,
-            model_name: ready.then_some(snap.model_name).flatten(),
-            model_version: ready.then_some(snap.model_version).flatten(),
+            model_name: ready.then_some(snap.model.name).flatten(),
+            model_version: ready.then_some(snap.model.version).flatten(),
             max_images: advertised_max_images,
             scoring_revision,
         }
@@ -346,9 +346,9 @@ impl CatalogFilterService {
             } else {
                 None
             },
-            model_name: if cfg.enabled { snap.model_name } else { None },
+            model_name: if cfg.enabled { snap.model.name } else { None },
             model_version: if cfg.enabled {
-                snap.model_version
+                snap.model.version
             } else {
                 None
             },
@@ -555,11 +555,7 @@ impl CatalogFilterService {
                     "内容过滤模型后端未绑定有效地址".to_string(),
                 ));
             };
-            let rev = compute_scoring_revision(
-                &cfg,
-                snap.model_name.as_deref(),
-                snap.model_version.as_deref(),
-            );
+            let rev = compute_scoring_revision(&cfg, &snap.model);
             // Check the cache while the backend and its revision are still verified.
             let cache_key = compute_cache_key(
                 &cfg,
@@ -740,6 +736,7 @@ impl CatalogFilterService {
             !title.trim().is_empty() || !description.trim().is_empty() || !tags.is_empty();
         let mut image_rows = Vec::with_capacity(images.len());
         let mut joint_rows = Vec::with_capacity(if has_txt { images.len() } else { 0 });
+        let mut corpse_scores = FilterProbabilities::default();
 
         let mut text_prob = None;
         let mut text_gore_prob = None;
@@ -747,14 +744,15 @@ impl CatalogFilterService {
         let mut title_prob = None;
         let mut description_prob = None;
 
-        for img_bytes in images {
+        for (index, img_bytes) in images.iter().enumerate() {
             let b64 = BASE64_STD.encode(img_bytes);
             let single_slice = std::slice::from_ref(&b64);
 
             let img_res = self
                 .call_backend_predict(endpoint, "", "", &[], single_slice)
                 .await?;
-            image_rows.push([img_res.prob, img_res.gore_prob, img_res.nsfw_prob]);
+            corpse_scores.merge_corpse_scores(&img_res, index, 1);
+            image_rows.push([img_res.fusion_score(), img_res.gore_prob, img_res.nsfw_prob]);
 
             if has_txt {
                 let joint_res = self
@@ -767,7 +765,11 @@ impl CatalogFilterService {
                     title_prob = joint_res.title_prob;
                     description_prob = joint_res.description_prob;
                 }
-                joint_rows.push([joint_res.prob, joint_res.gore_prob, joint_res.nsfw_prob]);
+                joint_rows.push([
+                    joint_res.fusion_score(),
+                    joint_res.gore_prob,
+                    joint_res.nsfw_prob,
+                ]);
             }
         }
 
@@ -795,8 +797,7 @@ impl CatalogFilterService {
             img_agg
         };
 
-        let raw_probs = FilterProbabilities {
-            prob: round6_prob(joint_agg[0]),
+        let mut raw_probs = FilterProbabilities {
             gore_prob: round6_prob(joint_agg[1]),
             nsfw_prob: round6_prob(joint_agg[2]),
             text_prob,
@@ -808,8 +809,9 @@ impl CatalogFilterService {
             image_gore_prob: Some(round6_prob(img_agg[1])),
             image_nsfw_prob: Some(round6_prob(img_agg[2])),
             per_image_probs: image_rows.iter().map(|r| round6_prob(r[0])).collect(),
-            scoring_revision: None,
+            ..corpse_scores
         };
+        raw_probs.set_fusion_score(round6_prob(joint_agg[0]));
 
         let mut adjusted = params.adjust_probabilities(&raw_probs);
         if !params.is_identity_calibration() {
@@ -842,11 +844,11 @@ impl CatalogFilterService {
         }
         if !has_txt && !encoded_images.is_empty() {
             if raw_probs.image_prob.is_none() {
-                raw_probs.image_prob = Some(raw_probs.prob);
+                raw_probs.image_prob = Some(raw_probs.fusion_score());
                 raw_probs.image_gore_prob = Some(raw_probs.gore_prob);
                 raw_probs.image_nsfw_prob = Some(raw_probs.nsfw_prob);
                 if raw_probs.per_image_probs.is_empty() && encoded_images.len() == 1 {
-                    raw_probs.per_image_probs = vec![raw_probs.prob];
+                    raw_probs.per_image_probs = vec![raw_probs.fusion_score()];
                 }
             }
             return;
@@ -893,14 +895,15 @@ impl CatalogFilterService {
             }
         }
         if let Some(img_res) = img_opt {
-            raw_probs.image_prob = Some(img_res.prob);
+            let image_fusion = img_res.fusion_score();
+            raw_probs.image_prob = Some(image_fusion);
             raw_probs.image_gore_prob = Some(img_res.gore_prob);
             raw_probs.image_nsfw_prob = Some(img_res.nsfw_prob);
             if raw_probs.per_image_probs.is_empty() {
                 if !img_res.per_image_probs.is_empty() {
                     raw_probs.per_image_probs = img_res.per_image_probs;
                 } else if encoded_images.len() == 1 {
-                    raw_probs.per_image_probs = vec![img_res.prob];
+                    raw_probs.per_image_probs = vec![image_fusion];
                 }
             }
         }
@@ -1004,17 +1007,15 @@ impl CatalogFilterService {
                             && snap.initialized_config.as_ref() == Some(cfg)
                             && snap.active_endpoint.as_deref() == Some(base_url.as_str())
                         {
-                            Some((snap.model_name.clone(), snap.model_version.clone()))
+                            Some(snap.model.clone())
                         } else {
                             None
                         }
                     };
-                    if let Some((prev_model_name, prev_model_version)) = routine_refresh {
+                    if let Some(prev_model) = routine_refresh {
                         match self.probe_upstream_health(&base_url).await {
-                            Ok((model_name, model_version)) => {
-                                if model_name == prev_model_name
-                                    && model_version == prev_model_version
-                                {
+                            Ok(model) => {
+                                if model == prev_model {
                                     let mut snap = self.runtime.write().unwrap();
                                     if snap.ready
                                         && snap.initialized_config.as_ref() == Some(cfg)
@@ -1031,11 +1032,7 @@ impl CatalogFilterService {
                                 let prev_sig =
                                     self.runtime.read().unwrap().last_scoring_signature.clone();
                                 let next_sig = if cfg.cache_ttl_secs > 0 {
-                                    let rev = compute_scoring_revision(
-                                        cfg,
-                                        model_name.as_deref(),
-                                        model_version.as_deref(),
-                                    );
+                                    let rev = compute_scoring_revision(cfg, &model);
                                     if prev_sig.as_deref() != Some(rev.as_str()) {
                                         self.clear_cache();
                                     }
@@ -1054,8 +1051,7 @@ impl CatalogFilterService {
                                     ready: true,
                                     running_pid: None,
                                     active_endpoint: Some(base_url),
-                                    model_name,
-                                    model_version,
+                                    model,
                                     last_error: None,
                                 };
                                 return;
@@ -1065,7 +1061,8 @@ impl CatalogFilterService {
                                 self.backend_generation.fetch_add(1, Ordering::AcqRel);
                                 let prev_sig =
                                     self.runtime.read().unwrap().last_scoring_signature.clone();
-                                let unverified_rev = compute_scoring_revision(cfg, None, None);
+                                let unverified_rev =
+                                    compute_scoring_revision(cfg, &ModelIdentity::default());
                                 let next_sig = if cfg.cache_ttl_secs > 0 {
                                     if prev_sig.as_deref() != Some(unverified_rev.as_str()) {
                                         self.clear_cache();
@@ -1085,8 +1082,7 @@ impl CatalogFilterService {
                                     ready: false,
                                     running_pid: None,
                                     active_endpoint: Some(base_url),
-                                    model_name: None,
-                                    model_version: None,
+                                    model: ModelIdentity::default(),
                                     last_error: Some(err),
                                 };
                                 return;
@@ -1100,13 +1096,13 @@ impl CatalogFilterService {
         let _execution = self.backend_execution.write().await;
         self.backend_generation.fetch_add(1, Ordering::AcqRel);
         let prev_sig = self.runtime.read().unwrap().last_scoring_signature.clone();
-        let unverified_rev = compute_scoring_revision(cfg, None, None);
+        let unverified_rev = compute_scoring_revision(cfg, &ModelIdentity::default());
         if force_restart || !cfg.enabled || cfg.cache_ttl_secs == 0 {
             self.clear_cache();
         }
-        let retained_for = |model_name: Option<&str>, model_version: Option<&str>| {
+        let retained_for = |model: &ModelIdentity| {
             if cfg.enabled && cfg.cache_ttl_secs > 0 {
-                let rev = compute_scoring_revision(cfg, model_name, model_version);
+                let rev = compute_scoring_revision(cfg, model);
                 if prev_sig.as_deref() != Some(rev.as_str()) {
                     self.clear_cache();
                 }
@@ -1141,8 +1137,7 @@ impl CatalogFilterService {
                 ready: false,
                 running_pid: None,
                 active_endpoint: None,
-                model_name: None,
-                model_version: None,
+                model: ModelIdentity::default(),
                 last_error: None,
             };
             return;
@@ -1166,8 +1161,7 @@ impl CatalogFilterService {
                         ready: false,
                         running_pid: None,
                         active_endpoint: None,
-                        model_name: None,
-                        model_version: None,
+                        model: ModelIdentity::default(),
                         last_error: Some(
                             "未配置 Left4Filters 部署路径 (filter.deploy_dir)".to_string(),
                         ),
@@ -1191,10 +1185,7 @@ impl CatalogFilterService {
                                 .await
                             {
                                 Ok(()) => {
-                                    let next_sig = retained_for(
-                                        existing.model_name.as_deref(),
-                                        existing.model_version.as_deref(),
-                                    );
+                                    let next_sig = retained_for(&existing.model);
                                     let mut snap = self.runtime.write().unwrap();
                                     snap.initialized_config = Some(cfg.clone());
                                     snap.last_scoring_signature = next_sig;
@@ -1203,8 +1194,7 @@ impl CatalogFilterService {
                                     snap.ready = true;
                                     snap.running_pid = existing.pid;
                                     snap.active_endpoint = Some(existing.endpoint.clone());
-                                    snap.model_name = existing.model_name.clone();
-                                    snap.model_version = existing.model_version.clone();
+                                    snap.model = existing.model.clone();
                                     snap.last_error = None;
                                     return;
                                 }
@@ -1231,10 +1221,7 @@ impl CatalogFilterService {
                 .await
                 {
                     Ok(handle) => {
-                        let next_sig = retained_for(
-                            handle.model_name.as_deref(),
-                            handle.model_version.as_deref(),
-                        );
+                        let next_sig = retained_for(&handle.model);
                         let next_crash_ts = if force_restart {
                             None
                         } else {
@@ -1254,8 +1241,7 @@ impl CatalogFilterService {
                             ready: true,
                             running_pid: handle.pid,
                             active_endpoint: Some(handle.endpoint.clone()),
-                            model_name: handle.model_name.clone(),
-                            model_version: handle.model_version.clone(),
+                            model: handle.model.clone(),
                             last_error: None,
                         };
                         *guard = Some(handle);
@@ -1274,8 +1260,7 @@ impl CatalogFilterService {
                             ready: false,
                             running_pid: None,
                             active_endpoint: None,
-                            model_name: None,
-                            model_version: None,
+                            model: ModelIdentity::default(),
                             last_error: Some(err),
                         };
                     }
@@ -1298,8 +1283,7 @@ impl CatalogFilterService {
                         ready: false,
                         running_pid: None,
                         active_endpoint: None,
-                        model_name: None,
-                        model_version: None,
+                        model: ModelIdentity::default(),
                         last_error: Some(
                             "未配置外部过滤推理服务地址 (filter.upstream_url)".to_string(),
                         ),
@@ -1321,8 +1305,7 @@ impl CatalogFilterService {
                             ready: false,
                             running_pid: None,
                             active_endpoint: None,
-                            model_name: None,
-                            model_version: None,
+                            model: ModelIdentity::default(),
                             last_error: Some(err),
                         };
                         return;
@@ -1330,9 +1313,8 @@ impl CatalogFilterService {
                 };
 
                 match self.probe_upstream_health(&base_url).await {
-                    Ok((model_name, model_version)) => {
-                        let next_sig =
-                            retained_for(model_name.as_deref(), model_version.as_deref());
+                    Ok(model) => {
+                        let next_sig = retained_for(&model);
                         *self.runtime.write().unwrap() = RuntimeSnapshot {
                             initialized_config: Some(cfg.clone()),
                             last_scoring_signature: next_sig,
@@ -1343,8 +1325,7 @@ impl CatalogFilterService {
                             ready: true,
                             running_pid: None,
                             active_endpoint: Some(base_url),
-                            model_name,
-                            model_version,
+                            model,
                             last_error: None,
                         };
                     }
@@ -1360,8 +1341,7 @@ impl CatalogFilterService {
                             ready: false,
                             running_pid: None,
                             active_endpoint: Some(base_url),
-                            model_name: None,
-                            model_version: None,
+                            model: ModelIdentity::default(),
                             last_error: Some(err),
                         };
                     }
@@ -1395,10 +1375,7 @@ impl CatalogFilterService {
         Ok(())
     }
 
-    async fn probe_upstream_health(
-        &self,
-        base_url: &str,
-    ) -> Result<(Option<String>, Option<String>), String> {
+    async fn probe_upstream_health(&self, base_url: &str) -> Result<ModelIdentity, String> {
         let url = format!("{}/health", base_url.trim_end_matches('/'));
         let resp = self
             .backend_client
@@ -1418,11 +1395,36 @@ impl CatalogFilterService {
         let body = read_bounded_response_bytes(resp, MAX_BACKEND_RESPONSE_BYTES)
             .await
             .map_err(|e| format!("读取上游健康检查响应失败: {e}"))?;
-        if let Ok(parsed) = serde_json::from_slice::<RunnerHealthPayload>(&body) {
-            Ok((parsed.model, parsed.version))
-        } else {
-            Ok((None, None))
+        let mut model = serde_json::from_slice::<ModelIdentity>(&body).unwrap_or_default();
+        if model.name.as_deref() == Some("Left4FiltersModel")
+            && model.version.is_none()
+            && model.revision.is_none()
+            && self.upstream_has_corpse_scores(base_url).await
+        {
+            model.revision = Some("left4filters-corpse-scores".into());
         }
+        Ok(model)
+    }
+
+    // Stock Left4Filters /health omits the version. An empty prediction checks
+    // for the new output fields without running image or text inference.
+    async fn upstream_has_corpse_scores(&self, base_url: &str) -> bool {
+        let response = self
+            .backend_client
+            .post(format!("{}/predict", base_url.trim_end_matches('/')))
+            .timeout(HEALTH_CHECK_TIMEOUT)
+            .json(&RawFilterPredictRequest::default())
+            .send()
+            .await;
+        let Ok(response) = response.and_then(reqwest::Response::error_for_status) else {
+            return false;
+        };
+        let Ok(body) = read_bounded_response_bytes(response, MAX_BACKEND_RESPONSE_BYTES).await
+        else {
+            return false;
+        };
+        serde_json::from_slice::<FilterProbabilities>(&body)
+            .is_ok_and(|scores| scores.corpse_prob.is_some() && scores.corpse_pile_prob.is_some())
     }
 
     async fn call_backend_predict(
@@ -1520,13 +1522,18 @@ impl CatalogFilterService {
             }
         };
 
-        serde_json::from_slice::<ManagedFilterPrediction>(&body).map_err(|err| {
-            let msg = format!("解析过滤推理后端响应失败: {err}");
-            if record_failure {
-                self.record_backend_failure(endpoint, msg.clone());
-            }
-            FilterServiceError::Unavailable(msg)
-        })
+        let mut prediction =
+            serde_json::from_slice::<ManagedFilterPrediction>(&body).map_err(|err| {
+                let msg = format!("解析过滤推理后端响应失败: {err}");
+                if record_failure {
+                    self.record_backend_failure(endpoint, msg.clone());
+                }
+                FilterServiceError::Unavailable(msg)
+            })?;
+        prediction
+            .probabilities
+            .infer_stock_corpse_review(images_base64.len());
+        Ok(prediction)
     }
 
     fn record_backend_failure(&self, endpoint: &str, message: String) {
@@ -1545,8 +1552,7 @@ impl CatalogFilterService {
             snap.upstream_verified_at = None;
             snap.next_retry_after = Some(Instant::now() + CRASH_RESTART_BACKOFF);
             snap.ready = false;
-            snap.model_name = None;
-            snap.model_version = None;
+            snap.model = ModelIdentity::default();
             self.clear_cache();
         }
         snap.last_error = Some(message);
@@ -2242,7 +2248,7 @@ fn scoring_signature(cfg: &FilterSection) -> String {
         CatalogFilterBackendKind::UpstreamHttp => cfg.upstream_url.clone().unwrap_or_default(),
     };
     format!(
-        "v2|{:?}|{}|t={}|i={}|m={}|{:?}|gw={:08x}|nw={:08x}|temp={:08x}|bias={:08x}",
+        "v3|{:?}|{}|t={}|i={}|m={}|{:?}|gw={:08x}|nw={:08x}|temp={:08x}|bias={:08x}",
         cfg.backend,
         target,
         p.enable_text,
@@ -2256,21 +2262,16 @@ fn scoring_signature(cfg: &FilterSection) -> String {
     )
 }
 
-fn compute_scoring_revision(
-    cfg: &FilterSection,
-    model_name: Option<&str>,
-    model_version: Option<&str>,
-) -> String {
+fn compute_scoring_revision(cfg: &FilterSection, model: &ModelIdentity) -> String {
     let mut hasher = Sha256::new();
     let sig = scoring_signature(cfg);
     hasher.update((sig.len() as u64).to_le_bytes());
     hasher.update(sig.as_bytes());
-    let name = model_name.unwrap_or("");
-    hasher.update((name.len() as u64).to_le_bytes());
-    hasher.update(name.as_bytes());
-    let version = model_version.unwrap_or("");
-    hasher.update((version.len() as u64).to_le_bytes());
-    hasher.update(version.as_bytes());
+    for value in [&model.name, &model.version, &model.revision] {
+        let value = value.as_deref().unwrap_or("");
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
     let digest = hasher.finalize();
     hex::encode(&digest[..8])
 }
@@ -2642,14 +2643,14 @@ async fn spawn_managed_python_runner(
                 } else {
                     format!("http://{host}:{port}")
                 };
-                return Ok((endpoint, parsed.model, parsed.version));
+                return Ok((endpoint, parsed.model));
             }
         }
     })
     .await;
 
     match ready_result {
-        Ok(Ok((endpoint, model_name, model_version))) => {
+        Ok(Ok((endpoint, model))) => {
             // Keep draining stdout using raw byte chunks until EOF so non-UTF-8 bytes never trigger SIGPIPE.
             tokio::spawn(async move {
                 let mut sink = [0u8; 4096];
@@ -2672,8 +2673,7 @@ async fn spawn_managed_python_runner(
                 pid,
                 deploy_dir: deploy_dir.to_path_buf(),
                 python_bin: configured_python.map(str::to_owned),
-                model_name,
-                model_version,
+                model,
                 stderr_buf,
             })
         }
@@ -2987,16 +2987,91 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let r1 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.0.0"));
+        let mut model = ModelIdentity {
+            name: Some("Left4Filters".into()),
+            version: Some("1.0.0".into()),
+            ..ModelIdentity::default()
+        };
+        let r1 = compute_scoring_revision(&cfg, &model);
         assert_eq!(r1.len(), 16);
         assert!(r1.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let r2 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.1.0"));
+        model.version = Some("1.1.0".into());
+        let r2 = compute_scoring_revision(&cfg, &model);
         assert_ne!(r1, r2);
 
         cfg.bias = 0.25;
-        let r3 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.0.0"));
+        model.version = Some("1.0.0".into());
+        let r3 = compute_scoring_revision(&cfg, &model);
         assert_ne!(r1, r3);
+    }
+
+    #[tokio::test]
+    async fn stock_upstream_upgrade_changes_revision_and_retains_corpse_review_in_gallery() {
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+
+        let corpse_supported = Arc::new(AtomicBool::new(false));
+        let model_state = corpse_supported.clone();
+        let hit_image = BASE64_STD.encode(b"corpse fixture");
+        let app = Router::new()
+            .route("/health", get(|| async { Json(json!({"model": "Left4FiltersModel"})) }))
+            .route("/predict", post(move |Json(req): Json<Value>| {
+                let has_corpse_scores = model_state.load(Ordering::Acquire);
+                let hit = has_corpse_scores && req["images_base64"][0].as_str() == Some(&hit_image);
+                async move {
+                    let mut scores = json!({"prob": if hit { 0.20 } else { 0.04 }, "gore_prob": 0.03, "nsfw_prob": 0.01});
+                    if has_corpse_scores {
+                        scores["corpse_prob"] = json!(if hit { 0.50 } else { 0.05 });
+                        scores["corpse_pile_prob"] = json!(0.01);
+                    }
+                    Json(scores)
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let store = Arc::new(CatalogConfigStore::new(None, Default::default()));
+        store
+            .update(|cfg| {
+                cfg.filter.enabled = true;
+                cfg.filter.backend = CatalogFilterBackendKind::UpstreamHttp;
+                cfg.filter.upstream_url = Some(endpoint.clone());
+                cfg.filter.gallery_aggregation = l4a_protocol::FilterGalleryAggregation::Mean;
+                cfg.filter.bias = -1.0;
+            })
+            .unwrap();
+        let service =
+            CatalogFilterService::new(store, Arc::new(ServerRepo::open_in_memory().unwrap()));
+        let before = service.public_info().await;
+        assert!(before.ready);
+
+        corpse_supported.store(true, Ordering::Release);
+        service.runtime.write().unwrap().upstream_verified_at = None;
+        let after = service.public_info().await;
+        assert!(after.ready);
+        assert_eq!(after.model_version, None);
+        assert_ne!(before.scoring_revision, after.scoring_revision);
+
+        let prediction = service
+            .predict_upstream_gallery(
+                &endpoint,
+                "Workshop item",
+                "",
+                &[],
+                &[b"ordinary fixture".to_vec(), b"corpse fixture".to_vec()],
+                &service.current_filter_section().params(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prediction.prob, 0.20);
+        assert!(prediction.fusion_score() < 0.04);
+        assert_eq!(prediction.corpse_prob, Some(0.50));
+        assert_eq!(prediction.corpse_image_indices, vec![1]);
+        server.abort();
     }
 
     #[tokio::test]
