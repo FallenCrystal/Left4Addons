@@ -351,6 +351,7 @@ export interface LocalFilterDeploymentStatus {
   recentCommits: FilterCommitInfo[];
   stageMessage?: string;
   lastError?: string;
+  cacheGeneration?: number;
 }
 
 export interface DeployLocalFilterRequest {

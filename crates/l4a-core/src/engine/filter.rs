@@ -124,16 +124,21 @@ impl L4aEngine {
     }
 
     pub async fn get_local_filter_status(&self) -> Result<LocalFilterDeploymentStatus, CoreError> {
-        Ok(self.local_filter.status().await)
+        let mut status = self.local_filter.status().await;
+        status.cache_generation = Some(*self.filter_cache_generation.lock().unwrap());
+        Ok(status)
     }
 
     pub async fn check_local_filter_updates(
         &self,
     ) -> Result<LocalFilterDeploymentStatus, CoreError> {
         let cfg = self.config();
-        self.local_filter
+        let mut status = self
+            .local_filter
             .check_updates(&cfg.filter.repo_url, cfg.https_only)
-            .await
+            .await?;
+        status.cache_generation = Some(*self.filter_cache_generation.lock().unwrap());
+        Ok(status)
     }
 
     pub async fn deploy_local_filter(
@@ -141,30 +146,45 @@ impl L4aEngine {
         request: DeployLocalFilterRequest,
     ) -> Result<LocalFilterDeploymentStatus, CoreError> {
         let cfg = self.config();
-        let status = self
+        let head_before = self.local_filter.current_repo_head_sha().await;
+        let mut outcome = match self
             .local_filter
-            .deploy(
-                &request,
-                &cfg.filter.repo_url,
-                &cfg.filter.local_params,
-                cfg.https_only,
-            )
-            .await?;
+            .deploy(&request, &cfg.filter.repo_url, cfg.https_only)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let head_after = self.local_filter.current_repo_head_sha().await;
+                if head_after != head_before {
+                    if let Ok(_workspace) = self.lock_workspace() {
+                        let mut generation = self.filter_cache_generation.lock().unwrap();
+                        let _ = self.db.clear_filter_verdicts();
+                        *generation += 1;
+                    }
+                    self.emit_workspace_update();
+                }
+                return Err(err);
+            }
+        };
 
-        // Persist updated deployment tracking settings back to config and clear prior model verdicts
+        // Persist updated deployment tracking settings back to config and clear prior model verdicts,
+        // even when `start_after_deploy` fails after the new commit has already been checked out.
         let workspace = self.lock_workspace()?;
         let mut updated_cfg = self.config();
         let mut changed = false;
-        if let Some(ref repo_url) = request
+        let requested_repo_url = request
             .repo_url
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-        {
-            if &updated_cfg.filter.repo_url != repo_url {
-                updated_cfg.filter.repo_url = repo_url.clone();
-                changed = true;
+            .filter(|s| !s.is_empty());
+        if requested_repo_url.is_some() {
+            if let Ok(canonical_url) =
+                validate_repo_url(&outcome.validated_repo_url, updated_cfg.https_only)
+            {
+                if updated_cfg.filter.repo_url != canonical_url {
+                    updated_cfg.filter.repo_url = canonical_url;
+                    changed = true;
+                }
             }
         }
         if updated_cfg.filter.track_latest != request.track_latest {
@@ -192,26 +212,32 @@ impl L4aEngine {
         }
         self.db.clear_filter_verdicts()?;
         *generation += 1;
+        let next_generation = *generation;
         drop(generation);
         drop(workspace);
         self.emit_workspace_update();
 
-        Ok(status)
+        if let Some(start_err) = outcome.start_error {
+            return Err(start_err);
+        }
+        outcome.status.cache_generation = Some(next_generation);
+        Ok(outcome.status)
     }
 
     pub async fn start_local_filter_service(
         &self,
     ) -> Result<LocalFilterDeploymentStatus, CoreError> {
-        let cfg = self.config();
-        self.local_filter
-            .start_service(&cfg.filter.local_params)
-            .await
+        let mut status = self.local_filter.start_service().await?;
+        status.cache_generation = Some(*self.filter_cache_generation.lock().unwrap());
+        Ok(status)
     }
 
     pub async fn stop_local_filter_service(
         &self,
     ) -> Result<LocalFilterDeploymentStatus, CoreError> {
-        self.local_filter.stop_service().await
+        let mut status = self.local_filter.stop_service().await?;
+        status.cache_generation = Some(*self.filter_cache_generation.lock().unwrap());
+        Ok(status)
     }
 
     pub fn get_filter_token_status(&self) -> Result<FilterTokenStatus, CoreError> {
@@ -229,12 +255,12 @@ impl L4aEngine {
         token: Option<String>,
     ) -> Result<FilterTokenStatus, CoreError> {
         let mut generation = self.filter_cache_generation.lock().unwrap();
-        self.db.clear_llm_filter_verdicts()?;
         let vault = self.token_vault.read().unwrap();
         match token.as_deref().map(str::trim) {
             Some(s) if !s.is_empty() => vault.seal(s)?,
             _ => vault.clear()?,
         }
+        self.db.clear_llm_filter_verdicts()?;
         *generation += 1;
         let cfg = self.config();
         Ok(FilterTokenStatus {

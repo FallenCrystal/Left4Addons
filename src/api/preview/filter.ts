@@ -204,7 +204,10 @@ export class PreviewFilterRuntime {
   }
 
   getStatus(): LocalFilterDeploymentStatus {
-    return structuredClone(this.status);
+    return {
+      ...structuredClone(this.status),
+      cacheGeneration: this.cacheGeneration,
+    };
   }
 
   getCachedVerdictsForSnapshot(state: DashboardSnapshot): FilterItemVerdict[] {
@@ -451,9 +454,6 @@ export class PreviewFilterRuntime {
           BORDERLINE_GORE_REGEX.test(combinedText);
         flagged = llmFlag;
         decisionSource = llmFlag ? 'llm_flagged_true' : 'llm_flagged_false';
-      } else if (!config.enableDirectFlag && !config.llmEnabled && evaluatedScore >= config.flagThreshold) {
-        flagged = true;
-        decisionSource = 'model_direct_flag';
       }
 
       let textSensitive = false;

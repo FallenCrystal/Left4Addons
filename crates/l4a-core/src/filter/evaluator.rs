@@ -197,14 +197,16 @@ pub fn compute_addon_state_sig(addon: &AddonSummary) -> String {
 
 fn target_is_stale_for_addon(target: &FilterEvaluationTarget, addon: &AddonSummary) -> bool {
     if let Some(ref hint) = target.revision_hint {
-        if hint.matches(':').count() >= 4 {
+        if hint.starts_with("v2:") {
             return hint != &build_addon_revision_hint(addon);
         }
-        if let (Some((hint_hash, _)), Some(ref current_hash)) =
-            (hint.split_once(':'), &addon.content_hash)
-        {
-            if !hint_hash.is_empty() && hint_hash != current_hash {
-                return true;
+        if target.target_key.starts_with("addon:") {
+            if let (Some((hint_hash, _)), Some(ref current_hash)) =
+                (hint.split_once(':'), &addon.content_hash)
+            {
+                if !hint_hash.is_empty() && hint_hash != current_hash {
+                    return true;
+                }
             }
         }
     }
@@ -233,7 +235,13 @@ pub fn compute_content_signature(target: &FilterEvaluationTarget, max_images: us
         hasher.update(b"\x1f");
     }
     hasher.update(b"\0");
-    for img in target.image_sources.iter().take(max_images) {
+    for img in target
+        .image_sources
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .take(max_images)
+    {
         hasher.update(img.as_bytes());
         hasher.update(b"\x1f");
     }
@@ -672,8 +680,8 @@ fn target_addon_id(target: &FilterEvaluationTarget) -> Option<AddonId> {
     target
         .target_key
         .strip_prefix("addon:")
+        .filter(|id| !id.is_empty())
         .map(|id| AddonId(id.to_string()))
-        .or_else(|| target.addon_id.clone())
 }
 
 async fn run_deduplicated_misses(
@@ -814,6 +822,7 @@ async fn evaluate_single_target(
 
     let mut had_load_error;
     let mut loaded_images: Vec<LoadedImage> = Vec::new();
+    let mut loaded_slot_indices: Vec<usize> = Vec::new();
     let mut deferred_remotes: Vec<(usize, ValidatedRemoteImage)> = Vec::new();
     let submitted_slot_indices: Vec<usize>;
 
@@ -874,6 +883,7 @@ async fn evaluate_single_target(
                 had_load_error = load_err;
                 deferred_remotes.clear();
                 submitted_slot_indices = loaded.iter().map(|(slot, _)| *slot).collect();
+                loaded_slot_indices = submitted_slot_indices.clone();
                 if loaded.is_empty() && !target.image_sources.is_empty() {
                     req.workshop_id = None;
                 }
@@ -908,6 +918,7 @@ async fn evaluate_single_target(
         let (imgs, load_err) = resolve_target_images(engine, target, max_images).await;
         had_load_error = load_err;
         submitted_slot_indices = imgs.iter().map(|(idx, _)| *idx).collect();
+        loaded_slot_indices = submitted_slot_indices.clone();
         let images_b64: Vec<String> = imgs.iter().map(|(_, img)| img.b64.clone()).collect();
         loaded_images = imgs.into_iter().map(|(_, img)| img).collect();
         policy.check_target(engine, target)?;
@@ -942,7 +953,8 @@ async fn evaluate_single_target(
             if mat_err {
                 had_load_error = true;
             }
-            loaded_images = materialized;
+            loaded_slot_indices = materialized.iter().map(|(slot, _)| *slot).collect();
+            loaded_images = materialized.into_iter().map(|(_, img)| img).collect();
         }
         policy.check_target(engine, target)?;
         let vault = engine.token_vault();
@@ -975,8 +987,25 @@ async fn evaluate_single_target(
         }
     }
 
-    let evaluated_image_indices =
-        compute_evaluated_image_indices(cfg, &submitted_slot_indices, &probs);
+    let llm_evaluated_image_slots: &[usize] = if matches!(
+        decision_source,
+        FilterDecisionSource::LlmFlaggedTrue | FilterDecisionSource::LlmFlaggedFalse
+    ) && cfg.llm_send_images
+        && !loaded_slot_indices.is_empty()
+    {
+        &loaded_slot_indices
+    } else {
+        &[]
+    };
+    let llm_flagged_with_images = decision_source == FilterDecisionSource::LlmFlaggedTrue
+        && !llm_evaluated_image_slots.is_empty();
+
+    let evaluated_image_indices = compute_evaluated_image_indices(
+        cfg,
+        &submitted_slot_indices,
+        &probs,
+        llm_evaluated_image_slots,
+    );
 
     let (
         text_sensitive,
@@ -984,7 +1013,14 @@ async fn evaluate_single_target(
         description_sensitive,
         image_sensitive,
         sensitive_image_indices,
-    ) = compute_modality_subdivision(cfg, target, &evaluated_image_indices, &probs, flagged);
+    ) = compute_modality_subdivision_inner(
+        cfg,
+        target,
+        &evaluated_image_indices,
+        &probs,
+        flagged,
+        llm_flagged_with_images,
+    );
 
     Ok(FilterItemVerdict {
         target_key: target.target_key.clone(),
@@ -1008,26 +1044,31 @@ fn compute_evaluated_image_indices(
     cfg: &ClientFilterConfig,
     submitted_slot_indices: &[usize],
     probs: &FilterProbabilities,
+    llm_evaluated_image_slots: &[usize],
 ) -> Vec<usize> {
-    if submitted_slot_indices.is_empty() {
-        return Vec::new();
-    }
-    if cfg.mode == ClientFilterSourceMode::Local && !cfg.local_params.sanitized().enable_image {
-        return Vec::new();
-    }
-    if !probs.per_image_probs.is_empty() {
+    let model_evaluated = if submitted_slot_indices.is_empty()
+        || (cfg.mode == ClientFilterSourceMode::Local && !cfg.local_params.sanitized().enable_image)
+    {
+        Vec::new()
+    } else if !probs.per_image_probs.is_empty() {
         let count = probs
             .per_image_probs
             .len()
             .min(submitted_slot_indices.len());
-        return submitted_slot_indices[..count].to_vec();
+        submitted_slot_indices[..count].to_vec()
+    } else if probs.text_prob.is_some() && probs.image_prob.is_none() {
+        // If the backend returned unimodal text breakdown with `image_prob == None` and empty
+        // `per_image_probs`, server-side image evaluation was disabled.
+        Vec::new()
+    } else {
+        submitted_slot_indices.to_vec()
+    };
+
+    if !model_evaluated.is_empty() {
+        model_evaluated
+    } else {
+        llm_evaluated_image_slots.to_vec()
     }
-    // If the backend returned unimodal text breakdown with `image_prob == None` and empty
-    // `per_image_probs`, server-side image evaluation was disabled.
-    if probs.text_prob.is_some() && probs.image_prob.is_none() {
-        return Vec::new();
-    }
-    submitted_slot_indices.to_vec()
 }
 
 fn catalog_image_sources(
@@ -1134,15 +1175,15 @@ async fn resolve_catalog_inline_images(
 async fn materialize_deferred_remotes_for_llm(
     engine: &L4aEngine,
     remotes: &[(usize, ValidatedRemoteImage)],
-) -> (Vec<LoadedImage>, bool) {
+) -> (Vec<(usize, LoadedImage)>, bool) {
     let mut out = Vec::with_capacity(remotes.len());
     let mut had_error = false;
-    for (_, remote) in remotes {
+    for (slot, remote) in remotes {
         match fetch_validated_remote_image(engine, remote).await {
-            Ok(img) => out.push(img),
+            Ok(img) => out.push((*slot, img)),
             Err(err) => {
                 had_error = true;
-                tracing::debug!(error = %err, "LLM 复核阶段下载远程预览图失败");
+                tracing::debug!(slot = *slot, error = %err, "LLM 复核阶段下载远程预览图失败");
             }
         }
     }
@@ -1209,12 +1250,14 @@ pub(crate) fn is_allowed_steam_cdn_image_url(parsed: &url::Url) -> bool {
     let Some(raw_host) = parsed.host_str() else {
         return false;
     };
-    let host = raw_host.to_ascii_lowercase();
-    if host == "steamusercontent.com"
-        || host.ends_with(".steamusercontent.com")
-        || host == "steamstatic.com"
-        || host.ends_with(".steamstatic.com")
-        || host == "media.steampowered.com"
+    let host = raw_host.trim_end_matches('.').to_ascii_lowercase();
+    if host == "media.steampowered.com"
+        || host
+            .strip_suffix(".steamusercontent.com")
+            .is_some_and(|sub| !sub.is_empty() && !sub.starts_with('.') && !sub.ends_with('.'))
+        || host
+            .strip_suffix(".steamstatic.com")
+            .is_some_and(|sub| !sub.is_empty() && !sub.starts_with('.') && !sub.ends_with('.'))
     {
         return true;
     }
@@ -1558,6 +1601,22 @@ async fn fetch_non_catalog_probabilities(
                         }),
                     ))
                 }
+                Err(PredictHttpOutcome::PayloadTooLarge(size_err)) => {
+                    let raw_predict_url =
+                        resolve_filter_endpoint_url(base, "/predict", &[], "自定义过滤服务端点")?;
+                    match post_raw_predict_subbatched(engine, &raw_predict_url, target, images_b64)
+                        .await
+                    {
+                        Ok(probs) => Ok((
+                            probs,
+                            Some(CustomEndpointUsed {
+                                url: raw_predict_url,
+                                is_raw_predict: true,
+                            }),
+                        )),
+                        Err(_) => Err(size_err),
+                    }
+                }
                 Err(err) => Err(err.into_core_error(&catalog_style_url)),
             }
         }
@@ -1589,6 +1648,7 @@ async fn post_raw_predict_subbatched(
 
 enum PredictHttpOutcome {
     NotFound,
+    PayloadTooLarge(CoreError),
     ImageFetch(CoreError),
     Other(CoreError),
 }
@@ -1597,7 +1657,7 @@ impl PredictHttpOutcome {
     fn into_core_error(self, url: &str) -> CoreError {
         match self {
             Self::NotFound => CoreError::NotFound(format!("过滤预测接口不存在 (404): {url}")),
-            Self::ImageFetch(err) | Self::Other(err) => err,
+            Self::PayloadTooLarge(err) | Self::ImageFetch(err) | Self::Other(err) => err,
         }
     }
 }
@@ -1606,9 +1666,9 @@ fn serialize_catalog_request(req: &FilterPredictRequest) -> Result<Vec<u8>, Pred
     let body = serde_json::to_vec(req)
         .map_err(|e| PredictHttpOutcome::Other(CoreError::InvalidInput(e.to_string())))?;
     if body.len() > CATALOG_FILTER_MAX_BODY_BYTES {
-        return Err(PredictHttpOutcome::Other(CoreError::InvalidInput(
-            "内容过滤请求超过 Catalog 的 48 MiB 体积限制".into(),
-        )));
+        return Err(PredictHttpOutcome::PayloadTooLarge(
+            CoreError::InvalidInput("内容过滤请求超过 Catalog 的 48 MiB 体积限制".into()),
+        ));
     }
     Ok(body)
 }
@@ -1734,7 +1794,24 @@ async fn populate_missing_unimodal_scores(
         .is_some_and(|d| !d.trim().is_empty());
     let has_text = has_title || has_desc;
 
-    if has_text && probs.text_prob.is_none() {
+    let server_omitted_text_scores = (probs.image_prob.is_some()
+        || !probs.per_image_probs.is_empty())
+        && probs.text_prob.is_none()
+        && probs.title_prob.is_none()
+        && probs.description_prob.is_none();
+    let server_omitted_image_scores = (probs.text_prob.is_some()
+        || probs.title_prob.is_some()
+        || probs.description_prob.is_some())
+        && probs.image_prob.is_none()
+        && probs.per_image_probs.is_empty();
+    let image_only_zero_response = !has_text
+        && probs.prob == 0.0
+        && probs.gore_prob == 0.0
+        && probs.nsfw_prob == 0.0
+        && probs.image_prob.is_none()
+        && probs.per_image_probs.is_empty();
+
+    if has_text && probs.text_prob.is_none() && !server_omitted_text_scores {
         if let Ok(tp) = post_unimodal_predict(
             engine,
             ep,
@@ -1785,7 +1862,11 @@ async fn populate_missing_unimodal_scores(
         }
     }
 
-    if !images_b64.is_empty() && (probs.image_prob.is_none() || probs.per_image_probs.is_empty()) {
+    if !images_b64.is_empty()
+        && (probs.image_prob.is_none() || probs.per_image_probs.is_empty())
+        && !server_omitted_image_scores
+        && !image_only_zero_response
+    {
         let mut per_img = Vec::with_capacity(images_b64.len());
         let mut max_ov = 0.0_f32;
         let mut max_gore = 0.0_f32;
@@ -1826,15 +1907,28 @@ pub fn compute_modality_subdivision(
     probs: &FilterProbabilities,
     flagged: bool,
 ) -> (bool, bool, bool, bool, Vec<usize>) {
+    compute_modality_subdivision_inner(cfg, target, evaluated_slot_indices, probs, flagged, false)
+}
+
+fn compute_modality_subdivision_inner(
+    cfg: &ClientFilterConfig,
+    target: &FilterEvaluationTarget,
+    evaluated_slot_indices: &[usize],
+    probs: &FilterProbabilities,
+    flagged: bool,
+    llm_flagged_with_images: bool,
+) -> (bool, bool, bool, bool, Vec<usize>) {
     if !flagged {
         return (false, false, false, false, Vec::new());
     }
 
-    let has_title = !target.title.trim().is_empty() || !target.tags.is_empty();
+    let has_title =
+        !target.title.trim().is_empty() || !target.tags.is_empty() || probs.title_prob.is_some();
     let has_desc = target
         .description
         .as_deref()
-        .is_some_and(|d| !d.trim().is_empty());
+        .is_some_and(|d| !d.trim().is_empty())
+        || probs.description_prob.is_some();
     let has_text = has_title || has_desc;
     let n_imgs = evaluated_slot_indices.len();
     let map_slot = |submitted_idx: usize| -> Option<usize> {
@@ -1881,6 +1975,17 @@ pub fn compute_modality_subdivision(
     let mut image_sensitive = n_imgs > 0
         && (probs.image_prob.is_some_and(|p| p >= m_t) || !sensitive_image_indices.is_empty());
 
+    // When the model did not score images (e.g., local/upstream `enable_image = false`)
+    // but the LLM reviewed the images and flagged the item, conservatively mark those
+    // images as sensitive so they remain blurred rather than leaking unblurred.
+    if llm_flagged_with_images
+        && probs.image_prob.is_none()
+        && probs.per_image_probs.is_empty()
+        && n_imgs > 0
+    {
+        image_sensitive = true;
+    }
+
     // Ensure a flagged item always identifies at least one sensitive modality
     if !text_sensitive && !image_sensitive {
         let has_any_unimodal = probs.text_prob.is_some()
@@ -1918,6 +2023,11 @@ pub fn compute_modality_subdivision(
                 image_sensitive = true;
             } else {
                 text_sensitive = true;
+            }
+            // If neither modality crossed `m_t` on the local model and the multimodal LLM
+            // reviewed the images before flagging, conservatively blur the reviewed images too.
+            if llm_flagged_with_images {
+                image_sensitive = true;
             }
         } else {
             text_sensitive = true;
@@ -2005,6 +2115,8 @@ mod tests {
         }
 
         for rejected in [
+            "https://steamusercontent.com/ugc/123/a.jpg",
+            "https://steamstatic.com/steam/apps/550/header.jpg",
             "https://evil-steamusercontent.com/ugc/123/a.jpg",
             "https://evil.example.com/a.jpg",
             "http://127.0.0.1:8080/a.jpg",
@@ -2065,5 +2177,117 @@ mod tests {
                 "expected {malformed:?} to return Err without panicking"
             );
         }
+    }
+
+    #[test]
+    fn compute_content_signature_skips_empty_image_sources_before_max_images() {
+        let base = FilterEvaluationTarget {
+            target_key: "ws:1".into(),
+            addon_id: None,
+            workshop_id: None,
+            title: "Sample".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec!["".into(), "  https://example.com/a.jpg  ".into()],
+            revision_hint: None,
+            bypass_cache: false,
+        };
+        let mut changed = base.clone();
+        changed.image_sources = vec!["".into(), "https://example.com/b.jpg".into()];
+
+        assert_ne!(
+            compute_content_signature(&base, 1),
+            compute_content_signature(&changed, 1),
+            "empty image_sources must be skipped before taking max_images"
+        );
+
+        let mut normalized = base.clone();
+        normalized.image_sources = vec!["https://example.com/a.jpg".into()];
+        assert_eq!(
+            compute_content_signature(&base, 1),
+            compute_content_signature(&normalized, 1)
+        );
+    }
+
+    #[test]
+    fn modality_subdivision_honors_catalog_backfilled_description_and_llm_image_fallback() {
+        let cfg = ClientFilterConfig {
+            subdivide_modalities: true,
+            modality_threshold: 0.30,
+            ..Default::default()
+        };
+
+        // 1. Catalog DB backfilled description when local target.description is None
+        let target_no_local_desc = FilterEvaluationTarget {
+            target_key: "addon:ws:100".into(),
+            addon_id: Some(l4a_protocol::AddonId("ws:100".into())),
+            workshop_id: Some(l4a_protocol::WorkshopId(100)),
+            title: "Benign Local Title".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec![],
+            revision_hint: None,
+            bypass_cache: false,
+        };
+        let probs_backfilled_desc = FilterProbabilities {
+            prob: 0.91,
+            gore_prob: 0.02,
+            nsfw_prob: 0.91,
+            text_prob: Some(0.91),
+            title_prob: Some(0.03),
+            description_prob: Some(0.91),
+            ..Default::default()
+        };
+        let (text_s, title_s, desc_s, img_s, _) = compute_modality_subdivision_inner(
+            &cfg,
+            &target_no_local_desc,
+            &[],
+            &probs_backfilled_desc,
+            true,
+            false,
+        );
+        assert!(text_s);
+        assert!(!title_s);
+        assert!(
+            desc_s,
+            "Catalog-backfilled description_prob >= m_t must set description_sensitive"
+        );
+        assert!(!img_s);
+
+        // 2. LLM flagged with images when neither text nor image crossed m_t on the small model
+        let target_with_img = FilterEvaluationTarget {
+            target_key: "ws:101".into(),
+            addon_id: None,
+            workshop_id: Some(l4a_protocol::WorkshopId(101)),
+            title: "Borderline Title".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec!["https://images.steamusercontent.com/ugc/1/a.jpg".into()],
+            revision_hint: None,
+            bypass_cache: false,
+        };
+        let probs_low_both = FilterProbabilities {
+            prob: 0.25,
+            gore_prob: 0.05,
+            nsfw_prob: 0.25,
+            text_prob: Some(0.22),
+            title_prob: Some(0.22),
+            image_prob: Some(0.10),
+            per_image_probs: vec![0.10],
+            ..Default::default()
+        };
+        let (text_s2, _, _, img_s2, _) = compute_modality_subdivision_inner(
+            &cfg,
+            &target_with_img,
+            &[0],
+            &probs_low_both,
+            true,
+            true,
+        );
+        assert!(text_s2);
+        assert!(
+            img_s2,
+            "LLM flagging with images when neither modality crossed m_t must conservatively mark image_sensitive"
+        );
     }
 }

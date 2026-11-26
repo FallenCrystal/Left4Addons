@@ -333,6 +333,7 @@ export function App() {
             collections={ctrl.snapshot.collections}
             userGroups={ctrl.snapshot.userGroups}
             profiles={ctrl.snapshot.profiles}
+            liveDownloads={ctrl.liveDownloads}
             busy={ctrl.busy}
             onRebuildBundles={() => void ctrl.rebuildBundles()}
             onCreateBundle={() => setBundleDialogIds([])}
@@ -384,6 +385,7 @@ export function App() {
             addons={ctrl.snapshot.addons}
             collections={ctrl.snapshot.collections}
             liveDownloads={ctrl.liveDownloads}
+            busy={ctrl.busy}
             onSearch={ctrl.searchWorkshop}
             onFetchItem={ctrl.fetchWorkshopItem}
             onImportSubscribed={ctrl.getSubscribedWorkshopIds}

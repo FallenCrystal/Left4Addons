@@ -69,7 +69,7 @@ export interface FilterSettingsSectionProps {
   namePreference: AddonNamePreference;
   exclusions: FilterExclusionRecord[];
   onUpdateFilter: (updater: (curr: ClientFilterConfig) => ClientFilterConfig) => void;
-  onSaveDraftFirst: () => Promise<boolean>;
+  onSaveDraftFirst: () => Promise<AppConfig | null>;
   onRefreshLocalStatus: () => Promise<LocalFilterDeploymentStatus | null>;
   onCheckLocalUpdates: () => Promise<LocalFilterDeploymentStatus | null>;
   onDeployLocalFilter: (
@@ -126,7 +126,10 @@ function clampNumber(
   max: number,
   integer: boolean,
 ): number {
-  const parsed = Number.parseFloat(raw.trim());
+  const trimmed = raw.trim();
+  const pattern = integer ? /^-?\d+$/ : /^-?(?:\d+(?:\.\d+)?|\.\d+)$/;
+  if (!pattern.test(trimmed)) return fallback;
+  const parsed = Number.parseFloat(trimmed);
   if (!Number.isFinite(parsed)) return fallback;
   const clamped = Math.min(max, Math.max(min, parsed));
   if (integer) return Math.round(clamped);
@@ -179,7 +182,7 @@ function NumericTextField({
         const raw = e.target.value;
         setDraftText(raw);
         const trimmed = raw.trim();
-        const completePattern = integer ? /^-?\d+$/ : /^-?\d+(?:\.\d+)?$/;
+        const completePattern = integer ? /^-?\d+$/ : /^-?(?:\d+(?:\.\d+)?|\.\d+)$/;
         if (completePattern.test(trimmed)) {
           const parsed = Number.parseFloat(trimmed);
           if (Number.isFinite(parsed) && parsed >= min && parsed <= max) {
@@ -192,6 +195,16 @@ function NumericTextField({
             if (normalized !== value) {
               onCommit(normalized);
             }
+          }
+        }
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' && draftText !== null) {
+          const clamped = clampNumber(draftText, value, min, max, integer);
+          setDraftText(String(clamped));
+          setTrackedValue(clamped);
+          if (clamped !== value) {
+            onCommit(clamped);
           }
         }
       }}
@@ -326,11 +339,12 @@ export function FilterSettingsSection({
 
   const handleDeploy = async (forceLatest = false) => {
     if (!forceLatest && missingPinnedCommit) return;
+    let currentFilter = filterRef.current;
     if (dirty) {
       const saved = await onSaveDraftFirst();
       if (!saved) return;
+      currentFilter = saved.filter;
     }
-    const currentFilter = filterRef.current;
     const trackLatest = forceLatest ? true : currentFilter.trackLatest;
     await onDeployLocalFilter({
       repoUrl: currentFilter.repoUrl.trim() || undefined,
@@ -385,7 +399,7 @@ export function FilterSettingsSection({
       }
       const verdict = await onEvaluateSandbox({
         targetKey: `sandbox:${Date.now()}`,
-        title: sandboxTitle.trim() || 'Untitled Sandbox Sample',
+        title: sandboxTitle.trim(),
         description: sandboxDesc.trim() || undefined,
         tags: [],
         imageSources: sandboxImage.trim() ? [sandboxImage.trim()] : [],
@@ -700,7 +714,7 @@ export function FilterSettingsSection({
           <Button
             variant="filled"
             size="sm"
-            disabled={filterStatusBusy || serviceTransitioning || missingPinnedCommit}
+            disabled={busy || filterStatusBusy || serviceTransitioning || missingPinnedCommit}
             icon={<Download size={14} />}
             onClick={() => void handleDeploy(false)}
           >
@@ -712,7 +726,7 @@ export function FilterSettingsSection({
           <Button
             variant="tonal"
             size="sm"
-            disabled={filterStatusBusy || serviceTransitioning}
+            disabled={busy || filterStatusBusy || serviceTransitioning}
             icon={<RefreshCw size={14} className={filterStatusBusy ? 'md-spin' : undefined} />}
             onClick={() => void handleCheckLocalUpdates()}
           >
@@ -723,7 +737,7 @@ export function FilterSettingsSection({
             <Button
               variant="filled"
               size="sm"
-              disabled={filterStatusBusy || serviceTransitioning}
+              disabled={busy || filterStatusBusy || serviceTransitioning}
               icon={<RefreshCw size={14} />}
               onClick={() => void handleDeploy(true)}
             >
@@ -736,7 +750,7 @@ export function FilterSettingsSection({
               variant="outlined"
               tone="error"
               size="sm"
-              disabled={filterStatusBusy}
+              disabled={busy || filterStatusBusy || serviceTransitioning}
               icon={<Square size={13} />}
               onClick={() => void onStopLocalService()}
             >
@@ -746,7 +760,7 @@ export function FilterSettingsSection({
             <Button
               variant="outlined"
               size="sm"
-              disabled={filterStatusBusy || !localStatus?.deployed || serviceTransitioning}
+              disabled={busy || filterStatusBusy || !localStatus?.deployed || serviceTransitioning}
               icon={<Play size={14} />}
               onClick={() => void handleStartLocalService()}
             >
@@ -777,6 +791,7 @@ export function FilterSettingsSection({
               <Select<FilterPresetId>
                 ariaLabel={t('filter.settings.preset')}
                 value={filter.preset}
+                disabled={catalogParamsLocked}
                 onChange={handleSelectPreset}
                 options={PRESET_OPTIONS.map((p) => ({
                   value: p,
@@ -790,6 +805,7 @@ export function FilterSettingsSection({
               <Switch
                 compact
                 checked={applyPresetThresholds}
+                disabled={catalogParamsLocked}
                 label={t('filter.settings.applyPresetThresholds')}
                 onChange={setApplyPresetThresholds}
               />
@@ -1061,6 +1077,7 @@ export function FilterSettingsSection({
                 <Button
                   variant="text"
                   size="sm"
+                  disabled={busy || filterStatusBusy}
                   icon={<RefreshCw size={13} />}
                   onClick={() => void handleRefreshTokenStatus()}
                 >
@@ -1109,7 +1126,7 @@ export function FilterSettingsSection({
               <Button
                 variant="tonal"
                 size="sm"
-                disabled={busy || !tokenInput.trim()}
+                disabled={busy || filterStatusBusy || !tokenInput.trim()}
                 icon={<KeyRound size={14} />}
                 onClick={async () => {
                   const res = await onSetLlmToken(tokenInput.trim());
@@ -1123,7 +1140,7 @@ export function FilterSettingsSection({
                   variant="text"
                   tone="error"
                   size="sm"
-                  disabled={busy}
+                  disabled={busy || filterStatusBusy}
                   icon={<Trash2 size={14} />}
                   onClick={() => void onSetLlmToken(null)}
                 >
@@ -1231,7 +1248,7 @@ export function FilterSettingsSection({
           <Button
             variant="outlined"
             size="sm"
-            disabled={busy}
+            disabled={busy || filterStatusBusy}
             icon={<Trash2 size={14} />}
             onClick={() => void onClearFilterCache()}
           >
@@ -1280,6 +1297,8 @@ export function FilterSettingsSection({
               variant="tonal"
               size="sm"
               disabled={
+                busy ||
+                filterStatusBusy ||
                 sandboxBusy ||
                 (!sandboxTitle.trim() && !sandboxDesc.trim() && !sandboxImage.trim())
               }
@@ -1447,11 +1466,11 @@ export function FilterSettingsSection({
                       <Select<ExclusionDisplayLevel>
                         ariaLabel={t('filter.exclusionLevelLabel')}
                         value={excl.displayLevel}
+                        disabled={busy}
                         onChange={(nextLevel) =>
                           void onUpsertExclusion({
                             addonId: excl.addonId,
                             displayLevel: nextLevel,
-                            bindFingerprint: excl.bindFingerprint && canBindFingerprint,
                             note: excl.note,
                           })
                         }

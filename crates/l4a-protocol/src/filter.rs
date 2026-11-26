@@ -834,6 +834,8 @@ pub struct LocalFilterDeploymentStatus {
     pub stage_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -990,7 +992,11 @@ impl ClientFilterConfig {
                 p.nsfw_weight,
                 p.temperature,
                 p.bias,
-                self.pinned_commit.as_deref().unwrap_or("latest")
+                if self.track_latest {
+                    "latest"
+                } else {
+                    self.pinned_commit.as_deref().unwrap_or("latest")
+                }
             ),
             ClientFilterSourceMode::Catalog => format!(
                 "catalog:url={}:https={}:rev={}",
@@ -1127,5 +1133,33 @@ mod tests {
         let sig_a = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r1"));
         let sig_b = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r2"));
         assert_ne!(sig_a, sig_b);
+    }
+
+    #[test]
+    fn canonical_policy_signature_ignores_pinned_commit_when_track_latest_true() {
+        let base = ClientFilterConfig {
+            enabled: true,
+            mode: ClientFilterSourceMode::Local,
+            track_latest: true,
+            pinned_commit: None,
+            ..Default::default()
+        };
+        let with_stale_pin = ClientFilterConfig {
+            pinned_commit: Some("deadbeef1234".into()),
+            ..base.clone()
+        };
+        let pinned = ClientFilterConfig {
+            track_latest: false,
+            pinned_commit: Some("deadbeef1234".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            base.canonical_policy_signature(None, true, None),
+            with_stale_pin.canonical_policy_signature(None, true, None)
+        );
+        assert_ne!(
+            base.canonical_policy_signature(None, true, None),
+            pinned.canonical_policy_signature(None, true, None)
+        );
     }
 }

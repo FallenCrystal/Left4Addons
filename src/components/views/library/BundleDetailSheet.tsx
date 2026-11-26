@@ -112,12 +112,16 @@ export function BundleDetailSheet({
     ? resolveBundleCoverPresentation(members, filterCtx, {
         allMembers,
         bundleCoverImage: bundle.coverImage,
+        bundleName: bundle.name,
         forceShowHiddenCards,
       })
     : null;
   const sheetTitle = bundle
-    ? coverPres?.redactTitle
-      ? formatRedactedAddonLabel(summary?.firstWorkshopId, t)
+    ? coverPres?.redactTitle || coverPres?.blurWholeCard
+      ? formatRedactedAddonLabel(
+          summary?.firstWorkshopId ?? allMembers.find((m) => m.workshopId)?.workshopId,
+          t,
+        )
       : bundle.name
     : '';
 

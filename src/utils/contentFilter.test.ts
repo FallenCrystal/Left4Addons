@@ -9,6 +9,7 @@ import type {
 import { en } from '../i18n/en';
 import { zh } from '../i18n/zh';
 import {
+  addonFilterKey,
   adjustProbabilities,
   adjustTriplet,
   buildAddonFilterTarget,
@@ -18,13 +19,18 @@ import {
   computeFilterPolicySignature,
   createDefaultFilterConfig,
   formatDiagnosticVerdictBadge,
+  getAddonSearchRedaction,
   getFilteredAddonFallbackCover,
   getPresetDefaultParams,
+  isAddonTitleRedacted,
+  isLinkedWorkshopTitleRedacted,
+  isWorkshopKeyTitleRedacted,
   resolveBundleCoverPresentation,
   resolveCardFilterState,
   resolveDetailFilterState,
   resolveLookupVerdict,
   resolveWorkshopVerdict,
+  workshopFilterKey,
 } from './contentFilter';
 
 function makeEnabledConfig(overrides: Partial<ClientFilterConfig> = {}): ClientFilterConfig {
@@ -686,6 +692,383 @@ describe('contentFilter pure resolution & calibration logic', () => {
     });
     expect(catSigR1).toMatch(/^pol_[0-9a-f]{32}$/);
     expect(catSigR1).not.toBe(catSigR2);
+  });
+
+  it('redacts pending and failed unrevealed titles under blur_card/hide_card and preserves mixed bundle blur', () => {
+    const makeAddon = (overrides: Partial<AddonSummary> & { id: string }): AddonSummary => ({
+      title: `Title ${overrides.id}`,
+      installState: 'installed',
+      enabled: true,
+      fileSize: 1024,
+      filesCount: 1,
+      categories: ['Campaign'],
+      maps: [],
+      hasDummyBypass: false,
+      remoteStatus: 'active',
+      updateAvailable: false,
+      addonInfo: {},
+      ...overrides,
+    });
+    const blurCfg = makeEnabledConfig({ flaggedAction: 'blur_card' });
+    const pendingAddon = makeAddon({
+      id: 'addon-pending',
+      workshopId: '991001',
+      title: 'Unverified Sensitive Title',
+    });
+    const flaggedAddon = makeAddon({
+      id: 'addon-flagged',
+      workshopId: '991002',
+      title: 'Confirmed Flagged Title',
+      coverImage: 'https://img.example.com/flagged.jpg',
+    });
+
+    const flaggedVerdict = makeFlaggedVerdict({
+      targetKey: addonFilterKey(flaggedAddon.id),
+      revisionHint: buildAddonRevisionHint(flaggedAddon),
+    });
+
+    const pendingCtx = {
+      filterConfig: blurCfg,
+      verdicts: { [addonFilterKey(flaggedAddon.id)]: flaggedVerdict },
+      exclusionsByAddonId: new Map(),
+      revealedCardIds: new Set<string>(),
+      failedTargetKeys: new Set<string>(),
+    };
+
+    // Pending addon under blur_card must redact title/description/meta in unblurred consumers & search
+    expect(getAddonSearchRedaction(pendingAddon, pendingCtx)).toEqual({
+      redactTitle: true,
+      redactDescription: true,
+      redactMeta: true,
+    });
+    expect(isAddonTitleRedacted(pendingAddon, pendingCtx)).toBe(true);
+    expect(isWorkshopKeyTitleRedacted('991009', 'Pending Workshop Title', pendingCtx)).toBe(true);
+
+    // Failed unrevealed addon under blur_card is redacted until revealed
+    const failedCtx = {
+      ...pendingCtx,
+      failedTargetKeys: new Set([addonFilterKey(pendingAddon.id), workshopFilterKey('991009')]),
+    };
+    expect(isAddonTitleRedacted(pendingAddon, failedCtx)).toBe(true);
+    expect(isWorkshopKeyTitleRedacted('991009', 'Failed Workshop Title', failedCtx)).toBe(true);
+
+    const revealedFailedCtx = {
+      ...failedCtx,
+      revealedCardIds: new Set([addonFilterKey(pendingAddon.id), workshopFilterKey('991009')]),
+    };
+    expect(isAddonTitleRedacted(pendingAddon, revealedFailedCtx)).toBe(false);
+    expect(isWorkshopKeyTitleRedacted('991009', 'Failed Workshop Title', revealedFailedCtx)).toBe(
+      false,
+    );
+
+    // Mixed flagged + pending members in a collapsed bundle must remain blurred and non-revealable (pendingEvaluation=true)
+    const mixedBundle = resolveBundleCoverPresentation([flaggedAddon, pendingAddon], pendingCtx);
+    expect(mixedBundle.blurWholeCard).toBe(true);
+    expect(mixedBundle.pendingEvaluation).toBe(true);
+    expect(mixedBundle.coverMode).toBe('hide');
+  });
+
+  it('handles optional lookup sets and linked workshop/library redaction transitions safely', () => {
+    const blurCfg = {
+      ...createDefaultFilterConfig(),
+      enabled: true,
+      applyToLibrary: true,
+      applyToWorkshop: true,
+      flaggedAction: 'blur_card' as const,
+    };
+
+    // Optional revealedCardIds / failedTargetKeys omitted must not throw
+    const minimalCtx = {
+      filterConfig: blurCfg,
+      verdicts: {},
+      exclusionsByAddonId: new Map(),
+    };
+    expect(isWorkshopKeyTitleRedacted('992001', 'Pending Title', minimalCtx)).toBe(true);
+
+    const downloadedAddon: AddonSummary = {
+      id: 'ws:992001',
+      workshopId: '992001',
+      title: 'Verified Safe Mod',
+      workshopTitle: 'Verified Safe Mod',
+      addonTitle: 'Verified Safe Mod',
+      installState: 'installed',
+      enabled: true,
+      fileSize: 1024,
+      filesCount: 1,
+      primaryDir: 'workshop',
+      categories: [],
+      maps: [],
+      hasDummyBypass: false,
+      remoteStatus: 'active',
+      updateAvailable: false,
+      addonInfo: {},
+      contentHash: 'hash-v1',
+    };
+    const safeWsVerdict: FilterItemVerdict = {
+      targetKey: workshopFilterKey('992001'),
+      flagged: false,
+      decisionSource: 'model_safe',
+      evaluatedScore: 0.02,
+      probabilities: { prob: 0.02, goreProb: 0.01, nsfwProb: 0.01 },
+      textSensitive: false,
+      titleSensitive: false,
+      descriptionSensitive: false,
+      imageSensitive: false,
+      evaluatedImageIndices: [],
+      sensitiveImageIndices: [],
+      complete: true,
+      evaluatedAt: '2026-11-26T00:00:00Z',
+    };
+    const downloadCtx = {
+      ...minimalCtx,
+      verdicts: { [workshopFilterKey('992001')]: safeWsVerdict },
+    };
+    // Fresh download already verified safe in Workshop should not falsely redact matching toast title
+    expect(
+      isLinkedWorkshopTitleRedacted('992001', downloadedAddon, 'Verified Safe Mod', downloadCtx, {
+        transferKind: 'download',
+      }),
+    ).toBe(false);
+    // If local VPK title differs from verified Workshop title, still shield until library eval runs
+    expect(
+      isLinkedWorkshopTitleRedacted('992001', downloadedAddon, 'Different VPK Title', downloadCtx, {
+        transferKind: 'download',
+      }),
+    ).toBe(true);
+
+    // applyToLibrary=false + applyToWorkshop=true must still redact pending workshop titles
+    const wsOnlyCtx = {
+      filterConfig: { ...blurCfg, applyToLibrary: false, applyToWorkshop: true },
+      verdicts: {},
+      exclusionsByAddonId: new Map(),
+    };
+    expect(
+      isLinkedWorkshopTitleRedacted('992001', downloadedAddon, 'Verified Safe Mod', wsOnlyCtx),
+    ).toBe(true);
+
+    // Post-update stale addon verdict (mismatched revisionHint) must be treated as pending & redacted
+    const staleSafeAddonVerdict: FilterItemVerdict = {
+      ...safeWsVerdict,
+      targetKey: addonFilterKey(downloadedAddon.id),
+      revisionHint: 'v2:old-hash-revision',
+    };
+    const updateCtx = {
+      ...minimalCtx,
+      verdicts: { [addonFilterKey(downloadedAddon.id)]: staleSafeAddonVerdict },
+    };
+    expect(
+      isLinkedWorkshopTitleRedacted('992001', downloadedAddon, 'Verified Safe Mod', updateCtx, {
+        transferKind: 'update',
+      }),
+    ).toBe(true);
+
+    // Safe local addon verdict must NOT trust a different unverified upstream rawTitle when applyToWorkshop=true
+    const currentSafeAddonVerdict: FilterItemVerdict = {
+      ...safeWsVerdict,
+      targetKey: addonFilterKey(downloadedAddon.id),
+      revisionHint: buildAddonRevisionHint(downloadedAddon),
+    };
+    const safeLocalOnlyCtx = {
+      ...minimalCtx,
+      verdicts: { [addonFilterKey(downloadedAddon.id)]: currentSafeAddonVerdict },
+    };
+    expect(
+      isLinkedWorkshopTitleRedacted('992001', downloadedAddon, 'Verified Safe Mod', safeLocalOnlyCtx),
+    ).toBe(false);
+    expect(
+      isLinkedWorkshopTitleRedacted(
+        '992001',
+        downloadedAddon,
+        'Unverified Upstream Renamed Title',
+        safeLocalOnlyCtx,
+      ),
+    ).toBe(true);
+
+    // Pending/failed under hide_image must redact title & description so unverified text never flashes
+    const pendingHideImage = resolveCardFilterState({
+      config: { ...blurCfg, flaggedAction: 'hide_image' },
+      scope: 'workshop',
+      verdict: undefined,
+      hasTargetFailed: false,
+      hasContent: true,
+    });
+    expect(pendingHideImage.redactTitle).toBe(true);
+    expect(pendingHideImage.redactDescription).toBe(true);
+    const failedHideImage = resolveCardFilterState({
+      config: { ...blurCfg, flaggedAction: 'hide_image' },
+      scope: 'workshop',
+      verdict: undefined,
+      hasTargetFailed: true,
+      hasContent: true,
+    });
+    expect(failedHideImage.redactTitle).toBe(true);
+    expect(failedHideImage.redactDescription).toBe(true);
+  });
+
+  it('shields pending/failed detail text, rejects stale library verdict revisions, redacts mixed/hidden sensitive bundle titles, and ignores pinnedCommit when trackLatest is true', () => {
+    const cfgBlur = makeEnabledConfig({ flaggedAction: 'blur_card', subdivideModalities: true });
+    const cfgHideImage = makeEnabledConfig({ flaggedAction: 'hide_image', subdivideModalities: true });
+    const cfgHideCard = makeEnabledConfig({ flaggedAction: 'hide_card', subdivideModalities: true });
+
+    // 1. Pending and failed unrevealed detail views must redact text (non-mark_only)
+    const pendingDetail = resolveDetailFilterState({
+      config: cfgBlur,
+      scope: 'library',
+      verdict: undefined,
+      hasTargetFailed: false,
+      hasContent: true,
+    });
+    expect(pendingDetail.pendingEvaluation).toBe(true);
+    expect(pendingDetail.redactText).toBe(true);
+
+    const failedDetailUnrevealed = resolveDetailFilterState({
+      config: cfgHideImage,
+      scope: 'library',
+      verdict: undefined,
+      hasTargetFailed: true,
+      hasContent: true,
+      revealed: false,
+    });
+    expect(failedDetailUnrevealed.redactText).toBe(true);
+
+    const failedDetailRevealed = resolveDetailFilterState({
+      config: cfgBlur,
+      scope: 'library',
+      verdict: undefined,
+      hasTargetFailed: true,
+      hasContent: true,
+      revealed: true,
+    });
+    expect(failedDetailRevealed.redactText).toBe(false);
+
+    // 2. Stale library addon verdict (mismatched revisionHint) must NOT be reused as safe
+    const updatedAddon: AddonSummary = {
+      id: 'ws:881100',
+      workshopId: '881100',
+      title: 'Updated Sensitive Mod',
+      author: 'Sensitive Author',
+      installState: 'installed',
+      enabled: true,
+      fileSize: 1024,
+      filesCount: 1,
+      categories: ['Campaign'],
+      maps: [],
+      hasDummyBypass: false,
+      remoteStatus: 'active',
+      updateAvailable: false,
+      addonInfo: {},
+      contentHash: 'new-hash-v2',
+    };
+    const staleSafeVerdict = makeFlaggedVerdict({
+      targetKey: addonFilterKey(updatedAddon.id),
+      revisionHint: 'v2:stale-old-revision',
+      flagged: false,
+    });
+    const staleCtx = {
+      filterConfig: cfgBlur,
+      verdicts: { [addonFilterKey(updatedAddon.id)]: staleSafeVerdict },
+      evaluatedRevisions: { [addonFilterKey(updatedAddon.id)]: 'v2:stale-old-revision' },
+      exclusionsByAddonId: new Map(),
+    };
+    expect(isAddonTitleRedacted(updatedAddon, staleCtx)).toBe(true);
+    expect(getAddonSearchRedaction(updatedAddon, staleCtx).redactMeta).toBe(true);
+
+    // 3. Mixed visible bundle (1 title-redacted + 1 safe) and hidden-owner bundle must redact bundle title
+    const part1Flagged: AddonSummary = {
+      ...updatedAddon,
+      id: 'ws:881101',
+      workshopId: '881101',
+      title: 'Explicit Campaign Part 1',
+      contentHash: 'p1-hash',
+    };
+    const part2Safe: AddonSummary = {
+      ...updatedAddon,
+      id: 'ws:881102',
+      workshopId: '881102',
+      title: 'Companion Texture Pack',
+      contentHash: 'p2-hash',
+    };
+    const flaggedTitleVerdict = makeFlaggedVerdict({
+      targetKey: addonFilterKey(part1Flagged.id),
+      revisionHint: buildAddonRevisionHint(part1Flagged),
+      flagged: true,
+      textSensitive: true,
+      titleSensitive: true,
+      imageSensitive: false,
+    });
+    const safePart2Verdict = makeFlaggedVerdict({
+      targetKey: addonFilterKey(part2Safe.id),
+      revisionHint: buildAddonRevisionHint(part2Safe),
+      flagged: false,
+    });
+
+    const mixedHideImagePres = resolveBundleCoverPresentation(
+      [part1Flagged, part2Safe],
+      {
+        filterConfig: cfgHideImage,
+        verdicts: {
+          [addonFilterKey(part1Flagged.id)]: flaggedTitleVerdict,
+          [addonFilterKey(part2Safe.id)]: safePart2Verdict,
+        },
+        exclusionsByAddonId: new Map(),
+      },
+      { allMembers: [part1Flagged, part2Safe], bundleName: 'Explicit Campaign' },
+    );
+    expect(mixedHideImagePres.redactTitle).toBe(true);
+
+    const hiddenPart1Pres = resolveBundleCoverPresentation(
+      [part2Safe],
+      {
+        filterConfig: cfgHideCard,
+        verdicts: {
+          [addonFilterKey(part1Flagged.id)]: flaggedTitleVerdict,
+          [addonFilterKey(part2Safe.id)]: safePart2Verdict,
+        },
+        exclusionsByAddonId: new Map(),
+      },
+      { allMembers: [part1Flagged, part2Safe], bundleName: 'Explicit Campaign' },
+    );
+    expect(hiddenPart1Pres.redactTitle).toBe(true);
+
+    // When bundleName matches the safe visible member and not the hidden flagged member, keep title visible
+    const safeBundleNamePres = resolveBundleCoverPresentation(
+      [part2Safe],
+      {
+        filterConfig: cfgHideCard,
+        verdicts: {
+          [addonFilterKey(part1Flagged.id)]: flaggedTitleVerdict,
+          [addonFilterKey(part2Safe.id)]: safePart2Verdict,
+        },
+        exclusionsByAddonId: new Map(),
+      },
+      { allMembers: [part1Flagged, part2Safe], bundleName: 'Companion Texture Pack' },
+    );
+    expect(safeBundleNamePres.redactTitle).toBe(false);
+
+    // 4. trackLatest=true must ignore stale pinnedCommit in computeFilterPolicySignature
+    const sigLatestNoPin = computeFilterPolicySignature(
+      makeEnabledConfig({ mode: 'local', trackLatest: true, pinnedCommit: undefined }),
+    );
+    const sigLatestWithStalePin = computeFilterPolicySignature(
+      makeEnabledConfig({ mode: 'local', trackLatest: true, pinnedCommit: 'abc1234567' }),
+    );
+    const sigPinned = computeFilterPolicySignature(
+      makeEnabledConfig({ mode: 'local', trackLatest: false, pinnedCommit: 'abc1234567' }),
+    );
+    expect(sigLatestWithStalePin).toBe(sigLatestNoPin);
+    expect(sigPinned).not.toBe(sigLatestNoPin);
+
+    // 5. Pending hide_image addon must also redact metadata/author in getAddonSearchRedaction
+    const pendingHideImageRedaction = getAddonSearchRedaction(updatedAddon, {
+      filterConfig: cfgHideImage,
+      verdicts: {},
+      exclusionsByAddonId: new Map(),
+    });
+    expect(pendingHideImageRedaction).toEqual({
+      redactTitle: true,
+      redactDescription: true,
+      redactMeta: true,
+    });
   });
 
   it('maintains 1:1 translation key parity between zh and en dictionaries', () => {

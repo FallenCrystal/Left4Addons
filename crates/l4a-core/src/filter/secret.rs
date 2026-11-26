@@ -304,7 +304,20 @@ impl TokenVault {
     ) -> Result<Zeroizing<[u8; KEY_LEN]>, CoreError> {
         let key_path = self.vault_key_path()?;
         match fs::symlink_metadata(key_path) {
-            Ok(_) => return self.read_existing_vault_key(machine_id, user_id),
+            Ok(_) => {
+                // Always enforce regular-file, ownership, and permission checks first.
+                verify_existing_vault_key_metadata(key_path)?;
+                match self.read_existing_vault_key(machine_id, user_id) {
+                    Ok(key) => return Ok(key),
+                    Err(CoreError::Config(msg)) => {
+                        tracing::warn!(
+                            error = %msg,
+                            "现有本地密钥文件内容已损坏或无法解封，保存新 Token 时将重新生成密钥"
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(CoreError::Io(err)),
         }
@@ -1039,5 +1052,33 @@ mod tests {
             Some(std::ffi::OsStr::new("")),
         );
         assert!(matches!(rel_res, Err(CoreError::Config(_))));
+    }
+
+    #[test]
+    fn corrupted_vault_key_recovers_on_seal_while_insecure_metadata_is_rejected() {
+        let dir = tempdir().unwrap();
+        let sealed = dir.path().join("config").join("llm_token.sealed");
+        let key_path = dir.path().join("user").join("vault.key");
+        let vault =
+            TokenVault::with_custom_identity(&sealed, &key_path, "machine-alpha", "uid:1000");
+
+        vault.seal("sk-initial-token").unwrap();
+        assert_eq!(vault.unseal().unwrap().as_str(), "sk-initial-token");
+
+        // Truncate/corrupt vault.key while keeping valid ownership & 0600 permissions.
+        fs::write(&key_path, b"corrupted").unwrap();
+        assert!(vault.unseal().is_err());
+
+        // Sealing a new token must recover by regenerating vault.key atomically.
+        vault.seal("sk-recovered-token").unwrap();
+        assert_eq!(vault.unseal().unwrap().as_str(), "sk-recovered-token");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Insecure permissions must still be rejected even during seal().
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(vault.seal("sk-should-fail").is_err());
+        }
     }
 }

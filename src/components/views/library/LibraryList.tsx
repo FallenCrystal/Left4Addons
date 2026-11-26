@@ -90,11 +90,13 @@ function BundleListRow({
   const coverPres = resolveBundleCoverPresentation(visibleMembers, filterCtx, {
     allMembers,
     bundleCoverImage: bundle.coverImage,
+    bundleName: bundle.name,
     forceShowHiddenCards,
   });
-  const bundleDisplayName = coverPres.redactTitle
-    ? formatRedactedAddonLabel(visibleSummary.firstWorkshopId ?? summary.firstWorkshopId, t)
-    : bundle.name;
+  const bundleDisplayName =
+    coverPres.redactTitle || coverPres.blurWholeCard
+      ? formatRedactedAddonLabel(visibleSummary.firstWorkshopId ?? summary.firstWorkshopId, t)
+      : bundle.name;
   const authorText = coverPres.redactAuthor
     ? t('filter.redactedAuthor')
     : coverPres.author || t('common.unknown');

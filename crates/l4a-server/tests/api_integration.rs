@@ -7108,3 +7108,98 @@ def open(_stream):
     state.filter.shutdown().await;
     cdn_task.abort();
 }
+
+#[tokio::test]
+async fn filter_public_info_reports_zero_max_images_when_disabled_and_runner_rejects_negative_chunks(
+) {
+    let state = ServerState::in_memory("info-secret").unwrap();
+    let app = build_router(state.clone());
+
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.enabled = false;
+            cfg.filter.enable_image = false;
+            cfg.filter.max_images = 4;
+        })
+        .unwrap();
+    let (code, body) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(code, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        info.max_images, 0,
+        "public_info must advertise maxImages = 0 when enable_image = false"
+    );
+
+    // Verify filter_runner.py rejects negative chunk sizes and handles JSON null booleans safely.
+    let runner_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../filter-assets/filter_runner.py");
+    let py_check = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import importlib.util, io, sys, types
+sys.modules.setdefault("numpy", types.ModuleType("numpy"))
+pil = types.ModuleType("PIL")
+pil_img = types.ModuleType("PIL.Image")
+pil_img.Image = object
+pil.Image = pil_img
+sys.modules.setdefault("PIL", pil)
+sys.modules.setdefault("PIL.Image", pil_img)
+
+spec = importlib.util.spec_from_file_location("filter_runner", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# 1. Negative, prefixed, and malformed chunk sizes / oversized headers / trailers must be rejected
+for bad_chunk in [
+    b"-1\r\nhello\r\n0\r\n\r\n",
+    b"0x5\r\nhello\r\n0\r\n\r\n",
+    b"+5\r\nhello\r\n0\r\n\r\n",
+    b"1_0\r\n0123456789abcdef\r\n0\r\n\r\n",
+    b"5;" + (b"x" * 70000) + b"\r\nhello\r\n0\r\n\r\n",
+]:
+    try:
+        mod.read_chunked_body(io.BytesIO(bad_chunk), 1024)
+        raise AssertionError(f"expected ValueError for malformed chunk: {bad_chunk[:20]!r}")
+    except ValueError:
+        pass
+
+# Oversized chunk trailers must raise OverflowError
+huge_trailer = b"0\r\n" + (b"X-Pad: " + b"a" * 4096 + b"\r\n") * 20 + b"\r\n"
+try:
+    mod.read_chunked_body(io.BytesIO(huge_trailer), 1024)
+    raise AssertionError("expected OverflowError for oversized chunk trailers")
+except OverflowError:
+    pass
+
+# Valid chunked body with extension and small trailer succeeds
+assert mod.read_chunked_body(io.BytesIO(b"5;ext=1\r\nhello\r\n0\r\nX-Ok: 1\r\n\r\n"), 1024) == b"hello"
+
+# 2. Explicit JSON null booleans must default to True and camelCase None must fall back to snake_case
+norm = mod.RunnerEngine._normalize_params({"enableText": None, "enableImage": None})
+assert norm["enable_text"] is True
+assert norm["enable_image"] is True
+norm2 = mod.RunnerEngine._normalize_params({
+    "maxImages": None,
+    "max_images": 4,
+    "goreWeight": None,
+    "gore_weight": 2.5,
+    "nsfwWeight": None,
+    "nsfw_weight": 0.5,
+})
+assert norm2["max_images"] == 4
+assert norm2["gore_weight"] == 2.5
+assert norm2["nsfw_weight"] == 0.5
+"#,
+        )
+        .arg(&runner_path)
+        .output();
+    if let Ok(out) = py_check {
+        assert!(
+            out.status.success(),
+            "filter_runner.py regression check failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

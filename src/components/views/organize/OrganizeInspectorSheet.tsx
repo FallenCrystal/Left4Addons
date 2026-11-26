@@ -18,6 +18,7 @@ import type {
   UserGroup,
 } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import type { LiveDownloadState } from '../../../state/useAppController';
 import {
   addonFilterKey,
   formatDiagnosticVerdictBadge,
@@ -41,6 +42,7 @@ export interface OrganizeInspectorSheetProps {
   addonsByWorkshopId: Map<string, AddonSummary>;
   loadingAddons: AddonSummary[];
   namePreference: AddonNamePreference;
+  liveDownloads?: Record<string, LiveDownloadState>;
   busy: boolean;
   onClose: () => void;
   onToggleBundleLock: (bundleId: string, locked: boolean) => void;
@@ -70,6 +72,7 @@ export function OrganizeInspectorSheet({
   addonsByWorkshopId,
   loadingAddons,
   namePreference,
+  liveDownloads,
   busy,
   onClose,
   onToggleBundleLock,
@@ -105,6 +108,7 @@ export function OrganizeInspectorSheet({
   const collectionMissing = visibleCollectionWids.filter(
     (wid) => addonsByWorkshopId.get(wid)?.installState !== 'installed',
   );
+  const collectionMissingIdle = collectionMissing.filter((wid) => !liveDownloads?.[wid]);
 
   const visibleGroupAddonIds = inspectedGroup
     ? inspectedGroup.addonIds.filter((id) => {
@@ -167,9 +171,10 @@ export function OrganizeInspectorSheet({
                 <Button
                   variant="filled"
                   size="sm"
+                  disabled={busy || collectionMissingIdle.length === 0}
                   icon={<Download size={14} />}
                   onClick={() => {
-                    for (const wid of collectionMissing) {
+                    for (const wid of collectionMissingIdle) {
                       const found = addonsByWorkshopId.get(wid);
                       const safeTitle =
                         found && !isAddonTitleRedacted(found, filterCtx)
@@ -392,6 +397,7 @@ export function OrganizeInspectorSheet({
                             <Button
                               variant="tonal"
                               size="sm"
+                              disabled={busy || Boolean(liveDownloads?.[wid])}
                               icon={<Download size={13} />}
                               onClick={() =>
                                 onDownloadWorkshopItem(

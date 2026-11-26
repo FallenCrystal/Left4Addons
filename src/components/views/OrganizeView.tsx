@@ -10,6 +10,7 @@ import type {
   UserGroup,
 } from '../../api/ipc';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
+import type { LiveDownloadState } from '../../state/useAppController';
 import {
   getAddonSearchRedaction,
   resolveLibraryAddonCardFilter,
@@ -33,6 +34,7 @@ export interface OrganizeViewProps {
   collections: TrackedCollectionRecord[];
   userGroups: UserGroup[];
   profiles: LoadoutProfile[];
+  liveDownloads?: Record<string, LiveDownloadState>;
   busy: boolean;
   onRebuildBundles: () => void;
   onCreateBundle: () => void;
@@ -64,6 +66,7 @@ export function OrganizeView({
   collections,
   userGroups,
   profiles,
+  liveDownloads,
   busy,
   onRebuildBundles,
   onCreateBundle,
@@ -296,6 +299,7 @@ export function OrganizeView({
             filteredCollections={filteredCollections}
             addonsByWorkshopId={addonsByWorkshopId}
             namePreference={namePreference}
+            liveDownloads={liveDownloads}
             busy={busy}
             onInspectCollection={(id) => setInspected({ kind: 'collection', id })}
             onDownloadWorkshopItem={onDownloadWorkshopItem}
@@ -345,6 +349,7 @@ export function OrganizeView({
         addonsByWorkshopId={addonsByWorkshopId}
         loadingAddons={loadingAddons}
         namePreference={namePreference}
+        liveDownloads={liveDownloads}
         busy={busy}
         onClose={() => setInspected(null)}
         onToggleBundleLock={onToggleBundleLock}

@@ -467,9 +467,8 @@ impl L4aEngine {
         if filter_params_changed {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 let lf = self.local_filter.clone();
-                let params = saved.filter.local_params.clone();
                 handle.spawn(async move {
-                    if let Err(err) = lf.reconfigure_params(&params).await {
+                    if let Err(err) = lf.reconfigure_to_desired().await {
                         tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
                     }
                 });
@@ -481,11 +480,7 @@ impl L4aEngine {
     pub async fn save_config_async(&self, next: AppConfig) -> Result<AppConfig, CoreError> {
         let (saved, filter_params_changed) = self.apply_saved_config(next)?;
         if filter_params_changed {
-            if let Err(err) = self
-                .local_filter
-                .reconfigure_params(&saved.filter.local_params)
-                .await
-            {
+            if let Err(err) = self.local_filter.reconfigure_to_desired().await {
                 tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
             }
         }

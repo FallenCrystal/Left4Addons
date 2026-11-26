@@ -472,5 +472,112 @@ it('preserves filter draft and sandbox inputs across tab switches, supports natu
   expect(screen.getByText('Left4Filters (2.3.0-fresh)')).toBeTruthy();
   expect(tempInput.value).toBe('0.5');
   expect(biasInput.value).toBe('-0.2');
+
+  // Malformed partial numeric input ("2abc") must revert on blur instead of committing 2.
+  fireEvent.focus(goreInput);
+  fireEvent.change(goreInput, { target: { value: '2abc' } });
+  fireEvent.blur(goreInput);
+  expect(goreInput.value).toBe('3');
+});
+
+it('preserves FilterPanel draft edits made while PATCH /admin/config/filter is in flight', async () => {
+  let resolveSave: ((value: Response) => void) | null = null;
+  const baseOverview = {
+    steam: { connectionState: 'connected', mode: 'anonymous' },
+    catalog: {
+      totalItems: 0,
+      activeItems: 0,
+      removedItems: 0,
+      privateItems: 0,
+      overrideCount: 0,
+      lastFullSyncAt: null,
+      lastIncrementalSyncAt: null,
+    },
+    sync: {
+      running: false,
+      mode: null,
+      startedAt: null,
+      finishedAt: null,
+      scanned: 0,
+      updated: 0,
+      removed: 0,
+      lastError: null,
+    },
+    filter: {
+      config: {
+        enabled: true,
+        backend: 'upstream_http',
+        upstreamUrl: 'http://127.0.0.1:18787',
+        cacheTtlSecs: 300,
+        params: {
+          threads: 4,
+          enableText: true,
+          enableImage: true,
+          maxImages: 2,
+          galleryAggregation: 'max',
+          goreWeight: 1,
+          nsfwWeight: 1,
+          temperature: 1,
+          bias: 0,
+        },
+      },
+      ready: true,
+      modelName: 'Left4Filters',
+      modelVersion: '2.0.0',
+      totalRequests: 0,
+      cacheHits: 0,
+      failedRequests: 0,
+    },
+  };
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((path: string, init?: RequestInit) => {
+      if (path.endsWith('/auth/me')) {
+        return Promise.resolve(
+          Response.json({ authenticated: true, username: 'admin', csrfToken: 'csrf-3' }),
+        );
+      }
+      if (path.endsWith('/overview')) {
+        return Promise.resolve(Response.json(baseOverview));
+      }
+      if (path.endsWith('/admin/config/filter') && init?.method === 'PATCH') {
+        const body = JSON.parse(String(init.body));
+        return new Promise<Response>((resolve) => {
+          resolveSave = () =>
+            resolve(Response.json({ ...baseOverview.filter, config: body }));
+        });
+      }
+      throw new Error(`Unexpected request ${path}`);
+    }),
+  );
+
+  await act(async () => {
+    render(<App />);
+  });
+  await act(async () => {
+    fireEvent.click(screen.getByRole('button', { name: '内容过滤模型' }));
+  });
+
+  const goreInput = screen.getByLabelText<HTMLInputElement>('血腥权重 goreWeight (0-3)');
+  fireEvent.focus(goreInput);
+  fireEvent.change(goreInput, { target: { value: '1.5' } });
+  fireEvent.blur(goreInput);
+
+  // Start saving 1.5 (remains pending)
+  fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
+  expect(resolveSave).not.toBeNull();
+
+  // Edit goreWeight to 2.2 while the first save is still in flight
+  fireEvent.focus(goreInput);
+  fireEvent.change(goreInput, { target: { value: '2.2' } });
+  fireEvent.blur(goreInput);
+  expect(goreInput.value).toBe('2.2');
+
+  // Resolve the in-flight save: the concurrent edit (2.2) MUST NOT be discarded!
+  await act(async () => {
+    resolveSave?.(Response.json(baseOverview.filter));
+  });
+  expect(goreInput.value).toBe('2.2');
 });
 

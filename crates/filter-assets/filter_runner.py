@@ -18,6 +18,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,10 +33,14 @@ MAX_IMAGE_DIMENSION = 4096
 MAX_SDK_RESIZE_ASPECT = 8
 MAX_SINGLE_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
+MAX_CHUNK_LINE_BYTES = 65536
+MAX_TRAILER_BYTES = 65536
 MAX_TITLE_CHARS = 4096
 MAX_DESC_CHARS = 65536
 MAX_TAGS_COUNT = 64
 MAX_TAG_CHARS = 256
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9a-fA-F]{1,16}$")
+_CONTENT_LENGTH_RE = re.compile(r"^[0-9]{1,16}$")
 
 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
@@ -209,17 +214,24 @@ class RunnerEngine:
     def _normalize_params(raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
             raw = {}
-        agg = str(raw.get("galleryAggregation") or raw.get("gallery_aggregation") or "max").lower()
+
+        def pick(camel: str, snake: str, default: Any) -> Any:
+            val = raw.get(camel)
+            if val is None:
+                val = raw.get(snake)
+            return default if val is None else val
+
+        agg = str(pick("galleryAggregation", "gallery_aggregation", "max") or "max").lower()
         if agg not in ("max", "top2_mean", "mean"):
             agg = "max"
         return {
             "threads": max(1, min(16, int(finite_float(raw.get("threads", 4), 4.0)))),
-            "enable_text": bool(raw.get("enableText", raw.get("enable_text", True))),
-            "enable_image": bool(raw.get("enableImage", raw.get("enable_image", True))),
-            "max_images": max(1, min(8, int(finite_float(raw.get("maxImages", raw.get("max_images", 2)), 2.0)))),
+            "enable_text": bool(pick("enableText", "enable_text", True)),
+            "enable_image": bool(pick("enableImage", "enable_image", True)),
+            "max_images": max(1, min(8, int(finite_float(pick("maxImages", "max_images", 2), 2.0)))),
             "gallery_aggregation": agg,
-            "gore_weight": max(0.0, min(3.0, finite_float(raw.get("goreWeight", raw.get("gore_weight", 1.0)), 1.0))),
-            "nsfw_weight": max(0.0, min(3.0, finite_float(raw.get("nsfwWeight", raw.get("nsfw_weight", 1.0)), 1.0))),
+            "gore_weight": max(0.0, min(3.0, finite_float(pick("goreWeight", "gore_weight", 1.0), 1.0))),
+            "nsfw_weight": max(0.0, min(3.0, finite_float(pick("nsfwWeight", "nsfw_weight", 1.0), 1.0))),
             "temperature": max(0.25, min(4.0, finite_float(raw.get("temperature", 1.0), 1.0))),
             "bias": max(-5.0, min(5.0, finite_float(raw.get("bias", 0.0), 0.0))),
         }
@@ -232,10 +244,11 @@ class RunnerEngine:
         normalized = self._normalize_params(next_raw)
         with self._lock:
             old_threads = self.params["threads"]
-            self.params = normalized
             if normalized["threads"] != old_threads:
-                self.clf = self._lf.Left4Filter(str(self.deploy_dir), num_threads=normalized["threads"])
+                new_clf = self._lf.Left4Filter(str(self.deploy_dir), num_threads=normalized["threads"])
                 Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+                self.clf = new_clf
+            self.params = normalized
             return dict(self.params)
 
     def info(self) -> dict[str, Any]:
@@ -535,16 +548,28 @@ def start_stdin_watchdog() -> None:
 def read_chunked_body(rfile: Any, max_bytes: int) -> bytes:
     out = bytearray()
     while True:
-        line = rfile.readline(65536)
+        line = rfile.readline(MAX_CHUNK_LINE_BYTES + 1)
         if not line:
             raise ValueError("incomplete_chunked_body")
+        if len(line) > MAX_CHUNK_LINE_BYTES or not line.endswith((b"\r\n", b"\n")):
+            raise ValueError("invalid_chunk_header_line")
         semi = line.find(b";")
-        hex_part = line[:semi] if semi != -1 else line
-        size = int(hex_part.strip(), 16)
+        hex_part = (line[:semi] if semi != -1 else line).strip()
+        if not _CHUNK_SIZE_RE.fullmatch(hex_part):
+            raise ValueError("invalid_chunk_size")
+        size = int(hex_part, 16)
         if size == 0:
+            trailer_bytes = 0
             while True:
-                trailer = rfile.readline(65536)
-                if not trailer or trailer in (b"\r\n", b"\n"):
+                trailer = rfile.readline(MAX_CHUNK_LINE_BYTES + 1)
+                if not trailer:
+                    raise ValueError("incomplete_chunked_trailer")
+                if len(trailer) > MAX_CHUNK_LINE_BYTES or not trailer.endswith((b"\r\n", b"\n")):
+                    raise ValueError("invalid_chunk_trailer_line")
+                trailer_bytes += len(trailer)
+                if trailer_bytes > MAX_TRAILER_BYTES:
+                    raise OverflowError("chunk_trailers_too_large")
+                if trailer in (b"\r\n", b"\n"):
                     break
             break
         if len(out) + size > max_bytes:
@@ -579,6 +604,8 @@ def main() -> None:
     engine = RunnerEngine(deploy_dir, initial_params, max_concurrency=args.max_concurrency)
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 15
+
         def _send(self, code: int, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
@@ -594,18 +621,27 @@ def main() -> None:
             return hmac.compare_digest(auth, expected_auth)
 
         def _read_json(self) -> dict[str, Any]:
-            te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
-            if te:
+            te_headers = [v.strip().lower() for v in (self.headers.get_all("Transfer-Encoding") or [])]
+            cl_headers = [v.strip() for v in (self.headers.get_all("Content-Length") or [])]
+            if len(te_headers) > 1:
+                raise ValueError("duplicate_transfer_encoding")
+            if len(cl_headers) > 1:
+                raise ValueError("duplicate_content_length")
+            if te_headers and cl_headers:
+                raise ValueError("conflicting_transfer_encoding_and_content_length")
+
+            if te_headers:
+                te = te_headers[0]
                 if te != "chunked":
                     raise ValueError(f"unsupported_transfer_encoding:{te}")
                 raw = read_chunked_body(self.rfile, MAX_REQUEST_BODY_BYTES)
             else:
-                cl_header = self.headers.get("Content-Length")
-                if cl_header is None:
+                if not cl_headers:
                     raise ValueError("missing_content_length")
-                length = int(cl_header)
-                if length < 0:
+                cl_header = cl_headers[0]
+                if not _CONTENT_LENGTH_RE.fullmatch(cl_header):
                     raise ValueError("invalid_content_length")
+                length = int(cl_header)
                 if length == 0:
                     return {}
                 if length > MAX_REQUEST_BODY_BYTES:
@@ -688,6 +724,7 @@ def main() -> None:
             pass
 
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    srv.daemon_threads = True
     bound_host, bound_port = srv.server_address[0], srv.server_address[1]
     ready_payload = engine.info()
     ready_payload["host"] = bound_host

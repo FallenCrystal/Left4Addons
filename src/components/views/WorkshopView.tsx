@@ -33,8 +33,11 @@ import type { LiveDownloadState } from '../../state/useAppController';
 import {
   collectWorkshopImageUrls,
   formatDiagnosticVerdictBadge,
+  formatRedactedAddonLabel,
   hasFilterableWorkshopContent,
   isAddonTitleRedacted,
+  isLinkedWorkshopTitleRedacted,
+  matchesEvaluatedAddonTitle,
   resolveCardFilterState,
   resolveDetailFilterState,
   resolveWorkshopVerdict,
@@ -77,6 +80,7 @@ export interface WorkshopViewProps {
   addons: AddonSummary[];
   collections: TrackedCollectionRecord[];
   liveDownloads: Record<string, LiveDownloadState>;
+  busy?: boolean;
   onSearch: (query: SearchQuery) => Promise<SearchResponse>;
   onFetchItem: (workshopId: string) => Promise<WorkshopItemRecord | null>;
   onImportSubscribed: () => Promise<string[] | null>;
@@ -97,6 +101,7 @@ export function WorkshopView({
   addons,
   collections,
   liveDownloads,
+  busy = false,
   onSearch,
   onFetchItem,
   onImportSubscribed,
@@ -137,6 +142,7 @@ export function WorkshopView({
   }
   const [directInput, setDirectInput] = useState('');
   const [directBusy, setDirectBusy] = useState(false);
+  const [trackingCollectionIds, setTrackingCollectionIds] = useState<Set<string>>(() => new Set());
   const [searchResult, setSearchResult] = useState<{
     reqKey: string;
     response: SearchResponse | null;
@@ -146,6 +152,7 @@ export function WorkshopView({
   const [missingSubs, setMissingSubs] = useState<string[] | null>(null);
 
   const searchSeqRef = useRef(0);
+  const directInspectSeqRef = useRef(0);
   const reqKey = JSON.stringify({ ...searchParams, language: searchLanguage });
 
   const localByWorkshopId = useMemo(() => {
@@ -241,7 +248,44 @@ export function WorkshopView({
     if (batch.length > 0) {
       registerWorkshopItems(batch);
     }
-  }, [displayedItems, activeItem, registerWorkshopItems]);
+    if (activeItem && activeItem.dependencies.length > 0) {
+      const covered = new Set(batch.map((item) => item.workshopId));
+      const depStubs: WorkshopItemRecord[] = [];
+      for (const dep of activeItem.dependencies) {
+        const depTitle = dep.title?.trim();
+        if (!depTitle || covered.has(dep.workshopId)) continue;
+        const depLocal = localByWorkshopId.get(dep.workshopId);
+        if (
+          filterConfig.applyToLibrary &&
+          depLocal &&
+          matchesEvaluatedAddonTitle(depLocal, depTitle)
+        ) {
+          continue;
+        }
+        covered.add(dep.workshopId);
+        depStubs.push({
+          workshopId: dep.workshopId,
+          fileType: 'item',
+          status: 'active',
+          title: depTitle,
+          tags: [],
+          dependencies: [],
+          collectionChildren: [],
+          source: activeItem.source,
+          fetchedAt: activeItem.fetchedAt,
+        });
+      }
+      if (depStubs.length > 0) {
+        registerWorkshopItems(depStubs, { onlyIfMissing: true });
+      }
+    }
+  }, [
+    displayedItems,
+    activeItem,
+    filterConfig.applyToLibrary,
+    localByWorkshopId,
+    registerWorkshopItems,
+  ]);
 
   const { visibleItems, filteredOutCount } = useMemo(() => {
     let hiddenCount = 0;
@@ -298,10 +342,74 @@ export function WorkshopView({
       activeItem,
     ],
   );
+  const activeCardFilter = useMemo(
+    () =>
+      activeItem && activeKey
+        ? resolveCardFilterState({
+            config: filterConfig,
+            scope: 'workshop',
+            verdict: activeVerdict,
+            revealed: revealedCardIds.has(activeKey),
+            forceShowHiddenCards: showingFilteredCards,
+            hasTargetFailed: failedTargetKeys.has(activeKey),
+            hasContent: hasFilterableWorkshopContent(activeItem),
+          })
+        : null,
+    [
+      activeItem,
+      activeKey,
+      activeVerdict,
+      failedTargetKeys,
+      filterConfig,
+      revealedCardIds,
+      showingFilteredCards,
+    ],
+  );
+  const activeRevealed = Boolean(activeKey && revealedCardIds.has(activeKey));
+  const activeDetailUnverifiedShield = Boolean(
+    activeCardFilter &&
+      !activeCardFilter.flagged &&
+      !activeRevealed &&
+      (activeCardFilter.blurWholeCard ||
+        activeCardFilter.hiddenCard ||
+        activeCardFilter.redactTitle),
+  );
+  const activeDetailFlaggedUnrevealed = Boolean(
+    activeCardFilter &&
+      activeCardFilter.flagged &&
+      !activeRevealed &&
+      (activeCardFilter.blurWholeCard || activeCardFilter.hiddenCard),
+  );
+  const activeDetailTextShielded =
+    activeDetailUnverifiedShield || activeDetailFlaggedUnrevealed;
+  const activeDisplayTitle = activeItem
+    ? activeDetailTextShielded
+      ? formatRedactedAddonLabel(activeItem.workshopId, t)
+      : activeItem.title
+    : '';
 
   const safePageSize = response ? Math.max(1, response.pageSize) : 24;
   const totalPages = response ? Math.max(1, Math.ceil(response.total / safePageSize)) : 1;
   const displayPage = loading && response ? response.page : searchParams.page;
+
+  const handleTrackCollection = async (collectionId: string) => {
+    if (trackingCollectionIds.has(collectionId)) return;
+    setTrackingCollectionIds((prev) => {
+      const next = new Set(prev);
+      next.add(collectionId);
+      return next;
+    });
+    try {
+      await onTrackCollection(collectionId, true);
+    } finally {
+      setTrackingCollectionIds((prev) => {
+        if (!prev.has(collectionId)) return prev;
+        const next = new Set(prev);
+        next.delete(collectionId);
+        return next;
+      });
+    }
+  };
 
   const handleDirectAction = async (kind: 'inspect' | 'download' | 'track') => {
     const id = extractWorkshopIdInput(directInput);
@@ -309,26 +417,54 @@ export function WorkshopView({
       onInvalidId();
       return;
     }
+    if (kind === 'download') {
+      if (liveDownloads[id]) {
+        return;
+      }
+      const local = localByWorkshopId.get(id);
+      if (local?.installState === 'installed' && !local.updateAvailable) {
+        onNotify(t('workshop.status.installed'));
+        return;
+      }
+      const safeLocalTitle =
+        local && !isLinkedWorkshopTitleRedacted(id, local, local.title, filterCtx)
+          ? local.title
+          : undefined;
+      setDirectInput('');
+      void (local?.installState === 'installed'
+        ? onUpdate(id, safeLocalTitle)
+        : onDownload(id, safeLocalTitle));
+      return;
+    }
+    if (kind === 'track' && (busy || trackedIds.has(id) || trackingCollectionIds.has(id))) {
+      return;
+    }
     setDirectBusy(true);
     try {
       if (kind === 'inspect') {
+        const seq = ++directInspectSeqRef.current;
         const item = await onFetchItem(id);
-        if (item) {
+        if (item && seq === directInspectSeqRef.current) {
           setActiveItem(item);
           setDirectInput('');
         }
-      } else if (kind === 'download') {
-        const local = localByWorkshopId.get(id);
-        const safeLocalTitle =
-          local && !isAddonTitleRedacted(local, filterCtx) ? local.title : undefined;
-        const result =
-          local?.installState === 'installed'
-            ? await onUpdate(id, safeLocalTitle)
-            : await onDownload(id, safeLocalTitle);
-        if (result) setDirectInput('');
       } else {
-        const tracked = await onTrackCollection(id, true);
-        if (tracked) setDirectInput('');
+        setTrackingCollectionIds((prev) => {
+          const next = new Set(prev);
+          next.add(id);
+          return next;
+        });
+        try {
+          const tracked = await onTrackCollection(id, true);
+          if (tracked) setDirectInput('');
+        } finally {
+          setTrackingCollectionIds((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
+        }
       }
     } finally {
       setDirectBusy(false);
@@ -351,6 +487,7 @@ export function WorkshopView({
     const dl = liveDownloads[item.workshopId];
     const isCollection = item.fileType === 'collection';
     const isTracked = trackedIds.has(item.workshopId);
+    const isTracking = trackingCollectionIds.has(item.workshopId);
     const unavailable = item.status === 'removed' || item.status === 'private_or_unavailable';
     const itemKey = workshopFilterKey(item.workshopId);
     const itemCardFilter = resolveCardFilterState({
@@ -362,11 +499,16 @@ export function WorkshopView({
       hasTargetFailed: failedTargetKeys.has(itemKey),
       hasContent: hasFilterableWorkshopContent(item),
     });
+    const unverifiedCardShielded =
+      (itemCardFilter.blurWholeCard || itemCardFilter.hiddenCard) &&
+      !itemCardFilter.flagged &&
+      !itemCardFilter.isBlurCardRevealed;
     const shouldOmitTaskTitle =
       (local ? isAddonTitleRedacted(local, filterCtx) : false) ||
       itemCardFilter.redactTitle ||
       ((itemCardFilter.blurWholeCard || itemCardFilter.hiddenCard) &&
-        itemCardFilter.titleSensitive);
+        itemCardFilter.titleSensitive) ||
+      unverifiedCardShielded;
     const safeTaskTitle = shouldOmitTaskTitle ? undefined : item.title;
 
     if (isCollection) {
@@ -374,11 +516,11 @@ export function WorkshopView({
         <Button
           variant={isTracked ? 'text' : 'tonal'}
           size="sm"
-          disabled={isTracked}
+          disabled={isTracked || busy || isTracking}
           icon={isTracked ? <BookmarkCheck size={14} /> : <BookmarkPlus size={14} />}
           onClick={(e) => {
             if (stopProp) e.stopPropagation();
-            void onTrackCollection(item.workshopId, true);
+            void handleTrackCollection(item.workshopId);
           }}
         >
           {isTracked ? t('workshop.tracked') : t('workshop.directTrack')}
@@ -557,7 +699,7 @@ export function WorkshopView({
           <IconButton
             size="sm"
             label={t('workshop.directTrack')}
-            disabled={directBusy || !directInput.trim()}
+            disabled={busy || directBusy || !directInput.trim()}
             onClick={() => void handleDirectAction('track')}
           >
             <BookmarkPlus size={15} />
@@ -819,7 +961,9 @@ export function WorkshopView({
                           </button>
                           <div className="l4a-addon-meta">
                             <span className="l4a-truncate">
-                              {item.creatorName || t('common.unknown')}
+                              {cardFilter.redactMeta
+                                ? t('filter.redactedAuthor')
+                                : item.creatorName || t('common.unknown')}
                             </span>
                             {item.fileSize ? (
                               <>
@@ -923,8 +1067,11 @@ export function WorkshopView({
 
       <SideSheet
         open={Boolean(activeItem)}
-        title={activeItem?.title ?? ''}
-        onClose={() => setActiveItem(null)}
+        title={activeDisplayTitle}
+        onClose={() => {
+          directInspectSeqRef.current += 1;
+          setActiveItem(null);
+        }}
         footer={
           activeItem && (
             <>
@@ -984,6 +1131,18 @@ export function WorkshopView({
                       gore: activeVerdict.probabilities.goreProb.toFixed(2),
                     })}
                   </span>
+                  {activeDetailFlaggedUnrevealed && activeKey && (
+                    <div style={{ marginTop: 4 }}>
+                      <Button
+                        variant="tonal"
+                        size="sm"
+                        icon={<Eye size={14} />}
+                        onClick={() => revealCard(activeKey)}
+                      >
+                        {t('filter.blurCardOverlay')}
+                      </Button>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -994,8 +1153,8 @@ export function WorkshopView({
             >
               <AddonCover
                 src={activeGalleryUrls[0] ?? activeItem.previewUrl}
-                title={activeItem.title}
-                category={activeItem.tags[0]}
+                title={activeDisplayTitle}
+                category={activeDetailTextShielded ? undefined : activeItem.tags[0]}
                 filterMode={activeDetailFilter.imageModeAt(0)}
                 filterLabel={
                   activeDetailFilter.pendingEvaluation ? t('filter.evaluatingMedia') : undefined
@@ -1020,8 +1179,8 @@ export function WorkshopView({
                       <div key={`${imageIdx}:${url}`} className="l4a-gallery-item">
                         <AddonCover
                           src={url}
-                          title={`${activeItem.title} #${imageIdx + 1}`}
-                          category={activeItem.tags[0]}
+                          title={`${activeDisplayTitle} #${imageIdx + 1}`}
+                          category={activeDetailTextShielded ? undefined : activeItem.tags[0]}
                           filterMode={imgMode}
                           filterLabel={
                             activeDetailFilter.pendingEvaluation
@@ -1045,7 +1204,9 @@ export function WorkshopView({
               <div className="l4a-kv-item">
                 <span className="l4a-kv-label">{t('detail.author')}</span>
                 <span className="l4a-kv-value">
-                  {activeItem.creatorName || t('common.unknown')}
+                  {activeDetailTextShielded
+                    ? t('filter.redactedAuthor')
+                    : activeItem.creatorName || t('common.unknown')}
                 </span>
               </div>
               <div className="l4a-kv-item">
@@ -1070,7 +1231,7 @@ export function WorkshopView({
               </div>
             </div>
 
-            {activeItem.tags.length > 0 && (
+            {!activeDetailTextShielded && activeItem.tags.length > 0 && (
               <div className="md-chip-row">
                 {activeItem.tags.map((tag) => (
                   <span key={tag} className="md-pill" data-tone="secondary">
@@ -1082,7 +1243,11 @@ export function WorkshopView({
 
             {activeItem.description && (
               <div className="md-body-small selectable l4a-description-box">
-                {activeItem.description}
+                {activeDetailTextShielded
+                  ? activeDetailFilter.pendingEvaluation
+                    ? t('filter.evaluatingMedia')
+                    : t('filter.redactedDescription')
+                  : activeItem.description}
               </div>
             )}
 
@@ -1091,13 +1256,23 @@ export function WorkshopView({
                 <span className="md-label-medium">{t('workshop.dependencies')}</span>
                 <div className="l4a-list">
                   {activeItem.dependencies.map((dep) => {
-                    const installed =
-                      localByWorkshopId.get(dep.workshopId)?.installState === 'installed';
+                    const depLocal = localByWorkshopId.get(dep.workshopId);
+                    const installed = depLocal?.installState === 'installed';
+                    const depRedacted = isLinkedWorkshopTitleRedacted(
+                      dep.workshopId,
+                      depLocal,
+                      dep.title,
+                      filterCtx,
+                    );
+                    const depDisplayTitle = depRedacted
+                      ? formatRedactedAddonLabel(dep.workshopId, t)
+                      : dep.title || `#${dep.workshopId}`;
+                    const safeDepTitle = depRedacted ? undefined : dep.title;
                     return (
                       <div key={dep.workshopId} className="l4a-list-row" style={{ cursor: 'default' }}>
                         <div className="l4a-list-main">
                           <span className="md-title-small l4a-truncate">
-                            {dep.title || `#${dep.workshopId}`}
+                            {depDisplayTitle}
                           </span>
                           <span className="md-body-small md-mono" style={{ color: 'var(--md-sys-color-on-surface-variant)' }}>
                             #{dep.workshopId}
@@ -1108,7 +1283,7 @@ export function WorkshopView({
                           size="sm"
                           disabled={installed || Boolean(liveDownloads[dep.workshopId])}
                           icon={<Download size={13} />}
-                          onClick={() => void onDownload(dep.workshopId, dep.title)}
+                          onClick={() => void onDownload(dep.workshopId, safeDepTitle)}
                         >
                           {installed ? t('workshop.status.installed') : t('common.download')}
                         </Button>
@@ -1163,14 +1338,16 @@ export function WorkshopView({
             </Button>
             <Button
               variant="filled"
+              disabled={(missingSubs ?? []).every((id) => Boolean(liveDownloads[id]))}
               icon={<Download size={15} />}
               onClick={() => {
-                const ids = missingSubs ?? [];
+                const ids = (missingSubs ?? []).filter((id) => !liveDownloads[id]);
                 setMissingSubs(null);
                 for (const id of ids) void onDownload(id);
               }}
             >
-              {t('common.download')} ({missingSubs?.length ?? 0})
+              {t('common.download')} (
+              {(missingSubs ?? []).filter((id) => !liveDownloads[id]).length})
             </Button>
           </>
         }
@@ -1184,6 +1361,7 @@ export function WorkshopView({
               <Button
                 variant="tonal"
                 size="sm"
+                disabled={Boolean(liveDownloads[id])}
                 icon={<Download size={13} />}
                 onClick={() => void onDownload(id)}
               >

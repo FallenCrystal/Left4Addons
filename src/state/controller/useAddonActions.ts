@@ -114,7 +114,7 @@ export function useAddonActions({
   }, [client, notify, refresh, setSyncReport, setSyncing]);
 
   const saveConfig = useCallback(
-    async (config: AppConfig, forceRescan = false, silent = false): Promise<boolean> => {
+    async (config: AppConfig, forceRescan = false, silent = false): Promise<AppConfig | null> => {
       setBusy(true);
       const prevConfig = snapshotRef.current?.config;
       const dirsChanged =
@@ -126,7 +126,8 @@ export function useAddonActions({
         !prevConfig || prevConfig.disableSteamworksSdk !== config.disableSteamworksSdk;
 
       try {
-        commitSavedConfig(await client.saveConfig(config));
+        const saved = await client.saveConfig(config);
+        commitSavedConfig(saved);
         if (sdkFlagChanged) {
           setSteamCaps(null);
         }
@@ -153,10 +154,10 @@ export function useAddonActions({
         } else if (!silent) {
           notify(tRef.current('settings.saved'));
         }
-        return true;
+        return saved;
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
-        return false;
+        return null;
       } finally {
         setBusy(false);
       }

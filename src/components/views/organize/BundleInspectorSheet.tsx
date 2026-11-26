@@ -48,9 +48,16 @@ export function BundleInspectorSheet({
   onCopy,
 }: BundleInspectorSheetProps) {
   const { t } = useTranslation();
+  const [trackedBundleId, setTrackedBundleId] = useState<string | null>(inspectedBundle?.id ?? null);
   const [bundleSheetTab, setBundleSheetTab] = useState<'members' | 'maps'>('members');
   const bundleTabsId = useId();
   const filterCtx = useContentFilterContext();
+
+  const currentBundleId = inspectedBundle?.id ?? null;
+  if (trackedBundleId !== currentBundleId) {
+    setTrackedBundleId(currentBundleId);
+    setBundleSheetTab('members');
+  }
 
   const allMembers = inspectedBundle
     ? inspectedBundle.memberAddonIds
@@ -70,11 +77,16 @@ export function BundleInspectorSheet({
     ? resolveBundleCoverPresentation(visibleMembers, filterCtx, {
         allMembers,
         bundleCoverImage: inspectedBundle.coverImage,
+        bundleName: inspectedBundle.name,
       })
     : null;
   const sheetTitle = inspectedBundle
-    ? coverPres?.redactTitle
-      ? formatRedactedAddonLabel(visibleMembers.find((m) => m.workshopId)?.workshopId, t)
+    ? coverPres?.redactTitle || coverPres?.blurWholeCard
+      ? formatRedactedAddonLabel(
+          visibleMembers.find((m) => m.workshopId)?.workshopId ??
+            allMembers.find((m) => m.workshopId)?.workshopId,
+          t,
+        )
       : inspectedBundle.name
     : '';
 

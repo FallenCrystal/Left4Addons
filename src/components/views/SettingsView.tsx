@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -65,7 +65,7 @@ export interface SettingsViewProps {
   filterStatusBusy?: boolean;
   filterTokenStatus?: FilterTokenStatus | null;
   filterEvalError?: string | null;
-  onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<boolean>;
+  onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<AppConfig | null>;
   onDetectPath: () => Promise<string | null>;
   onOpenInFileManager: (path: string) => void;
   onRefreshSteamCaps: () => void;
@@ -91,6 +91,10 @@ export interface SettingsViewProps {
   onSelectAddon?: (addon: AddonSummary) => void;
 }
 
+const NOOP_ASYNC_NULL = async () => null;
+const NOOP_ASYNC_FALSE = async () => false;
+const NOOP_VOID = () => {};
+
 export function SettingsView({
   config,
   section,
@@ -113,18 +117,18 @@ export function SettingsView({
   onChangeTheme,
   onChangeLanguage,
   onNotify,
-  onRefreshLocalFilterStatus = async () => null,
-  onCheckLocalFilterUpdates = async () => null,
-  onDeployLocalFilter = async () => null,
-  onStartLocalFilterService = async () => null,
-  onStopLocalFilterService = async () => null,
-  onRefreshFilterTokenStatus = async () => null,
-  onSetFilterLlmToken = async () => null,
-  onClearFilterCache = async () => null,
-  onRetryFailedEvaluations = () => {},
-  onEvaluateSandboxTarget = async () => null,
-  onUpsertFilterExclusion = async () => false,
-  onDeleteFilterExclusion = async () => false,
+  onRefreshLocalFilterStatus = NOOP_ASYNC_NULL,
+  onCheckLocalFilterUpdates = NOOP_ASYNC_NULL,
+  onDeployLocalFilter = NOOP_ASYNC_NULL,
+  onStartLocalFilterService = NOOP_ASYNC_NULL,
+  onStopLocalFilterService = NOOP_ASYNC_NULL,
+  onRefreshFilterTokenStatus = NOOP_ASYNC_NULL,
+  onSetFilterLlmToken = NOOP_ASYNC_NULL,
+  onClearFilterCache = NOOP_ASYNC_NULL,
+  onRetryFailedEvaluations = NOOP_VOID,
+  onEvaluateSandboxTarget = NOOP_ASYNC_NULL,
+  onUpsertFilterExclusion = NOOP_ASYNC_FALSE,
+  onDeleteFilterExclusion = NOOP_ASYNC_FALSE,
   onSelectAddon,
 }: SettingsViewProps) {
   const { t } = useTranslation();
@@ -176,25 +180,47 @@ export function SettingsView({
   }, [dirty, saveBarMounted]);
 
   const handleSave = useCallback(async () => {
-    if (!dirty || busy) return;
+    if (!dirty || busy || filterStatusBusy) return;
     const savedDraft = draft;
     const ok = await onSaveConfig(effective, pathsChanged);
     if (ok) {
       setDraft((curr) => (curr === savedDraft ? null : curr));
     }
-  }, [busy, dirty, draft, effective, onSaveConfig, pathsChanged]);
+  }, [busy, dirty, draft, effective, filterStatusBusy, onSaveConfig, pathsChanged]);
+
+  const handleSaveRef = useRef(handleSave);
+  const pendingShortcutSaveRef = useRef(false);
 
   useEffect(() => {
-    if (!dirty) return;
+    handleSaveRef.current = handleSave;
+    if (pendingShortcutSaveRef.current) {
+      pendingShortcutSaveRef.current = false;
+      void handleSave();
+    }
+  }, [handleSave]);
+
+  useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault();
-        void handleSave();
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+          pendingShortcutSaveRef.current = true;
+          active.blur();
+          window.setTimeout(() => {
+            if (pendingShortcutSaveRef.current) {
+              pendingShortcutSaveRef.current = false;
+              void handleSaveRef.current();
+            }
+          }, 0);
+        } else {
+          void handleSaveRef.current();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [dirty, handleSave]);
+  }, []);
 
   const handleDetect = async () => {
     setDetecting(true);
@@ -571,7 +597,9 @@ export function SettingsView({
           {section === 'filter' && (
             <FilterSettingsSection
               effectiveConfig={effective}
-              dirty={dirty}
+              dirty={
+                draft !== null && JSON.stringify(draft.filter) !== JSON.stringify(config.filter)
+              }
               busy={busy}
               filterStatusBusy={filterStatusBusy}
               localStatus={localFilterStatus}
@@ -584,13 +612,27 @@ export function SettingsView({
                 updateDraft((d) => ({ ...d, filter: updater(d.filter) }))
               }
               onSaveDraftFirst={async () => {
-                if (!dirty) return true;
-                const savedDraft = draft;
-                const ok = await onSaveConfig(effective, pathsChanged);
-                if (ok) {
-                  setDraft((curr) => (curr === savedDraft ? null : curr));
+                if (busy || filterStatusBusy) return null;
+                if (!draft) return config;
+                if (JSON.stringify(draft.filter) === JSON.stringify(config.filter)) {
+                  return config;
                 }
-                return ok;
+                const savedFilterDraft = draft.filter;
+                const saved = await onSaveConfig(
+                  { ...config, filter: savedFilterDraft },
+                  false,
+                );
+                if (saved) {
+                  setDraft((curr) => {
+                    if (!curr) return null;
+                    const merged: AppConfig = {
+                      ...curr,
+                      filter: curr.filter === savedFilterDraft ? saved.filter : curr.filter,
+                    };
+                    return JSON.stringify(merged) === JSON.stringify(saved) ? null : merged;
+                  });
+                }
+                return saved;
               }}
               onRefreshLocalStatus={onRefreshLocalFilterStatus}
               onCheckLocalUpdates={onCheckLocalFilterUpdates}
@@ -875,13 +917,18 @@ export function SettingsView({
           <span className="l4a-settings-save-dot" aria-hidden="true" />
           <span className="md-label-large">{t('settings.unsavedChanges')}</span>
           <div className="l4a-spacer" />
-          <Button variant="text" size="sm" disabled={busy || !dirty} onClick={() => setDraft(null)}>
+          <Button
+            variant="text"
+            size="sm"
+            disabled={busy || filterStatusBusy || !dirty}
+            onClick={() => setDraft(null)}
+          >
             {t('common.cancel')}
           </Button>
           <Button
             variant="filled"
             size="sm"
-            disabled={busy || !dirty}
+            disabled={busy || filterStatusBusy || !dirty}
             onClick={() => void handleSave()}
           >
             {(dirty ? pathsChanged : lastPathsChanged)

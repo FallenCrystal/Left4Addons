@@ -79,6 +79,7 @@ export interface FilterChipProps {
   onClick?: () => void;
   onRemove?: () => void;
   removeLabel?: string;
+  disabled?: boolean;
 }
 
 export function FilterChip({
@@ -90,6 +91,7 @@ export function FilterChip({
   onClick,
   onRemove,
   removeLabel,
+  disabled = false,
 }: FilterChipProps) {
   const { t } = useTranslation();
 
@@ -103,6 +105,7 @@ export function FilterChip({
         <button
           type="button"
           className="md-chip-main"
+          disabled={disabled}
           onClick={onClick}
         >
           {selected ? <Check size={14} strokeWidth={2.4} /> : icon}
@@ -112,6 +115,7 @@ export function FilterChip({
         <button
           type="button"
           className="md-chip-remove"
+          disabled={disabled}
           aria-label={removeLabel ?? `${t('common.remove')} ${label}`}
           onClick={onRemove}
         >
@@ -128,6 +132,7 @@ export function FilterChip({
       aria-pressed={selected}
       data-selected={selected ? 'true' : 'false'}
       data-tone={tone}
+      disabled={disabled}
       onClick={onClick}
     >
       {selected ? <Check size={14} strokeWidth={2.4} /> : icon}

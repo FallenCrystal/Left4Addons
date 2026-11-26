@@ -158,4 +158,49 @@ describe('automatic content filter lifecycle', () => {
     act(() => result.current.handleFilterVerdictsUpdated([safeVerdict(target)], sig, 0));
     expect(result.current.filterVerdicts[target.targetKey]).toBeUndefined();
   });
+
+  it('clears failedTargetKeys and revealedCardIds for an addon when its revision changes', async () => {
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.mode = 'local';
+    snapshot.config.filter.flaggedAction = 'blur_card';
+    snapshot.addons = [snapshot.addons[0]];
+    const target = buildAddonFilterTarget(snapshot.addons[0]);
+    const sig = policy(snapshot);
+
+    let failNext = true;
+    const evaluate = vi.fn(async (targets: FilterEvaluationTarget[]) => {
+      if (failNext) {
+        return {
+          policySignature: sig,
+          cacheGeneration: 0,
+          items: targets.map((item) => ({
+            targetKey: item.targetKey,
+            status: 'failed' as const,
+            error: 'temporary error',
+          })),
+        };
+      }
+      return new Promise<never>(() => {});
+    });
+
+    const { result, rerender, snapshotRef } = setup(snapshot, { evaluateFilterItems: evaluate });
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    expect(result.current.failedTargetKeys.has(target.targetKey)).toBe(true);
+
+    act(() => result.current.revealCard(target.targetKey));
+    expect(result.current.revealedCardIds.has(target.targetKey)).toBe(true);
+
+    // Update the addon's contentHash (simulating an update on disk) -> stale failed/revealed flags must clear
+    failNext = false;
+    const updatedSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      addons: [{ ...snapshot.addons[0], contentHash: 'updated-v2-hash' }],
+    };
+    snapshotRef.current = updatedSnapshot;
+    rerender({ snapshot: updatedSnapshot });
+
+    expect(result.current.failedTargetKeys.has(target.targetKey)).toBe(false);
+    expect(result.current.revealedCardIds.has(target.targetKey)).toBe(false);
+  });
 });

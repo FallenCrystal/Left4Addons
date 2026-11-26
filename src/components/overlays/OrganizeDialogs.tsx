@@ -156,10 +156,12 @@ function AddonPicker({
           visible.map((addon) => {
             const checked = selected.has(addon.id);
             const cardFilter = resolveLibraryAddonCardFilter(addon, filterCtx);
+            const searchRedaction = getAddonSearchRedaction(addon, filterCtx);
             const displayName = formatFilteredAddonTitle(addon, namePreference, filterCtx, t);
-            const authorText = cardFilter.redactMeta
-              ? t('filter.redactedAuthor')
-              : addon.author || t('common.unknown');
+            const authorText =
+              searchRedaction.redactMeta || cardFilter.blurWholeCard
+                ? t('filter.redactedAuthor')
+                : addon.author || t('common.unknown');
             const coverLabel = cardFilter.pendingEvaluation
               ? t('filter.evaluatingMedia')
               : undefined;

@@ -51,9 +51,12 @@
   "ready": true,
   "modelName": "Left4FiltersModel",
   "modelVersion": "1.0.0",
-  "maxImages": 2
+  "maxImages": 2,
+  "scoringRevision": "a1b2c3d4e5f60718"
 }
 ```
+- 当服务端关闭图片模态 (`enable_image = false`) 时，`maxImages` 返回 `0`。
+- `scoringRevision` 为当前服务端评分配置与模型版本的摘要标识，后端未就绪或禁用时省略。
 
 ### `POST /api/v1/filter/predict`
 对创意工坊条目或给定多模态输入执行敏感度概率评估 (`FilterPredictRequest` -> `FilterProbabilities`)：
@@ -67,11 +70,11 @@
   "imageUrls": ["https://images.steamusercontent.com/ugc/..."]
 }
 ```
-- **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
+- **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb`、`scoringRevision` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
 - **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
 - 公开预测和管理员试算共用并发配额，JSON 请求体上限为 48 MiB。读取超时返回 `408 Request Timeout`，配额已满时返回 `429 Too Many Requests`。管理员试算在读取请求体前验证身份。
 - **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。
-- **SSRF 与载荷限制**：`imageUrls` 仅允许 `https://` 协议及受信任的 Steam CDN 域名白名单（`steamuserimages-a.akamaihd.net`、`images.steamusercontent.com`、`steamcdn-a.akamaihd.net`、`cdn.cloudflare.steamstatic.com`、`shared.cloudflare.steamstatic.com`、`shared.fastly.steamstatic.com`），禁止跨域名重定向至非白名单主机，单图上限 `16 MiB`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+- **SSRF 与载荷限制**：`imageUrls` 允许受信任的 Steam CDN 域名白名单（`media.steampowered.com`、`*.steamusercontent.com`、`*.steamstatic.com`、`steamuserimages*.akamaihd.net`、`steamcdn*.akamaihd.net` 以及 `cloud*.steampowered.com/ugc/*`），支持 `https://` 并将历史 `http://` Steam CDN 链接自动升级为 `https://` 后抓取；最多跟随 3 次 HTTP 重定向且每跳均须通过 Steam CDN 白名单校验，单图上限 `16 MiB`、像素上限 `4096×4096`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
 - 当服务端无法读取请求中的预览图 URL 时，响应附带 `code: "image_fetch_failed"`。客户端可以读取预览图后用 `imagesBase64` 重试。
 
 ---

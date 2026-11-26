@@ -6,6 +6,7 @@ import type {
   TrackedCollectionRecord,
 } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import type { LiveDownloadState } from '../../../state/useAppController';
 import {
   formatFilteredAddonTitle,
   isAddonTitleRedacted,
@@ -20,6 +21,7 @@ export interface CollectionsTabProps {
   filteredCollections: TrackedCollectionRecord[];
   addonsByWorkshopId: Map<string, AddonSummary>;
   namePreference: AddonNamePreference;
+  liveDownloads?: Record<string, LiveDownloadState>;
   busy: boolean;
   onInspectCollection: (collectionId: string) => void;
   onDownloadWorkshopItem: (workshopId: string, title?: string) => void;
@@ -32,6 +34,7 @@ export function CollectionsTab({
   filteredCollections,
   addonsByWorkshopId,
   namePreference,
+  liveDownloads,
   busy,
   onInspectCollection,
   onDownloadWorkshopItem,
@@ -61,6 +64,7 @@ export function CollectionsTab({
         const missing = visibleWids.filter(
           (id) => addonsByWorkshopId.get(id)?.installState !== 'installed',
         );
+        const missingIdle = missing.filter((id) => !liveDownloads?.[id]);
         const installed = total - missing.length;
         const percent = total > 0 ? Math.round((installed / total) * 100) : 0;
         const previewTitles = visibleWids.slice(0, 3).map((wid) => {
@@ -142,9 +146,10 @@ export function CollectionsTab({
                   <Button
                     variant="tonal"
                     size="sm"
+                    disabled={busy || missingIdle.length === 0}
                     icon={<Download size={13} />}
                     onClick={() => {
-                      for (const id of missing) {
+                      for (const id of missingIdle) {
                         const found = addonsByWorkshopId.get(id);
                         const safeTitle =
                           found && !isAddonTitleRedacted(found, filterCtx)

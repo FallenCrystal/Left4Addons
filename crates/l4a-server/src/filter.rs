@@ -170,6 +170,7 @@ impl CatalogFilterService {
     pub fn new(config_store: Arc<CatalogConfigStore>, repo: Arc<ServerRepo>) -> Arc<Self> {
         let backend_client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(PREDICT_TIMEOUT)
             .build()
             .expect("failed to build backend reqwest client");
@@ -272,13 +273,18 @@ impl CatalogFilterService {
     pub async fn public_info(&self) -> CatalogFilterPublicInfo {
         let cfg = self.current_filter_section();
         let params = cfg.params();
+        let advertised_max_images = if params.enable_image {
+            params.max_images
+        } else {
+            0
+        };
         if !cfg.enabled {
             return CatalogFilterPublicInfo {
                 enabled: false,
                 ready: false,
                 model_name: None,
                 model_version: None,
-                max_images: params.max_images,
+                max_images: advertised_max_images,
                 scoring_revision: None,
             };
         }
@@ -288,13 +294,18 @@ impl CatalogFilterService {
         let _execution = self.backend_execution.read().await;
         let cfg = self.current_filter_section();
         let params = cfg.params();
+        let advertised_max_images = if params.enable_image {
+            params.max_images
+        } else {
+            0
+        };
         if !cfg.enabled {
             return CatalogFilterPublicInfo {
                 enabled: false,
                 ready: false,
                 model_name: None,
                 model_version: None,
-                max_images: params.max_images,
+                max_images: advertised_max_images,
                 scoring_revision: None,
             };
         }
@@ -312,7 +323,7 @@ impl CatalogFilterService {
             ready,
             model_name: ready.then_some(snap.model_name).flatten(),
             model_version: ready.then_some(snap.model_version).flatten(),
-            max_images: params.max_images,
+            max_images: advertised_max_images,
             scoring_revision,
         }
     }
@@ -606,6 +617,11 @@ impl CatalogFilterService {
         let has_txt = !effective_title.trim().is_empty()
             || !effective_desc.trim().is_empty()
             || !effective_tags.is_empty();
+        if !has_txt && final_images.is_empty() && db_image_fetch_failed {
+            return Err(FilterServiceError::ImageFetch(
+                "无法拉取任何工坊预览图".to_string(),
+            ));
+        }
         let mut probabilities = if !has_txt && final_images.is_empty() {
             FilterProbabilities::default()
         } else {
@@ -973,6 +989,114 @@ impl CatalogFilterService {
         cfg: &FilterSection,
         force_restart: bool,
     ) {
+        // Routine UpstreamHttp health TTL refresh: probe `/health` without stalling in-flight
+        // predictions or bumping `backend_generation` unless upstream fails or model metadata changed.
+        if !force_restart
+            && cfg.enabled
+            && cfg.backend == CatalogFilterBackendKind::UpstreamHttp
+            && guard.is_none()
+        {
+            if let Some(ref raw_url) = cfg.upstream_url {
+                if let Ok(base_url) = validate_upstream_base_url(raw_url) {
+                    let routine_refresh = {
+                        let snap = self.runtime.read().unwrap();
+                        if snap.ready
+                            && snap.initialized_config.as_ref() == Some(cfg)
+                            && snap.active_endpoint.as_deref() == Some(base_url.as_str())
+                        {
+                            Some((snap.model_name.clone(), snap.model_version.clone()))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((prev_model_name, prev_model_version)) = routine_refresh {
+                        match self.probe_upstream_health(&base_url).await {
+                            Ok((model_name, model_version)) => {
+                                if model_name == prev_model_name
+                                    && model_version == prev_model_version
+                                {
+                                    let mut snap = self.runtime.write().unwrap();
+                                    if snap.ready
+                                        && snap.initialized_config.as_ref() == Some(cfg)
+                                        && snap.active_endpoint.as_deref()
+                                            == Some(base_url.as_str())
+                                    {
+                                        snap.upstream_verified_at = Some(Instant::now());
+                                        snap.last_error = None;
+                                        return;
+                                    }
+                                }
+                                let _execution = self.backend_execution.write().await;
+                                self.backend_generation.fetch_add(1, Ordering::AcqRel);
+                                let prev_sig =
+                                    self.runtime.read().unwrap().last_scoring_signature.clone();
+                                let next_sig = if cfg.cache_ttl_secs > 0 {
+                                    let rev = compute_scoring_revision(
+                                        cfg,
+                                        model_name.as_deref(),
+                                        model_version.as_deref(),
+                                    );
+                                    if prev_sig.as_deref() != Some(rev.as_str()) {
+                                        self.clear_cache();
+                                    }
+                                    Some(rev)
+                                } else {
+                                    self.clear_cache();
+                                    None
+                                };
+                                *self.runtime.write().unwrap() = RuntimeSnapshot {
+                                    initialized_config: Some(cfg.clone()),
+                                    last_scoring_signature: next_sig,
+                                    backoff_config: None,
+                                    next_retry_after: None,
+                                    upstream_verified_at: Some(Instant::now()),
+                                    last_crash_respawn_at: None,
+                                    ready: true,
+                                    running_pid: None,
+                                    active_endpoint: Some(base_url),
+                                    model_name,
+                                    model_version,
+                                    last_error: None,
+                                };
+                                return;
+                            }
+                            Err(err) => {
+                                let _execution = self.backend_execution.write().await;
+                                self.backend_generation.fetch_add(1, Ordering::AcqRel);
+                                let prev_sig =
+                                    self.runtime.read().unwrap().last_scoring_signature.clone();
+                                let unverified_rev = compute_scoring_revision(cfg, None, None);
+                                let next_sig = if cfg.cache_ttl_secs > 0 {
+                                    if prev_sig.as_deref() != Some(unverified_rev.as_str()) {
+                                        self.clear_cache();
+                                    }
+                                    Some(unverified_rev)
+                                } else {
+                                    self.clear_cache();
+                                    None
+                                };
+                                *self.runtime.write().unwrap() = RuntimeSnapshot {
+                                    initialized_config: None,
+                                    last_scoring_signature: next_sig,
+                                    backoff_config: Some(cfg.clone()),
+                                    next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                                    upstream_verified_at: None,
+                                    last_crash_respawn_at: None,
+                                    ready: false,
+                                    running_pid: None,
+                                    active_endpoint: Some(base_url),
+                                    model_name: None,
+                                    model_version: None,
+                                    last_error: Some(err),
+                                };
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let _execution = self.backend_execution.write().await;
         self.backend_generation.fetch_add(1, Ordering::AcqRel);
         let prev_sig = self.runtime.read().unwrap().last_scoring_signature.clone();
@@ -1111,14 +1235,22 @@ impl CatalogFilterService {
                             handle.model_name.as_deref(),
                             handle.model_version.as_deref(),
                         );
-                        let prev_crash_ts = self.runtime.read().unwrap().last_crash_respawn_at;
+                        let next_crash_ts = if force_restart {
+                            None
+                        } else {
+                            self.runtime
+                                .read()
+                                .unwrap()
+                                .last_crash_respawn_at
+                                .map(|_| Instant::now())
+                        };
                         let snap_next = RuntimeSnapshot {
                             initialized_config: Some(cfg.clone()),
                             last_scoring_signature: next_sig,
                             backoff_config: None,
                             next_retry_after: None,
                             upstream_verified_at: None,
-                            last_crash_respawn_at: prev_crash_ts,
+                            last_crash_respawn_at: next_crash_ts,
                             ready: true,
                             running_pid: handle.pid,
                             active_endpoint: Some(handle.endpoint.clone()),
@@ -1635,6 +1767,8 @@ async fn read_lossy_response_snippet(mut resp: reqwest::Response, max_bytes: usi
 
 fn is_disallowed_upstream_ipv4(ip: Ipv4Addr) -> bool {
     ip == Ipv4Addr::new(169, 254, 169, 254)
+        || ip == Ipv4Addr::new(100, 100, 100, 200)
+        || ip.octets()[0] == 0
         || ip.is_link_local()
         || ip.is_unspecified()
         || ip.is_broadcast()
@@ -1644,6 +1778,9 @@ fn is_disallowed_upstream_ipv4(ip: Ipv4Addr) -> bool {
 fn is_disallowed_upstream_ipv6(ip: Ipv6Addr) -> bool {
     if let Some(mapped) = ip.to_ipv4_mapped() {
         return is_disallowed_upstream_ipv4(mapped);
+    }
+    if let Some(compat) = ip.to_ipv4() {
+        return is_disallowed_upstream_ipv4(compat);
     }
     // Block AWS IPv6 IMDS (fd00:ec2::254), link-local (fe80::/10), unspecified (::), multicast.
     let segs = ip.segments();
@@ -1658,6 +1795,9 @@ pub fn validate_upstream_base_url(raw: &str) -> Result<String, String> {
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("upstream_url 不允许包含内嵌账号密码".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("upstream_url 不允许包含查询参数 (?) 或片段 (#)".to_string());
     }
     match parsed.host() {
         Some(Host::Ipv4(ip)) if is_disallowed_upstream_ipv4(ip) => {
@@ -2387,8 +2527,19 @@ async fn spawn_managed_python_runner(
     let params_json = serde_json::to_string(&params.sanitized())
         .map_err(|e| format!("序列化模型参数失败: {e}"))?;
 
+    let clean_deploy_dir = {
+        let raw = canonical_deploy_dir.to_string_lossy();
+        #[cfg(windows)]
+        {
+            raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_string()
+        }
+        #[cfg(not(windows))]
+        {
+            raw.into_owned()
+        }
+    };
     let mut deploy_arg = OsString::from("--deploy-dir=");
-    deploy_arg.push(&canonical_deploy_dir);
+    deploy_arg.push(&clean_deploy_dir);
 
     let mut command = Command::new(&python_exe);
     command
@@ -2460,18 +2611,21 @@ async fn spawn_managed_python_runner(
     let mut stdout_reader = BufReader::new(stdout);
     let ready_result = tokio::time::timeout(RUNNER_STARTUP_TIMEOUT, async {
         let mut line_buf = Vec::with_capacity(512);
+        let mut total_scanned: usize = 0;
         loop {
             line_buf.clear();
+            let remaining = MAX_READY_LINE_BYTES.saturating_sub(total_scanned);
             let n = (&mut stdout_reader)
-                .take((MAX_READY_LINE_BYTES + 1) as u64)
+                .take((remaining + 1) as u64)
                 .read_until(b'\n', &mut line_buf)
                 .await
                 .map_err(|e| format!("读取 Python 子进程输出失败: {e}"))?;
             if n == 0 {
                 return Err("Python 过滤子进程在输出就绪信号前提前退出".to_string());
             }
-            if line_buf.len() > MAX_READY_LINE_BYTES {
-                return Err("Python 子进程启动输出单行超过 64 KiB 上限".to_string());
+            total_scanned = total_scanned.saturating_add(line_buf.len());
+            if total_scanned > MAX_READY_LINE_BYTES {
+                return Err("Python 子进程启动输出超过 64 KiB 上限".to_string());
             }
             let line = String::from_utf8_lossy(&line_buf);
             let trimmed = line.trim_end_matches(['\r', '\n']);
@@ -2843,5 +2997,209 @@ mod tests {
         cfg.bias = 0.25;
         let r3 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.0.0"));
         assert_ne!(r1, r3);
+    }
+
+    #[tokio::test]
+    async fn upstream_ttl_refresh_restores_ready_state_if_backend_failed_during_health_probe() {
+        use axum::{routing::get, Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        let store = Arc::new(crate::config::CatalogConfigStore::new(
+            None,
+            crate::config::CatalogConfig::default(),
+        ));
+        let repo = Arc::new(crate::db::ServerRepo::open_in_memory().unwrap());
+
+        let probe_count = Arc::new(AtomicUsize::new(0));
+        let second_entered = Arc::new(Notify::new());
+        let second_release = Arc::new(Notify::new());
+
+        let app = {
+            let probe_count = probe_count.clone();
+            let second_entered = second_entered.clone();
+            let second_release = second_release.clone();
+            Router::new().route(
+                "/health",
+                get(move || {
+                    let probe_count = probe_count.clone();
+                    let second_entered = second_entered.clone();
+                    let second_release = second_release.clone();
+                    async move {
+                        let n = probe_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        if n == 2 {
+                            second_entered.notify_one();
+                            second_release.notified().await;
+                        }
+                        Json(serde_json::json!({
+                            "status": "ok",
+                            "model_name": "Left4Filters",
+                            "model_version": "1.0.0"
+                        }))
+                    }
+                }),
+            )
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        store
+            .update(|cfg| {
+                cfg.filter.enabled = true;
+                cfg.filter.backend = CatalogFilterBackendKind::UpstreamHttp;
+                cfg.filter.upstream_url = Some(base_url.clone());
+            })
+            .unwrap();
+
+        let service = CatalogFilterService::new(store, repo);
+        let _ = service.reconfigure().await;
+        assert!(service.runtime.read().unwrap().ready);
+
+        // Force TTL expiration so the next reconfigure() takes the routine refresh path.
+        service.runtime.write().unwrap().upstream_verified_at =
+            Some(Instant::now() - UPSTREAM_HEALTH_TTL - Duration::from_secs(5));
+        let gen_before = service.backend_generation.load(Ordering::Acquire);
+
+        let svc_clone = service.clone();
+        let refresh_task = tokio::spawn(async move {
+            let _ = svc_clone.reconfigure().await;
+        });
+
+        second_entered.notified().await;
+        service.record_backend_failure(&base_url, "simulated upstream disconnect".into());
+        assert!(!service.runtime.read().unwrap().ready);
+        second_release.notify_one();
+
+        refresh_task.await.unwrap();
+
+        let snap = service.runtime.read().unwrap().clone();
+        assert!(
+            snap.ready,
+            "successful /health refresh must restore ready=true after concurrent failure"
+        );
+        assert!(snap.initialized_config.is_some());
+        assert!(snap.backoff_config.is_none());
+        assert!(snap.next_retry_after.is_none());
+        assert!(snap.last_error.is_none());
+        assert!(service.backend_generation.load(Ordering::Acquire) > gen_before);
+
+        server_task.abort();
+    }
+
+    #[test]
+    fn validate_upstream_base_url_rejects_query_fragment_and_reserved_metadata_ips() {
+        assert!(validate_upstream_base_url("http://127.0.0.1:8788").is_ok());
+        assert!(validate_upstream_base_url("https://filter.internal:8443/v1").is_ok());
+
+        for bad in [
+            "http://127.0.0.1:8788?token=abc",
+            "http://127.0.0.1:8788#frag",
+            "http://0.1.2.3:8788",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[::169.254.169.254]/",
+            "http://[::ffff:100.100.100.200]/",
+        ] {
+            assert!(
+                validate_upstream_base_url(bad).is_err(),
+                "expected validate_upstream_base_url to reject {bad}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn predict_once_fails_closed_when_db_only_images_fail_and_no_text() {
+        use axum::{routing::get, Json, Router};
+
+        let store = Arc::new(crate::config::CatalogConfigStore::new(
+            None,
+            crate::config::CatalogConfig::default(),
+        ));
+        let repo = Arc::new(crate::db::ServerRepo::open_in_memory().unwrap());
+
+        let app = Router::new()
+            .route(
+                "/health",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "model_name": "Left4Filters",
+                        "model_version": "1.0.0"
+                    }))
+                }),
+            )
+            .route(
+                "/broken-preview.jpg",
+                get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        let item = l4a_protocol::WorkshopItemRecord {
+            workshop_id: l4a_protocol::WorkshopId(777001),
+            file_type: l4a_protocol::WorkshopFileType::Item,
+            status: l4a_protocol::WorkshopItemStatus::Active,
+            title: "DB Title Ignored When Text Disabled".into(),
+            description: Some("DB Description".into()),
+            creator_steam_id: None,
+            creator_name: None,
+            preview_url: Some(format!("{base_url}/broken-preview.jpg")),
+            previews: vec![],
+            file_url: None,
+            file_size: None,
+            time_created: None,
+            time_updated: None,
+            subscriptions: None,
+            favorites: None,
+            tags: vec![],
+            dependencies: vec![],
+            collection_children: vec![],
+            source: l4a_protocol::MetadataSource::CatalogServer,
+            fetched_at: chrono::Utc::now(),
+        };
+        repo.upsert_item(&item, false, false).unwrap();
+
+        store
+            .update(|cfg| {
+                cfg.filter.enabled = true;
+                cfg.filter.backend = CatalogFilterBackendKind::UpstreamHttp;
+                cfg.filter.upstream_url = Some(base_url.clone());
+                cfg.filter.enable_text = false;
+                cfg.filter.enable_image = true;
+            })
+            .unwrap();
+
+        let service = CatalogFilterService::new(store, repo);
+        service.set_allow_loopback_image_urls_for_testing(true);
+        let _ = service.reconfigure().await;
+
+        let err = service
+            .predict(l4a_protocol::FilterPredictRequest {
+                workshop_id: Some(l4a_protocol::WorkshopId(777001)),
+                title: None,
+                description: None,
+                tags: vec![],
+                image_base64: None,
+                images_base64: vec![],
+                image_urls: vec![],
+            })
+            .await
+            .expect_err(
+                "expected ImageFetch error when all DB preview images fail and text is disabled",
+            );
+        assert!(
+            matches!(err, FilterServiceError::ImageFetch(_)),
+            "expected ImageFetch error, got: {err:?}"
+        );
+
+        server_task.abort();
     }
 }

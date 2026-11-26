@@ -2,7 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as ipc from '../api/ipc';
 import type { AppConfig, DashboardSnapshot, SteamCapabilities, SyncReport } from '../api/ipc';
-import { computeFilterPolicySignature } from '../utils/contentFilter';
+import {
+  computeFilterPolicySignature,
+  isLinkedWorkshopTitleRedacted,
+  type FilterLookupSource,
+} from '../utils/contentFilter';
 import type { BatchDialogPayload, NotifyOptions, SnackbarItem } from './controller/types';
 import { getClient } from './controller/types';
 import { useAddonActions } from './controller/useAddonActions';
@@ -53,7 +57,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   const snapshotSeqRef = useRef(0);
   const lastCommittedSeqRef = useRef(0);
   const lastSavedConfigSeqRef = useRef(0);
-  const refreshInFlightRef = useRef(false);
+  const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
   const refreshQueuedRef = useRef(false);
   const snapshotRef = useRef<DashboardSnapshot | null>(null);
   const tRef = useRef(t);
@@ -160,28 +164,32 @@ export function useAppController(onOpenReconcile?: () => void) {
   }, []);
 
   const refresh = useCallback(async (): Promise<boolean> => {
-    if (refreshInFlightRef.current) {
+    if (refreshPromiseRef.current) {
       refreshQueuedRef.current = true;
-      return true;
+      return refreshPromiseRef.current;
     }
-    refreshInFlightRef.current = true;
-    let ok = true;
-    try {
-      do {
-        refreshQueuedRef.current = false;
-        const seq = nextSnapshotSeq();
-        try {
-          const next = await client.getDashboardSnapshot();
-          commitSnapshot(seq, next);
-        } catch (err) {
-          ok = false;
-          notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
-        }
-      } while (refreshQueuedRef.current);
-    } finally {
-      refreshInFlightRef.current = false;
-    }
-    return ok;
+    const run = (async () => {
+      let ok = true;
+      try {
+        do {
+          refreshQueuedRef.current = false;
+          ok = true;
+          const seq = nextSnapshotSeq();
+          try {
+            const next = await client.getDashboardSnapshot();
+            commitSnapshot(seq, next);
+          } catch (err) {
+            ok = false;
+            notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
+          }
+        } while (refreshQueuedRef.current);
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+      return ok;
+    })();
+    refreshPromiseRef.current = run;
+    return run;
   }, [client, commitSnapshot, nextSnapshotSeq, notify]);
 
   const [bootstrapNonce, setBootstrapNonce] = useState(0);
@@ -259,6 +267,41 @@ export function useAppController(onOpenReconcile?: () => void) {
     setBusy,
   });
 
+  const isWorkshopTitleRedacted = useCallback(
+    (
+      workshopId: string,
+      rawTitle?: string,
+      addonId?: string,
+      options?: { transferKind?: 'download' | 'update' },
+    ): boolean => {
+      const liveSnapshot = snapshotRef.current;
+      const freshExclusions = liveSnapshot
+        ? new Map(liveSnapshot.filterExclusions.map((e) => [e.addonId, e]))
+        : contentFilter.exclusionsByAddonId;
+      const lookup: FilterLookupSource = {
+        filterConfig: liveSnapshot?.config.filter ?? contentFilter.filterConfig,
+        verdicts: contentFilter.filterVerdicts,
+        evaluatedRevisions: contentFilter.evaluatedRevisions,
+        exclusionsByAddonId: freshExclusions,
+        revealedCardIds: contentFilter.revealedCardIds,
+        failedTargetKeys: contentFilter.failedTargetKeys,
+      };
+      const addons = liveSnapshot?.addons ?? [];
+      const found =
+        (addonId ? addons.find((a) => a.id === addonId) : undefined) ??
+        addons.find((a) => a.workshopId === workshopId);
+      return isLinkedWorkshopTitleRedacted(workshopId, found, rawTitle, lookup, options);
+    },
+    [
+      contentFilter.evaluatedRevisions,
+      contentFilter.exclusionsByAddonId,
+      contentFilter.failedTargetKeys,
+      contentFilter.filterConfig,
+      contentFilter.filterVerdicts,
+      contentFilter.revealedCardIds,
+    ],
+  );
+
   const liveDownloadController = useLiveDownloads({
     client,
     snapshotRef,
@@ -266,6 +309,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     onOpenReconcileRef,
     notify,
     refresh,
+    isWorkshopTitleRedacted,
     onFilterVerdictsUpdated: contentFilter.handleFilterVerdictsUpdated,
     onLocalFilterStatusChanged: contentFilter.handleLocalFilterStatusChanged,
   });

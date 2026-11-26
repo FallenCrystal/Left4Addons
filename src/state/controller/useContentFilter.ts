@@ -98,13 +98,31 @@ export function useContentFilter({
     revisions: {},
   }));
 
+  const [localFilterStatus, setLocalFilterStatus] = useState<LocalFilterDeploymentStatus | null>(
+    null,
+  );
+  const [filterStatusBusy, setFilterStatusBusy] = useState(false);
+  const [filterTokenStatus, setFilterTokenStatus] = useState<FilterTokenStatus | null>(null);
+  const [filterEvalError, setFilterEvalError] = useState<string | null>(null);
+  const [revealedStore, setRevealedStore] = useState<{
+    policySig: string;
+    keys: Set<string>;
+  }>(() => ({ policySig: policySignature, keys: new Set() }));
+  const [failedStore, setFailedStore] = useState<{
+    policySig: string;
+    keys: Set<string>;
+  }>(() => ({ policySig: policySignature, keys: new Set() }));
+  const [evalRetryNonce, setEvalRetryNonce] = useState(0);
+
   const [hydrationTracker, setHydrationTracker] = useState<{
     addons: DashboardSnapshot['addons'] | undefined;
+    addonRevs: Map<string, string>;
     cached: FilterItemVerdict[] | undefined;
     policySig: string;
     cacheGeneration: number;
   }>({
     addons: undefined,
+    addonRevs: new Map(),
     cached: undefined,
     policySig: policySignature,
     cacheGeneration,
@@ -117,19 +135,48 @@ export function useContentFilter({
     policySignature !== hydrationTracker.policySig ||
     cacheGeneration !== hydrationTracker.cacheGeneration
   ) {
-    setHydrationTracker({
-      addons: snapshot?.addons,
-      cached: snapshot?.cachedFilterVerdicts,
-      policySig: policySignature,
-      cacheGeneration,
-    });
-
     const currentRevByKey = new Map<string, string>();
     if (snapshot) {
       for (const addon of snapshot.addons) {
         currentRevByKey.set(addonFilterKey(addon.id), buildAddonRevisionHint(addon));
       }
     }
+    const staleAddonKeys = new Set<string>();
+    for (const [key, prevRev] of hydrationTracker.addonRevs) {
+      if (currentRevByKey.get(key) !== prevRev) {
+        staleAddonKeys.add(key);
+      }
+    }
+
+    setHydrationTracker({
+      addons: snapshot?.addons,
+      addonRevs: currentRevByKey,
+      cached: snapshot?.cachedFilterVerdicts,
+      policySig: policySignature,
+      cacheGeneration,
+    });
+
+    if (staleAddonKeys.size > 0) {
+      setFailedStore((prev) => {
+        if (prev.policySig !== policySignature) return prev;
+        let removed = false;
+        const next = new Set(prev.keys);
+        for (const key of staleAddonKeys) {
+          if (next.delete(key)) removed = true;
+        }
+        return removed ? { policySig: prev.policySig, keys: next } : prev;
+      });
+      setRevealedStore((prev) => {
+        if (prev.policySig !== policySignature) return prev;
+        let removed = false;
+        const next = new Set(prev.keys);
+        for (const key of staleAddonKeys) {
+          if (next.delete(key)) removed = true;
+        }
+        return removed ? { policySig: prev.policySig, keys: next } : prev;
+      });
+    }
+
     const cached =
       basePolicySignature === policySignature && snapshotCacheGeneration === cacheGeneration
         ? snapshot?.cachedFilterVerdicts ?? []
@@ -193,22 +240,6 @@ export function useContentFilter({
     });
   }
 
-  const [localFilterStatus, setLocalFilterStatus] = useState<LocalFilterDeploymentStatus | null>(
-    null,
-  );
-  const [filterStatusBusy, setFilterStatusBusy] = useState(false);
-  const [filterTokenStatus, setFilterTokenStatus] = useState<FilterTokenStatus | null>(null);
-  const [filterEvalError, setFilterEvalError] = useState<string | null>(null);
-  const [revealedStore, setRevealedStore] = useState<{
-    policySig: string;
-    keys: Set<string>;
-  }>(() => ({ policySig: policySignature, keys: new Set() }));
-  const [failedStore, setFailedStore] = useState<{
-    policySig: string;
-    keys: Set<string>;
-  }>(() => ({ policySig: policySignature, keys: new Set() }));
-  const [evalRetryNonce, setEvalRetryNonce] = useState(0);
-
   const verdictStoreIsCurrent =
     verdictStore.policySig === policySignature && verdictStore.cacheGeneration === cacheGeneration;
   const filterVerdicts = verdictStoreIsCurrent ? verdictStore.map : EMPTY_VERDICTS;
@@ -261,9 +292,27 @@ export function useContentFilter({
   }, [snapshot?.config]);
 
   useEffect(() => {
+    const prevMap = currentRevByKeyRef.current;
     const map = new Map<string, string>();
     for (const addon of snapshot?.addons ?? []) {
       map.set(addonFilterKey(addon.id), buildAddonRevisionHint(addon));
+    }
+    const staleKeys = new Set<string>();
+    for (const [key, prevRev] of prevMap) {
+      if (map.get(key) !== prevRev) {
+        staleKeys.add(key);
+      }
+    }
+    if (staleKeys.size > 0) {
+      for (const key of staleKeys) {
+        failedTargetKeysRef.current.delete(key);
+      }
+      for (const sigEntry of Array.from(failedSigsRef.current)) {
+        const parts = sigEntry.split('::');
+        if (parts.length >= 2 && staleKeys.has(parts[1])) {
+          failedSigsRef.current.delete(sigEntry);
+        }
+      }
     }
     currentRevByKeyRef.current = map;
   }, [snapshot?.addons]);
@@ -553,25 +602,31 @@ export function useContentFilter({
             }
             const batchErrorMsg = explicitFailureMsg ?? incompleteNoticeMsg;
 
-            const nextFailedSet = new Set(failedTargetKeysRef.current);
-            let failedChanged = false;
-            for (const k of clearedKeys) {
-              if (nextFailedSet.delete(k)) failedChanged = true;
-            }
-            for (const k of failedKeys) {
-              if (!nextFailedSet.has(k)) {
-                nextFailedSet.add(k);
-                failedChanged = true;
-              }
-            }
-            if (failedChanged) {
-              failedTargetKeysRef.current = nextFailedSet;
-              setFailedStore({ policySig: sig, keys: nextFailedSet });
+            if (clearedKeys.length > 0 || failedKeys.length > 0) {
+              const refNext = new Set(failedTargetKeysRef.current);
+              for (const k of clearedKeys) refNext.delete(k);
+              for (const k of failedKeys) refNext.add(k);
+              failedTargetKeysRef.current = refNext;
+              setFailedStore((prev) => {
+                const base = prev.policySig === sig ? prev.keys : new Set<string>();
+                const next = new Set(base);
+                let changed = prev.policySig !== sig;
+                for (const k of clearedKeys) {
+                  if (next.delete(k)) changed = true;
+                }
+                for (const k of failedKeys) {
+                  if (!next.has(k)) {
+                    next.add(k);
+                    changed = true;
+                  }
+                }
+                return changed ? { policySig: sig, keys: next } : prev;
+              });
             }
 
             if (batchErrorMsg) {
               setFilterEvalError(batchErrorMsg);
-            } else if (nextFailedSet.size === 0) {
+            } else if (failedTargetKeysRef.current.size === 0) {
               setFilterEvalError(null);
             }
 
@@ -580,17 +635,22 @@ export function useContentFilter({
           .catch((err) => {
             if (evalEpochRef.current !== epoch) return;
             const sig = policySigRef.current;
-            const nextFailedSet = new Set(failedTargetKeysRef.current);
-            let hasEligibleTarget = false;
+            const newlyFailed: string[] = [];
             for (const t of chunk) {
               if (!targetStillEligible(t.targetKey, t.revisionHint)) continue;
-              hasEligibleTarget = true;
               failedSigsRef.current.add(`${sig}::${t.targetKey}::${t.revisionHint ?? ''}`);
-              nextFailedSet.add(t.targetKey);
+              newlyFailed.push(t.targetKey);
             }
-            if (!hasEligibleTarget) return;
-            failedTargetKeysRef.current = nextFailedSet;
-            setFailedStore({ policySig: sig, keys: nextFailedSet });
+            if (newlyFailed.length === 0) return;
+            const refNext = new Set(failedTargetKeysRef.current);
+            for (const k of newlyFailed) refNext.add(k);
+            failedTargetKeysRef.current = refNext;
+            setFailedStore((prev) => {
+              const base = prev.policySig === sig ? prev.keys : new Set<string>();
+              const next = new Set(base);
+              for (const k of newlyFailed) next.add(k);
+              return { policySig: sig, keys: next };
+            });
             setFilterEvalError(err instanceof Error ? err.message : String(err));
           })
           .finally(() => {
@@ -687,11 +747,17 @@ export function useContentFilter({
   ]);
 
   const registerWorkshopItems = useCallback(
-    (items: WorkshopItemRecord[]) => {
+    (items: WorkshopItemRecord[], options?: { onlyIfMissing?: boolean }) => {
       if (items.length === 0) return;
-      const targets = items.map((item) => buildWorkshopFilterTarget(item));
-      for (const target of targets) {
+      const onlyIfMissing = options?.onlyIfMissing ?? false;
+      const targets: FilterEvaluationTarget[] = [];
+      for (const item of items) {
+        const target = buildWorkshopFilterTarget(item);
+        if (onlyIfMissing && workshopRegistryRef.current.has(target.targetKey)) {
+          continue;
+        }
         workshopRegistryRef.current.set(target.targetKey, target);
+        targets.push(target);
       }
       if (workshopRegistryRef.current.size > 160) {
         const keys = Array.from(workshopRegistryRef.current.keys());
@@ -699,7 +765,7 @@ export function useContentFilter({
           workshopRegistryRef.current.delete(keys[i]);
         }
       }
-      if (filterConfig.enabled && filterConfig.applyToWorkshop) {
+      if (targets.length > 0 && filterConfig.enabled && filterConfig.applyToWorkshop) {
         enqueueTargets(targets);
       }
     },
@@ -820,7 +886,7 @@ export function useContentFilter({
           latestConfigRef.current = mergedConfig;
           commitSavedConfig(mergedConfig);
         }
-        resetLocalVerdicts();
+        resetLocalVerdicts(status.cacheGeneration);
         notify(tRef.current('filter.toastDeployed'));
         return status;
       } catch (err) {

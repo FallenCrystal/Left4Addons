@@ -21,10 +21,7 @@ import type { LiveDownloadState } from '../../state/useAppController';
 import {
   formatFilteredAddonTitle,
   formatRedactedAddonLabel,
-  isAddonTitleRedacted,
-  resolveCardFilterState,
-  resolveLookupVerdict,
-  workshopFilterKey,
+  isLinkedWorkshopTitleRedacted,
 } from '../../utils/contentFilter';
 import {
   formatAddonDisplayName,
@@ -98,24 +95,9 @@ export function TaskCenterSheet({
     return map;
   }, [addons]);
 
-  const isWidTitleRedacted = (wid: string, rawTitle?: string | null): boolean => {
-    const found = addonsByWid.get(wid);
-    if (found) {
-      return isAddonTitleRedacted(found, filterCtx);
-    }
-    const wsKey = workshopFilterKey(wid);
-    const wsState = resolveCardFilterState({
-      config: filterCtx.filterConfig,
-      scope: 'workshop',
-      verdict: resolveLookupVerdict(wsKey, filterCtx),
-      revealed: filterCtx.revealedCardIds.has(wsKey),
-      hasTargetFailed: filterCtx.failedTargetKeys.has(wsKey),
-      hasContent: Boolean(rawTitle?.trim()),
-    });
-    return (
-      wsState.redactTitle ||
-      ((wsState.blurWholeCard || wsState.hiddenCard) && wsState.titleSensitive)
-    );
+  const isWidTitleRedacted = (wid: string, rawTitle?: string | null, addonId?: string): boolean => {
+    const found = (addonId ? addonsById.get(addonId) : undefined) ?? addonsByWid.get(wid);
+    return isLinkedWorkshopTitleRedacted(wid, found, rawTitle ?? undefined, filterCtx);
   };
 
   const resolveSafeWidTitle = (
@@ -124,24 +106,24 @@ export function TaskCenterSheet({
     addonId?: string,
   ): string | undefined => {
     const found = (addonId ? addonsById.get(addonId) : undefined) ?? addonsByWid.get(wid);
-    if (found) {
-      if (isAddonTitleRedacted(found, filterCtx)) {
-        return formatRedactedAddonLabel(wid, t);
-      }
-      return rawFallback?.trim() || formatAddonDisplayName(found, namePreference);
-    }
-    if (isWidTitleRedacted(wid, rawFallback)) {
+    if (isLinkedWorkshopTitleRedacted(wid, found, rawFallback ?? undefined, filterCtx)) {
       return formatRedactedAddonLabel(wid, t);
+    }
+    if (found) {
+      return rawFallback?.trim() || formatAddonDisplayName(found, namePreference);
     }
     return rawFallback?.trim() || undefined;
   };
 
   const addonLabel = (wid: string): string | undefined => {
     const found = addonsByWid.get(wid);
+    if (isLinkedWorkshopTitleRedacted(wid, found, undefined, filterCtx)) {
+      return formatRedactedAddonLabel(wid, t);
+    }
     if (found) {
       return formatFilteredAddonTitle(found, namePreference, filterCtx, t);
     }
-    return isWidTitleRedacted(wid) ? formatRedactedAddonLabel(wid, t) : undefined;
+    return undefined;
   };
 
   const safeTitleHint = (wid: string, rawHint?: string | null): string | undefined => {

@@ -1685,5 +1685,415 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     ).toBeTruthy();
     expect(within(inspector).queryByText('Explicit R18 Bikini Assets Pack')).toBeNull();
   });
+
+  it('preserves invalidated exclusion bindings on display-level change, locks presets in Catalog mode, and redacts download/update task titles and toasts', async () => {
+    setTauriMode(true);
+    const initial = await previewEngine.getDashboardSnapshot();
+    const targetAddon = {
+      ...initial.addons[0],
+      id: 'ws:2814199999',
+      workshopId: '2814199999',
+      title: 'Top Secret Sensitive Addon',
+      workshopTitle: 'Top Secret Sensitive Addon',
+      addonTitle: 'Top Secret Sensitive Addon',
+      installState: 'installed' as const,
+      updateAvailable: true,
+      contentHash: 'hash-v2-changed',
+    };
+    initial.addons = [targetAddon];
+    initial.bundles = [];
+    initial.filterExclusions = [
+      {
+        addonId: targetAddon.id,
+        displayLevel: 'hide_text',
+        bindFingerprint: true,
+        boundFingerprint: 'hash-v1-original',
+        fingerprintValid: false,
+        createdAt: '2026-11-26T00:00:00Z',
+        updatedAt: '2026-11-26T00:00:00Z',
+      },
+    ];
+    initial.config = {
+      ...initial.config,
+      filter: {
+        ...initial.config.filter,
+        enabled: true,
+        mode: 'catalog',
+        applyToLibrary: true,
+        flaggedAction: 'blur_card',
+      },
+    };
+    // Mark addon flagged with titleSensitive so even with invalidated exclusion it stays title-redacted
+    initial.cachedFilterVerdicts = [
+      {
+        targetKey: `addon:${targetAddon.id}`,
+        revisionHint: undefined,
+        flagged: true,
+        decisionSource: 'model_direct_flag',
+        evaluatedScore: 0.95,
+        probabilities: { prob: 0.95, goreProb: 0.01, nsfwProb: 0.95 },
+        textSensitive: true,
+        titleSensitive: true,
+        descriptionSensitive: false,
+        imageSensitive: true,
+        evaluatedImageIndices: [0],
+        sensitiveImageIndices: [0],
+        complete: true,
+        evaluatedAt: '2026-11-26T00:00:00Z',
+      },
+    ];
+
+    const upsertCalls: Array<Record<string, unknown>> = [];
+    const updateCalls: Array<Record<string, unknown>> = [];
+
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_dashboard_snapshot' || cmd === 'scan_workspace') {
+        return initial;
+      }
+      if (cmd === 'get_local_filter_status') {
+        return {
+          deployed: false,
+          serviceState: 'not_deployed',
+          env: { gitAvailable: true, pythonAvailable: true, venvAvailable: true },
+          updateAvailable: false,
+          recentCommits: [],
+        };
+      }
+      if (cmd === 'get_filter_token_status') {
+        return {
+          hasEncryptedLocalToken: false,
+          envVarName: 'L4A_LLM_API_KEY',
+          envVarPresent: false,
+          dpapiProtected: false,
+        };
+      }
+      if (cmd === 'evaluate_filter_items') {
+        const targets = (args?.targets as Array<{ targetKey: string; revisionHint?: string }>) ?? [];
+        return {
+          policySignature: initial.filterPolicySignature ?? 'pol_test',
+          cacheGeneration: 0,
+          items: targets.map((t) => ({
+            targetKey: t.targetKey,
+            status: 'completed',
+            complete: true,
+            verdict: {
+              ...initial.cachedFilterVerdicts![0],
+              targetKey: t.targetKey,
+              revisionHint: t.revisionHint,
+            },
+          })),
+        };
+      }
+      if (cmd === 'upsert_filter_exclusion') {
+        const req = (args?.request as Record<string, unknown>) ?? {};
+        upsertCalls.push(req);
+        return initial;
+      }
+      if (cmd === 'update_workshop_item') {
+        updateCalls.push(args ?? {});
+        return targetAddon;
+      }
+      return initial;
+    });
+
+    render(<App />);
+
+    // 1. Go to Settings -> Content Filter
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+
+    // Preset selector must be disabled in Catalog mode
+    const presetSelect = await screen.findByRole('combobox', { name: 'Parameter Preset' });
+    expect((presetSelect as HTMLButtonElement).disabled).toBe(true);
+
+    // Changing invalidated exclusion's display level MUST omit bindFingerprint (no silent rebind!)
+    const levelSelect = screen.getByRole('combobox', { name: 'Display Level When Excluded' });
+    fireEvent.click(levelSelect);
+    fireEvent.click(
+      within(screen.getByRole('listbox', { name: 'Display Level When Excluded' })).getByRole(
+        'option',
+        { name: /Blur/ },
+      ),
+    );
+    await waitFor(() => expect(upsertCalls.length).toBe(1));
+    expect(upsertCalls[0]).toEqual({
+      addonId: targetAddon.id,
+      displayLevel: 'blur_image',
+      note: undefined,
+    });
+    expect('bindFingerprint' in upsertCalls[0]).toBe(false);
+
+    // 2. Open the excluded addon detail sheet and click Update:
+    //    both update_workshop_item titleHint and the completion toast must NOT leak the raw title!
+    fireEvent.click(screen.getByRole('button', { name: /#2814199999/ }));
+    const sheet = await screen.findByRole('dialog');
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Update' }));
+
+    await waitFor(() => expect(updateCalls.length).toBe(1));
+    expect(updateCalls[0].titleHint).toBeUndefined();
+    await waitFor(() => {
+      expect(screen.getByText('Updated · Sensitive title hidden · #2814199999')).toBeTruthy();
+    });
+    expect(screen.queryByText(/Updated · Top Secret Sensitive Addon/)).toBeNull();
+  });
+
+  it('saves only filter config on Deploy Now without flushing unsaved path edits and shields pending Direct Inspect text in WorkshopView', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.applyToWorkshop = true;
+    snapshot.config.filter.flaggedAction = 'blur_card';
+    snapshot.config.filter.mode = 'local';
+
+    const saveCalls: Array<{ config: AppConfig; forceRescan?: boolean }> = [];
+    let scanCalls = 0;
+
+    invokeMock.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === 'get_dashboard_snapshot') {
+        return snapshot;
+      }
+      if (cmd === 'scan_workspace') {
+        scanCalls += 1;
+        return snapshot;
+      }
+      if (cmd === 'save_config') {
+        const nextCfg = args?.config as AppConfig;
+        saveCalls.push({ config: structuredClone(nextCfg) });
+        snapshot.config = structuredClone(nextCfg);
+        return snapshot.config;
+      }
+      if (cmd === 'deploy_local_filter') {
+        return {
+          deployed: true,
+          serviceState: 'running',
+          env: { gitAvailable: true, pythonAvailable: true, venvAvailable: true },
+          updateAvailable: false,
+          recentCommits: [],
+          cacheGeneration: 5,
+        };
+      }
+      if (cmd === 'get_local_filter_status') {
+        return {
+          deployed: false,
+          serviceState: 'not_deployed',
+          env: { gitAvailable: true, pythonAvailable: true, venvAvailable: true },
+          updateAvailable: false,
+          recentCommits: [],
+          cacheGeneration: 0,
+        };
+      }
+      if (cmd === 'get_filter_token_status') {
+        return {
+          hasEncryptedLocalToken: false,
+          envVarName: 'L4A_LLM_API_KEY',
+          envVarPresent: false,
+          dpapiProtected: false,
+          cacheGeneration: 0,
+        };
+      }
+      if (cmd === 'search_workshop') {
+        return { items: [], total: 0, page: 1, pageSize: 24, source: 'catalog_server' };
+      }
+      if (cmd === 'fetch_workshop_item') {
+        return {
+          workshopId: '99887766',
+          fileType: 'item',
+          status: 'active',
+          title: 'Unverified Explicit Mod Title',
+          description: 'Unverified Explicit Description Body',
+          creatorName: 'SecretAuthorName',
+          tags: ['Survivors'],
+          dependencies: [],
+          collectionChildren: [],
+          source: 'catalog_server',
+          fetchedAt: '2026-11-26T00:00:00Z',
+        };
+      }
+      if (cmd === 'evaluate_filter_items') {
+        const targets = (args?.targets as Array<{ targetKey: string; revisionHint?: string }>) ?? [];
+        if (targets.some((t) => t.targetKey === 'ws:99887766')) {
+          // Keep Direct Inspect evaluation pending so SideSheet renders while unverified!
+          return new Promise(() => {});
+        }
+        return {
+          policySignature: snapshot.filterPolicySignature ?? 'pol_test',
+          cacheGeneration: 0,
+          items: targets.map((t) => ({
+            targetKey: t.targetKey,
+            status: 'completed',
+            complete: true,
+            verdict: {
+              targetKey: t.targetKey,
+              revisionHint: t.revisionHint,
+              flagged: false,
+              decisionSource: 'model_safe',
+              evaluatedScore: 0.01,
+              probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+              textSensitive: false,
+              titleSensitive: false,
+              descriptionSensitive: false,
+              imageSensitive: false,
+              evaluatedImageIndices: [],
+              sensitiveImageIndices: [],
+              complete: true,
+              evaluatedAt: '2026-11-26T00:00:00Z',
+            },
+          })),
+        };
+      }
+      return snapshot;
+    });
+
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+
+    // 1. Edit Loading Dir on Paths tab (unsaved), then edit a Filter setting and click Deploy Now
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    const loadingInput = (await screen.findByLabelText(
+      'Manual Addons Directory (addons)',
+    )) as HTMLInputElement;
+    const originalLoadingDir = loadingInput.value;
+    fireEvent.change(loadingInput, { target: { value: '/tmp/unsaved-custom-loading-dir' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Content Filter' }));
+    const flagInput = (await screen.findByLabelText('Direct Flag Threshold (0–1)')) as HTMLInputElement;
+    fireEvent.focus(flagInput);
+    fireEvent.change(flagInput, { target: { value: '0.61' } });
+    fireEvent.blur(flagInput);
+
+    const scanCallsBeforeDeploy = scanCalls;
+    fireEvent.click(await screen.findByRole('button', { name: 'Deploy Now' }));
+    await waitFor(() => expect(saveCalls.length).toBe(1));
+    expect(saveCalls[0].config.filter.flagThreshold).toBe(0.61);
+    expect(saveCalls[0].config.loadingDir).toBe(originalLoadingDir);
+    expect(scanCalls).toBe(scanCallsBeforeDeploy);
+
+    // Switching back to Paths tab still preserves the unsaved loadingDir edit
+    fireEvent.click(screen.getByRole('button', { name: 'Paths' }));
+    expect(
+      ((await screen.findByLabelText('Manual Addons Directory (addons)')) as HTMLInputElement)
+        .value,
+    ).toBe('/tmp/unsaved-custom-loading-dir');
+
+    // 2. Navigate to Workshop and Direct Inspect an unverified item under blur_card
+    fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
+    const directInput = await screen.findByPlaceholderText('Workshop ID or URL');
+    fireEvent.change(directInput, { target: { value: '99887766' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect' }));
+
+    const sheet = await screen.findByRole('dialog');
+    expect(within(sheet).getByText(/Sensitive title hidden · #99887766/)).toBeTruthy();
+    expect(within(sheet).queryByText('Unverified Explicit Mod Title')).toBeNull();
+    expect(within(sheet).queryByText('SecretAuthorName')).toBeNull();
+    expect(within(sheet).queryByText('Unverified Explicit Description Body')).toBeNull();
+  });
+
+  it('shields flagged Direct Inspect text in WorkshopView until explicitly revealed and redacts AddonPicker author under blur_card', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.collapseCampaignBundles = false;
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.applyToLibrary = true;
+    snapshot.config.filter.applyToWorkshop = true;
+    snapshot.config.filter.flaggedAction = 'blur_card';
+    snapshot.addons[3].author = 'HiddenPickerAuthor';
+    const sig = computeFilterPolicySignature(snapshot.config.filter, {
+      catalogServerUrl: snapshot.config.catalogServerUrl,
+      httpsOnly: snapshot.config.httpsOnly,
+    });
+    snapshot.filterPolicySignature = sig;
+
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: { targets?: FilterEvaluationTarget[] }) => {
+        if (cmd === 'search_workshop') {
+          return { items: [], total: 0, page: 1, pageSize: 24, source: 'catalog_server' };
+        }
+        if (cmd === 'fetch_workshop_item') {
+          return {
+            workshopId: '66778899',
+            fileType: 'item',
+            status: 'active',
+            title: 'Explicit Flagged Direct Mod',
+            description: 'Explicit Flagged Direct Description',
+            creatorName: 'ExplicitCreator',
+            tags: ['ExplicitTag'],
+            dependencies: [],
+            collectionChildren: [],
+            source: 'catalog_server',
+            fetchedAt: '2026-11-26T00:00:00Z',
+          };
+        }
+        if (cmd === 'evaluate_filter_items') {
+          const targets = args?.targets ?? [];
+          return {
+            policySignature: sig,
+            cacheGeneration: 0,
+            items: targets.map((t) => {
+              const isFlagged =
+                t.targetKey === 'ws:66778899' || t.targetKey === `addon:${snapshot.addons[3].id}`;
+              return {
+                targetKey: t.targetKey,
+                status: 'completed' as const,
+                complete: true,
+                verdict: {
+                  targetKey: t.targetKey,
+                  revisionHint: t.revisionHint,
+                  flagged: isFlagged,
+                  decisionSource: isFlagged
+                    ? ('model_direct_flag' as const)
+                    : ('model_safe' as const),
+                  evaluatedScore: isFlagged ? 0.96 : 0.01,
+                  probabilities: { prob: isFlagged ? 0.96 : 0.01, goreProb: 0.01, nsfwProb: isFlagged ? 0.96 : 0.01 },
+                  textSensitive: isFlagged,
+                  titleSensitive: isFlagged,
+                  descriptionSensitive: isFlagged,
+                  imageSensitive: isFlagged,
+                  evaluatedImageIndices: [],
+                  sensitiveImageIndices: [],
+                  complete: true,
+                  evaluatedAt: '2026-11-26T00:00:00Z',
+                },
+              };
+            }),
+          };
+        }
+        return snapshot;
+      },
+    );
+
+    const { container } = render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+    await waitFor(() => {
+      expect(container.querySelector('[data-pending-eval="true"]')).toBeNull();
+    });
+
+    // 1. Organize -> Groups -> New Group picker must redact author of unrevealed blur_card flagged addon
+    fireEvent.click(screen.getByRole('button', { name: 'Organize' }));
+    fireEvent.click(await screen.findByRole('tab', { name: /Groups/ }));
+    fireEvent.click(await screen.findByRole('button', { name: 'New Group' }));
+    const groupDialog = await screen.findByRole('dialog', { name: 'New Group' });
+    expect(within(groupDialog).queryByText('HiddenPickerAuthor')).toBeNull();
+    fireEvent.keyDown(window, { key: 'Escape' });
+
+    // 2. Workshop Direct Inspect of a flagged mod shields sensitive text until user clicks reveal button
+    fireEvent.click(screen.getByRole('button', { name: 'Workshop' }));
+    const directInput = await screen.findByPlaceholderText('Workshop ID or URL');
+    fireEvent.change(directInput, { target: { value: '66778899' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect' }));
+
+    const sheet = await screen.findByRole('dialog');
+    const revealBtn = await within(sheet).findByRole('button', {
+      name: /Sensitive · Click to show text/,
+    });
+    expect(within(sheet).queryByText('Explicit Flagged Direct Mod')).toBeNull();
+    expect(within(sheet).queryByText('ExplicitCreator')).toBeNull();
+    expect(within(sheet).queryByText('Explicit Flagged Direct Description')).toBeNull();
+
+    // Clicking the reveal button exposes the text cleanly
+    fireEvent.click(revealBtn);
+    expect(await within(sheet).findByText('Explicit Flagged Direct Mod')).toBeTruthy();
+    expect(within(sheet).getByText('ExplicitCreator')).toBeTruthy();
+    expect(within(sheet).getByText('Explicit Flagged Direct Description')).toBeTruthy();
+  });
 });
 

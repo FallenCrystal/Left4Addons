@@ -467,10 +467,19 @@ enum PredictLocalError {
     HttpStatus(CoreError),
 }
 
+pub struct LocalFilterDeployOutcome {
+    pub status: LocalFilterDeploymentStatus,
+    pub validated_repo_url: String,
+    pub start_error: Option<CoreError>,
+}
+
 pub struct LocalFilterManager {
     paths: AppPaths,
     events: Arc<dyn EventSink>,
+    /// Lock ordering: always acquire `op_lock` before `predict_execution.write()`.
+    /// Never acquire `op_lock` while holding `predict_execution.read()`.
     op_lock: tokio::sync::Mutex<Option<RunningRunner>>,
+    predict_execution: tokio::sync::RwLock<()>,
     state: Mutex<CachedStatusState>,
     desired_params: RwLock<FilterModelParams>,
     last_auto_restart_at: Mutex<Option<Instant>>,
@@ -490,6 +499,7 @@ impl LocalFilterManager {
             paths,
             events,
             op_lock: tokio::sync::Mutex::new(None),
+            predict_execution: tokio::sync::RwLock::new(()),
             state: Mutex::new(CachedStatusState::default()),
             desired_params: RwLock::new(FilterModelParams::default()),
             last_auto_restart_at: Mutex::new(None),
@@ -621,7 +631,9 @@ impl LocalFilterManager {
             ));
         }
 
-        let (current, remote, recent, update_available) = if repo_dir.join(".git").exists() {
+        let has_valid_repo = repo_dir.join(".git").exists()
+            && is_valid_git_repo_async(&self.shutdown_token, repo_dir).await?;
+        let (current, remote, recent, update_available) = if has_valid_repo {
             ensure_origin_url_async(&self.shutdown_token, repo_dir, &validated_url).await?;
             run_git_async(
                 &self.shutdown_token,
@@ -677,9 +689,8 @@ impl LocalFilterManager {
         &self,
         request: &DeployLocalFilterRequest,
         default_repo_url: &str,
-        params: &FilterModelParams,
         https_only: bool,
-    ) -> Result<LocalFilterDeploymentStatus, CoreError> {
+    ) -> Result<LocalFilterDeployOutcome, CoreError> {
         let mut runner_guard = self.op_lock.lock().await;
 
         let raw_url = request
@@ -705,11 +716,13 @@ impl LocalFilterManager {
             Some(validate_target_commit(raw_commit)?)
         };
 
-        self.set_desired_params(params);
         *self.last_auto_restart_at.lock().unwrap() = None;
 
         // Stop any running Python process before touching git checkout or venv files
-        self.stop_runner_inner(&mut runner_guard).await;
+        {
+            let _exec = self.predict_execution.write().await;
+            self.stop_runner_inner(&mut runner_guard).await;
+        }
         self.emit_stage(
             LocalFilterServiceState::Deploying,
             Some("正在检查本地 Git 与 Python 环境...".into()),
@@ -745,15 +758,11 @@ impl LocalFilterManager {
             st.last_error = None;
         }
 
-        if request.start_after_deploy {
+        let start_error = if request.start_after_deploy {
             let latest_params = self.desired_params.read().unwrap().clone();
-            if let Err(err) = self
-                .start_runner_locked(&mut runner_guard, &latest_params)
+            self.start_runner_locked(&mut runner_guard, &latest_params)
                 .await
-            {
-                self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
-                return Err(err);
-            }
+                .err()
         } else {
             let mut st = self.state.lock().unwrap();
             st.service_state = LocalFilterServiceState::Stopped;
@@ -762,16 +771,23 @@ impl LocalFilterManager {
             st.active_runner_synced = None;
             st.stage_message = None;
             st.last_error = None;
-        }
+            None
+        };
 
         let status = {
             let st = self.state.lock().unwrap();
             self.snapshot_from_state(env, &st)
         };
-        self.events.emit(CoreEvent::LocalFilterStatusChanged {
-            status: status.clone(),
-        });
-        Ok(status)
+        if start_error.is_none() {
+            self.events.emit(CoreEvent::LocalFilterStatusChanged {
+                status: status.clone(),
+            });
+        }
+        Ok(LocalFilterDeployOutcome {
+            status,
+            validated_repo_url: validated_url,
+            start_error,
+        })
     }
 
     async fn run_deploy_steps(
@@ -822,18 +838,24 @@ impl LocalFilterManager {
         fs::create_dir_all(&self.paths.filters_dir)?;
         let repo_dir = &self.paths.filter_repo_dir;
 
-        if !repo_dir.join(".git").exists() {
+        let has_valid_repo = repo_dir.join(".git").exists()
+            && is_valid_git_repo_async(&self.shutdown_token, repo_dir).await?;
+        if !has_valid_repo {
             if repo_dir.exists() {
                 fs::remove_dir_all(repo_dir)?;
             }
             let repo_str = clean_os_path(repo_dir);
-            run_git_async(
+            if let Err(err) = run_git_async(
                 &self.shutdown_token,
                 &self.paths.filters_dir,
                 &["clone", "--no-checkout", "--", validated_url, &repo_str],
                 GIT_NETWORK_TIMEOUT,
             )
-            .await?;
+            .await
+            {
+                let _ = fs::remove_dir_all(repo_dir);
+                return Err(err);
+            }
         } else {
             ensure_origin_url_async(&self.shutdown_token, repo_dir, validated_url).await?;
             run_git_async(
@@ -851,6 +873,14 @@ impl LocalFilterManager {
             GIT_NETWORK_TIMEOUT,
         )
         .await;
+
+        let prev_head = if has_valid_repo {
+            rev_parse_async(&self.shutdown_token, repo_dir, "HEAD")
+                .await
+                .ok()
+        } else {
+            None
+        };
 
         if track_latest {
             let remote_ref = resolve_remote_default_ref_async(&self.shutdown_token, repo_dir)
@@ -879,107 +909,170 @@ impl LocalFilterManager {
             .await?;
         }
 
-        let deploy_dir = repo_dir.join("deploy");
-        for req_file in REQUIRED_DEPLOY_FILES {
-            if !deploy_dir.join(req_file).is_file() {
-                return Err(CoreError::InvalidInput(format!(
-                    "模型仓库缺少必要的部署文件: deploy/{req_file}"
+        let post_checkout = async {
+            let deploy_dir = repo_dir.join("deploy");
+            for req_file in REQUIRED_DEPLOY_FILES {
+                if !deploy_dir.join(req_file).is_file() {
+                    return Err(CoreError::InvalidInput(format!(
+                        "模型仓库缺少必要的部署文件: deploy/{req_file}"
+                    )));
+                }
+            }
+
+            let (cur_commit, rem_commit, recent_commits) =
+                inspect_local_repo_async(&self.shutdown_token, repo_dir).await?;
+
+            self.emit_stage(
+                LocalFilterServiceState::Deploying,
+                Some("正在配置 Python 虚拟环境与推理依赖...".into()),
+                None,
+            );
+
+            let venv_py = venv_python_path(&self.paths.filter_venv_dir);
+            let has_valid_venv = if is_executable_file(&venv_py) {
+                match venv_has_pip_async(&self.shutdown_token, &venv_py).await {
+                    Ok(valid) => valid,
+                    Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => {
+                        return Err(CoreError::Io(err));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "现有 Python 虚拟环境解释器不可执行或已损坏，准备重建虚拟环境"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !has_valid_venv {
+                if self.paths.filter_venv_dir.exists() {
+                    fs::remove_dir_all(&self.paths.filter_venv_dir)?;
+                }
+                let venv_str = clean_os_path(&make_absolute_preserving_symlinks(
+                    &self.paths.filter_venv_dir,
+                ));
+                let out = match run_cancellable_command(
+                    &self.shutdown_token,
+                    OsStr::new(&sys_python),
+                    None,
+                    &["-m", "venv", &venv_str],
+                    &[("PYTHONIOENCODING", "utf-8")],
+                    VENV_CREATE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(out) => out,
+                    Err(err) => {
+                        let _ = fs::remove_dir_all(&self.paths.filter_venv_dir);
+                        return Err(err);
+                    }
+                };
+                if !out.status.success() {
+                    let _ = fs::remove_dir_all(&self.paths.filter_venv_dir);
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return Err(CoreError::Unsupported(format!(
+                        "创建 Python 虚拟环境失败: {stderr}"
+                    )));
+                }
+            }
+
+            let venv_py = venv_python_path(&self.paths.filter_venv_dir);
+            if !is_executable_file(&venv_py) {
+                return Err(CoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Python 虚拟环境创建后未找到解释器",
                 )));
             }
-        }
 
-        let (cur_commit, rem_commit, recent_commits) =
-            inspect_local_repo_async(&self.shutdown_token, repo_dir).await?;
+            let req_path = repo_dir.join("deploy").join("requirements.txt");
+            let req_content = fs::read_to_string(&req_path)?;
+            let has_packages = req_content
+                .lines()
+                .map(str::trim)
+                .any(|line| !line.is_empty() && !line.starts_with('#'));
 
-        self.emit_stage(
-            LocalFilterServiceState::Deploying,
-            Some("正在配置 Python 虚拟环境与推理依赖...".into()),
-            None,
-        );
-
-        let venv_py = venv_python_path(&self.paths.filter_venv_dir);
-        if !is_executable_file(&venv_py) {
-            let venv_str = clean_os_path(&make_absolute_preserving_symlinks(
-                &self.paths.filter_venv_dir,
-            ));
-            let out = run_cancellable_command(
-                &self.shutdown_token,
-                OsStr::new(&sys_python),
-                None,
-                &["-m", "venv", &venv_str],
-                &[("PYTHONIOENCODING", "utf-8")],
-                VENV_CREATE_TIMEOUT,
-            )
-            .await?;
-            if !out.status.success() {
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                return Err(CoreError::Unsupported(format!(
-                    "创建 Python 虚拟环境失败: {stderr}"
-                )));
+            if has_packages {
+                let req_str = clean_os_path(&req_path);
+                let pip_out = run_cancellable_command(
+                    &self.shutdown_token,
+                    venv_py.as_os_str(),
+                    None,
+                    &[
+                        "-m",
+                        "pip",
+                        "install",
+                        "--disable-pip-version-check",
+                        "--timeout",
+                        "20",
+                        "--retries",
+                        "2",
+                        "-r",
+                        &req_str,
+                    ],
+                    &[("PIP_NO_INPUT", "1"), ("PYTHONIOENCODING", "utf-8")],
+                    PIP_INSTALL_TIMEOUT,
+                )
+                .await?;
+                if !pip_out.status.success()
+                    && !venv_deps_importable_async(&self.shutdown_token, &venv_py).await?
+                {
+                    let stderr = String::from_utf8_lossy(&pip_out.stderr).trim().to_string();
+                    return Err(CoreError::Network(format!(
+                        "安装模型 Python 依赖失败: {stderr}"
+                    )));
+                }
             }
+
+            fs::write(&self.paths.filter_runner_path, FILTER_RUNNER_PY)?;
+
+            Ok((env, cur_commit, rem_commit, recent_commits))
         }
+        .await;
 
-        let venv_py = venv_python_path(&self.paths.filter_venv_dir);
-        if !is_executable_file(&venv_py) {
-            return Err(CoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "Python 虚拟环境创建后未找到解释器",
-            )));
-        }
-
-        let req_path = repo_dir.join("deploy").join("requirements.txt");
-        let req_content = fs::read_to_string(&req_path)?;
-        let has_packages = req_content
-            .lines()
-            .map(str::trim)
-            .any(|line| !line.is_empty() && !line.starts_with('#'));
-
-        if has_packages {
-            let req_str = clean_os_path(&req_path);
-            let pip_out = run_cancellable_command(
-                &self.shutdown_token,
-                venv_py.as_os_str(),
-                None,
-                &[
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--timeout",
-                    "20",
-                    "--retries",
-                    "2",
-                    "-r",
-                    &req_str,
-                ],
-                &[("PIP_NO_INPUT", "1"), ("PYTHONIOENCODING", "utf-8")],
-                PIP_INSTALL_TIMEOUT,
-            )
-            .await?;
-            if !pip_out.status.success()
-                && !venv_deps_importable_async(&self.shutdown_token, &venv_py).await
+        if post_checkout.is_err() {
+            if let Some(ref old_sha) = prev_head {
+                let _ = run_git_async(
+                    &self.shutdown_token,
+                    repo_dir,
+                    &["checkout", "--force", "--detach", old_sha],
+                    GIT_FAST_TIMEOUT,
+                )
+                .await;
+            }
+            if let Ok((cur_commit, rem_commit, recent_commits)) =
+                inspect_local_repo_async(&self.shutdown_token, repo_dir).await
             {
-                let stderr = String::from_utf8_lossy(&pip_out.stderr).trim().to_string();
-                return Err(CoreError::Network(format!(
-                    "安装模型 Python 依赖失败: {stderr}"
-                )));
+                let mut st = self.state.lock().unwrap();
+                st.update_available = match (&cur_commit, &rem_commit) {
+                    (Some(c), Some(r)) => c.sha != r.sha,
+                    _ => false,
+                };
+                st.current_commit = cur_commit;
+                st.remote_latest_commit = rem_commit;
+                st.recent_commits = recent_commits;
             }
         }
 
-        fs::write(&self.paths.filter_runner_path, FILTER_RUNNER_PY)?;
-
-        Ok((env, cur_commit, rem_commit, recent_commits))
+        post_checkout
     }
 
-    pub async fn start_service(
-        &self,
-        params: &FilterModelParams,
-    ) -> Result<LocalFilterDeploymentStatus, CoreError> {
-        let sanitized = params.sanitized();
-        self.set_desired_params(&sanitized);
+    pub async fn current_repo_head_sha(&self) -> Option<String> {
+        let repo_dir = &self.paths.filter_repo_dir;
+        if !repo_dir.join(".git").exists() {
+            return None;
+        }
+        rev_parse_async(&self.shutdown_token, repo_dir, "HEAD")
+            .await
+            .ok()
+    }
+
+    pub async fn start_service(&self) -> Result<LocalFilterDeploymentStatus, CoreError> {
         *self.last_auto_restart_at.lock().unwrap() = None;
         let mut runner_guard = self.op_lock.lock().await;
         self.reap_exited_runner(&mut runner_guard);
+        let sanitized = self.desired_params.read().unwrap().clone();
         if runner_guard.is_some() {
             self.sync_or_restart_runner_locked(&mut runner_guard, &sanitized)
                 .await?;
@@ -987,7 +1080,15 @@ impl LocalFilterManager {
             .start_runner_locked(&mut runner_guard, &sanitized)
             .await
         {
-            self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
+            let err_msg = err.to_string();
+            let should_emit = {
+                let st = self.state.lock().unwrap();
+                st.service_state != LocalFilterServiceState::Error
+                    || st.last_error.as_deref() != Some(err_msg.as_str())
+            };
+            if should_emit {
+                self.emit_stage(LocalFilterServiceState::Error, None, Some(err_msg));
+            }
             return Err(err);
         }
         drop(runner_guard);
@@ -1003,7 +1104,6 @@ impl LocalFilterManager {
         params: &FilterModelParams,
     ) -> Result<String, CoreError> {
         let sanitized = params.sanitized();
-        self.set_desired_params(&sanitized);
         let mut runner_guard = self.op_lock.lock().await;
         self.reap_exited_runner(&mut runner_guard);
         if runner_guard.is_some() {
@@ -1043,7 +1143,10 @@ impl LocalFilterManager {
 
     pub async fn stop_service(&self) -> Result<LocalFilterDeploymentStatus, CoreError> {
         let mut runner_guard = self.op_lock.lock().await;
-        self.stop_runner_inner(&mut runner_guard).await;
+        {
+            let _exec = self.predict_execution.write().await;
+            self.stop_runner_inner(&mut runner_guard).await;
+        }
         {
             let mut st = self.state.lock().unwrap();
             st.service_state = LocalFilterServiceState::Stopped;
@@ -1065,6 +1168,8 @@ impl LocalFilterManager {
         if let Ok(mut runner_guard) =
             tokio::time::timeout(Duration::from_secs(5), self.op_lock.lock()).await
         {
+            let _exec =
+                tokio::time::timeout(Duration::from_secs(2), self.predict_execution.write()).await;
             self.stop_runner_inner(&mut runner_guard).await;
         }
         let mut st = self.state.lock().unwrap();
@@ -1075,16 +1180,21 @@ impl LocalFilterManager {
         st.stage_message = None;
     }
 
-    pub async fn reconfigure_params(&self, params: &FilterModelParams) -> Result<(), CoreError> {
-        let sanitized = params.sanitized();
-        self.set_desired_params(&sanitized);
+    pub async fn reconfigure_to_desired(&self) -> Result<(), CoreError> {
         let mut guard = self.op_lock.lock().await;
         self.reap_exited_runner(&mut guard);
         if guard.is_some() {
-            self.sync_or_restart_runner_locked(&mut guard, &sanitized)
+            let latest = self.desired_params.read().unwrap().clone();
+            self.sync_or_restart_runner_locked(&mut guard, &latest)
                 .await?;
         }
         Ok(())
+    }
+
+    pub async fn reconfigure_params(&self, params: &FilterModelParams) -> Result<(), CoreError> {
+        let sanitized = params.sanitized();
+        self.set_desired_params(&sanitized);
+        self.reconfigure_to_desired().await
     }
 
     /// Ensures the active runner's parameters match `sanitized_params`.
@@ -1113,6 +1223,11 @@ impl LocalFilterManager {
             return Ok(endpoint);
         }
 
+        let _exec = self.predict_execution.write().await;
+        if synced_arc.lock().unwrap().as_ref() == Some(sanitized_params) {
+            return Ok(endpoint);
+        }
+
         match self
             .post_configure_http(port, &token, sanitized_params)
             .await
@@ -1123,6 +1238,9 @@ impl LocalFilterManager {
             }
             Err(PredictLocalError::Transport(cfg_err) | PredictLocalError::HttpStatus(cfg_err)) => {
                 *synced_arc.lock().unwrap() = None;
+                if self.shutdown_token.is_cancelled() {
+                    return Err(cfg_err);
+                }
                 tracing::warn!(
                     error = %cfg_err,
                     "同步本地过滤运行参数失败，正在重启守护进程以避免旧参数误判"
@@ -1132,11 +1250,15 @@ impl LocalFilterManager {
                     .start_runner_locked(runner_guard, sanitized_params)
                     .await
                 {
-                    self.emit_stage(
-                        LocalFilterServiceState::Error,
-                        None,
-                        Some(restart_err.to_string()),
-                    );
+                    let err_msg = restart_err.to_string();
+                    let should_emit = {
+                        let st = self.state.lock().unwrap();
+                        st.service_state != LocalFilterServiceState::Error
+                            || st.last_error.as_deref() != Some(err_msg.as_str())
+                    };
+                    if should_emit {
+                        self.emit_stage(LocalFilterServiceState::Error, None, Some(err_msg));
+                    }
                     return Err(restart_err);
                 }
                 let restarted_ep = runner_guard
@@ -1162,19 +1284,31 @@ impl LocalFilterManager {
         params: &FilterModelParams,
     ) -> Result<(), PredictLocalError> {
         let url = format!("http://127.0.0.1:{port}/configure");
-        let resp = self
+        let send_fut = self
             .http_client
             .post(&url)
             .timeout(CONFIGURE_HTTP_TIMEOUT)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             .json(&params.sanitized())
-            .send()
-            .await
-            .map_err(|e| {
-                PredictLocalError::Transport(CoreError::Network(format!(
-                    "同步本地过滤运行参数失败: {e}"
-                )))
-            })?;
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = self.shutdown_token.cancelled() => {
+                return Err(PredictLocalError::Transport(CoreError::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "操作在应用退出时被取消",
+                    ),
+                )));
+            }
+            res = send_fut => {
+                res.map_err(|e| {
+                    PredictLocalError::Transport(CoreError::Network(format!(
+                        "同步本地过滤运行参数失败: {e}"
+                    )))
+                })?
+            }
+        };
         if !resp.status().is_success() {
             return Err(PredictLocalError::HttpStatus(CoreError::Network(format!(
                 "同步本地过滤运行参数返回 HTTP {}",
@@ -1194,17 +1328,20 @@ impl LocalFilterManager {
         params: &FilterModelParams,
     ) -> Result<FilterProbabilities, CoreError> {
         let sanitized = params.sanitized();
-        self.set_desired_params(&sanitized);
 
-        let effective_imgs: &[String] = if sanitized.enable_image {
-            let cap = images_base64.len().min(sanitized.max_images as usize);
-            &images_base64[..cap]
+        let effective_imgs: Vec<String> = if sanitized.enable_image {
+            images_base64
+                .iter()
+                .filter(|s| !s.trim().is_empty())
+                .take(sanitized.max_images as usize)
+                .cloned()
+                .collect()
         } else {
-            &[]
+            Vec::new()
         };
 
         let sub_batches =
-            split_images_by_raw_budget(effective_imgs, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES);
+            split_images_by_raw_budget(&effective_imgs, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES);
         let mut sub_results = Vec::with_capacity(sub_batches.len());
 
         for sub_imgs in sub_batches {
@@ -1224,6 +1361,20 @@ impl LocalFilterManager {
 
         merge_managed_predictions(sub_results, &sanitized)
             .ok_or_else(|| CoreError::Network("本地过滤模型未返回完整的逐图评分".into()))
+    }
+
+    fn endpoint_matches_synced(
+        &self,
+        endpoint: &str,
+        sanitized_params: &FilterModelParams,
+    ) -> bool {
+        let st = self.state.lock().unwrap();
+        if let (Some(ref ep), Some(ref synced_arc)) =
+            (&st.service_endpoint, &st.active_runner_synced)
+        {
+            return ep == endpoint && synced_arc.lock().unwrap().as_ref() == Some(sanitized_params);
+        }
+        false
     }
 
     async fn ensure_synced_endpoint_for_predict(
@@ -1295,29 +1446,60 @@ impl LocalFilterManager {
         auto_restart: bool,
         sanitized_params: &FilterModelParams,
     ) -> Result<ManagedFilterPrediction, CoreError> {
-        let endpoint = self
-            .ensure_synced_endpoint_for_predict(sanitized_params, auto_restart)
-            .await?;
+        let (endpoint, send_result) = {
+            let mut chosen_endpoint = String::new();
+            let mut exec_guard_opt = None;
+            for _ in 0..2 {
+                let ep = self
+                    .ensure_synced_endpoint_for_predict(sanitized_params, auto_restart)
+                    .await?;
+                let exec_guard = self.predict_execution.read().await;
+                if self.endpoint_matches_synced(&ep, sanitized_params) {
+                    chosen_endpoint = ep;
+                    exec_guard_opt = Some(exec_guard);
+                    break;
+                }
+            }
+            let Some(_exec_guard) = exec_guard_opt else {
+                return Err(CoreError::Network(
+                    "本地过滤运行参数正在切换，请重试评估".into(),
+                ));
+            };
+            let res = self.send_predict_http(&chosen_endpoint, payload).await;
+            (chosen_endpoint, res)
+        };
 
-        match self.send_predict_http(&endpoint, payload).await {
+        match send_result {
             Ok(probs) => Ok(probs),
             Err(PredictLocalError::HttpStatus(err)) => Err(err),
             Err(PredictLocalError::Transport(err)) => {
+                if self.shutdown_token.is_cancelled() {
+                    return Err(err);
+                }
                 let mut guard = self.op_lock.lock().await;
                 self.reap_exited_runner(&mut guard);
 
                 // If the runner bound to `endpoint` suffered a transport failure, terminate it before recovery
+                let mut terminated_status: Option<LocalFilterDeploymentStatus> = None;
                 if guard.as_ref().is_some_and(|r| r.endpoint == endpoint) {
+                    let _exec = self.predict_execution.write().await;
                     self.stop_runner_inner(&mut guard).await;
                     let mut st = self.state.lock().unwrap();
                     st.service_state = LocalFilterServiceState::Error;
                     st.service_endpoint = None;
                     st.running_pid = None;
                     st.active_runner_synced = None;
+                    st.stage_message = None;
                     st.last_error = Some(err.to_string());
+                    let env = st.last_env.clone().unwrap_or_default();
+                    terminated_status = Some(self.snapshot_from_state(env, &st));
                 }
 
                 if !auto_restart || !self.is_deployed() {
+                    if let Some(status) = terminated_status {
+                        self.events
+                            .emit(CoreEvent::LocalFilterStatusChanged { status });
+                    }
                     return Err(err);
                 }
 
@@ -1329,6 +1511,10 @@ impl LocalFilterManager {
                     {
                         let mut last_restart = self.last_auto_restart_at.lock().unwrap();
                         if last_restart.is_some_and(|t| t.elapsed() < AUTO_RESTART_COOLDOWN) {
+                            if let Some(status) = terminated_status {
+                                self.events
+                                    .emit(CoreEvent::LocalFilterStatusChanged { status });
+                            }
                             return Err(err);
                         }
                         *last_restart = Some(Instant::now());
@@ -1350,6 +1536,12 @@ impl LocalFilterManager {
                 };
                 drop(guard);
 
+                let _exec_guard = self.predict_execution.read().await;
+                if !self.endpoint_matches_synced(&retry_endpoint, sanitized_params) {
+                    return Err(CoreError::Network(
+                        "本地过滤运行参数正在切换，请重试评估".into(),
+                    ));
+                }
                 match self.send_predict_http(&retry_endpoint, payload).await {
                     Ok(probs) => Ok(probs),
                     Err(PredictLocalError::Transport(e) | PredictLocalError::HttpStatus(e)) => {
@@ -1366,18 +1558,30 @@ impl LocalFilterManager {
         payload: &RawFilterPredictRequest,
     ) -> Result<ManagedFilterPrediction, PredictLocalError> {
         let url = format!("{}/predict", endpoint.trim_end_matches('/'));
-        let resp = self
+        let send_fut = self
             .http_client
             .post(&url)
             .timeout(PREDICT_HTTP_TIMEOUT)
             .json(payload)
-            .send()
-            .await
-            .map_err(|e| {
-                PredictLocalError::Transport(CoreError::Network(format!(
-                    "调用本地过滤模型推理失败: {e}"
-                )))
-            })?;
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = self.shutdown_token.cancelled() => {
+                return Err(PredictLocalError::Transport(CoreError::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "操作在应用退出时被取消",
+                    ),
+                )));
+            }
+            res = send_fut => {
+                res.map_err(|e| {
+                    PredictLocalError::Transport(CoreError::Network(format!(
+                        "调用本地过滤模型推理失败: {e}"
+                    )))
+                })?
+            }
+        };
         if !resp.status().is_success() {
             let status = resp.status();
             let detail = resp.text().await.unwrap_or_default();
@@ -1423,6 +1627,22 @@ impl LocalFilterManager {
             None,
         );
 
+        let res = self
+            .start_runner_body_locked(runner_guard, &venv_py, params)
+            .await;
+        if let Err(ref err) = res {
+            self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
+            *self.last_auto_restart_at.lock().unwrap() = Some(Instant::now());
+        }
+        res
+    }
+
+    async fn start_runner_body_locked(
+        &self,
+        runner_guard: &mut Option<RunningRunner>,
+        venv_py: &Path,
+        params: &FilterModelParams,
+    ) -> Result<(), CoreError> {
         let rng = SystemRandom::new();
         let mut token_bytes = [0u8; 32];
         rng.fill(&mut token_bytes)
@@ -1433,7 +1653,7 @@ impl LocalFilterManager {
         let params_json =
             serde_json::to_string(&boot_params).map_err(|e| CoreError::Config(e.to_string()))?;
 
-        let mut cmd = tokio::process::Command::new(&venv_py);
+        let mut cmd = tokio::process::Command::new(venv_py);
         cmd.args([
             &clean_os_path(&self.paths.filter_runner_path),
             "--host",
@@ -1750,6 +1970,7 @@ impl LocalFilterManager {
             recent_commits: st.recent_commits.clone(),
             stage_message: st.stage_message.clone(),
             last_error: st.last_error.clone(),
+            cache_generation: None,
         }
     }
 }
@@ -1842,8 +2063,47 @@ async fn run_cancellable_command(
     }
 }
 
-async fn venv_deps_importable_async(cancel: &CancellationToken, venv_py: &Path) -> bool {
-    run_cancellable_command(
+async fn venv_has_pip_async(cancel: &CancellationToken, venv_py: &Path) -> Result<bool, CoreError> {
+    let out = run_cancellable_command(
+        cancel,
+        venv_py.as_os_str(),
+        None,
+        &["-m", "pip", "--version"],
+        &[("PYTHONIOENCODING", "utf-8")],
+        Duration::from_secs(20),
+    )
+    .await?;
+    Ok(out.status.success())
+}
+
+async fn is_valid_git_repo_async(
+    cancel: &CancellationToken,
+    repo_dir: &Path,
+) -> Result<bool, CoreError> {
+    let out = run_cancellable_command(
+        cancel,
+        OsStr::new("git"),
+        Some(repo_dir),
+        &[
+            "--git-dir",
+            ".git",
+            "--work-tree",
+            ".",
+            "rev-parse",
+            "--is-inside-work-tree",
+        ],
+        GIT_STALL_ENVS,
+        GIT_FAST_TIMEOUT,
+    )
+    .await?;
+    Ok(out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true")
+}
+
+async fn venv_deps_importable_async(
+    cancel: &CancellationToken,
+    venv_py: &Path,
+) -> Result<bool, CoreError> {
+    let out = run_cancellable_command(
         cancel,
         venv_py.as_os_str(),
         None,
@@ -1851,8 +2111,8 @@ async fn venv_deps_importable_async(cancel: &CancellationToken, venv_py: &Path) 
         &[("PYTHONIOENCODING", "utf-8")],
         Duration::from_secs(20),
     )
-    .await
-    .is_ok_and(|out| out.status.success())
+    .await?;
+    Ok(out.status.success())
 }
 
 async fn run_git_async(
@@ -2368,5 +2628,40 @@ mod tests {
         assert_eq!(probs.per_image_probs, vec![0.10, 0.88]);
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn is_valid_git_repo_rejects_corrupt_git_dir_inside_parent_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init must succeed");
+
+        let corrupt_child = dir.path().join("corrupt-child");
+        fs::create_dir_all(corrupt_child.join(".git")).unwrap();
+
+        let cancel = CancellationToken::new();
+        assert!(
+            is_valid_git_repo_async(&cancel, dir.path()).await.unwrap(),
+            "valid parent git repo must be accepted"
+        );
+        assert!(
+            !is_valid_git_repo_async(&cancel, &corrupt_child)
+                .await
+                .unwrap(),
+            "corrupt nested .git directory must NOT fall back to ancestor git repo"
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(
+            is_valid_git_repo_async(&cancelled, dir.path())
+                .await
+                .is_err(),
+            "cancelled token must return Err rather than Ok(false)"
+        );
     }
 }

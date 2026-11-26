@@ -1,4 +1,4 @@
-import { useState, type ChangeEvent } from 'react';
+import { useRef, useState, type ChangeEvent } from 'react';
 import {
   Activity,
   FlaskConical,
@@ -102,11 +102,8 @@ function NumericInput({
       setEditState(null);
       return;
     }
-    const trimmed = editState.raw.trim();
-    const parsed = integer
-      ? Number.parseInt(trimmed, 10)
-      : Number.parseFloat(trimmed);
-    if (trimmed !== '' && Number.isFinite(parsed)) {
+    const parsed = parseCompleteNumber(editState.raw, integer);
+    if (parsed !== null) {
       const normalized = integer ? Math.round(parsed) : parsed;
       const clamped = Math.min(max, Math.max(min, normalized));
       const clean = clamped === 0 ? 0 : clamped;
@@ -177,6 +174,7 @@ export function FilterPanel({
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  const statusReqSeqRef = useRef(0);
 
   // Test sandbox state
   const [testWorkshopInput, setTestWorkshopInput] = useState('');
@@ -188,7 +186,16 @@ export function FilterPanel({
   const [testResult, setTestResult] = useState<FilterProbabilities | null>(null);
 
   const effective = draft ?? filter.config;
-  const dirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(filter.config);
+  const normalizeConfigForDirty = (cfg: CatalogFilterConfigDto): CatalogFilterConfigDto => ({
+    ...cfg,
+    deployDir: undefined,
+    pythonBin: undefined,
+    upstreamUrl: cfg.upstreamUrl?.trim() || undefined,
+  });
+  const dirty =
+    draft !== null &&
+    JSON.stringify(normalizeConfigForDirty(draft)) !==
+      JSON.stringify(normalizeConfigForDirty(filter.config));
   const activePreset = detectFilterPreset(effective.params);
 
   const updateDraft = (updater: (curr: CatalogFilterConfigDto) => CatalogFilterConfigDto) => {
@@ -203,10 +210,13 @@ export function FilterPanel({
   };
 
   const handleRefreshStatus = async () => {
+    const seq = ++statusReqSeqRef.current;
     setRefreshing(true);
     try {
       const next = await getFilterStatus();
-      onFilterUpdated(next);
+      if (seq === statusReqSeqRef.current) {
+        onFilterUpdated(next);
+      }
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
     } finally {
@@ -215,10 +225,13 @@ export function FilterPanel({
   };
 
   const handleRestart = async () => {
+    const seq = ++statusReqSeqRef.current;
     setRestarting(true);
     try {
       const next = await restartFilterBackend();
-      onFilterUpdated(next);
+      if (seq === statusReqSeqRef.current) {
+        onFilterUpdated(next);
+      }
       onNotify(
         next.ready
           ? '内容过滤推理后端已重启并就绪'
@@ -232,11 +245,15 @@ export function FilterPanel({
   };
 
   const handleSaveConfig = async () => {
+    const seq = ++statusReqSeqRef.current;
+    const savedDraft = draft;
     setSaving(true);
     try {
       const next = await updateFilterConfig(buildConfigPayload(effective));
-      setDraft(null);
-      onFilterUpdated(next);
+      setDraft((curr) => (curr === savedDraft ? null : curr));
+      if (seq === statusReqSeqRef.current) {
+        onFilterUpdated(next);
+      }
       onNotify('内容过滤配置已应用并持久化至 catalog.toml');
     } catch (err) {
       onNotify(err instanceof Error ? err.message : String(err), 'error');
@@ -292,12 +309,16 @@ export function FilterPanel({
     const req = buildSandboxRequest();
     if (!req) return;
 
+    const seq = ++statusReqSeqRef.current;
+    const savedDraft = draft;
     setSaving(true);
     setTesting(true);
     try {
       const next = await updateFilterConfig(buildConfigPayload(effective));
-      setDraft(null);
-      onFilterUpdated(next);
+      setDraft((curr) => (curr === savedDraft ? null : curr));
+      if (seq === statusReqSeqRef.current) {
+        onFilterUpdated(next);
+      }
       const probs = await testFilterPredict(req);
       setTestResult(probs);
       onNotify('内容过滤配置已保存并完成概率试算');
@@ -333,7 +354,7 @@ export function FilterPanel({
           <button
             type="button"
             className="cat-btn"
-            disabled={refreshing}
+            disabled={refreshing || saving || restarting}
             onClick={() => void handleRefreshStatus()}
           >
             <RefreshCw size={14} className={refreshing ? 'cat-spin' : undefined} />
@@ -342,7 +363,7 @@ export function FilterPanel({
           <button
             type="button"
             className="cat-btn"
-            disabled={restarting}
+            disabled={restarting || saving || testing || refreshing}
             onClick={() => void handleRestart()}
           >
             <RotateCcw size={14} className={restarting ? 'cat-spin' : undefined} />
@@ -435,7 +456,7 @@ export function FilterPanel({
                 <button
                   type="button"
                   className="cat-btn cat-btn-sm"
-                  disabled={saving}
+                  disabled={saving || restarting}
                   onClick={() => setDraft(null)}
                 >
                   撤销修改
@@ -444,7 +465,7 @@ export function FilterPanel({
               <button
                 type="button"
                 className="cat-btn cat-btn-primary cat-btn-sm"
-                disabled={!dirty || saving}
+                disabled={!dirty || saving || restarting || testing}
                 onClick={() => void handleSaveConfig()}
               >
                 <Save size={13} />
@@ -556,7 +577,7 @@ export function FilterPanel({
                   id="cat-filter-deploy-dir"
                   className="cat-input cat-mono"
                   placeholder="在主机的 catalog.toml 中配置"
-                  value={effective.deployDir ?? ''}
+                  value={filter.config.deployDir ?? ''}
                   readOnly
                 />
               </div>
@@ -568,7 +589,7 @@ export function FilterPanel({
                   id="cat-filter-python-bin"
                   className="cat-input cat-mono"
                   placeholder="留空自动探测 .venv / python3"
-                  value={effective.pythonBin ?? ''}
+                  value={filter.config.pythonBin ?? ''}
                   readOnly
                 />
               </div>
@@ -771,6 +792,7 @@ export function FilterPanel({
               <button
                 type="button"
                 className="cat-btn cat-btn-sm"
+                disabled={testing}
                 onClick={() => {
                   setTestWorkshopInput('');
                   setTestTitle('');
@@ -787,7 +809,7 @@ export function FilterPanel({
                   <button
                     type="button"
                     className="cat-btn cat-btn-sm"
-                    disabled={testing || saving}
+                    disabled={testing || saving || restarting}
                     onClick={() => void handleRunTest()}
                   >
                     <Play size={13} />
@@ -796,7 +818,7 @@ export function FilterPanel({
                   <button
                     type="button"
                     className="cat-btn cat-btn-primary cat-btn-sm"
-                    disabled={testing || saving}
+                    disabled={testing || saving || restarting}
                     onClick={() => void handleSaveAndTest()}
                   >
                     <Save size={13} />
@@ -807,7 +829,7 @@ export function FilterPanel({
                 <button
                   type="button"
                   className="cat-btn cat-btn-primary cat-btn-sm"
-                  disabled={testing || saving}
+                  disabled={testing || saving || restarting}
                   onClick={() => void handleRunTest()}
                 >
                   <Play size={13} />

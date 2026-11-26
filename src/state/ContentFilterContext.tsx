@@ -18,7 +18,10 @@ export interface ContentFilterContextValue {
   failedTargetKeys: ReadonlySet<string>;
   evalError: string | null;
   revealCard: (cardKey: string) => void;
-  registerWorkshopItems: (items: WorkshopItemRecord[]) => void;
+  registerWorkshopItems: (
+    items: WorkshopItemRecord[],
+    options?: { onlyIfMissing?: boolean },
+  ) => void;
   retryFailedEvaluations: () => void;
   upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
   deleteFilterExclusion: (addonId: AddonId) => Promise<boolean>;

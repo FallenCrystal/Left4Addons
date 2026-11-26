@@ -30,10 +30,10 @@ import type {
 import { useContentFilterContext } from '../../state/ContentFilterContext';
 import {
   getFilteredAddonFallbackCover,
-  addonFilterKey,
   collectAddonImageSources,
   formatRedactedAddonLabel,
   isAddonTitleRedacted,
+  resolveAddonVerdict,
   resolveLibraryAddonDetailFilter,
 } from '../../utils/contentFilter';
 import {
@@ -103,6 +103,7 @@ export function AddonDetailSheet({
   onCopy,
 }: AddonDetailSheetProps) {
   const { t } = useTranslation();
+  const [trackedAddonId, setTrackedAddonId] = useState<string | null>(addon?.id ?? null);
   const [tab, setTab] = useState<'info' | 'maps'>('info');
   const [showZeroFlags, setShowZeroFlags] = useState(false);
   const [draftExclAddonId, setDraftExclAddonId] = useState<string | null>(null);
@@ -110,9 +111,18 @@ export function AddonDetailSheet({
   const [draftBindFingerprint, setDraftBindFingerprint] = useState<boolean>(true);
   const tabsId = useId();
 
+  const currentAddonId = addon?.id ?? null;
+  if (trackedAddonId !== currentAddonId) {
+    setTrackedAddonId(currentAddonId);
+    setTab('info');
+    setShowZeroFlags(false);
+    setDraftExclAddonId(null);
+    setDraftLevel('lazy_load');
+    setDraftBindFingerprint(true);
+  }
+
   const filterCtx = useContentFilterContext();
   const {
-    verdicts,
     exclusionsByAddonId,
     upsertFilterExclusion,
     deleteFilterExclusion,
@@ -143,7 +153,7 @@ export function AddonDetailSheet({
 
   const installed = addon.installState === 'installed';
   const exclusion = exclusionsByAddonId.get(addon.id);
-  const verdict = verdicts[addonFilterKey(addon.id)];
+  const verdict = resolveAddonVerdict(addon, filterCtx) ?? undefined;
   const detailFilter = resolveLibraryAddonDetailFilter(addon, filterCtx);
   const addonImageSources = collectAddonImageSources(addon);
 
@@ -585,6 +595,7 @@ export function AddonDetailSheet({
                 <Select<ExclusionDisplayLevel>
                   ariaLabel={t('filter.exclusionLevelLabel')}
                   value={effectiveDraftLevel}
+                  disabled={busy}
                   onChange={(nextLevel) => {
                     setDraftExclAddonId(addon.id);
                     setDraftLevel(nextLevel);
@@ -643,7 +654,14 @@ export function AddonDetailSheet({
                     size="sm"
                     disabled={busy}
                     icon={<Trash2 size={14} />}
-                    onClick={() => void deleteFilterExclusion(addon.id)}
+                    onClick={async () => {
+                      const ok = await deleteFilterExclusion(addon.id);
+                      if (ok) {
+                        setDraftExclAddonId(null);
+                        setDraftLevel('lazy_load');
+                        setDraftBindFingerprint(true);
+                      }
+                    }}
                   >
                     {t('filter.removeExclusion')}
                   </Button>
@@ -680,6 +698,7 @@ export function AddonDetailSheet({
                 <IconButton
                   size="sm"
                   label={t('library.addToGroup')}
+                  disabled={busy}
                   onClick={() => onAddToGroup(addon)}
                 >
                   <Plus size={16} />
@@ -699,6 +718,7 @@ export function AddonDetailSheet({
                       key={g.id}
                       label={g.name}
                       tone="surface"
+                      disabled={busy}
                       icon={
                         g.color ? (
                           <span
@@ -746,13 +766,23 @@ export function AddonDetailSheet({
                   {t('detail.description')}
                 </span>
                 <div className="md-body-small selectable l4a-description-box">
-                  {detailFilter.redactText ? t('filter.redactedDescription') : description}
+                  {detailFilter.redactText
+                    ? detailFilter.pendingEvaluation
+                      ? t('filter.evaluatingMedia')
+                      : t('filter.redactedDescription')
+                    : description}
                 </div>
               </div>
             )}
 
             {detailFilter.redactText ? (
-              <div className="md-body-small l4a-description-box">{t('filter.redactedMeta')}</div>
+              <div className="md-body-small l4a-description-box">
+                {detailFilter.pendingEvaluation
+                  ? t('filter.evaluatingMedia')
+                  : detailFilter.exclusionActive
+                    ? t('filter.redactedMeta')
+                    : t('filter.redactedDescription')}
+              </div>
             ) : (
               (visibleInfoEntries.length > 0 || zeroFlagEntries.length > 0) && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>

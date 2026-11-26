@@ -86,10 +86,12 @@ export function BundlesTab({
         const coverPres = resolveBundleCoverPresentation(visibleMembers, filterCtx, {
           allMembers,
           bundleCoverImage: bundle.coverImage,
+          bundleName: bundle.name,
         });
-        const bundleDisplayName = coverPres.redactTitle
-          ? formatRedactedAddonLabel(visibleMembers.find((m) => m.workshopId)?.workshopId, t)
-          : bundle.name;
+        const bundleDisplayName =
+          coverPres.redactTitle || coverPres.blurWholeCard
+            ? formatRedactedAddonLabel(visibleMembers.find((m) => m.workshopId)?.workshopId, t)
+            : bundle.name;
 
         return (
           <article

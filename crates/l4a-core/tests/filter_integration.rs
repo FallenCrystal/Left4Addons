@@ -3409,3 +3409,467 @@ async fn malformed_unicode_data_urls_do_not_panic_and_concurrent_ipc_batches_are
         "expected global filter_eval_semaphore to bound concurrent /predict calls to <= 4, got {observed_peak}"
     );
 }
+
+#[tokio::test]
+async fn ws_target_with_addon_id_caches_cleanly_failed_token_preserves_llm_cache_and_startup_failure_enters_error_cooldown(
+) {
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("loading");
+    std::fs::create_dir_all(&loading).unwrap();
+
+    let vpk_path = loading.join("safe_campaign.vpk");
+    create_test_vpk(
+        &vpk_path,
+        "Safe Campaign",
+        "Mapper",
+        false,
+        None,
+        b"safe-campaign-payload",
+    );
+
+    let predict_calls = Arc::new(AtomicUsize::new(0));
+    let predict_calls_srv = predict_calls.clone();
+    let app = Router::new().route(
+        "/predict",
+        post(move || {
+            let calls = predict_calls_srv.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::Json(serde_json::json!({
+                    "prob": 0.12,
+                    "gore_prob": 0.05,
+                    "nsfw_prob": 0.10
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/predict")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    let snap = engine.scan().unwrap();
+    let addon = snap.addons.first().expect("scanned addon").clone();
+
+    // 1. A `ws:` target carrying both `addon_id` and a `https://` URL in `revision_hint` (4+ colons)
+    //    must NOT be misclassified as a stale local addon and must hit cache on repeat evaluation.
+    let ws_target = FilterEvaluationTarget {
+        target_key: "ws:123456".into(),
+        addon_id: Some(addon.id.clone()),
+        workshop_id: Some(l4a_protocol::WorkshopId(123456)),
+        title: "Workshop Mirror Item".into(),
+        description: Some("Clean description".into()),
+        tags: vec!["Campaign".into()],
+        image_sources: vec![],
+        revision_hint: Some(
+            "1763900000:Workshop Mirror Item:imgs=1:https://images.steamusercontent.com/ugc/1/a.jpg"
+                .into(),
+        ),
+        bypass_cache: false,
+    };
+    let first = engine
+        .evaluate_filter_items(vec![ws_target.clone()])
+        .await
+        .unwrap();
+    assert_eq!(first.items.len(), 1);
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 1);
+
+    let second = engine.evaluate_filter_items(vec![ws_target]).await.unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(
+        predict_calls.load(Ordering::SeqCst),
+        1,
+        "ws: target with addon_id and URL revision_hint must hit SQLite cache"
+    );
+
+    // 2. Failing `set_filter_llm_token` (oversized >8192 bytes) must NOT wipe existing LLM verdicts.
+    let active_sig = first.policy_signature.clone();
+    let llm_verdict = l4a_protocol::FilterItemVerdict {
+        target_key: "ws:llm-keep".into(),
+        revision_hint: None,
+        flagged: true,
+        decision_source: FilterDecisionSource::LlmFlaggedTrue,
+        evaluated_score: 0.45,
+        probabilities: FilterProbabilities {
+            prob: 0.45,
+            gore_prob: 0.10,
+            nsfw_prob: 0.44,
+            ..Default::default()
+        },
+        text_sensitive: true,
+        title_sensitive: true,
+        description_sensitive: false,
+        image_sensitive: false,
+        evaluated_image_indices: vec![],
+        sensitive_image_indices: vec![],
+        complete: true,
+        evaluated_at: chrono::Utc::now(),
+    };
+    engine
+        .db()
+        .put_cached_filter_verdict(
+            "ws:llm-keep",
+            "sig-keep",
+            None,
+            &active_sig,
+            &active_sig,
+            &llm_verdict,
+        )
+        .unwrap();
+    let too_long = "x".repeat(9000);
+    assert!(engine.set_filter_llm_token(Some(too_long)).is_err());
+    let still_cached = engine
+        .db()
+        .get_cached_filter_verdict("ws:llm-keep", "sig-keep", &active_sig, None, None)
+        .unwrap();
+    assert!(
+        still_cached.is_some(),
+        "failed vault.seal must not delete cached LLM verdicts"
+    );
+
+    // 3. When auto-start fails after emitting `Starting`, `service_state` must transition to `Error`
+    //    (never stuck in `Starting`) and enforce the 3s restart cooldown on immediate retries.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let paths = engine.paths();
+        let deploy_dir = paths.filter_repo_dir.join("deploy");
+        std::fs::create_dir_all(paths.filter_repo_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(&deploy_dir).unwrap();
+        for f in [
+            "l4filter.py",
+            "vision_encoder.onnx",
+            "fusion_head.onnx",
+            "text_vocab.json",
+            "requirements.txt",
+        ] {
+            std::fs::write(deploy_dir.join(f), "stub").unwrap();
+        }
+        let venv_bin = paths.filter_venv_dir.join("bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let failing_py = venv_bin.join("python");
+        std::fs::write(&failing_py, "#!/usr/bin/env sh\necho 'boom' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&failing_py, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(&paths.filter_runner_path, "# stub runner\n").unwrap();
+
+        let mut local_cfg = engine.config();
+        local_cfg.filter.mode = ClientFilterSourceMode::Local;
+        local_cfg.filter.auto_start_local_service = true;
+        engine.save_config_async(local_cfg).await.unwrap();
+
+        let local_target = FilterEvaluationTarget {
+            target_key: "ws:auto-start-fail".into(),
+            addon_id: None,
+            workshop_id: None,
+            title: "Auto Start Failure Probe".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec![],
+            revision_hint: None,
+            bypass_cache: true,
+        };
+        let batch1 = engine
+            .evaluate_filter_items(vec![local_target.clone()])
+            .await
+            .unwrap();
+        match &batch1.items[0].outcome {
+            FilterTargetOutcome::Failed { error } => {
+                assert!(
+                    error.contains("boom"),
+                    "expected failing runner stderr 'boom', got: {error}"
+                );
+            }
+            other => panic!("expected Failed outcome on broken runner boot, got {other:?}"),
+        }
+        let status = engine.get_local_filter_status().await.unwrap();
+        assert_eq!(
+            status.service_state,
+            LocalFilterServiceState::Error,
+            "failed auto-start must transition service_state out of Starting into Error"
+        );
+
+        let batch2 = engine
+            .evaluate_filter_items(vec![local_target])
+            .await
+            .unwrap();
+        match &batch2.items[0].outcome {
+            FilterTargetOutcome::Failed { error } => {
+                assert!(
+                    error.contains("冷却"),
+                    "immediate retry after startup failure must hit 3s cooldown, got: {error}"
+                );
+            }
+            other => panic!("expected cooldown Failed outcome, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn llm_review_with_images_when_model_image_eval_disabled_marks_images_sensitive() {
+    use axum::{routing::post, Json, Router};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let llm_saw_image = Arc::new(AtomicBool::new(false));
+    let llm_saw_image_route = llm_saw_image.clone();
+
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/predict",
+            post(|| async {
+                // Simulate text-only scoring backend (`image_prob: None`, `per_image_probs: []`)
+                Json(serde_json::json!({
+                    "prob": 0.45,
+                    "goreProb": 0.10,
+                    "nsfwProb": 0.44,
+                    "textProb": 0.45,
+                    "titleProb": 0.45
+                }))
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let llm_saw_image = llm_saw_image_route.clone();
+                async move {
+                    let raw = body.to_string();
+                    if raw.contains("image_url") {
+                        llm_saw_image.store(true, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "content": "{\"sensitive\": true}"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}")),
+                enable_direct_flag: true,
+                flag_threshold: 0.80,
+                llm_enabled: true,
+                llm_threshold: 0.20,
+                llm_endpoint: format!("http://{addr}/v1/chat/completions"),
+                llm_model: "mock-vision".into(),
+                llm_send_images: true,
+                llm_token_source: LlmTokenSource::EncryptedLocal,
+                subdivide_modalities: true,
+                modality_threshold: 0.30,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine
+        .set_filter_llm_token(Some("sk-test-token-123".into()))
+        .unwrap();
+
+    // Valid 1x1 PNG data URL
+    let png_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2dIAAAAASUVORK5CYII=";
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:llm-image-fallback".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Borderline Title".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![png_data_url.into()],
+                revision_hint: None,
+                bypass_cache: true,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(verdicts.len(), 1);
+    let verdict = &verdicts[0];
+    assert!(
+        llm_saw_image.load(Ordering::SeqCst),
+        "LLM request must include the image"
+    );
+    assert!(verdict.flagged);
+    assert_eq!(
+        verdict.decision_source,
+        FilterDecisionSource::LlmFlaggedTrue
+    );
+    assert_eq!(verdict.evaluated_image_indices, vec![0]);
+    assert!(
+        verdict.image_sensitive,
+        "LLM flagging with images must conservatively mark images sensitive when model did not score images"
+    );
+    assert_eq!(verdict.sensitive_image_indices, vec![0]);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn custom_endpoint_image_disabled_does_not_fabricate_zero_image_scores_for_llm_flagged_item()
+{
+    use axum::{routing::post, Json, Router};
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let image_only_probes = Arc::new(AtomicUsize::new(0));
+    let image_only_probes_srv = image_only_probes.clone();
+
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/predict",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let image_only_probes_srv = image_only_probes_srv.clone();
+                async move {
+                    let has_title = body
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.trim().is_empty());
+                    if !has_title {
+                        image_only_probes_srv.fetch_add(1, Ordering::SeqCst);
+                        return Json(json!({
+                            "prob": 0.0,
+                            "goreProb": 0.0,
+                            "nsfwProb": 0.0
+                        }));
+                    }
+                    // Simulates an l4a-server / Catalog-compatible endpoint with `enable_image = false`:
+                    // returns textProb/titleProb, omits imageProb/perImageProbs.
+                    Json(json!({
+                        "prob": 0.45,
+                        "goreProb": 0.10,
+                        "nsfwProb": 0.45,
+                        "textProb": 0.45,
+                        "titleProb": 0.45
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(|| async move {
+                Json(json!({
+                    "choices": [{
+                        "message": { "content": "{\"sensitive\": true}" }
+                    }]
+                }))
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/api/v1/filter/predict")),
+                enable_direct_flag: true,
+                flag_threshold: 0.85,
+                subdivide_modalities: true,
+                modality_threshold: 0.30,
+                llm_enabled: true,
+                llm_threshold: 0.25,
+                llm_endpoint: format!("http://{addr}/v1/chat/completions"),
+                llm_model: "test-vision".into(),
+                llm_send_images: true,
+                llm_token_source: LlmTokenSource::EncryptedLocal,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine
+        .set_filter_llm_token(Some("sk-test-token-456".into()))
+        .unwrap();
+
+    let png_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2dIAAAAASUVORK5CYII=";
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:custom-img-disabled".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Borderline Custom Endpoint Title".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![png_data_url.into()],
+                revision_hint: None,
+                bypass_cache: true,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(verdicts.len(), 1);
+    let verdict = &verdicts[0];
+    assert_eq!(
+        image_only_probes.load(Ordering::SeqCst),
+        0,
+        "must not run image-only probes when server returned textProb without imageProb"
+    );
+    assert!(verdict.flagged);
+    assert_eq!(
+        verdict.decision_source,
+        FilterDecisionSource::LlmFlaggedTrue
+    );
+    assert!(
+        verdict.probabilities.image_prob.is_none()
+            && verdict.probabilities.per_image_probs.is_empty(),
+        "image probabilities must remain absent rather than fabricated 0.0"
+    );
+    assert!(
+        verdict.image_sensitive,
+        "LLM flagging with images must preserve image_sensitive=true on image-disabled CustomEndpoint"
+    );
+    assert_eq!(verdict.sensitive_image_indices, vec![0]);
+
+    server_handle.abort();
+}

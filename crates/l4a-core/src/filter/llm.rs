@@ -364,9 +364,32 @@ pub async fn judge_with_openai_llm(
         )));
     }
 
-    let payload: Value = resp
-        .json()
+    const MAX_LLM_RESPONSE_BYTES: usize = 1024 * 1024;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_LLM_RESPONSE_BYTES as u64 {
+            return Err(CoreError::Network(format!(
+                "OpenAI 兼容审核接口响应体超过 {} 字节上限",
+                MAX_LLM_RESPONSE_BYTES
+            )));
+        }
+    }
+    let mut raw_body = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
+        .map_err(|e| CoreError::Network(format!("读取 LLM 响应体失败: {e}")))?
+    {
+        if raw_body.len().saturating_add(chunk.len()) > MAX_LLM_RESPONSE_BYTES {
+            return Err(CoreError::Network(format!(
+                "OpenAI 兼容审核接口响应体超过 {} 字节上限",
+                MAX_LLM_RESPONSE_BYTES
+            )));
+        }
+        raw_body.extend_from_slice(&chunk);
+    }
+
+    let payload: Value = serde_json::from_slice(&raw_body)
         .map_err(|e| CoreError::Network(format!("解析 LLM JSON 响应失败: {e}")))?;
 
     parse_chat_completion_payload(&payload)

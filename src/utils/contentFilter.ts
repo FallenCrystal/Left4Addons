@@ -580,7 +580,7 @@ export function computeFilterPolicySignature(
       break;
     case 'local':
     default:
-      modePart = `local:txt=${p.enableText}:img=${p.enableImage}:max=${p.maxImages}:agg=${rustDebugGalleryAgg(p.galleryAggregation)}:gw=${fmtF32Fixed4(p.goreWeight)}:nw=${fmtF32Fixed4(p.nsfwWeight)}:t=${fmtF32Fixed4(p.temperature)}:b=${fmtF32Fixed4(p.bias)}:commit=${filter.pinnedCommit ?? 'latest'}`;
+      modePart = `local:txt=${p.enableText}:img=${p.enableImage}:max=${p.maxImages}:agg=${rustDebugGalleryAgg(p.galleryAggregation)}:gw=${fmtF32Fixed4(p.goreWeight)}:nw=${fmtF32Fixed4(p.nsfwWeight)}:t=${fmtF32Fixed4(p.temperature)}:b=${fmtF32Fixed4(p.bias)}:commit=${filter.trackLatest ? 'latest' : (filter.pinnedCommit ?? 'latest')}`;
       break;
   }
 
@@ -724,11 +724,14 @@ export function resolveCardFilterState({
         pendingEvaluation: true,
       };
     }
+    const isHideImage = config.flaggedAction === 'hide_image';
     return {
       ...neutral,
       exclusionInvalidated,
       pendingEvaluation: true,
       coverMode: 'hide',
+      redactTitle: isHideImage,
+      redactDescription: isHideImage,
       blurWholeCard:
         config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card',
     };
@@ -741,12 +744,15 @@ export function resolveCardFilterState({
         exclusionInvalidated,
       };
     }
+    const isHideImage = config.flaggedAction === 'hide_image';
     const shouldBlur =
       config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card';
     return {
       ...neutral,
       exclusionInvalidated,
       coverMode: 'hide',
+      redactTitle: isHideImage,
+      redactDescription: isHideImage,
       blurWholeCard: shouldBlur && !revealed,
       isBlurCardRevealed: shouldBlur && revealed,
     };
@@ -821,6 +827,7 @@ export interface ResolveDetailFilterOptions {
   scope: 'library' | 'workshop';
   verdict?: FilterItemVerdict | null;
   exclusion?: FilterExclusionRecord | null;
+  revealed?: boolean;
   totalImages?: number;
   hasTargetFailed?: boolean;
   hasContent?: boolean;
@@ -831,6 +838,7 @@ export function resolveDetailFilterState({
   scope,
   verdict,
   exclusion,
+  revealed = false,
   totalImages,
   hasTargetFailed = false,
   hasContent = true,
@@ -901,6 +909,7 @@ export function resolveDetailFilterState({
       pendingEvaluation: true,
       coverMode: 'hide',
       mapCoverMode: 'hide',
+      redactText: true,
       isImageIndexSensitive: () => true,
       imageModeAt: () => 'hide',
     };
@@ -918,6 +927,7 @@ export function resolveDetailFilterState({
       exclusionInvalidated,
       coverMode: 'blur',
       mapCoverMode: 'blur',
+      redactText: !revealed,
       isImageIndexSensitive: () => true,
       imageModeAt: () => 'blur',
     };
@@ -1005,6 +1015,26 @@ export function resolveWorkshopVerdict(
   );
 }
 
+export function resolveAddonVerdict(
+  addon: AddonSummary,
+  filterCtx: Pick<FilterLookupSource, 'verdicts' | 'evaluatedRevisions'>,
+): FilterItemVerdict | null | undefined {
+  const targetKey = addonFilterKey(addon.id);
+  const expectedRevision = buildAddonRevisionHint(addon);
+  const verdict = filterCtx.verdicts[targetKey];
+  if (verdict) {
+    if (verdict.revisionHint === undefined || verdict.revisionHint === expectedRevision) {
+      return verdict;
+    }
+    return undefined;
+  }
+  const completedRevision = filterCtx.evaluatedRevisions?.[targetKey];
+  if (completedRevision !== undefined && completedRevision === expectedRevision) {
+    return null;
+  }
+  return undefined;
+}
+
 export function resolveLibraryAddonCardFilter(
   addon: AddonSummary,
   filterCtx: FilterLookupSource,
@@ -1014,7 +1044,7 @@ export function resolveLibraryAddonCardFilter(
   return resolveCardFilterState({
     config: filterCtx.filterConfig,
     scope: 'library',
-    verdict: resolveLookupVerdict(key, filterCtx),
+    verdict: resolveAddonVerdict(addon, filterCtx),
     exclusion: filterCtx.exclusionsByAddonId.get(addon.id),
     revealed: filterCtx.revealedCardIds?.has(key) ?? false,
     forceShowHiddenCards: options?.forceShowHiddenCards ?? false,
@@ -1032,8 +1062,9 @@ export function resolveLibraryAddonDetailFilter(
   return resolveDetailFilterState({
     config: filterCtx.filterConfig,
     scope: 'library',
-    verdict: resolveLookupVerdict(key, filterCtx),
+    verdict: resolveAddonVerdict(addon, filterCtx),
     exclusion: filterCtx.exclusionsByAddonId.get(addon.id),
+    revealed: filterCtx.revealedCardIds?.has(key) ?? false,
     totalImages: imageSources.length,
     hasTargetFailed: filterCtx.failedTargetKeys?.has(key) ?? false,
     hasContent: hasFilterableAddonContent(addon),
@@ -1065,20 +1096,138 @@ export function getAddonSearchRedaction(
   filterCtx: FilterLookupSource,
 ): AddonSearchRedactionOptions {
   const state = resolveLibraryAddonCardFilter(addon, filterCtx);
+  const unverifiedCardShielded =
+    (state.blurWholeCard || state.hiddenCard) && !state.flagged && !state.isBlurCardRevealed;
+  const unverifiedTitleShielded = !state.flagged && state.redactTitle;
   const redactTitle =
-    state.redactTitle || ((state.blurWholeCard || state.hiddenCard) && state.titleSensitive);
+    state.redactTitle ||
+    ((state.blurWholeCard || state.hiddenCard) && state.titleSensitive) ||
+    unverifiedCardShielded;
   const redactDescription =
     state.redactDescription ||
-    ((state.blurWholeCard || state.hiddenCard) && state.descriptionSensitive);
+    ((state.blurWholeCard || state.hiddenCard) && state.descriptionSensitive) ||
+    unverifiedCardShielded;
   return {
     redactTitle,
     redactDescription,
-    redactMeta: state.redactMeta,
+    redactMeta: state.redactMeta || unverifiedCardShielded || unverifiedTitleShielded,
   };
 }
 
 export function isAddonTitleRedacted(addon: AddonSummary, filterCtx: FilterLookupSource): boolean {
   return Boolean(getAddonSearchRedaction(addon, filterCtx).redactTitle);
+}
+
+export function isWorkshopKeyTitleRedacted(
+  workshopId: string,
+  rawTitle: string | undefined,
+  filterCtx: FilterLookupSource,
+): boolean {
+  const wsKey = workshopFilterKey(workshopId);
+  const wsState = resolveCardFilterState({
+    config: filterCtx.filterConfig,
+    scope: 'workshop',
+    verdict: resolveLookupVerdict(wsKey, filterCtx),
+    revealed: filterCtx.revealedCardIds?.has(wsKey) ?? false,
+    hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey) ?? false,
+    hasContent: Boolean(rawTitle?.trim()),
+  });
+  const unverifiedCardShielded =
+    (wsState.blurWholeCard || wsState.hiddenCard) &&
+    !wsState.flagged &&
+    !wsState.isBlurCardRevealed;
+  return (
+    wsState.redactTitle ||
+    ((wsState.blurWholeCard || wsState.hiddenCard) && wsState.titleSensitive) ||
+    unverifiedCardShielded
+  );
+}
+
+export function matchesEvaluatedAddonTitle(addon: AddonSummary, candidate: string): boolean {
+  const trimmed = candidate.trim();
+  if (!trimmed) return true;
+  const known = [
+    addon.title,
+    addon.workshopTitle,
+    addon.addonTitle,
+    addon.currentFileName ? stripVpkExtension(addon.currentFileName) : undefined,
+  ]
+    .map((s) => s?.trim())
+    .filter((s): s is string => Boolean(s));
+  return known.includes(trimmed);
+}
+
+export function isLinkedWorkshopTitleRedacted(
+  workshopId: string,
+  addon: AddonSummary | undefined,
+  rawTitle: string | undefined,
+  filterCtx: FilterLookupSource,
+  options?: { transferKind?: 'download' | 'update' },
+): boolean {
+  if (!addon) {
+    return isWorkshopKeyTitleRedacted(workshopId, rawTitle, filterCtx);
+  }
+
+  const addonKey = addonFilterKey(addon.id);
+  const localState = resolveLibraryAddonCardFilter(addon, filterCtx);
+  if (localState.exclusionActive) {
+    return localState.redactTitle;
+  }
+
+  const addonVerdict = resolveAddonVerdict(addon, filterCtx);
+  const addonFailed = filterCtx.failedTargetKeys?.has(addonKey) ?? false;
+  const wsKey = workshopFilterKey(workshopId);
+  const wsVerdict = resolveLookupVerdict(wsKey, filterCtx);
+
+  // Freshly downloaded Workshop item already verified safe in Workshop before library eval runs:
+  // avoid falsely redacting the completion toast when the title matches the verified Workshop title.
+  if (
+    options?.transferKind === 'download' &&
+    addonVerdict === undefined &&
+    !addonFailed &&
+    (wsVerdict === null ||
+      (wsVerdict !== undefined && !wsVerdict.flagged && wsVerdict.complete !== false))
+  ) {
+    const candidate = (rawTitle ?? addon.title).trim();
+    const trustedWsTitle = addon.workshopTitle?.trim();
+    if (!candidate || (trustedWsTitle && candidate === trustedWsTitle)) {
+      return false;
+    }
+  }
+
+  if (isAddonTitleRedacted(addon, filterCtx)) {
+    return true;
+  }
+
+  if (!filterCtx.filterConfig.applyToLibrary) {
+    return isWorkshopKeyTitleRedacted(workshopId, rawTitle ?? addon.title, filterCtx);
+  }
+
+  const trimmedRawTitle = rawTitle?.trim();
+  if (
+    trimmedRawTitle &&
+    filterCtx.filterConfig.applyToWorkshop &&
+    !matchesEvaluatedAddonTitle(addon, trimmedRawTitle)
+  ) {
+    return isWorkshopKeyTitleRedacted(workshopId, trimmedRawTitle, filterCtx);
+  }
+
+  if (wsVerdict?.flagged) {
+    const wsState = resolveCardFilterState({
+      config: filterCtx.filterConfig,
+      scope: 'workshop',
+      verdict: wsVerdict,
+      revealed: filterCtx.revealedCardIds?.has(wsKey) ?? false,
+      hasTargetFailed: filterCtx.failedTargetKeys?.has(wsKey) ?? false,
+      hasContent: Boolean((rawTitle ?? addon.title).trim()),
+    });
+    return (
+      wsState.redactTitle ||
+      ((wsState.blurWholeCard || wsState.hiddenCard) && wsState.titleSensitive)
+    );
+  }
+
+  return false;
 }
 
 export function formatRedactedAddonLabel(
@@ -1128,12 +1277,22 @@ export interface BundleCoverPresentation {
   blurWholeCard: boolean;
 }
 
+function memberTitleOverlapsBundleName(member: AddonSummary, bundleNameLower: string): boolean {
+  const candidates = [member.title, member.workshopTitle, member.addonTitle]
+    .map((s) => s?.trim().toLowerCase())
+    .filter((s): s is string => Boolean(s));
+  return candidates.some(
+    (c) => c === bundleNameLower || c.includes(bundleNameLower) || bundleNameLower.includes(c),
+  );
+}
+
 export function resolveBundleCoverPresentation(
   visibleMembers: readonly AddonSummary[],
   filterCtx: FilterLookupSource,
   options?: {
     allMembers?: readonly AddonSummary[];
     bundleCoverImage?: string;
+    bundleName?: string;
     forceShowHiddenCards?: boolean;
   },
 ): BundleCoverPresentation {
@@ -1147,16 +1306,42 @@ export function resolveBundleCoverPresentation(
     (entry) => !entry.state.hiddenCard || options?.forceShowHiddenCards,
   );
 
-  const redactTitle = eligible.length > 0 && eligible.every((e) => e.state.redactTitle);
+  const memberNeedsTitleRedaction = (state: CardFilterState): boolean =>
+    state.redactTitle ||
+    ((state.blurWholeCard || state.hiddenCard) && (!state.flagged || state.titleSensitive));
+
+  let redactTitle =
+    eligible.length > 0 && eligible.some((e) => memberNeedsTitleRedaction(e.state));
+
+  if (!redactTitle && options?.allMembers && options.allMembers.length > 0) {
+    const bundleNameLower = options.bundleName?.trim().toLowerCase() ?? '';
+    const hiddenTitleSensitiveMembers = options.allMembers.filter((member) => {
+      const state = resolveLibraryAddonCardFilter(member, filterCtx, {
+        forceShowHiddenCards: options.forceShowHiddenCards,
+      });
+      return state.hiddenCard && memberNeedsTitleRedaction(state);
+    });
+    if (hiddenTitleSensitiveMembers.length > 0 && bundleNameLower) {
+      const hiddenMatches = hiddenTitleSensitiveMembers.some((m) =>
+        memberTitleOverlapsBundleName(m, bundleNameLower),
+      );
+      const safeVisibleMatches = eligible.some(
+        (e) =>
+          !memberNeedsTitleRedaction(e.state) &&
+          memberTitleOverlapsBundleName(e.member, bundleNameLower),
+      );
+      if (hiddenMatches || !safeVisibleMatches) {
+        redactTitle = true;
+      }
+    }
+  }
+
   const author = eligible.find((e) => !e.state.redactMeta && e.member.author?.trim())?.member.author;
   const redactAuthor = !author && eligible.some((e) => e.state.redactMeta && e.member.author?.trim());
-  const blurWholeCard =
-    eligible.length > 0 &&
-    eligible.every((e) => e.state.blurWholeCard && !e.state.pendingEvaluation);
-  const allPendingBlur =
-    eligible.length > 0 &&
-    eligible.every((e) => e.state.blurWholeCard && e.state.pendingEvaluation);
-  const effectiveBlurWholeCard = blurWholeCard || allPendingBlur;
+  const effectiveBlurWholeCard =
+    eligible.length > 0 && eligible.every((e) => e.state.blurWholeCard);
+  const anyPendingBlur =
+    effectiveBlurWholeCard && eligible.some((e) => e.state.pendingEvaluation);
 
   const withCover = eligible.filter((e) =>
     Boolean(e.member.coverImage?.trim() || e.member.localCoverImage?.trim()),
@@ -1173,7 +1358,7 @@ export function resolveBundleCoverPresentation(
       src: ownerEntry.member.coverImage,
       fallbackSrc: getFilteredAddonFallbackCover(ownerEntry.member, filterCtx),
       coverMode: effectiveBlurWholeCard ? 'hide' : ownerEntry.state.coverMode,
-      pendingEvaluation: ownerEntry.state.pendingEvaluation,
+      pendingEvaluation: effectiveBlurWholeCard ? anyPendingBlur : ownerEntry.state.pendingEvaluation,
       redactTitle,
       redactAuthor,
       author,
@@ -1202,7 +1387,9 @@ export function resolveBundleCoverPresentation(
               ? getFilteredAddonFallbackCover(bundleOwner, filterCtx)
               : undefined,
           coverMode: effectiveBlurWholeCard ? 'hide' : bundleOwnerState.coverMode,
-          pendingEvaluation: bundleOwnerState.pendingEvaluation,
+          pendingEvaluation: effectiveBlurWholeCard
+            ? anyPendingBlur
+            : bundleOwnerState.pendingEvaluation,
           redactTitle,
           redactAuthor,
           author,
@@ -1217,7 +1404,7 @@ export function resolveBundleCoverPresentation(
     src: undefined,
     fallbackSrc: undefined,
     coverMode: effectiveBlurWholeCard ? 'hide' : 'none',
-    pendingEvaluation: allPendingBlur,
+    pendingEvaluation: anyPendingBlur,
     redactTitle,
     redactAuthor,
     author,
