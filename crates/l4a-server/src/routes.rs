@@ -993,6 +993,10 @@ fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
         }
         FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
         FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::BackendRejected(detail) => {
+            tracing::debug!(error = %detail, "过滤推理后端拒绝请求");
+            err_resp(StatusCode::BAD_REQUEST, "内容过滤模型无法处理该请求")
+        }
         FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
         FilterServiceError::ScoringChanged => {
             err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
@@ -1006,7 +1010,9 @@ fn admin_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
         FilterServiceError::Disabled(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
         FilterServiceError::Unavailable(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
         FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
-        FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::BadRequest(msg) | FilterServiceError::BackendRejected(msg) => {
+            err_resp(StatusCode::BAD_REQUEST, msg)
+        }
         FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
         FilterServiceError::ScoringChanged => {
             err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())

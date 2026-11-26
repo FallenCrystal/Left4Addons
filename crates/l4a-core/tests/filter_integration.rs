@@ -3666,8 +3666,8 @@ async fn ws_target_with_addon_id_caches_cleanly_failed_token_preserves_llm_cache
 }
 
 #[tokio::test]
-async fn llm_review_with_images_when_model_image_eval_disabled_marks_images_sensitive() {
-    use axum::{routing::post, Json, Router};
+async fn catalog_image_scoring_disabled_still_allows_llm_image_review() {
+    use l4a_protocol::WorkshopId;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let llm_saw_image = Arc::new(AtomicBool::new(false));
@@ -3675,15 +3675,31 @@ async fn llm_review_with_images_when_model_image_eval_disabled_marks_images_sens
 
     let app = Router::new()
         .route(
+            "/api/v1/filter/info",
+            get(|| async {
+                Json(CatalogFilterPublicInfo {
+                    enabled: true,
+                    ready: true,
+                    model_name: None,
+                    model_version: None,
+                    max_images: 0,
+                    scoring_revision: Some("text-only".into()),
+                })
+            }),
+        )
+        .route(
             "/api/v1/filter/predict",
-            post(|| async {
-                // Simulate text-only scoring backend (`image_prob: None`, `per_image_probs: []`)
+            post(|Json(request): Json<FilterPredictRequest>| async move {
+                assert!(request.image_urls.is_empty());
+                assert!(request.images_base64.is_empty());
+                assert_eq!(request.workshop_id, Some(WorkshopId::new(42).unwrap()));
                 Json(serde_json::json!({
                     "prob": 0.45,
                     "goreProb": 0.10,
                     "nsfwProb": 0.44,
                     "textProb": 0.45,
-                    "titleProb": 0.45
+                    "titleProb": 0.45,
+                    "scoringRevision": "text-only"
                 }))
             }),
         )
@@ -3721,10 +3737,10 @@ async fn llm_review_with_images_when_model_image_eval_disabled_marks_images_sens
         AppConfig {
             loading_dir: loading_dir.to_str().unwrap().into(),
             https_only: false,
+            catalog_server_url: Some(format!("http://{addr}")),
             filter: ClientFilterConfig {
                 enabled: true,
-                mode: ClientFilterSourceMode::CustomEndpoint,
-                custom_endpoint_url: Some(format!("http://{addr}")),
+                mode: ClientFilterSourceMode::Catalog,
                 enable_direct_flag: true,
                 flag_threshold: 0.80,
                 llm_enabled: true,
@@ -3752,7 +3768,7 @@ async fn llm_review_with_images_when_model_image_eval_disabled_marks_images_sens
             .evaluate_filter_items(vec![FilterEvaluationTarget {
                 target_key: "ws:llm-image-fallback".into(),
                 addon_id: None,
-                workshop_id: None,
+                workshop_id: Some(WorkshopId::new(42).unwrap()),
                 title: "Borderline Title".into(),
                 description: None,
                 tags: vec![],

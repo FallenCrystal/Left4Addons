@@ -494,8 +494,13 @@ pub fn merge_managed_predictions(
     if has_missing_rows && parts.len() > 1 {
         return None;
     }
-    let mut probabilities = std::mem::take(&mut parts.first_mut()?.1.probabilities);
-    if parts.len() == 1 && (parts[0].0 == 0 || has_missing_rows) {
+    let (first_count, first) = parts.first_mut()?;
+    let first_count = *first_count;
+    let mut probabilities = std::mem::take(&mut first.probabilities);
+    probabilities
+        .corpse_image_indices
+        .retain(|&index| index < first_count);
+    if parts.len() == 1 && (first_count == 0 || has_missing_rows) {
         return Some(probabilities);
     }
     let mut image_rows = Vec::new();
@@ -1227,6 +1232,7 @@ mod tests {
             probabilities: FilterProbabilities {
                 corpse_prob: Some(0.10),
                 corpse_pile_prob: Some(0.09),
+                corpse_image_indices: vec![1],
                 ..Default::default()
             },
             image_rows: vec![[0.01, 0.02, 0.01]],

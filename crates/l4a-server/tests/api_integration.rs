@@ -5873,17 +5873,26 @@ async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_le
                 let hits = hits_cl.clone();
                 async move {
                     hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if payload["title"] == "Backend rejection" {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({ "error": secret_internal_path })),
+                        );
+                    }
                     let count = payload["images_base64"]
                         .as_array()
                         .map(|a| a.len())
                         .unwrap_or(0);
-                    axum::Json(json!({
-                        "prob": 0.25,
-                        "goreProb": 0.10,
-                        "nsfwProb": 0.20,
-                        "textProb": 0.15,
-                        "imageProb": if count > 0 { Some(0.25) } else { None }
-                    }))
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "prob": 0.25,
+                            "goreProb": 0.10,
+                            "nsfwProb": 0.20,
+                            "textProb": 0.15,
+                            "imageProb": if count > 0 { Some(0.25) } else { None }
+                        })),
+                    )
                 }
             }),
         );
@@ -5910,7 +5919,7 @@ async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_le
         &disabled_app,
         "PATCH",
         "/api/v1/admin/config/filter",
-        admin_hdr,
+        admin_hdr.clone(),
         Some(serde_json::to_value(&healthy_dto).unwrap()),
     )
     .await;
@@ -5974,6 +5983,29 @@ async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_le
     .await;
     assert_eq!(slice_code, StatusCode::OK);
     assert_eq!(predict_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    for (uri, headers, expected_detail) in [
+        ("/api/v1/filter/predict", vec![], false),
+        ("/api/v1/admin/filter/test", admin_hdr, true),
+    ] {
+        let (code, body) = json_request(
+            &disabled_app,
+            "POST",
+            uri,
+            headers,
+            Some(json!({ "title": "Backend rejection" })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains(secret_internal_path),
+            expected_detail
+        );
+    }
 
     mock_task.abort();
 }

@@ -2286,6 +2286,7 @@ pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterP
     let Some((count, mut merged)) = parts.next() else {
         return FilterProbabilities::default();
     };
+    merged.corpse_image_indices.retain(|&index| index < count);
     if parts.len() == 0 {
         return merged;
     }
@@ -2295,7 +2296,6 @@ pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterP
         (a, b) => a.or(b),
     };
     let mut fusion_prob = merged.fusion_score();
-    merged.corpse_image_indices.retain(|&index| index < count);
     let mut offset = count;
     for (count, part) in parts {
         fusion_prob = fusion_prob.max(part.fusion_score());
@@ -2548,6 +2548,12 @@ mod tests {
 
     #[test]
     fn merge_raw_max_keeps_corpse_floor_out_of_fusion_and_remaps_hits() {
+        let single = FilterProbabilities {
+            corpse_image_indices: vec![0, 1],
+            ..Default::default()
+        };
+        assert_eq!(merge_raw_max(vec![(1, single)]).corpse_image_indices, [0]);
+
         let merged = merge_raw_max(vec![
             (
                 2,

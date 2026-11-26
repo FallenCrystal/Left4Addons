@@ -71,4 +71,3 @@ gore_weight = 1.0
 nsfw_weight = 1.0
 temperature = 1.0
 bias = 0.0
-

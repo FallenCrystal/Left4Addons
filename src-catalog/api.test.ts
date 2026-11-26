@@ -118,4 +118,3 @@ describe('catalog web console helpers', () => {
     });
   });
 });
-

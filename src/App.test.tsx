@@ -2096,4 +2096,3 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(within(sheet).getByText('Explicit Flagged Direct Description')).toBeTruthy();
   });
 });
-

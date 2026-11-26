@@ -586,4 +586,3 @@ it('preserves FilterPanel draft edits made while PATCH /admin/config/filter is i
   });
   expect(goreInput.value).toBe('2.2');
 });
-

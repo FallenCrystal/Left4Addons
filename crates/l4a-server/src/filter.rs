@@ -65,6 +65,8 @@ pub enum FilterServiceError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    BackendRejected(String),
+    #[error("{0}")]
     ImageFetch(String),
     #[error("内容过滤评分配置已更新，请重试")]
     ScoringChanged,
@@ -1447,11 +1449,8 @@ impl CatalogFilterService {
         let body = read_bounded_response_bytes(response, MAX_BACKEND_RESPONSE_BYTES)
             .await
             .ok()?;
-        Some(
-            serde_json::from_slice::<FilterProbabilities>(&body).is_ok_and(|scores| {
-                scores.corpse_prob.is_some() && scores.corpse_pile_prob.is_some()
-            }),
-        )
+        let scores = serde_json::from_slice::<FilterProbabilities>(&body).ok()?;
+        Some(scores.corpse_prob.is_some() && scores.corpse_pile_prob.is_some())
     }
 
     async fn call_backend_predict(
@@ -1535,7 +1534,7 @@ impl CatalogFilterService {
             if record_failure {
                 self.failed_requests.fetch_add(1, Ordering::Relaxed);
             }
-            return Err(FilterServiceError::BadRequest(msg));
+            return Err(FilterServiceError::BackendRejected(msg));
         }
 
         let body = match read_bounded_response_bytes(resp, MAX_BACKEND_RESPONSE_BYTES).await {
@@ -3111,7 +3110,6 @@ mod tests {
         use serde_json::json;
         use std::sync::atomic::AtomicU16;
 
-        // 200 answers with corpse scores, any other value is returned as the probe status.
         let probe_status = Arc::new(AtomicU16::new(200));
         let state = probe_status.clone();
         let app = Router::new()
@@ -3124,11 +3122,16 @@ mod tests {
                 post(move || {
                     let status = state.load(Ordering::Acquire);
                     async move {
-                        let body = json!({
-                            "prob": 0.0, "gore_prob": 0.0, "nsfw_prob": 0.0,
-                            "corpse_prob": 0.0, "corpse_pile_prob": 0.0
-                        });
-                        (StatusCode::from_u16(status).unwrap(), Json(body))
+                        let body = if status == 200 {
+                            json!({
+                                "prob": 0.0, "gore_prob": 0.0, "nsfw_prob": 0.0,
+                                "corpse_prob": 0.0, "corpse_pile_prob": 0.0
+                            })
+                            .to_string()
+                        } else {
+                            "unexpected response".to_string()
+                        };
+                        (StatusCode::from_u16(status).unwrap(), body)
                     }
                 }),
             );
@@ -3152,7 +3155,7 @@ mod tests {
             Some(STOCK_CORPSE_SCORES_REVISION)
         );
 
-        for transient in [503, 429] {
+        for transient in [503, 429, 201] {
             probe_status.store(transient, Ordering::Release);
             service.runtime.write().unwrap().upstream_verified_at = None;
             let refreshed = service.public_info().await;

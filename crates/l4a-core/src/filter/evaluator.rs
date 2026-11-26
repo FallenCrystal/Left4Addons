@@ -215,7 +215,7 @@ fn target_is_stale_for_addon(target: &FilterEvaluationTarget, addon: &AddonSumma
 
 pub fn compute_content_signature(target: &FilterEvaluationTarget, max_images: usize) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"l4a-filter-content-v1\0");
+    hasher.update(b"l4a-filter-content-v2\0");
     hasher.update(target.target_key.as_bytes());
     hasher.update(b"\0");
     if let Some(ref aid) = target.addon_id {
@@ -235,13 +235,9 @@ pub fn compute_content_signature(target: &FilterEvaluationTarget, max_images: us
         hasher.update(b"\x1f");
     }
     hasher.update(b"\0");
-    for img in target
-        .image_sources
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .take(max_images)
-    {
+    hasher.update((target.image_sources.len() as u64).to_le_bytes());
+    for (slot, img) in indexed_image_sources(target, max_images) {
+        hasher.update((slot as u64).to_le_bytes());
         hasher.update(img.as_bytes());
         hasher.update(b"\x1f");
     }
@@ -483,6 +479,9 @@ pub async fn evaluate_targets(
             max_images: catalog
                 .as_ref()
                 .and_then(|state| state.max_images)
+                .filter(|&cap| {
+                    cap > 0 || !app_cfg.filter.llm_enabled || !app_cfg.filter.llm_send_images
+                })
                 .unwrap_or_else(|| effective_max_images(&app_cfg.filter)),
             catalog,
             automatic,
@@ -827,6 +826,11 @@ async fn evaluate_single_target(
     let submitted_slot_indices: Vec<usize>;
 
     let (mut probs, custom_endpoint) = if cfg.mode == ClientFilterSourceMode::Catalog {
+        let catalog = policy
+            .catalog
+            .as_ref()
+            .expect("Catalog mode has a scoring snapshot");
+        let model_max_images = catalog.max_images.unwrap_or(max_images);
         let base = app_cfg
             .catalog_server_url
             .as_deref()
@@ -847,7 +851,7 @@ async fn evaluate_single_target(
             tags: target.tags.clone(),
             ..Default::default()
         };
-        let plan = prepare_catalog_images(engine, target, max_images);
+        let plan = prepare_catalog_images(engine, target, model_max_images);
         let remote_result = if let CatalogImagePlan::RemoteUrls {
             slot_indices,
             image_urls,
@@ -857,7 +861,8 @@ async fn evaluate_single_target(
         {
             deferred_remotes = remotes;
             req.image_urls = image_urls;
-            if req.image_urls.is_empty() && !target.image_sources.is_empty() {
+            if model_max_images > 0 && req.image_urls.is_empty() && !target.image_sources.is_empty()
+            {
                 req.workshop_id = None;
             }
             policy.check_target(engine, target)?;
@@ -879,7 +884,7 @@ async fn evaluate_single_target(
             None => {
                 req.image_urls.clear();
                 let (loaded, load_err) =
-                    resolve_catalog_inline_images(engine, target, max_images, &req).await?;
+                    resolve_catalog_inline_images(engine, target, model_max_images, &req).await?;
                 had_load_error = load_err;
                 deferred_remotes.clear();
                 submitted_slot_indices = loaded.iter().map(|(slot, _)| *slot).collect();
@@ -896,10 +901,6 @@ async fn evaluate_single_target(
             }
         };
 
-        let catalog = policy
-            .catalog
-            .as_ref()
-            .expect("Catalog mode has a scoring snapshot");
         let returned_revision = probs.scoring_revision.as_deref();
         record_catalog_observation(
             engine,
@@ -947,16 +948,17 @@ async fn evaluate_single_target(
     let (flagged, decision_source) = if direct_flag {
         (true, FilterDecisionSource::ModelDirectFlag)
     } else if cfg.llm_enabled && evaluated_score >= llm_threshold {
-        if cfg.mode == ClientFilterSourceMode::Catalog
-            && cfg.llm_send_images
-            && loaded_images.is_empty()
-            && !deferred_remotes.is_empty()
+        if let Some(catalog) = policy
+            .catalog
+            .as_ref()
+            .filter(|_| cfg.llm_send_images && loaded_images.is_empty())
         {
-            let (materialized, mat_err) =
-                materialize_deferred_remotes_for_llm(engine, &deferred_remotes).await;
-            if mat_err {
-                had_load_error = true;
-            }
+            let (materialized, mat_err) = if catalog.max_images == Some(0) {
+                resolve_target_images(engine, target, max_images).await
+            } else {
+                materialize_deferred_remotes_for_llm(engine, &deferred_remotes).await
+            };
+            had_load_error |= mat_err;
             loaded_slot_indices = materialized.iter().map(|(slot, _)| *slot).collect();
             loaded_images = materialized.into_iter().map(|(_, img)| img).collect();
         }
@@ -1075,7 +1077,7 @@ fn compute_evaluated_image_indices(
     }
 }
 
-fn catalog_image_sources(
+fn indexed_image_sources(
     target: &FilterEvaluationTarget,
     max_images: usize,
 ) -> impl Iterator<Item = (usize, &str)> {
@@ -1093,7 +1095,7 @@ fn prepare_catalog_images(
     target: &FilterEvaluationTarget,
     max_images: usize,
 ) -> CatalogImagePlan {
-    let requires_inline_mode = catalog_image_sources(target, max_images).any(|(_, src)| {
+    let requires_inline_mode = indexed_image_sources(target, max_images).any(|(_, src)| {
         is_valid_local_cover_key(src)
             || has_ascii_prefix_ignore_case(src, b"data:")
             || matches!(
@@ -1110,7 +1112,7 @@ fn prepare_catalog_images(
     let mut remotes = Vec::new();
     let mut had_load_error = false;
 
-    for (slot_idx, trimmed) in catalog_image_sources(target, max_images) {
+    for (slot_idx, trimmed) in indexed_image_sources(target, max_images) {
         if is_remote_image_url(trimmed) {
             match validate_remote_filter_image_url(engine, trimmed) {
                 Ok(
@@ -1160,7 +1162,7 @@ async fn resolve_catalog_inline_images(
     drop(base_json);
     let mut loaded = Vec::new();
     let mut missing = false;
-    for (slot, src) in catalog_image_sources(target, max_images) {
+    for (slot, src) in indexed_image_sources(target, max_images) {
         match load_single_image(engine, src).await {
             Ok(img) if img.b64.len() + 3 <= remaining => {
                 remaining -= img.b64.len() + 3;
@@ -2227,10 +2229,16 @@ mod tests {
         );
 
         let mut normalized = base.clone();
-        normalized.image_sources = vec!["https://example.com/a.jpg".into()];
+        normalized.image_sources[1] = "https://example.com/a.jpg".into();
         assert_eq!(
             compute_content_signature(&base, 1),
             compute_content_signature(&normalized, 1)
+        );
+        normalized.image_sources.swap(0, 1);
+        assert_ne!(
+            compute_content_signature(&base, 1),
+            compute_content_signature(&normalized, 1),
+            "cached verdicts use the original image slot indices"
         );
     }
 
