@@ -8,8 +8,8 @@ import type {
   CoreEvent,
   DashboardSnapshot,
   DeployLocalFilterRequest,
+  FilterEvaluationBatchResponse,
   FilterEvaluationTarget,
-  FilterItemVerdict,
   FilterTokenStatus,
   LoadoutProfile,
   LocalFilterDeploymentStatus,
@@ -29,6 +29,7 @@ import type {
   WorkshopItemRecord,
 } from './ipc';
 import { IpcError } from './ipc';
+import { computeFilterPolicySignature } from '../utils/contentFilter';
 import {
   deletePreviewFilterExclusion,
   PreviewFilterRuntime,
@@ -72,6 +73,10 @@ class PreviewEngine {
 
   private cloneSnapshot(): DashboardSnapshot {
     reconcilePreviewExclusions(this.state);
+    this.state.filterPolicySignature = computeFilterPolicySignature(this.state.config.filter, {
+      catalogServerUrl: this.state.config.catalogServerUrl,
+      httpsOnly: this.state.config.httpsOnly,
+    });
     this.state.cachedFilterVerdicts = this.filterRuntime.getCachedVerdictsForSnapshot(this.state);
     return structuredClone(this.state);
   }
@@ -359,7 +364,7 @@ class PreviewEngine {
 
   async evaluateFilterItems(
     targets: FilterEvaluationTarget[],
-  ): Promise<FilterItemVerdict[]> {
+  ): Promise<FilterEvaluationBatchResponse> {
     return this.filterRuntime.evaluateItems(targets, this.state.config.filter, this.emit, {
       catalogServerUrl: this.state.config.catalogServerUrl,
       httpsOnly: this.state.config.httpsOnly,

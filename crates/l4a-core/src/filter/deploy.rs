@@ -1,9 +1,11 @@
+use super::FILTER_RUNNER_PY;
 use crate::config::AppPaths;
 use crate::engine::EventSink;
 use crate::error::CoreError;
 use l4a_protocol::{
-    CoreEvent, DeployLocalFilterRequest, FilterCommitInfo, FilterEnvReport, FilterModelParams,
-    FilterProbabilities, LocalFilterDeploymentStatus, LocalFilterServiceState, FILTER_RUNNER_PY,
+    CoreEvent, DeployLocalFilterRequest, FilterCommitInfo, FilterEnvReport,
+    FilterGalleryAggregation, FilterModelParams, FilterProbabilities, LocalFilterDeploymentStatus,
+    LocalFilterServiceState, RawFilterPredictRequest,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
@@ -16,6 +18,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio_util::sync::CancellationToken;
+
+pub(crate) const MAX_RAW_PREDICT_IMAGE_BATCH_BYTES: usize = 30 * 1024 * 1024;
 
 const REQUIRED_DEPLOY_FILES: &[&str] = &[
     "l4filter.py",
@@ -75,6 +79,10 @@ fn clean_os_path(path: &Path) -> String {
     raw.into_owned()
 }
 
+fn make_absolute_preserving_symlinks(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn is_unc_or_network_path(path: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -96,19 +104,20 @@ fn is_unc_or_network_path(path: &Path) -> bool {
     cleaned.starts_with(r"\\") || cleaned.starts_with("//")
 }
 
-fn venv_python_path(venv_dir: &Path) -> PathBuf {
+pub(crate) fn venv_python_path(venv_dir: &Path) -> PathBuf {
+    let abs_venv = make_absolute_preserving_symlinks(venv_dir);
     #[cfg(windows)]
     {
-        venv_dir.join("Scripts").join("python.exe")
+        abs_venv.join("Scripts").join("python.exe")
     }
     #[cfg(not(windows))]
     {
-        let py = venv_dir.join("bin").join("python");
-        if py.is_file() {
+        let py = abs_venv.join("bin").join("python");
+        if is_executable_file(&py) {
             py
         } else {
-            let py3 = venv_dir.join("bin").join("python3");
-            if py3.is_file() {
+            let py3 = abs_venv.join("bin").join("python3");
+            if is_executable_file(&py3) {
                 py3
             } else {
                 py
@@ -117,8 +126,13 @@ fn venv_python_path(venv_dir: &Path) -> PathBuf {
     }
 }
 
-fn which_executable(program: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
+fn which_executable_in_paths(program: &str, path_var: &OsStr) -> Option<PathBuf> {
+    let prog_path = Path::new(program);
+    if prog_path.components().count() > 1 {
+        let abs = make_absolute_preserving_symlinks(prog_path);
+        return is_executable_file(&abs).then_some(abs);
+    }
+
     #[cfg(windows)]
     let exts: Vec<String> = std::env::var("PATHEXT")
         .unwrap_or_else(|_| ".EXE;.CMD;.BAT".into())
@@ -127,22 +141,27 @@ fn which_executable(program: &str) -> Option<String> {
         .map(|s| s.trim().to_ascii_lowercase())
         .collect();
 
-    for dir in std::env::split_paths(&path_var) {
+    for dir in std::env::split_paths(path_var) {
         let direct = dir.join(program);
         if is_executable_file(&direct) {
-            return Some(clean_os_path(&direct));
+            return Some(make_absolute_preserving_symlinks(&direct));
         }
         #[cfg(windows)]
         {
             for ext in &exts {
                 let candidate = dir.join(format!("{program}{ext}"));
                 if is_executable_file(&candidate) {
-                    return Some(clean_os_path(&candidate));
+                    return Some(make_absolute_preserving_symlinks(&candidate));
                 }
             }
         }
     }
     None
+}
+
+fn which_executable(program: &str) -> Option<String> {
+    let path_var = std::env::var_os("PATH")?;
+    which_executable_in_paths(program, &path_var).map(|p| clean_os_path(&p))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -161,6 +180,80 @@ fn is_executable_file(path: &Path) -> bool {
     {
         true
     }
+}
+
+pub(crate) fn probe_python_candidates(
+    candidates: &[(&str, &[&str])],
+    path_override: Option<&OsStr>,
+) -> Option<(String, String, bool)> {
+    let probe_script = "import sys\nif sys.version_info < (3, 9):\n    sys.exit(2)\nprint(sys.executable)\nprint(sys.version.split()[0])\ntry:\n    import venv, ensurepip\n    print('1')\nexcept Exception:\n    print('0')\n";
+    let effective_path = path_override
+        .map(OsStr::to_os_string)
+        .or_else(|| std::env::var_os("PATH"));
+
+    let mut fallback_no_venv: Option<(String, String)> = None;
+
+    for &(prog, prefix_args) in candidates {
+        let resolved_bin = if prefix_args.is_empty() {
+            effective_path
+                .as_deref()
+                .and_then(|pv| which_executable_in_paths(prog, pv))
+        } else {
+            None
+        };
+
+        let mut cmd = match resolved_bin {
+            Some(ref p) => std::process::Command::new(p),
+            None => std::process::Command::new(prog),
+        };
+        if let Some(ref pv) = effective_path {
+            cmd.env("PATH", pv);
+        }
+        cmd.args(prefix_args)
+            .args(["-c", probe_script])
+            .env("PYTHONIOENCODING", "utf-8")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_std_cmd(&mut cmd);
+
+        let Ok(out) = cmd.output() else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let Some(reported_exe) = lines.next() else {
+            continue;
+        };
+        let Some(ver) = lines.next() else {
+            continue;
+        };
+        let has_venv = lines.next() == Some("1");
+
+        // Preserve any virtualenv symlink path rather than replacing it with a canonicalized target.
+        let preserved_exe = if let Some(bin_path) = resolved_bin {
+            clean_os_path(&bin_path)
+        } else {
+            let reported_path = make_absolute_preserving_symlinks(Path::new(reported_exe));
+            if is_executable_file(&reported_path) {
+                clean_os_path(&reported_path)
+            } else {
+                reported_exe.to_string()
+            }
+        };
+
+        if has_venv {
+            return Some((preserved_exe, ver.to_string(), true));
+        }
+        if fallback_no_venv.is_none() {
+            fallback_no_venv = Some((preserved_exe, ver.to_string()));
+        }
+    }
+
+    fallback_no_venv.map(|(exe, ver)| (exe, ver, false))
 }
 
 pub fn probe_environment() -> FilterEnvReport {
@@ -188,57 +281,16 @@ pub fn probe_environment() -> FilterEnvReport {
         }
     }
 
-    let probe_script = "import sys\nif sys.version_info < (3, 9):\n    sys.exit(2)\nprint(sys.executable)\nprint(sys.version.split()[0])\ntry:\n    import venv, ensurepip\n    print('1')\nexcept Exception:\n    print('0')\n";
-
     #[cfg(windows)]
     let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[]), ("py", &["-3"])];
     #[cfg(not(windows))]
     let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[])];
 
-    let mut fallback_no_venv: Option<(String, String)> = None;
-
-    for &(prog, prefix_args) in candidates {
-        let mut cmd = std::process::Command::new(prog);
-        cmd.args(prefix_args)
-            .args(["-c", probe_script])
-            .env("PYTHONIOENCODING", "utf-8")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        configure_std_cmd(&mut cmd);
-
-        let Ok(out) = cmd.output() else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
-        let Some(exe_path) = lines.next() else {
-            continue;
-        };
-        let Some(ver) = lines.next() else {
-            continue;
-        };
-        let has_venv = lines.next() == Some("1");
-        if has_venv {
-            report.python_available = true;
-            report.python_path = Some(exe_path.to_string());
-            report.python_version = Some(ver.to_string());
-            report.venv_available = true;
-            return report;
-        }
-        if fallback_no_venv.is_none() {
-            fallback_no_venv = Some((exe_path.to_string(), ver.to_string()));
-        }
-    }
-
-    if let Some((exe_path, ver)) = fallback_no_venv {
+    if let Some((exe_path, ver, has_venv)) = probe_python_candidates(candidates, None) {
         report.python_available = true;
         report.python_path = Some(exe_path);
         report.python_version = Some(ver);
-        report.venv_available = false;
+        report.venv_available = has_venv;
     }
 
     report
@@ -392,6 +444,7 @@ struct RunningRunner {
     port: u16,
     runner_token: String,
     stderr_tail: Arc<Mutex<String>>,
+    synced_params: Arc<Mutex<Option<FilterModelParams>>>,
 }
 
 #[derive(Default)]
@@ -406,7 +459,7 @@ struct CachedStatusState {
     recent_commits: Vec<FilterCommitInfo>,
     stage_message: Option<String>,
     last_error: Option<String>,
-    active_runner_info: Option<(u16, String)>,
+    active_runner_synced: Option<Arc<Mutex<Option<FilterModelParams>>>>,
 }
 
 enum PredictLocalError {
@@ -418,10 +471,8 @@ pub struct LocalFilterManager {
     paths: AppPaths,
     events: Arc<dyn EventSink>,
     op_lock: tokio::sync::Mutex<Option<RunningRunner>>,
-    configure_lock: tokio::sync::Mutex<()>,
     state: Mutex<CachedStatusState>,
     desired_params: RwLock<FilterModelParams>,
-    applied_params: Mutex<Option<FilterModelParams>>,
     last_auto_restart_at: Mutex<Option<Instant>>,
     shutdown_token: CancellationToken,
     http_client: reqwest::Client,
@@ -439,10 +490,8 @@ impl LocalFilterManager {
             paths,
             events,
             op_lock: tokio::sync::Mutex::new(None),
-            configure_lock: tokio::sync::Mutex::new(()),
             state: Mutex::new(CachedStatusState::default()),
             desired_params: RwLock::new(FilterModelParams::default()),
-            applied_params: Mutex::new(None),
             last_auto_restart_at: Mutex::new(None),
             shutdown_token: CancellationToken::new(),
             http_client,
@@ -450,7 +499,14 @@ impl LocalFilterManager {
     }
 
     pub fn set_desired_params(&self, params: &FilterModelParams) {
-        *self.desired_params.write().unwrap() = params.sanitized();
+        let sanitized = params.sanitized();
+        *self.desired_params.write().unwrap() = sanitized.clone();
+        if let Some(ref synced_arc) = self.state.lock().unwrap().active_runner_synced {
+            let mut synced = synced_arc.lock().unwrap();
+            if synced.as_ref() != Some(&sanitized) {
+                *synced = None;
+            }
+        }
     }
 
     pub fn is_deployed(&self) -> bool {
@@ -465,7 +521,7 @@ impl LocalFilterManager {
         {
             return false;
         }
-        venv_python_path(&self.paths.filter_venv_dir).is_file()
+        is_executable_file(&venv_python_path(&self.paths.filter_venv_dir))
             && self.paths.filter_runner_path.is_file()
     }
 
@@ -703,7 +759,7 @@ impl LocalFilterManager {
             st.service_state = LocalFilterServiceState::Stopped;
             st.service_endpoint = None;
             st.running_pid = None;
-            st.active_runner_info = None;
+            st.active_runner_synced = None;
             st.stage_message = None;
             st.last_error = None;
         }
@@ -812,28 +868,12 @@ impl LocalFilterManager {
             let target = target_commit.ok_or_else(|| {
                 CoreError::InvalidInput("关闭跟随最新版本时必须指定目标 Commit".into())
             })?;
-            let verify_spec = format!("{target}^{{commit}}");
-            if run_git_async(
-                &self.shutdown_token,
-                repo_dir,
-                &["cat-file", "-e", &verify_spec],
-                GIT_FAST_TIMEOUT,
-            )
-            .await
-            .is_err()
-            {
-                run_git_async(
-                    &self.shutdown_token,
-                    repo_dir,
-                    &["fetch", "origin", target],
-                    GIT_NETWORK_TIMEOUT,
-                )
-                .await?;
-            }
+            let resolved_sha =
+                resolve_target_commit_sha_async(&self.shutdown_token, repo_dir, target).await?;
             run_git_async(
                 &self.shutdown_token,
                 repo_dir,
-                &["checkout", "--force", "--detach", target],
+                &["checkout", "--force", "--detach", &resolved_sha],
                 GIT_FAST_TIMEOUT,
             )
             .await?;
@@ -858,8 +898,10 @@ impl LocalFilterManager {
         );
 
         let venv_py = venv_python_path(&self.paths.filter_venv_dir);
-        if !venv_py.is_file() {
-            let venv_str = clean_os_path(&self.paths.filter_venv_dir);
+        if !is_executable_file(&venv_py) {
+            let venv_str = clean_os_path(&make_absolute_preserving_symlinks(
+                &self.paths.filter_venv_dir,
+            ));
             let out = run_cancellable_command(
                 &self.shutdown_token,
                 OsStr::new(&sys_python),
@@ -878,7 +920,7 @@ impl LocalFilterManager {
         }
 
         let venv_py = venv_python_path(&self.paths.filter_venv_dir);
-        if !venv_py.is_file() {
+        if !is_executable_file(&venv_py) {
             return Err(CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "Python 虚拟环境创建后未找到解释器",
@@ -933,19 +975,22 @@ impl LocalFilterManager {
         &self,
         params: &FilterModelParams,
     ) -> Result<LocalFilterDeploymentStatus, CoreError> {
-        self.set_desired_params(params);
+        let sanitized = params.sanitized();
+        self.set_desired_params(&sanitized);
         *self.last_auto_restart_at.lock().unwrap() = None;
         let mut runner_guard = self.op_lock.lock().await;
         self.reap_exited_runner(&mut runner_guard);
-        if runner_guard.is_none() {
-            let latest = self.desired_params.read().unwrap().clone();
-            if let Err(err) = self.start_runner_locked(&mut runner_guard, &latest).await {
-                self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
-                return Err(err);
-            }
+        if runner_guard.is_some() {
+            self.sync_or_restart_runner_locked(&mut runner_guard, &sanitized)
+                .await?;
+        } else if let Err(err) = self
+            .start_runner_locked(&mut runner_guard, &sanitized)
+            .await
+        {
+            self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
+            return Err(err);
         }
         drop(runner_guard);
-        let _ = self.reconfigure_params(params).await;
         let status = self.status().await;
         self.events.emit(CoreEvent::LocalFilterStatusChanged {
             status: status.clone(),
@@ -957,14 +1002,14 @@ impl LocalFilterManager {
         &self,
         params: &FilterModelParams,
     ) -> Result<String, CoreError> {
-        self.set_desired_params(params);
+        let sanitized = params.sanitized();
+        self.set_desired_params(&sanitized);
         let mut runner_guard = self.op_lock.lock().await;
         self.reap_exited_runner(&mut runner_guard);
-        if let Some(ref running) = *runner_guard {
-            let endpoint = running.endpoint.clone();
-            drop(runner_guard);
-            let _ = self.ensure_params_synced().await;
-            return Ok(endpoint);
+        if runner_guard.is_some() {
+            return self
+                .sync_or_restart_runner_locked(&mut runner_guard, &sanitized)
+                .await;
         }
 
         let recovering_from_crash =
@@ -979,8 +1024,8 @@ impl LocalFilterManager {
             *last_restart = Some(Instant::now());
         }
 
-        let latest = self.desired_params.read().unwrap().clone();
-        self.start_runner_locked(&mut runner_guard, &latest).await?;
+        self.start_runner_locked(&mut runner_guard, &sanitized)
+            .await?;
         let endpoint = runner_guard
             .as_ref()
             .map(|r| r.endpoint.clone())
@@ -1004,7 +1049,7 @@ impl LocalFilterManager {
             st.service_state = LocalFilterServiceState::Stopped;
             st.service_endpoint = None;
             st.running_pid = None;
-            st.active_runner_info = None;
+            st.active_runner_synced = None;
             st.stage_message = None;
         }
         drop(runner_guard);
@@ -1026,41 +1071,87 @@ impl LocalFilterManager {
         st.service_state = LocalFilterServiceState::Stopped;
         st.service_endpoint = None;
         st.running_pid = None;
-        st.active_runner_info = None;
+        st.active_runner_synced = None;
         st.stage_message = None;
     }
 
     pub async fn reconfigure_params(&self, params: &FilterModelParams) -> Result<(), CoreError> {
-        self.set_desired_params(params);
-        self.ensure_params_synced().await
+        let sanitized = params.sanitized();
+        self.set_desired_params(&sanitized);
+        let mut guard = self.op_lock.lock().await;
+        self.reap_exited_runner(&mut guard);
+        if guard.is_some() {
+            self.sync_or_restart_runner_locked(&mut guard, &sanitized)
+                .await?;
+        }
+        Ok(())
     }
 
-    async fn ensure_params_synced(&self) -> Result<(), CoreError> {
-        let _cfg_guard = self.configure_lock.lock().await;
-        if let Ok(mut rg) = self.op_lock.try_lock() {
-            self.reap_exited_runner(&mut rg);
-        }
-        let info = self.state.lock().unwrap().active_runner_info.clone();
-        let Some((port, token)) = info else {
-            return Ok(());
+    /// Ensures the active runner's parameters match `sanitized_params`.
+    /// If `POST /configure` fails or times out, cleanly stops and restarts the runner with
+    /// `sanitized_params` instead of allowing stale-parameter predictions.
+    async fn sync_or_restart_runner_locked(
+        &self,
+        runner_guard: &mut Option<RunningRunner>,
+        sanitized_params: &FilterModelParams,
+    ) -> Result<String, CoreError> {
+        let (endpoint, port, token, synced_arc) = {
+            let Some(ref running) = *runner_guard else {
+                return Err(CoreError::InvalidInput(
+                    "本地过滤守护进程未运行，请先部署或启动服务".into(),
+                ));
+            };
+            (
+                running.endpoint.clone(),
+                running.port,
+                running.runner_token.clone(),
+                running.synced_params.clone(),
+            )
         };
-        let target_params = self.desired_params.read().unwrap().clone();
-        if self.applied_params.lock().unwrap().as_ref() == Some(&target_params) {
-            return Ok(());
+
+        if synced_arc.lock().unwrap().as_ref() == Some(sanitized_params) {
+            return Ok(endpoint);
         }
 
-        match self.post_configure_http(port, &token, &target_params).await {
+        match self
+            .post_configure_http(port, &token, sanitized_params)
+            .await
+        {
             Ok(()) => {
-                *self.applied_params.lock().unwrap() = Some(target_params);
-                Ok(())
+                *synced_arc.lock().unwrap() = Some(sanitized_params.clone());
+                Ok(endpoint)
             }
-            Err(PredictLocalError::Transport(err)) => {
-                if let Ok(mut rg) = self.op_lock.try_lock() {
-                    self.reap_exited_runner(&mut rg);
+            Err(PredictLocalError::Transport(cfg_err) | PredictLocalError::HttpStatus(cfg_err)) => {
+                *synced_arc.lock().unwrap() = None;
+                tracing::warn!(
+                    error = %cfg_err,
+                    "同步本地过滤运行参数失败，正在重启守护进程以避免旧参数误判"
+                );
+                self.stop_runner_inner(runner_guard).await;
+                if let Err(restart_err) = self
+                    .start_runner_locked(runner_guard, sanitized_params)
+                    .await
+                {
+                    self.emit_stage(
+                        LocalFilterServiceState::Error,
+                        None,
+                        Some(restart_err.to_string()),
+                    );
+                    return Err(restart_err);
                 }
-                Err(err)
+                let restarted_ep = runner_guard
+                    .as_ref()
+                    .map(|r| r.endpoint.clone())
+                    .ok_or_else(|| CoreError::Network("本地过滤服务重启后无可用地址".into()))?;
+                let st_copy = {
+                    let st = self.state.lock().unwrap();
+                    let env = st.last_env.clone().unwrap_or_default();
+                    self.snapshot_from_state(env, &st)
+                };
+                self.events
+                    .emit(CoreEvent::LocalFilterStatusChanged { status: st_copy });
+                Ok(restarted_ep)
             }
-            Err(PredictLocalError::HttpStatus(err)) => Err(err),
         }
     }
 
@@ -1102,30 +1193,116 @@ impl LocalFilterManager {
         auto_restart: bool,
         params: &FilterModelParams,
     ) -> Result<FilterProbabilities, CoreError> {
-        self.set_desired_params(params);
-        let _ = self.ensure_params_synced().await;
+        let sanitized = params.sanitized();
+        self.set_desired_params(&sanitized);
 
-        let endpoint = match self.active_endpoint() {
-            Some(ep) => ep,
-            None => {
-                if auto_restart && self.is_deployed() {
-                    self.ensure_started_endpoint(params).await?
-                } else {
-                    return Err(CoreError::InvalidInput(
-                        "本地过滤守护进程未运行，请先部署或启动服务".into(),
-                    ));
-                }
-            }
+        let effective_imgs: &[String] = if sanitized.enable_image {
+            let cap = images_base64.len().min(sanitized.max_images as usize);
+            &images_base64[..cap]
+        } else {
+            &[]
         };
 
-        let payload = serde_json::json!({
-            "title": title,
-            "description": description.unwrap_or(""),
-            "tags": tags,
-            "imagesBase64": images_base64,
-        });
+        let sub_batches =
+            split_images_by_raw_budget(effective_imgs, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES);
+        let mut sub_results: Vec<(usize, FilterProbabilities)> =
+            Vec::with_capacity(sub_batches.len());
 
-        match self.send_predict_http(&endpoint, &payload).await {
+        for sub_imgs in sub_batches {
+            let sub_count = sub_imgs.len();
+            let req = RawFilterPredictRequest {
+                title: Some(title.to_string()),
+                description: description.map(str::to_owned),
+                tags: tags.to_vec(),
+                image_base64: None,
+                images_base64: sub_imgs,
+            };
+            let probs = self
+                .predict_raw_once(&req, auto_restart, &sanitized)
+                .await?;
+            sub_results.push((sub_count, probs));
+        }
+
+        Ok(merge_subbatch_probabilities(
+            sub_results,
+            sanitized.gallery_aggregation,
+        ))
+    }
+
+    async fn ensure_synced_endpoint_for_predict(
+        &self,
+        sanitized_params: &FilterModelParams,
+        auto_restart: bool,
+    ) -> Result<String, CoreError> {
+        if let Ok(mut guard) = self.op_lock.try_lock() {
+            self.reap_exited_runner(&mut guard);
+        }
+
+        {
+            let st = self.state.lock().unwrap();
+            if let (Some(ref ep), Some(ref synced_arc)) =
+                (&st.service_endpoint, &st.active_runner_synced)
+            {
+                if synced_arc.lock().unwrap().as_ref() == Some(sanitized_params) {
+                    return Ok(ep.clone());
+                }
+            }
+        }
+
+        let mut guard = self.op_lock.lock().await;
+        self.reap_exited_runner(&mut guard);
+        if guard.is_some() {
+            return self
+                .sync_or_restart_runner_locked(&mut guard, sanitized_params)
+                .await;
+        }
+
+        if !auto_restart || !self.is_deployed() {
+            return Err(CoreError::InvalidInput(
+                "本地过滤守护进程未运行，请先部署或启动服务".into(),
+            ));
+        }
+
+        let recovering_from_crash =
+            self.state.lock().unwrap().service_state == LocalFilterServiceState::Error;
+        if recovering_from_crash {
+            let mut last_restart = self.last_auto_restart_at.lock().unwrap();
+            if last_restart.is_some_and(|t| t.elapsed() < AUTO_RESTART_COOLDOWN) {
+                return Err(CoreError::Network(
+                    "本地过滤守护进程异常退出，自动重启冷却中 (3s)，请稍后重试".into(),
+                ));
+            }
+            *last_restart = Some(Instant::now());
+        }
+
+        self.start_runner_locked(&mut guard, sanitized_params)
+            .await?;
+        let endpoint = guard
+            .as_ref()
+            .map(|r| r.endpoint.clone())
+            .ok_or_else(|| CoreError::Network("本地过滤服务启动后无可用地址".into()))?;
+        let st_copy = {
+            let st = self.state.lock().unwrap();
+            let env = st.last_env.clone().unwrap_or_default();
+            self.snapshot_from_state(env, &st)
+        };
+        drop(guard);
+        self.events
+            .emit(CoreEvent::LocalFilterStatusChanged { status: st_copy });
+        Ok(endpoint)
+    }
+
+    async fn predict_raw_once(
+        &self,
+        payload: &RawFilterPredictRequest,
+        auto_restart: bool,
+        sanitized_params: &FilterModelParams,
+    ) -> Result<FilterProbabilities, CoreError> {
+        let endpoint = self
+            .ensure_synced_endpoint_for_predict(sanitized_params, auto_restart)
+            .await?;
+
+        match self.send_predict_http(&endpoint, payload).await {
             Ok(probs) => Ok(probs),
             Err(PredictLocalError::HttpStatus(err)) => Err(err),
             Err(PredictLocalError::Transport(err)) => {
@@ -1139,7 +1316,7 @@ impl LocalFilterManager {
                     st.service_state = LocalFilterServiceState::Error;
                     st.service_endpoint = None;
                     st.running_pid = None;
-                    st.active_runner_info = None;
+                    st.active_runner_synced = None;
                     st.last_error = Some(err.to_string());
                 }
 
@@ -1147,9 +1324,10 @@ impl LocalFilterManager {
                     return Err(err);
                 }
 
-                // Reuse if another concurrent caller already restarted a fresh runner
-                let retry_endpoint = if let Some(ref running) = *guard {
-                    running.endpoint.clone()
+                // Reuse & sync if another concurrent caller already restarted a fresh runner
+                let retry_endpoint = if guard.is_some() {
+                    self.sync_or_restart_runner_locked(&mut guard, sanitized_params)
+                        .await?
                 } else {
                     {
                         let mut last_restart = self.last_auto_restart_at.lock().unwrap();
@@ -1158,8 +1336,8 @@ impl LocalFilterManager {
                         }
                         *last_restart = Some(Instant::now());
                     }
-                    let latest = self.desired_params.read().unwrap().clone();
-                    self.start_runner_locked(&mut guard, &latest).await?;
+                    self.start_runner_locked(&mut guard, sanitized_params)
+                        .await?;
                     let ep = guard
                         .as_ref()
                         .map(|r| r.endpoint.clone())
@@ -1175,7 +1353,7 @@ impl LocalFilterManager {
                 };
                 drop(guard);
 
-                match self.send_predict_http(&retry_endpoint, &payload).await {
+                match self.send_predict_http(&retry_endpoint, payload).await {
                     Ok(probs) => Ok(probs),
                     Err(PredictLocalError::Transport(e) | PredictLocalError::HttpStatus(e)) => {
                         Err(e)
@@ -1188,7 +1366,7 @@ impl LocalFilterManager {
     async fn send_predict_http(
         &self,
         endpoint: &str,
-        payload: &serde_json::Value,
+        payload: &RawFilterPredictRequest,
     ) -> Result<FilterProbabilities, PredictLocalError> {
         let url = format!("{}/predict", endpoint.trim_end_matches('/'));
         let resp = self
@@ -1227,7 +1405,7 @@ impl LocalFilterManager {
         if !REQUIRED_DEPLOY_FILES
             .iter()
             .all(|f| deploy_dir.join(f).is_file())
-            || !venv_py.is_file()
+            || !is_executable_file(&venv_py)
         {
             return Err(CoreError::InvalidInput(
                 "本地过滤模型尚未完成部署，请先执行一键部署".into(),
@@ -1442,28 +1620,28 @@ impl LocalFilterManager {
 
         // Re-check latest desired_params in case save_config updated them while Python was booting
         let latest_desired = self.desired_params.read().unwrap().clone();
-        let active_applied = if latest_desired != boot_params {
+        let initial_synced = if latest_desired != boot_params {
             match self
                 .post_configure_http(banner.port, &runner_token, &latest_desired)
                 .await
             {
-                Ok(()) => latest_desired,
+                Ok(()) => Some(latest_desired),
                 Err(PredictLocalError::Transport(err) | PredictLocalError::HttpStatus(err)) => {
-                    tracing::warn!(error = %err, "守护进程启动后同步最新过滤参数失败");
-                    boot_params
+                    tracing::warn!(error = %err, "守护进程启动后同步最新过滤参数失败，标记为待重配");
+                    None
                 }
             }
         } else {
-            boot_params
+            Some(boot_params)
         };
-        *self.applied_params.lock().unwrap() = Some(active_applied);
+        let synced_params = Arc::new(Mutex::new(initial_synced));
 
         {
             let mut st = self.state.lock().unwrap();
             st.service_state = LocalFilterServiceState::Running;
             st.service_endpoint = Some(endpoint.clone());
             st.running_pid = pid;
-            st.active_runner_info = Some((banner.port, runner_token.clone()));
+            st.active_runner_synced = Some(synced_params.clone());
             st.stage_message = None;
             st.last_error = None;
         }
@@ -1476,6 +1654,7 @@ impl LocalFilterManager {
             port: banner.port,
             runner_token,
             stderr_tail,
+            synced_params,
         });
         Ok(())
     }
@@ -1500,14 +1679,16 @@ impl LocalFilterManager {
         };
 
         if let Some(err_msg) = exited {
+            if let Some(ref r) = *runner_guard {
+                *r.synced_params.lock().unwrap() = None;
+            }
             *runner_guard = None;
-            *self.applied_params.lock().unwrap() = None;
             let status_snapshot = {
                 let mut st = self.state.lock().unwrap();
                 st.service_state = LocalFilterServiceState::Error;
                 st.service_endpoint = None;
                 st.running_pid = None;
-                st.active_runner_info = None;
+                st.active_runner_synced = None;
                 st.stage_message = None;
                 st.last_error = Some(err_msg);
                 let env = st.last_env.clone().unwrap_or_default();
@@ -1520,8 +1701,8 @@ impl LocalFilterManager {
     }
 
     async fn stop_runner_inner(&self, runner_guard: &mut Option<RunningRunner>) {
-        *self.applied_params.lock().unwrap() = None;
         if let Some(mut running) = runner_guard.take() {
+            *running.synced_params.lock().unwrap() = None;
             drop(running.stdin.take());
             let _ = running.child.kill().await;
             let _ = tokio::time::timeout(Duration::from_secs(3), running.child.wait()).await;
@@ -1540,7 +1721,7 @@ impl LocalFilterManager {
             if !matches!(service_state, LocalFilterServiceState::Running) {
                 st.service_endpoint = None;
                 st.running_pid = None;
-                st.active_runner_info = None;
+                st.active_runner_synced = None;
             }
             st.stage_message = stage_message;
             if last_error.is_some() {
@@ -1743,6 +1924,202 @@ async fn rev_parse_async(
     Ok(sha)
 }
 
+async fn try_rev_parse_commit_async(
+    cancel: &CancellationToken,
+    repo_dir: &Path,
+    spec: &str,
+) -> Option<String> {
+    let out = run_git_async(
+        cancel,
+        repo_dir,
+        &["rev-parse", "--verify", "--quiet", spec],
+        GIT_FAST_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    let sha = out.trim();
+    (sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| sha.to_ascii_lowercase())
+}
+
+async fn resolve_target_commit_sha_async(
+    cancel: &CancellationToken,
+    repo_dir: &Path,
+    target: &str,
+) -> Result<String, CoreError> {
+    let origin_spec = format!("refs/remotes/origin/{target}^{{commit}}");
+    let direct_spec = format!("{target}^{{commit}}");
+
+    for spec in [&origin_spec, &direct_spec] {
+        if let Some(sha) = try_rev_parse_commit_async(cancel, repo_dir, spec).await {
+            return Ok(sha);
+        }
+    }
+
+    run_git_async(
+        cancel,
+        repo_dir,
+        &["fetch", "origin", target],
+        GIT_NETWORK_TIMEOUT,
+    )
+    .await?;
+
+    for spec in [
+        origin_spec.as_str(),
+        direct_spec.as_str(),
+        "FETCH_HEAD^{commit}",
+    ] {
+        if let Some(sha) = try_rev_parse_commit_async(cancel, repo_dir, spec).await {
+            return Ok(sha);
+        }
+    }
+
+    Err(CoreError::InvalidInput(format!(
+        "无法解析目标 Commit 或远端分支: {target}"
+    )))
+}
+
+pub(crate) fn split_images_by_raw_budget(
+    images_base64: &[String],
+    max_raw_bytes: usize,
+) -> Vec<Vec<String>> {
+    if images_base64.is_empty() {
+        return vec![Vec::new()];
+    }
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut current_bytes: usize = 0;
+
+    for img in images_base64 {
+        let est_raw = img.len().saturating_mul(3) / 4;
+        if !current.is_empty() && current_bytes.saturating_add(est_raw) > max_raw_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes = current_bytes.saturating_add(est_raw);
+        current.push(img.clone());
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+fn aggregate_subbatch_scalars(
+    values: &[(usize, f32)],
+    aggregation: FilterGalleryAggregation,
+) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    if values.len() == 1 {
+        return values[0].1;
+    }
+    match aggregation {
+        FilterGalleryAggregation::Mean => {
+            let total_weight: usize = values.iter().map(|(c, _)| (*c).max(1)).sum();
+            let weighted_sum: f32 = values.iter().map(|(c, v)| (*c).max(1) as f32 * *v).sum();
+            (weighted_sum / total_weight as f32).clamp(0.0, 1.0)
+        }
+        FilterGalleryAggregation::Top2Mean => {
+            let mut expanded: Vec<f32> = Vec::new();
+            for &(count, val) in values {
+                expanded.push(val);
+                if count >= 2 {
+                    expanded.push(val);
+                }
+            }
+            expanded.sort_by(f32::total_cmp);
+            let n = expanded.len();
+            if n >= 2 {
+                ((expanded[n - 1] + expanded[n - 2]) * 0.5).clamp(0.0, 1.0)
+            } else {
+                expanded[0].clamp(0.0, 1.0)
+            }
+        }
+        FilterGalleryAggregation::Max => values
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(0.0_f32, f32::max)
+            .clamp(0.0, 1.0),
+    }
+}
+
+pub(crate) fn merge_subbatch_probabilities(
+    parts: Vec<(usize, FilterProbabilities)>,
+    aggregation: FilterGalleryAggregation,
+) -> FilterProbabilities {
+    if parts.is_empty() {
+        return FilterProbabilities::default();
+    }
+    if parts.len() == 1 {
+        return parts.into_iter().next().unwrap().1;
+    }
+
+    let first = &parts[0].1;
+    let mut all_per_image = Vec::new();
+    let mut all_have_per_image = true;
+    for (count, p) in &parts {
+        if *count > 0 && p.per_image_probs.len() == *count {
+            all_per_image.extend_from_slice(&p.per_image_probs);
+        } else {
+            all_have_per_image = false;
+        }
+    }
+    if !all_have_per_image {
+        all_per_image.clear();
+    }
+
+    let ov_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.prob)).collect();
+    let gore_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.gore_prob)).collect();
+    let nsfw_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.nsfw_prob)).collect();
+
+    let img_vals: Vec<(usize, f32)> = parts
+        .iter()
+        .filter_map(|(c, p)| p.image_prob.map(|v| (*c, v)))
+        .collect();
+    let img_gore_vals: Vec<(usize, f32)> = parts
+        .iter()
+        .filter_map(|(c, p)| p.image_gore_prob.map(|v| (*c, v)))
+        .collect();
+    let img_nsfw_vals: Vec<(usize, f32)> = parts
+        .iter()
+        .filter_map(|(c, p)| p.image_nsfw_prob.map(|v| (*c, v)))
+        .collect();
+
+    let image_prob = if !all_per_image.is_empty()
+        && aggregation == FilterGalleryAggregation::Top2Mean
+        && all_per_image.len() >= 2
+    {
+        let mut sorted = all_per_image.clone();
+        sorted.sort_by(f32::total_cmp);
+        let n = sorted.len();
+        Some(((sorted[n - 1] + sorted[n - 2]) * 0.5).clamp(0.0, 1.0))
+    } else if !img_vals.is_empty() {
+        Some(aggregate_subbatch_scalars(&img_vals, aggregation))
+    } else {
+        None
+    };
+
+    FilterProbabilities {
+        prob: aggregate_subbatch_scalars(&ov_vals, aggregation),
+        gore_prob: aggregate_subbatch_scalars(&gore_vals, aggregation),
+        nsfw_prob: aggregate_subbatch_scalars(&nsfw_vals, aggregation),
+        text_prob: first.text_prob,
+        text_gore_prob: first.text_gore_prob,
+        text_nsfw_prob: first.text_nsfw_prob,
+        title_prob: first.title_prob,
+        description_prob: first.description_prob,
+        image_prob,
+        image_gore_prob: (!img_gore_vals.is_empty())
+            .then(|| aggregate_subbatch_scalars(&img_gore_vals, aggregation)),
+        image_nsfw_prob: (!img_nsfw_vals.is_empty())
+            .then(|| aggregate_subbatch_scalars(&img_nsfw_vals, aggregation)),
+        per_image_probs: all_per_image,
+        scoring_revision: first.scoring_revision.clone(),
+    }
+}
+
 async fn resolve_remote_default_ref_async(
     cancel: &CancellationToken,
     repo_dir: &Path,
@@ -1887,7 +2264,7 @@ async fn ls_remote_head_async(
             if sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Ok(Some(FilterCommitInfo {
                     sha: sha.to_string(),
-                    short_sha: sha[..7].to_string(),
+                    short_sha: sha.chars().take(7).collect(),
                     subject: "Remote HEAD".to_string(),
                     committed_at: String::new(),
                 }));
@@ -1924,5 +2301,162 @@ mod tests {
         assert!(
             validate_repo_url("https://github.com/FallenCrystal/Left4Filters.git", true).is_ok()
         );
+    }
+
+    #[test]
+    fn split_images_by_raw_budget_enforces_30_mib_subbatches_and_merges_per_image_probs() {
+        // Three ~12 MiB raw images (~16 MiB base64 each):
+        // img0 + img1 = 24 MiB <= 30 MiB; adding img2 = 36 MiB > 30 MiB -> [2, 1] sub-batches!
+        let twelve_mib_b64 = "A".repeat(16 * 1024 * 1024);
+        let imgs = vec![
+            twelve_mib_b64.clone(),
+            twelve_mib_b64.clone(),
+            twelve_mib_b64,
+        ];
+        let batches = split_images_by_raw_budget(&imgs, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches[1].len(), 1);
+
+        let merged = merge_subbatch_probabilities(
+            vec![
+                (
+                    2,
+                    FilterProbabilities {
+                        prob: 0.12,
+                        gore_prob: 0.02,
+                        nsfw_prob: 0.11,
+                        text_prob: Some(0.03),
+                        image_prob: Some(0.12),
+                        per_image_probs: vec![0.04, 0.12],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    1,
+                    FilterProbabilities {
+                        prob: 0.91,
+                        gore_prob: 0.01,
+                        nsfw_prob: 0.90,
+                        text_prob: Some(0.03),
+                        image_prob: Some(0.91),
+                        per_image_probs: vec![0.91],
+                        ..Default::default()
+                    },
+                ),
+            ],
+            FilterGalleryAggregation::Max,
+        );
+        assert_eq!(merged.prob, 0.91);
+        assert_eq!(merged.nsfw_prob, 0.90);
+        assert_eq!(merged.image_prob, Some(0.91));
+        assert_eq!(merged.per_image_probs, vec![0.04, 0.12, 0.91]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn venv_python_path_and_probe_preserve_virtualenv_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let sys_env = probe_environment();
+        assert!(sys_env.python_available);
+        let sys_py = sys_env.python_path.as_ref().unwrap();
+        let real_target = fs::canonicalize(sys_py).unwrap();
+
+        let fake_venv = dir.path().join("custom-venv");
+        let status = std::process::Command::new(sys_py)
+            .args(["-m", "venv", "--without-pip"])
+            .arg(&fake_venv)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "python -m venv --without-pip must succeed"
+        );
+
+        let bin_dir = fake_venv.join("bin");
+        let symlink_py = bin_dir.join("python");
+        let symlink_py3 = bin_dir.join("python3");
+
+        let resolved_venv_py = venv_python_path(&fake_venv);
+        assert_eq!(
+            resolved_venv_py,
+            make_absolute_preserving_symlinks(&symlink_py)
+        );
+        assert_ne!(
+            resolved_venv_py, real_target,
+            "venv_python_path must preserve symlink instead of canonicalizing"
+        );
+        assert!(fs::symlink_metadata(&resolved_venv_py)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let probed = probe_python_candidates(&[("python3", &[])], Some(bin_dir.as_os_str()))
+            .expect("probe_python_candidates should find symlinked python3");
+        assert_eq!(
+            Path::new(&probed.0),
+            make_absolute_preserving_symlinks(&symlink_py3)
+        );
+        assert_ne!(Path::new(&probed.0), real_target.as_path());
+    }
+
+    #[tokio::test]
+    async fn send_predict_http_uses_snake_case_images_base64_and_never_camel_case() {
+        use crate::engine::NullEventSink;
+        use axum::{http::StatusCode, routing::post, Json, Router};
+
+        let app = Router::new().route(
+            "/predict",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                if body.get("imagesBase64").is_some() || body.get("imageBase64").is_some() {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "camelCase forbidden" })),
+                    );
+                }
+                let imgs = body
+                    .get("images_base64")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                assert_eq!(imgs.len(), 2);
+                assert_eq!(imgs[0].as_str(), Some("aW1nMA=="));
+                assert_eq!(imgs[1].as_str(), Some("aW1nMQ=="));
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "prob": 0.88,
+                        "gore_prob": 0.05,
+                        "nsfw_prob": 0.87,
+                        "per_image_probs": [0.10, 0.88]
+                    })),
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
+        let mgr = LocalFilterManager::new(paths, Arc::new(NullEventSink));
+        let payload = RawFilterPredictRequest {
+            title: Some("Test".into()),
+            description: None,
+            tags: vec!["Map".into()],
+            image_base64: None,
+            images_base64: vec!["aW1nMA==".into(), "aW1nMQ==".into()],
+        };
+        let probs = mgr
+            .send_predict_http(&format!("http://{addr}"), &payload)
+            .await
+            .unwrap_or_else(|_| panic!("expected strict snake_case /predict to succeed"));
+        assert_eq!(probs.prob, 0.88);
+        assert_eq!(probs.per_image_probs, vec![0.10, 0.88]);
+
+        server_handle.abort();
     }
 }

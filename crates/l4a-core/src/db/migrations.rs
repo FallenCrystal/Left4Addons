@@ -186,6 +186,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
             policy_sig TEXT NOT NULL,
             verdict_json TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            addon_state_sig TEXT,
             PRIMARY KEY (target_key, policy_sig)
         );
         CREATE INDEX IF NOT EXISTS idx_filter_verdicts_policy_sig ON filter_verdicts(policy_sig);
@@ -204,6 +205,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), CoreError> {
         "tasks",
         "target_title",
         "ALTER TABLE tasks ADD COLUMN target_title TEXT",
+    )?;
+    ensure_column_exists(
+        &tx,
+        "filter_verdicts",
+        "addon_state_sig",
+        "ALTER TABLE filter_verdicts ADD COLUMN addon_state_sig TEXT",
     )?;
 
     // Force the next scan to re-extract metadata with the corrected VPK parser.

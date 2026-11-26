@@ -500,6 +500,7 @@ export const zh = {
   filter: {
     evaluatingMedia: '正在进行内容安全评估…',
     evalFailedRetry: '过滤评估失败 · 点击重试',
+    evalIncompleteRetry: '部分预览图加载失败，安全评估未完成',
     imageHidden: '已隐藏敏感图片',
     lazyLoadPreview: '点击加载预览',
     blurredImage: '敏感图片已模糊',

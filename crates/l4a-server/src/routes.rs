@@ -907,6 +907,17 @@ async fn guard_filter_enabled(
             "内容过滤服务未启用",
         ));
     }
+    let _admission_permit = state
+        .server
+        .filter
+        .acquire_public_admission()
+        .await
+        .ok_or_else(|| {
+            err_resp(
+                StatusCode::TOO_MANY_REQUESTS,
+                "内容过滤请求繁忙，请稍后重试",
+            )
+        })?;
     Ok(next.run(request).await)
 }
 

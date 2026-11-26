@@ -6,9 +6,9 @@ use crate::filter::secret::validate_env_var_name;
 use crate::filter::{evaluate_targets, TokenVault};
 use l4a_protocol::{
     AddonId, ClientFilterConfig, CoreEvent, DashboardSnapshot, DeployLocalFilterRequest,
-    FilterEvaluationTarget, FilterItemVerdict, FilterTokenStatus, LocalFilterDeploymentStatus,
-    UpsertFilterExclusionRequest, DEFAULT_FILTER_REPO_URL, DEFAULT_LLM_ENDPOINT, DEFAULT_LLM_MODEL,
-    DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_TOKEN_ENV_VAR,
+    FilterEvaluationBatchResponse, FilterEvaluationTarget, FilterTokenStatus,
+    LocalFilterDeploymentStatus, UpsertFilterExclusionRequest, DEFAULT_FILTER_REPO_URL,
+    DEFAULT_LLM_ENDPOINT, DEFAULT_LLM_MODEL, DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_TOKEN_ENV_VAR,
 };
 
 fn sanitize_filter_basics(cfg: &mut ClientFilterConfig) {
@@ -150,7 +150,7 @@ impl L4aEngine {
             )
             .await?;
 
-        // Persist updated deployment tracking settings back to config
+        // Persist updated deployment tracking settings back to config and clear prior model verdicts
         let workspace = self.lock_workspace()?;
         let mut updated_cfg = self.config();
         let mut changed = false;
@@ -188,10 +188,9 @@ impl L4aEngine {
             save_config(&self.paths.settings_path, &updated_cfg)?;
             *self.config.write().unwrap() = updated_cfg;
         }
+        let _ = self.db.clear_filter_verdicts();
         drop(workspace);
-        if changed {
-            self.emit_workspace_update();
-        }
+        self.emit_workspace_update();
 
         Ok(status)
     }
@@ -233,11 +232,12 @@ impl L4aEngine {
     pub async fn evaluate_filter_items(
         &self,
         targets: Vec<FilterEvaluationTarget>,
-    ) -> Result<Vec<FilterItemVerdict>, CoreError> {
+    ) -> Result<FilterEvaluationBatchResponse, CoreError> {
         evaluate_targets(self, targets).await
     }
 
     pub fn clear_filter_cache(&self) -> Result<u64, CoreError> {
+        *self.catalog_scoring_cache.lock().unwrap() = None;
         self.db.clear_filter_verdicts()
     }
 

@@ -10,8 +10,8 @@ import type {
   CoreEvent,
   DashboardSnapshot,
   DeployLocalFilterRequest,
+  FilterEvaluationBatchResponse,
   FilterEvaluationTarget,
-  FilterItemVerdict,
   FilterTokenStatus,
   LoadoutProfile,
   LocalFilterDeploymentStatus,
@@ -141,7 +141,9 @@ export interface DesktopClient {
   stopLocalFilterService: () => Promise<LocalFilterDeploymentStatus>;
   getFilterTokenStatus: () => Promise<FilterTokenStatus>;
   setFilterLlmToken: (token: string | null) => Promise<FilterTokenStatus>;
-  evaluateFilterItems: (targets: FilterEvaluationTarget[]) => Promise<FilterItemVerdict[]>;
+  evaluateFilterItems: (
+    targets: FilterEvaluationTarget[],
+  ) => Promise<FilterEvaluationBatchResponse>;
   clearFilterCache: () => Promise<number>;
   upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<DashboardSnapshot>;
   deleteFilterExclusion: (addonId: AddonId) => Promise<DashboardSnapshot>;

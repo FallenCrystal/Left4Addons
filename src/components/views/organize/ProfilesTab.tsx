@@ -3,9 +3,10 @@ import { Pencil, Play, SlidersHorizontal, Trash2 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, LoadoutProfile } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import {
-  formatFilteredAddonTitle,
+  formatRedactedAddonLabel,
   resolveLibraryAddonCardFilter,
 } from '../../../utils/contentFilter';
+import { formatAddonDisplayName } from '../../../utils/format';
 import { Button, EmptyState, IconButton } from '../../m3/primitives';
 import { computeProfileDiff } from './helpers';
 
@@ -46,29 +47,14 @@ export function ProfilesTab({
     );
   }
 
-  const visibleLoadingAddons = loadingAddons.filter(
-    (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
-  );
-
   return (
     <div className="l4a-card-grid-wide">
       {filteredProfiles.map((profile) => {
-        const rawDiff = computeProfileDiff(profile, addonsById, visibleLoadingAddons);
-        const visibleMissingIds = rawDiff.missingIds.filter((id) => {
-          const found = addonsById.get(id);
-          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
-        });
+        const rawDiff = computeProfileDiff(profile, addonsById, loadingAddons);
         const noChange = rawDiff.toEnable.length === 0 && rawDiff.toDisable.length === 0;
         const previewMembers = profile.enabledAddonIds
           .map((id) => addonsById.get(id))
-          .filter(
-            (a): a is AddonSummary =>
-              Boolean(a) && !resolveLibraryAddonCardFilter(a!, filterCtx).hiddenCard,
-          );
-        const visibleEnabledCount = profile.enabledAddonIds.filter((id) => {
-          const found = addonsById.get(id);
-          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
-        }).length;
+          .filter((a): a is AddonSummary => Boolean(a));
 
         return (
           <article
@@ -87,7 +73,7 @@ export function ProfilesTab({
                   {profile.name}
                 </span>
                 <span className="md-pill" data-tone="primary">
-                  {t('common.items', { count: visibleEnabledCount })}
+                  {t('common.items', { count: profile.enabledAddonIds.length })}
                 </span>
               </div>
 
@@ -122,20 +108,29 @@ export function ProfilesTab({
                     )}
                   </>
                 )}
-                {visibleMissingIds.length > 0 && (
+                {rawDiff.missingIds.length > 0 && (
                   <span className="md-pill" data-tone="error">
-                    {t('organize.profileMissing', { count: visibleMissingIds.length })}
+                    {t('organize.profileMissing', { count: rawDiff.missingIds.length })}
                   </span>
                 )}
               </div>
 
               {previewMembers.length > 0 && (
                 <div className="l4a-member-preview">
-                  {previewMembers.slice(0, 3).map((m) => (
-                    <span key={m.id} className="l4a-member-chip l4a-truncate">
-                      {formatFilteredAddonTitle(m, namePreference, filterCtx, t)}
-                    </span>
-                  ))}
+                  {previewMembers.slice(0, 3).map((m) => {
+                    const cardFilter = resolveLibraryAddonCardFilter(m, filterCtx);
+                    const shouldRedact =
+                      cardFilter.hiddenCard ||
+                      cardFilter.redactTitle ||
+                      cardFilter.blurWholeCard;
+                    return (
+                      <span key={m.id} className="l4a-member-chip l4a-truncate">
+                        {shouldRedact
+                          ? formatRedactedAddonLabel(m.workshopId, t)
+                          : formatAddonDisplayName(m, namePreference)}
+                      </span>
+                    );
+                  })}
                   {previewMembers.length > 3 && (
                     <span className="l4a-member-chip">
                       {t('organize.moreMembers', { count: previewMembers.length - 3 })}

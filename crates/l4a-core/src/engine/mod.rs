@@ -85,6 +85,8 @@ pub struct L4aEngine {
     hydration_backoff: Mutex<HashMap<WorkshopId, (u32, Instant)>>,
     local_filter: Arc<LocalFilterManager>,
     token_vault: RwLock<TokenVault>,
+    pub(crate) filter_eval_semaphore: tokio::sync::Semaphore,
+    pub(crate) catalog_scoring_cache: Mutex<Option<(String, Instant, Option<String>)>>,
     allow_loopback_image_urls_for_testing: AtomicBool,
     loopback_http_client: reqwest::Client,
     https_only_http_client: reqwest::Client,
@@ -159,6 +161,8 @@ impl L4aEngine {
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
             token_vault,
+            filter_eval_semaphore: tokio::sync::Semaphore::new(4),
+            catalog_scoring_cache: Mutex::new(None),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
             https_only_http_client,
@@ -203,6 +207,8 @@ impl L4aEngine {
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
             token_vault,
+            filter_eval_semaphore: tokio::sync::Semaphore::new(4),
+            catalog_scoring_cache: Mutex::new(None),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
             https_only_http_client,
@@ -216,6 +222,17 @@ impl L4aEngine {
             .store(allow, Ordering::Release);
     }
 
+    /// Expires the 30-second Catalog `/api/v1/filter/info` cache timestamp strictly for integration tests.
+    pub fn expire_catalog_scoring_cache_for_testing(&self) {
+        if let Some(entry) = self.catalog_scoring_cache.lock().unwrap().as_mut() {
+            if let Some(past) = Instant::now().checked_sub(Duration::from_secs(60)) {
+                entry.1 = past;
+            } else {
+                *self.catalog_scoring_cache.lock().unwrap() = None;
+            }
+        }
+    }
+
     pub(crate) fn allow_loopback_image_urls_for_testing(&self) -> bool {
         self.allow_loopback_image_urls_for_testing
             .load(Ordering::Acquire)
@@ -223,6 +240,36 @@ impl L4aEngine {
 
     pub(crate) fn loopback_http_client(&self) -> &reqwest::Client {
         &self.loopback_http_client
+    }
+
+    pub(crate) fn prepare_routed_get(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::RequestBuilder, CoreError> {
+        if crate::filter::llm::is_loopback_url(url) {
+            return Ok(self.loopback_http_client.get(url).timeout(timeout));
+        }
+        let resolved = self
+            .mirror
+            .validate_url(url)
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        let https_only = self.config.read().unwrap().https_only;
+        if resolved.insecure_tls && !https_only {
+            let (client, _) = self
+                .mirror
+                .build_client_for(url, Some(timeout))
+                .map_err(|e| CoreError::Network(e.to_string()))?;
+            let (req, _) = self.mirror.prepare_get(&client, url);
+            return Ok(req.timeout(timeout));
+        }
+        let client = if https_only {
+            &self.https_only_http_client
+        } else {
+            &self.standard_http_client
+        };
+        let (req, _) = self.mirror.prepare_get(client, url);
+        Ok(req.timeout(timeout))
     }
 
     pub(crate) fn prepare_routed_post(
@@ -253,6 +300,37 @@ impl L4aEngine {
         };
         let (req, _) = self.mirror.prepare_post(client, url);
         Ok(req.timeout(timeout))
+    }
+
+    pub(crate) fn cached_catalog_scoring_revision(
+        &self,
+        catalog_server_url: Option<&str>,
+    ) -> Option<String> {
+        let normalized = catalog_server_url
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches('/');
+        if normalized.is_empty() {
+            return None;
+        }
+        let guard = self.catalog_scoring_cache.lock().unwrap();
+        match &*guard {
+            Some((cached_url, _, rev)) if cached_url == normalized => rev.clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn current_filter_policy_signature(&self, cfg: &AppConfig) -> String {
+        let catalog_rev = if cfg.filter.mode == ClientFilterSourceMode::Catalog {
+            self.cached_catalog_scoring_revision(cfg.catalog_server_url.as_deref())
+        } else {
+            None
+        };
+        cfg.filter.canonical_policy_signature(
+            cfg.catalog_server_url.as_deref(),
+            cfg.https_only,
+            catalog_rev.as_deref(),
+        )
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -342,6 +420,11 @@ impl L4aEngine {
         };
         self.local_filter
             .set_desired_params(&next.filter.local_params);
+
+        let active_policy_sig = self.current_filter_policy_signature(&next);
+        if let Err(err) = self.db.prune_filter_verdicts_except(&active_policy_sig) {
+            tracing::warn!(error = %err, "保存配置时清理旧策略过滤缓存失败");
+        }
 
         if let Some(ref dyn_bridge) = self.dynamic_bridge {
             dyn_bridge.set_enabled(!next.disable_steamworks_sdk);
@@ -437,18 +520,40 @@ impl L4aEngine {
 
     fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {
         let config = self.config();
-        let local_sha = if config.filter.mode == ClientFilterSourceMode::Local {
-            self.local_filter.active_commit_sha()
-        } else {
-            None
-        };
-        let policy_sig =
-            crate::filter::evaluator::compute_policy_signature(&config, local_sha.as_deref());
-        let cached_filter_verdicts = self.db.list_filter_verdicts_for_policy(&policy_sig)?;
+        let addons = self.db.list_addons()?;
+        let filter_policy_signature = self.current_filter_policy_signature(&config);
+        let max_age = crate::filter::evaluator::remote_verdict_cache_max_age(&config.filter);
+        let raw_verdict_rows = self
+            .db
+            .list_filter_verdicts_for_policy(&filter_policy_signature, max_age)?;
+
+        let addon_sigs_by_key: HashMap<String, String> = addons
+            .iter()
+            .map(|addon| {
+                (
+                    format!("addon:{}", addon.id.as_str()),
+                    crate::filter::compute_addon_state_sig(addon),
+                )
+            })
+            .collect();
+
+        let cached_filter_verdicts = raw_verdict_rows
+            .into_iter()
+            .filter_map(|row| {
+                if let Some(current_sig) = addon_sigs_by_key.get(&row.verdict.target_key) {
+                    if row.addon_state_sig.as_deref() != Some(current_sig.as_str()) {
+                        return None;
+                    }
+                } else if row.addon_state_sig.is_some() {
+                    return None;
+                }
+                Some(row.verdict)
+            })
+            .collect();
 
         Ok(DashboardSnapshot {
             config,
-            addons: self.db.list_addons()?,
+            addons,
             bundles: self.db.list_bundles()?,
             collections: self.db.list_tracked_collections()?,
             user_groups: self.db.list_user_groups()?,
@@ -457,6 +562,7 @@ impl L4aEngine {
             tasks: self.db.list_tasks()?,
             filter_exclusions: self.db.list_filter_exclusions()?,
             cached_filter_verdicts,
+            filter_policy_signature,
         })
     }
 

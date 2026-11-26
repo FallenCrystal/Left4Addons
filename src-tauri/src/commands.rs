@@ -3,8 +3,8 @@ use l4a_core::{validate_external_url, CoreError};
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
     DashboardSnapshot, DeployLocalFilterRequest, DesktopError, DesktopErrorCode,
-    FilterEvaluationTarget, FilterItemVerdict, FilterTokenStatus, GroupId, IssueId, LoadoutProfile,
-    LocalFilterDeploymentStatus, ProfileApplyReport, ProfileId, ReconcileAction,
+    FilterEvaluationBatchResponse, FilterEvaluationTarget, FilterTokenStatus, GroupId, IssueId,
+    LoadoutProfile, LocalFilterDeploymentStatus, ProfileApplyReport, ProfileId, ReconcileAction,
     ReconcileBatchItem, ReconcileBatchReport, RenamePreviewItem, RenameRuleConfig, SearchQuery,
     SearchResponse, SyncReport, TrackedCollectionRecord, UpsertFilterExclusionRequest, UserGroup,
     WorkshopId, WorkshopItemRecord,
@@ -595,7 +595,7 @@ pub async fn set_filter_llm_token(
 pub async fn evaluate_filter_items(
     targets: Vec<FilterEvaluationTarget>,
     state: State<'_, TauriState>,
-) -> Result<Vec<FilterItemVerdict>, DesktopError> {
+) -> Result<FilterEvaluationBatchResponse, DesktopError> {
     state
         .engine
         .evaluate_filter_items(targets)

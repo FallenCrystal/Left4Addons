@@ -49,4 +49,6 @@ known_addons.json
 .env.*
 catalog.toml
 crates/l4a-server/web-dist/
+__pycache__/
+*.pyc
 

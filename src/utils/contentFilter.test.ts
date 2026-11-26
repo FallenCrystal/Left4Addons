@@ -52,7 +52,9 @@ function makeFlaggedVerdict(overrides: Partial<FilterItemVerdict> = {}): FilterI
     titleSensitive: false,
     descriptionSensitive: false,
     imageSensitive: true,
+    evaluatedImageIndices: [0, 1],
     sensitiveImageIndices: [0],
+    complete: true,
     evaluatedAt: '2026-11-25T00:00:00Z',
     ...overrides,
   };
@@ -264,14 +266,38 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(settledSafe.pendingEvaluation).toBe(false);
     expect(settledSafe.coverMode).toBe('none');
     expect(settledSafe.blurWholeCard).toBe(false);
+
+    // Failed / incomplete target (verdict === undefined, hasTargetFailed === true) stays conservative (never flashes raw cover) while clearing pendingEvaluation
+    const failedBlurCard = resolveCardFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'blur_card' }),
+      scope: 'library',
+      verdict: undefined,
+      hasTargetFailed: true,
+      hasContent: true,
+    });
+    expect(failedBlurCard.pendingEvaluation).toBe(false);
+    expect(failedBlurCard.coverMode).toBe('hide');
+    expect(failedBlurCard.blurWholeCard).toBe(true);
+
+    const failedDetail = resolveDetailFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'hide_image' }),
+      scope: 'workshop',
+      verdict: undefined,
+      hasTargetFailed: true,
+      hasContent: true,
+    });
+    expect(failedDetail.pendingEvaluation).toBe(false);
+    expect(failedDetail.coverMode).toBe('blur');
+    expect(failedDetail.imageModeAt(0)).toBe('blur');
   });
 
-  it('enforces image-only blurring in Detail view, subdivides gallery screenshots, and blurs unscanned screenshots beyond perImageProbs', () => {
+  it('enforces image-only blurring in Detail view, maps evaluatedImageIndices to original gallery slots, and blurs unscanned or failed-to-load slots', () => {
     const galleryVerdict = makeFlaggedVerdict({
       imageSensitive: true,
       textSensitive: true,
       titleSensitive: true,
       descriptionSensitive: true,
+      evaluatedImageIndices: [0, 1],
       sensitiveImageIndices: [1],
       probabilities: {
         prob: 0.91,
@@ -283,7 +309,7 @@ describe('contentFilter pure resolution & calibration logic', () => {
     });
 
     // Subdivided detail view: never redacts text; safe cover (0) stays 'none', flagged shot (1) is 'blur',
-    // and unscanned shots (index >= perImageProbs.length: 2, 3) are blurred defensively!
+    // and unscanned shots (2, 3) are blurred defensively!
     const detailSubdivided = resolveDetailFilterState({
       config: makeEnabledConfig({ flaggedAction: 'hide_card', subdivideModalities: true }),
       scope: 'workshop',
@@ -297,6 +323,31 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(detailSubdivided.imageModeAt(1)).toBe('blur');
     expect(detailSubdivided.imageModeAt(2)).toBe('blur');
     expect(detailSubdivided.imageModeAt(3)).toBe('blur');
+
+    // Original gallery slot mapping when slot 0 failed to load and slot 3 exceeded maxImages:
+    // evaluatedImageIndices: [1, 2], sensitiveImageIndices: [2] -> blurs slots 0, 2, 3 and leaves slot 1 clear!
+    const sparseSlotVerdict = makeFlaggedVerdict({
+      imageSensitive: true,
+      evaluatedImageIndices: [1, 2],
+      sensitiveImageIndices: [2],
+      probabilities: {
+        prob: 0.92,
+        goreProb: 0.91,
+        nsfwProb: 0.03,
+        perImageProbs: [0.02, 0.91],
+      },
+    });
+    const detailSparseSlots = resolveDetailFilterState({
+      config: makeEnabledConfig({ flaggedAction: 'blur_card', subdivideModalities: true }),
+      scope: 'workshop',
+      verdict: sparseSlotVerdict,
+      totalImages: 4,
+    });
+    expect(detailSparseSlots.coverMode).toBe('blur');
+    expect(detailSparseSlots.imageModeAt(0)).toBe('blur');
+    expect(detailSparseSlots.imageModeAt(1)).toBe('none');
+    expect(detailSparseSlots.imageModeAt(2)).toBe('blur');
+    expect(detailSparseSlots.imageModeAt(3)).toBe('blur');
 
     // Non-subdivided detail view: all images (0, 1, 2, 3) are blurred while text remains unredacted
     const detailCoarse = resolveDetailFilterState({
@@ -411,7 +462,7 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(invalidDetail.redactText).toBe(false);
   });
 
-  it('never allows bundle.coverImage to bypass member filterMode on collapsed bundles', () => {
+  it('omits bundle.coverImage when owned by a hiddenCard member or unverified, and enforces the owning visible member filterMode', () => {
     const makeAddon = (id: string, coverImage?: string): AddonSummary => ({
       id,
       workshopId: id.replace('ws:', ''),
@@ -430,21 +481,22 @@ describe('contentFilter pure resolution & calibration logic', () => {
     });
 
     const memberWithCover = makeAddon('ws:100', 'https://img.example.com/member100.jpg');
-    const memberWithoutCover = makeAddon('ws:200', undefined);
+    const safeMemberWithoutCover = makeAddon('ws:200', undefined);
+    const hiddenOwnerMember = makeAddon('ws:300', 'https://img.example.com/hidden_nsfw.jpg');
+    const visibleOwnerMember = makeAddon('ws:400', 'https://img.example.com/visible_blurred.jpg');
+
     const flaggedVerdict100 = makeFlaggedVerdict({
       targetKey: 'addon:ws:100',
       imageSensitive: true,
       textSensitive: true,
       titleSensitive: true,
     });
-    const flaggedVerdict200 = makeFlaggedVerdict({
-      targetKey: 'addon:ws:200',
+    const hiddenVerdict300 = makeFlaggedVerdict({
+      targetKey: 'addon:ws:300',
       imageSensitive: true,
-      textSensitive: true,
-      titleSensitive: true,
     });
 
-    // Case 1: Member has cover AND bundle.coverImage is populated -> still enforces 'hide' & redactTitle!
+    // Case 1: Visible member has cover -> enforces member's 'hide' & redactTitle!
     const presWithMemberCover = resolveBundleCoverPresentation(
       [memberWithCover],
       {
@@ -453,33 +505,77 @@ describe('contentFilter pure resolution & calibration logic', () => {
         evaluatedRevisions: { 'addon:ws:100': 'r1' },
         exclusionsByAddonId: new Map(),
       },
-      { bundleCoverImage: 'https://img.example.com/explicit_bundle_cover.jpg' },
+      {
+        allMembers: [memberWithCover],
+        bundleCoverImage: 'https://img.example.com/explicit_bundle_cover.jpg',
+      },
     );
     expect(presWithMemberCover.coverMode).toBe('hide');
     expect(presWithMemberCover.redactTitle).toBe(true);
 
-    // Case 2: Members have NO individual cover, falling back to bundle.coverImage -> still enforces strictest member coverMode ('hide' / 'blur')!
-    const presFallbackBundleCover = resolveBundleCoverPresentation(
-      [memberWithoutCover],
+    // Case 2: bundle.coverImage belongs to a hiddenCard member -> omitted completely!
+    const presHiddenOwner = resolveBundleCoverPresentation(
+      [safeMemberWithoutCover],
+      {
+        filterConfig: makeEnabledConfig({ flaggedAction: 'hide_card' }),
+        verdicts: { 'addon:ws:300': hiddenVerdict300 },
+        evaluatedRevisions: { 'addon:ws:200': 'r1', 'addon:ws:300': 'r1' },
+        exclusionsByAddonId: new Map(),
+      },
+      {
+        allMembers: [hiddenOwnerMember, safeMemberWithoutCover],
+        bundleCoverImage: 'https://img.example.com/hidden_nsfw.jpg',
+      },
+    );
+    expect(presHiddenOwner.src).toBeUndefined();
+    expect(presHiddenOwner.fallbackSrc).toBeUndefined();
+
+    // Case 3: bundle.coverImage cannot be verified against any member in allMembers -> omitted completely!
+    const presUnverified = resolveBundleCoverPresentation(
+      [safeMemberWithoutCover],
+      {
+        filterConfig: makeEnabledConfig({ flaggedAction: 'hide_card' }),
+        verdicts: {},
+        evaluatedRevisions: { 'addon:ws:200': 'r1' },
+        exclusionsByAddonId: new Map(),
+      },
+      {
+        allMembers: [safeMemberWithoutCover],
+        bundleCoverImage: 'https://img.example.com/orphan_unverified.jpg',
+      },
+    );
+    expect(presUnverified.src).toBeUndefined();
+    expect(presUnverified.fallbackSrc).toBeUndefined();
+
+    // Case 4: bundle.coverImage is owned by a visible member in allMembers -> uses that exact owner's coverMode ('blur')!
+    const presVisibleOwner = resolveBundleCoverPresentation(
+      [safeMemberWithoutCover],
       {
         filterConfig: makeEnabledConfig({ enabled: false }),
-        verdicts: { 'addon:ws:200': flaggedVerdict200 },
+        verdicts: {},
         evaluatedRevisions: {},
-        exclusionsByAddonId: new Map([['ws:200', { ...makeExclusion('blur_image'), addonId: 'ws:200' }]]),
+        exclusionsByAddonId: new Map([
+          ['ws:400', { ...makeExclusion('blur_image'), addonId: 'ws:400' }],
+        ]),
       },
-      { bundleCoverImage: 'https://img.example.com/explicit_bundle_cover.jpg' },
+      {
+        allMembers: [visibleOwnerMember, safeMemberWithoutCover],
+        bundleCoverImage: 'https://img.example.com/visible_blurred.jpg',
+      },
     );
-    expect(presFallbackBundleCover.src).toBe('https://img.example.com/explicit_bundle_cover.jpg');
-    expect(presFallbackBundleCover.coverMode).toBe('blur');
+    expect(presVisibleOwner.src).toBe('https://img.example.com/visible_blurred.jpg');
+    expect(presVisibleOwner.ownerMember?.id).toBe('ws:400');
+    expect(presVisibleOwner.coverMode).toBe('blur');
   });
 
-  it('matches Rust FilterPresetId calibration math, deduplicates Workshop gallery URLs, and tracks policy signatures', () => {
+  it('matches Rust FilterPresetId calibration math, deduplicates Workshop gallery URLs, and computes canonical pol_<32hex> policy signatures', () => {
     const identity = getPresetDefaultParams('recommended');
     const raw = {
       prob: 0.721234,
       goreProb: 0.013712,
       nsfwProb: 0.718001,
       perImageProbs: [0.719, 0.018],
+      scoringRevision: 'rev1',
     };
     expect(adjustProbabilities(identity, raw)).toEqual(raw);
 
@@ -488,6 +584,7 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(g).toBe(0);
     expect(ov).toBeLessThan(0.01);
     expect(Math.abs(ov - n)).toBeLessThan(1e-5);
+    expect(adjustProbabilities(nsfwOnly, raw).scoringRevision).toBe('rev1');
 
     const urls = collectWorkshopImageUrls({
       workshopId: '1',
@@ -516,9 +613,25 @@ describe('contentFilter pure resolution & calibration logic', () => {
     const c1 = makeEnabledConfig({ flaggedAction: 'blur_card' });
     const c2 = makeEnabledConfig({ flaggedAction: 'hide_image' });
     const c3 = makeEnabledConfig({ flagThreshold: 0.55 });
+    const sig1 = computeFilterPolicySignature(c1);
+    expect(sig1).toMatch(/^pol_[0-9a-f]{32}$/);
     // Changing UI-only flaggedAction preserves cached verdict policy signature; changing threshold invalidates it!
-    expect(computeFilterPolicySignature(c1)).toBe(computeFilterPolicySignature(c2));
-    expect(computeFilterPolicySignature(c1)).not.toBe(computeFilterPolicySignature(c3));
+    expect(sig1).toBe(computeFilterPolicySignature(c2));
+    expect(sig1).not.toBe(computeFilterPolicySignature(c3));
+
+    const catCfg = makeEnabledConfig({ mode: 'catalog' });
+    const catSigR1 = computeFilterPolicySignature(catCfg, {
+      catalogServerUrl: 'https://cat.example/',
+      httpsOnly: true,
+      catalogScoringRevision: 'r1',
+    });
+    const catSigR2 = computeFilterPolicySignature(catCfg, {
+      catalogServerUrl: 'https://cat.example',
+      httpsOnly: true,
+      catalogScoringRevision: 'r2',
+    });
+    expect(catSigR1).toMatch(/^pol_[0-9a-f]{32}$/);
+    expect(catSigR1).not.toBe(catSigR2);
   });
 
   it('maintains 1:1 translation key parity between zh and en dictionaries', () => {

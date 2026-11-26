@@ -120,34 +120,22 @@ export function OrganizeInspectorSheet({
     : null;
   const groupToggleableIds = groupSummary ? groupSummary.loading.map((a) => a.id) : [];
 
-  const rawProfileDiff = inspectedProfile
+  const profileDiff = inspectedProfile
     ? computeProfileDiff(inspectedProfile, addonsById, loadingAddons)
     : null;
-  const profileDiff = rawProfileDiff
-    ? {
-        toEnable: rawProfileDiff.toEnable.filter(
-          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
-        ),
-        toDisable: rawProfileDiff.toDisable.filter(
-          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
-        ),
-        unchangedEnabled: rawProfileDiff.unchangedEnabled.filter(
-          (a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
-        ),
-        missingIds: rawProfileDiff.missingIds.filter((id) => {
-          const found = addonsById.get(id);
-          return !found || !resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard;
-        }),
-      }
-    : null;
-  const profileHiddenCount =
-    rawProfileDiff && profileDiff
-      ? rawProfileDiff.toEnable.length -
-        profileDiff.toEnable.length +
-        (rawProfileDiff.toDisable.length - profileDiff.toDisable.length) +
-        (rawProfileDiff.unchangedEnabled.length - profileDiff.unchangedEnabled.length) +
-        (rawProfileDiff.missingIds.length - profileDiff.missingIds.length)
-      : 0;
+  const profileHiddenCount = profileDiff
+    ? profileDiff.toEnable.filter((a) => resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard)
+        .length +
+      profileDiff.toDisable.filter((a) => resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard)
+        .length +
+      profileDiff.unchangedEnabled.filter(
+        (a) => resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard,
+      ).length +
+      profileDiff.missingIds.filter((id) => {
+        const found = addonsById.get(id);
+        return Boolean(found && resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard);
+      }).length
+    : 0;
 
   return (
     <>
@@ -626,6 +614,7 @@ export function OrganizeInspectorSheet({
                       addon={addon}
                       namePreference={namePreference}
                       busy={busy}
+                      includeHiddenAsRedacted
                       badge={{ text: `+ ${t('common.enable')}`, tone: 'primary' }}
                       onSelectAddon={onSelectAddon}
                       onOpenInFileManager={onOpenInFileManager}
@@ -651,6 +640,7 @@ export function OrganizeInspectorSheet({
                       addon={addon}
                       namePreference={namePreference}
                       busy={busy}
+                      includeHiddenAsRedacted
                       badge={{ text: `- ${t('common.disable')}`, tone: 'tertiary' }}
                       onSelectAddon={onSelectAddon}
                       onOpenInFileManager={onOpenInFileManager}
@@ -676,6 +666,7 @@ export function OrganizeInspectorSheet({
                       addon={addon}
                       namePreference={namePreference}
                       busy={busy}
+                      includeHiddenAsRedacted
                       onSelectAddon={onSelectAddon}
                       onOpenInFileManager={onOpenInFileManager}
                       onToggleSingle={onToggleSingle}

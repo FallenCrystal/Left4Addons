@@ -68,6 +68,7 @@ export function BundleInspectorSheet({
     : null;
   const coverPres = inspectedBundle
     ? resolveBundleCoverPresentation(visibleMembers, filterCtx, {
+        allMembers,
         bundleCoverImage: inspectedBundle.coverImage,
       })
     : null;

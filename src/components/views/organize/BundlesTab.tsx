@@ -79,11 +79,12 @@ export function BundlesTab({
 
   return (
     <div className="l4a-card-grid-wide">
-      {visibleEntries.map(({ bundle, visibleMembers }) => {
+      {visibleEntries.map(({ bundle, allMembers, visibleMembers }) => {
         const visibleMemberIds = visibleMembers.map((m) => m.id);
         const summary = summarizeGroupMembers(visibleMemberIds, addonsById);
         const toggleableIds = summary.loading.map((a) => a.id);
         const coverPres = resolveBundleCoverPresentation(visibleMembers, filterCtx, {
+          allMembers,
           bundleCoverImage: bundle.coverImage,
         });
         const bundleDisplayName = coverPres.redactTitle
@@ -97,6 +98,7 @@ export function BundlesTab({
             data-clickable="true"
             data-muted={summary.loading.length > 0 && summary.noneEnabled ? 'true' : 'false'}
             data-blur-card={coverPres.blurWholeCard ? 'true' : 'false'}
+            data-pending-eval={coverPres.pendingEvaluation ? 'true' : undefined}
           >
             {coverPres.blurWholeCard &&
               (coverPres.pendingEvaluation ? (

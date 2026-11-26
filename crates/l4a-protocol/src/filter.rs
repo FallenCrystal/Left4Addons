@@ -2,9 +2,6 @@ use crate::ids::{AddonId, WorkshopId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Embedded Python HTTP runner wrapping an unmodified `Left4Filters` deployment.
-pub const FILTER_RUNNER_PY: &str = include_str!("filter_runner.py");
-
 pub const DEFAULT_FILTER_REPO_URL: &str = "https://github.com/FallenCrystal/Left4Filters.git";
 pub const DEFAULT_LLM_ENDPOINT: &str = "https://api.openai.com/v1";
 pub const DEFAULT_LLM_MODEL: &str = "gpt-4o-mini";
@@ -317,6 +314,7 @@ impl FilterModelParams {
                 .iter()
                 .map(|v| self.adjust_scalar(*v))
                 .collect(),
+            scoring_revision: raw.scoring_revision.clone(),
         }
     }
 }
@@ -402,6 +400,12 @@ pub struct FilterProbabilities {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub per_image_probs: Vec<f32>,
+    #[serde(
+        alias = "scoring_revision",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scoring_revision: Option<String>,
 }
 
 impl FilterProbabilities {
@@ -444,6 +448,23 @@ pub struct FilterPredictRequest {
     pub image_urls: Vec<String>,
 }
 
+/// Wire request DTO for raw `Left4Filters` `/predict` endpoints (`deploy/server.py` & `filter_runner.py`),
+/// which expect `snake_case` image fields (`image_base64`, `images_base64`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct RawFilterPredictRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images_base64: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogFilterPublicInfo {
@@ -454,6 +475,8 @@ pub struct CatalogFilterPublicInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
     pub max_images: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -809,6 +832,8 @@ pub struct FilterEvaluationTarget {
 #[serde(rename_all = "camelCase")]
 pub struct FilterItemVerdict {
     pub target_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_hint: Option<String>,
     pub flagged: bool,
     pub decision_source: FilterDecisionSource,
     pub evaluated_score: f32,
@@ -817,9 +842,126 @@ pub struct FilterItemVerdict {
     pub title_sensitive: bool,
     pub description_sensitive: bool,
     pub image_sensitive: bool,
+    /// Original slot indices in `FilterEvaluationTarget.image_sources` that were actually evaluated.
+    #[serde(default)]
+    pub evaluated_image_indices: Vec<usize>,
+    /// Original slot indices in `FilterEvaluationTarget.image_sources` marked sensitive.
     #[serde(default)]
     pub sensitive_image_indices: Vec<usize>,
+    /// `true` when all candidate media loaded and the verdict is complete/cacheable; `false` when
+    /// e.g. a preview image failed to load on a non-flagged item so the UI should keep it retryable.
+    #[serde(default = "default_true")]
+    pub complete: bool,
     pub evaluated_at: DateTime<Utc>,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum FilterTargetOutcome {
+    Completed {
+        verdict: FilterItemVerdict,
+        complete: bool,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterEvaluationItemResult {
+    pub target_key: String,
+    #[serde(flatten)]
+    pub outcome: FilterTargetOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterEvaluationBatchResponse {
+    pub policy_signature: String,
+    pub items: Vec<FilterEvaluationItemResult>,
+}
+
+impl ClientFilterConfig {
+    /// Canonical deterministic policy identifier shared across native engine, IPC events, and UI.
+    pub fn canonical_policy_signature(
+        &self,
+        catalog_server_url: Option<&str>,
+        https_only: bool,
+        catalog_scoring_revision: Option<&str>,
+    ) -> String {
+        let p = self.local_params.sanitized();
+        let mode_part = match self.mode {
+            ClientFilterSourceMode::Local => format!(
+                "local:txt={}:img={}:max={}:agg={:?}:gw={:.4}:nw={:.4}:t={:.4}:b={:.4}:commit={}",
+                p.enable_text,
+                p.enable_image,
+                p.max_images,
+                p.gallery_aggregation,
+                p.gore_weight,
+                p.nsfw_weight,
+                p.temperature,
+                p.bias,
+                self.pinned_commit.as_deref().unwrap_or("latest")
+            ),
+            ClientFilterSourceMode::Catalog => format!(
+                "catalog:url={}:https={}:rev={}",
+                catalog_server_url
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('/'),
+                https_only,
+                catalog_scoring_revision.unwrap_or("unverified")
+            ),
+            ClientFilterSourceMode::CustomEndpoint => format!(
+                "custom:url={}:https={}",
+                self.custom_endpoint_url
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('/'),
+                https_only
+            ),
+        };
+        let llm_part = if self.llm_enabled {
+            format!(
+                "1:t={:.4}:ep={}:m={}:img={}:sys={}",
+                self.llm_threshold,
+                self.llm_endpoint.trim().trim_end_matches('/'),
+                self.llm_model.trim(),
+                self.llm_send_images,
+                fnv1a_hex(self.llm_system_prompt.trim().as_bytes())
+            )
+        } else {
+            "0".to_string()
+        };
+        let raw = format!(
+            "v2|{mode_part}|st={:?}|df={}:{:.4}|llm={llm_part}|sub={}:{:.4}",
+            self.score_target,
+            self.enable_direct_flag,
+            self.flag_threshold,
+            self.subdivide_modalities,
+            self.modality_threshold
+        );
+        format!("pol_{}", fnv1a_hex(raw.as_bytes()))
+    }
+}
+
+pub fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h2: u64 = 0x84222325cbf29ce4;
+    for (idx, &b) in bytes.iter().enumerate() {
+        h1 ^= u64::from(b);
+        h1 = h1.wrapping_mul(0x100000001b3);
+        h2 ^= u64::from(b.rotate_left((idx % 7) as u32));
+        h2 = h2.wrapping_mul(0x100000001b3);
+    }
+    format!("{h1:016x}{h2:016x}")
 }
 
 #[cfg(test)]
@@ -843,6 +985,7 @@ mod tests {
             image_gore_prob: Some(0.012),
             image_nsfw_prob: Some(0.715),
             per_image_probs: vec![0.719, 0.018],
+            scoring_revision: Some("rev1".into()),
         };
         let adj = params.adjust_probabilities(&raw);
         assert_eq!(adj, raw);
@@ -866,8 +1009,30 @@ mod tests {
     }
 
     #[test]
-    fn runner_script_is_embedded() {
-        assert!(FILTER_RUNNER_PY.contains("L4A_FILTER_READY"));
-        assert!(FILTER_RUNNER_PY.contains("class RunnerEngine"));
+    fn raw_filter_predict_request_serializes_snake_case_image_fields() {
+        let req = RawFilterPredictRequest {
+            title: Some("Addon".into()),
+            description: None,
+            tags: vec!["UI".into()],
+            image_base64: Some("AAA=".into()),
+            images_base64: vec!["BBB=".into()],
+        };
+        let encoded = serde_json::to_value(&req).unwrap();
+        assert_eq!(encoded["image_base64"], "AAA=");
+        assert_eq!(encoded["images_base64"], serde_json::json!(["BBB="]));
+        assert!(encoded.get("imageBase64").is_none());
+        assert!(encoded.get("imagesBase64").is_none());
+    }
+
+    #[test]
+    fn canonical_policy_signature_tracks_catalog_scoring_revision() {
+        let cfg = ClientFilterConfig {
+            enabled: true,
+            mode: ClientFilterSourceMode::Catalog,
+            ..Default::default()
+        };
+        let sig_a = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r1"));
+        let sig_b = cfg.canonical_policy_signature(Some("https://cat.example"), true, Some("r2"));
+        assert_ne!(sig_a, sig_b);
     }
 }

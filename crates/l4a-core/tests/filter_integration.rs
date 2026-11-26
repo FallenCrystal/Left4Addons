@@ -14,9 +14,11 @@ use image::{ImageBuffer, Rgb};
 use l4a_core::db::LocalDb;
 use l4a_core::{AppPaths, EventSink, L4aEngine, NullEventSink, TokenVault};
 use l4a_protocol::{
-    AppConfig, ClientFilterConfig, ClientFilterSourceMode, CoreEvent, DeployLocalFilterRequest,
-    ExclusionDisplayLevel, FilterDecisionSource, FilterEvaluationTarget, FilterPredictRequest,
-    FilterProbabilities, LlmTokenSource, LocalFilterServiceState, UpsertFilterExclusionRequest,
+    AppConfig, CatalogFilterPublicInfo, ClientFilterConfig, ClientFilterSourceMode, CoreEvent,
+    DeployLocalFilterRequest, ExclusionDisplayLevel, FilterDecisionSource,
+    FilterEvaluationBatchResponse, FilterEvaluationTarget, FilterItemVerdict, FilterPredictRequest,
+    FilterProbabilities, FilterTargetOutcome, LlmTokenSource, LocalFilterServiceState,
+    RawFilterPredictRequest, UpsertFilterExclusionRequest,
 };
 use l4a_steam::MockSteamBridge;
 use serde_json::{json, Value};
@@ -29,6 +31,30 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 
 use support::{create_test_vpk, make_engine, make_engine_with_events, RecordedEvents};
+
+fn unwrap_verdicts(batch: FilterEvaluationBatchResponse) -> Vec<FilterItemVerdict> {
+    assert!(
+        batch.policy_signature.starts_with("pol_"),
+        "expected canonical policy_signature starting with pol_, got {}",
+        batch.policy_signature
+    );
+    batch
+        .items
+        .into_iter()
+        .map(|item| match item.outcome {
+            FilterTargetOutcome::Completed { verdict, complete } => {
+                assert_eq!(verdict.complete, complete);
+                verdict
+            }
+            FilterTargetOutcome::Failed { error } => {
+                panic!(
+                    "expected target {} to succeed, failed with: {error}",
+                    item.target_key
+                )
+            }
+        })
+        .collect()
+}
 
 fn make_tiny_jpeg(r: u8, g: u8, b: u8) -> Vec<u8> {
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(4, 4, Rgb([r, g, b]));
@@ -549,20 +575,22 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     let nsfw_img_url = format!("{base_url}/img/nsfw.jpg");
 
     // 1. Low score < llm_threshold -> ModelSafe, LLM not called
-    let low_verdicts = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:1001".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[LOW] Normal Campaign Map".into(),
-            description: Some("A regular 4-chapter co-op campaign".into()),
-            tags: vec!["Campaign".into()],
-            image_sources: vec![safe_img_url.clone()],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let low_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:1001".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[LOW] Normal Campaign Map".into(),
+                description: Some("A regular 4-chapter co-op campaign".into()),
+                tags: vec!["Campaign".into()],
+                image_sources: vec![safe_img_url.clone()],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert_eq!(low_verdicts.len(), 1);
     assert!(!low_verdicts[0].flagged);
     assert_eq!(
@@ -572,20 +600,22 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     assert_eq!(mock_state.llm_calls.load(Ordering::SeqCst), 0);
 
     // 2. High score >= flag_threshold -> ModelDirectFlag, LLM not called + Image-only subdivision
-    let high_img_verdicts = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:1002".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[HIGH_IMG_ONLY] innocuous skin name".into(),
-            description: Some("clean text description".into()),
-            tags: vec!["Survivors".into()],
-            image_sources: vec![nsfw_img_url.clone()],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let high_img_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:1002".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[HIGH_IMG_ONLY] innocuous skin name".into(),
+                description: Some("clean text description".into()),
+                tags: vec!["Survivors".into()],
+                image_sources: vec![nsfw_img_url.clone()],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(high_img_verdicts[0].flagged);
     assert_eq!(
         high_img_verdicts[0].decision_source,
@@ -593,24 +623,27 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     );
     assert!(high_img_verdicts[0].image_sensitive);
     assert!(!high_img_verdicts[0].text_sensitive);
+    assert_eq!(high_img_verdicts[0].evaluated_image_indices, vec![0]);
     assert_eq!(high_img_verdicts[0].sensitive_image_indices, vec![0]);
     assert_eq!(mock_state.llm_calls.load(Ordering::SeqCst), 0);
 
     // 3. Mid score [llm_threshold, flag_threshold) -> escalates to OpenAI Chat Completions
-    let mid_true = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:1003".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[MID_LLM_TRUE] Borderline Survivor Mod".into(),
-            description: Some("Check preview image carefully".into()),
-            tags: vec!["Survivors".into(), "Anime".into()],
-            image_sources: vec![nsfw_img_url.clone()],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let mid_true = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:1003".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[MID_LLM_TRUE] Borderline Survivor Mod".into(),
+                description: Some("Check preview image carefully".into()),
+                tags: vec!["Survivors".into(), "Anime".into()],
+                image_sources: vec![nsfw_img_url.clone()],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(mid_true[0].flagged);
     assert_eq!(
         mid_true[0].decision_source,
@@ -642,20 +675,22 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     assert!(sent_img_url.ends_with(&img2_b64));
 
     // Mid score returning false -> LlmFlaggedFalse
-    let mid_false = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:1004".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[MID_LLM_FALSE] Red HUD Font".into(),
-            description: Some("Just red damage numbers".into()),
-            tags: vec!["UI".into()],
-            image_sources: vec![safe_img_url.clone()],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let mid_false = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:1004".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[MID_LLM_FALSE] Red HUD Font".into(),
+                description: Some("Just red damage numbers".into()),
+                tags: vec!["UI".into()],
+                image_sources: vec![safe_img_url.clone()],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(!mid_false[0].flagged);
     assert_eq!(
         mid_false[0].decision_source,
@@ -666,33 +701,35 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     assert_eq!(mock_state.llm_calls.load(Ordering::SeqCst), 2);
 
     // 4. Modality subdivision: text-only sensitive & multi-image specific index
-    let sub_verdicts = engine
-        .evaluate_filter_items(vec![
-            FilterEvaluationTarget {
-                target_key: "ws:1005".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[HIGH_TXT_ONLY] Explicit R18 Title".into(),
-                description: Some("Innocent body text".into()),
-                tags: vec!["Skin".into()],
-                image_sources: vec![safe_img_url.clone()],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-            FilterEvaluationTarget {
-                target_key: "ws:1006".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[MULTI_IMG] Pack With Mixed Screenshots".into(),
-                description: Some("Pack of textures".into()),
-                tags: vec!["Skin".into()],
-                image_sources: vec![safe_img_url.clone(), nsfw_img_url.clone()],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-        ])
-        .await
-        .unwrap();
+    let sub_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![
+                FilterEvaluationTarget {
+                    target_key: "ws:1005".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[HIGH_TXT_ONLY] Explicit R18 Title".into(),
+                    description: Some("Innocent body text".into()),
+                    tags: vec!["Skin".into()],
+                    image_sources: vec![safe_img_url.clone()],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+                FilterEvaluationTarget {
+                    target_key: "ws:1006".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[MULTI_IMG] Pack With Mixed Screenshots".into(),
+                    description: Some("Pack of textures".into()),
+                    tags: vec!["Skin".into()],
+                    image_sources: vec![safe_img_url.clone(), nsfw_img_url.clone()],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+            ])
+            .await
+            .unwrap(),
+    );
 
     // Text-only item
     assert!(sub_verdicts[0].flagged);
@@ -706,24 +743,27 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
     assert!(sub_verdicts[1].flagged);
     assert!(!sub_verdicts[1].text_sensitive);
     assert!(sub_verdicts[1].image_sensitive);
+    assert_eq!(sub_verdicts[1].evaluated_image_indices, vec![0, 1]);
     assert_eq!(sub_verdicts[1].sensitive_image_indices, vec![1]);
 
     // 5. SQLite cache hit verification & clear_filter_cache
     let calls_before_cached = mock_state.predict_calls.load(Ordering::SeqCst);
-    let cached_again = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:1006".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[MULTI_IMG] Pack With Mixed Screenshots".into(),
-            description: Some("Pack of textures".into()),
-            tags: vec!["Skin".into()],
-            image_sources: vec![safe_img_url, nsfw_img_url],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let cached_again = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:1006".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[MULTI_IMG] Pack With Mixed Screenshots".into(),
+                description: Some("Pack of textures".into()),
+                tags: vec!["Skin".into()],
+                image_sources: vec![safe_img_url, nsfw_img_url],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert_eq!(cached_again[0].sensitive_image_indices, vec![1]);
     assert_eq!(
         mock_state.predict_calls.load(Ordering::SeqCst),
@@ -825,7 +865,7 @@ async fn custom_endpoint_raw_predict_fallback_and_unimodal_followup() {
     // Raw Left4Filters /predict server: does NOT expose /api/v1/filter/predict and returns ONLY {prob, gore_prob, nsfw_prob}
     let app = Router::new().route(
         "/predict",
-        post(move |Json(req): Json<FilterPredictRequest>| {
+        post(move |Json(req): Json<RawFilterPredictRequest>| {
             let calls_ref = calls_ref.clone();
             let img_nsfw_b64 = img_nsfw_b64.clone();
             async move {
@@ -869,25 +909,28 @@ async fn custom_endpoint_raw_predict_fallback_and_unimodal_followup() {
         Arc::new(MockSteamBridge::new(false)),
     );
 
-    let verdicts = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:9001".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "Clean Survivor Title".into(),
-            description: Some("Clean description".into()),
-            tags: vec!["Survivors".into()],
-            image_sources: vec![img_safe_data_url, img_nsfw_data_url],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:9001".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Clean Survivor Title".into(),
+                description: Some("Clean description".into()),
+                tags: vec!["Survivors".into()],
+                image_sources: vec![img_safe_data_url, img_nsfw_data_url],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(verdicts.len(), 1);
     assert!(verdicts[0].flagged);
     assert!(!verdicts[0].text_sensitive);
     assert!(verdicts[0].image_sensitive);
+    assert_eq!(verdicts[0].evaluated_image_indices, vec![0, 1]);
     assert_eq!(verdicts[0].sensitive_image_indices, vec![1]);
     // 1 joint call + follow-up text/title/desc + 2 per-image calls >= 4
     assert!(raw_calls.load(Ordering::SeqCst) >= 4);
@@ -943,33 +986,35 @@ async fn local_python_runner_daemon_lifecycle_and_live_reconfigure() {
         .is_some_and(|u| u.starts_with("http://127.0.0.1:")));
 
     // Evaluate against the live Python runner
-    let verdicts = engine
-        .evaluate_filter_items(vec![
-            FilterEvaluationTarget {
-                target_key: "ws:5001".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "Safe Weapon Skin".into(),
-                description: Some("Standard rifle".into()),
-                tags: vec!["Weapons".into()],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-            FilterEvaluationTarget {
-                target_key: "ws:5002".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "Explicit NSFW Skin".into(),
-                description: Some("Adult mod".into()),
-                tags: vec!["Survivors".into()],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-        ])
-        .await
-        .unwrap();
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![
+                FilterEvaluationTarget {
+                    target_key: "ws:5001".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "Safe Weapon Skin".into(),
+                    description: Some("Standard rifle".into()),
+                    tags: vec!["Weapons".into()],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+                FilterEvaluationTarget {
+                    target_key: "ws:5002".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "Explicit NSFW Skin".into(),
+                    description: Some("Adult mod".into()),
+                    tags: vec!["Survivors".into()],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+            ])
+            .await
+            .unwrap(),
+    );
     assert!(!verdicts[0].flagged);
     assert!(verdicts[1].flagged);
     assert_eq!(
@@ -983,20 +1028,22 @@ async fn local_python_runner_daemon_lifecycle_and_live_reconfigure() {
     next_cfg.filter.local_params.gore_weight = 1.0;
     engine.save_config(next_cfg).unwrap();
 
-    let reevaluated = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:5002".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "Explicit NSFW Skin".into(),
-            description: Some("Adult mod".into()),
-            tags: vec!["Survivors".into()],
-            image_sources: vec![],
-            revision_hint: None,
-            bypass_cache: false, // policy_sig changed automatically, so cache invalidates!
-        }])
-        .await
-        .unwrap();
+    let reevaluated = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:5002".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Explicit NSFW Skin".into(),
+                description: Some("Adult mod".into()),
+                tags: vec!["Survivors".into()],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false, // policy_sig changed automatically, so cache invalidates!
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(
         !reevaluated[0].flagged,
         "after live /configure with nsfw_weight=0.0, pure NSFW item must drop to safe"
@@ -1113,20 +1160,22 @@ async fn llm_judge_safe_json_think_tags_content_filter_and_direct_flag_disabled(
         Arc::new(MockSteamBridge::new(false)),
     );
 
-    let direct_off = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:2001".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "[DIRECT_OFF] High Score Mod".into(),
-            description: None,
-            tags: vec![],
-            image_sources: vec![],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let direct_off = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:2001".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[DIRECT_OFF] High Score Mod".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(!direct_off[0].flagged);
     assert_eq!(
         direct_off[0].decision_source,
@@ -1156,55 +1205,57 @@ async fn llm_judge_safe_json_think_tags_content_filter_and_direct_flag_disabled(
     llm_cfg.filter.llm_token_source = LlmTokenSource::EncryptedLocal;
     engine.save_config_async(llm_cfg).await.unwrap();
 
-    let llm_verdicts = engine
-        .evaluate_filter_items(vec![
-            FilterEvaluationTarget {
-                target_key: "ws:2002".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[SAFE_TRUE] Clean Mod".into(),
-                description: None,
-                tags: vec![],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-            FilterEvaluationTarget {
-                target_key: "ws:2003".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[SAFE_FALSE] Unsafe Mod".into(),
-                description: None,
-                tags: vec![],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-            FilterEvaluationTarget {
-                target_key: "ws:2004".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[THINK_TRUE] Reasoning Mod".into(),
-                description: None,
-                tags: vec![],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-            FilterEvaluationTarget {
-                target_key: "ws:2005".into(),
-                addon_id: None,
-                workshop_id: None,
-                title: "[CONTENT_FILTER] Provider Blocked Mod".into(),
-                description: None,
-                tags: vec![],
-                image_sources: vec![],
-                revision_hint: None,
-                bypass_cache: false,
-            },
-        ])
-        .await
-        .unwrap();
+    let llm_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![
+                FilterEvaluationTarget {
+                    target_key: "ws:2002".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[SAFE_TRUE] Clean Mod".into(),
+                    description: None,
+                    tags: vec![],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+                FilterEvaluationTarget {
+                    target_key: "ws:2003".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[SAFE_FALSE] Unsafe Mod".into(),
+                    description: None,
+                    tags: vec![],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+                FilterEvaluationTarget {
+                    target_key: "ws:2004".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[THINK_TRUE] Reasoning Mod".into(),
+                    description: None,
+                    tags: vec![],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+                FilterEvaluationTarget {
+                    target_key: "ws:2005".into(),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: "[CONTENT_FILTER] Provider Blocked Mod".into(),
+                    description: None,
+                    tags: vec![],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                },
+            ])
+            .await
+            .unwrap(),
+    );
 
     assert_eq!(llm_verdicts.len(), 4);
     assert!(
@@ -1402,30 +1453,49 @@ async fn batch_partial_failure_dedup_fail_open_cache_guard_and_snapshot_verdicts
         .await
         .unwrap();
 
-    // 3 succeeded items returned (2 from deduplicated 3001 + 1 from 3003); 3002 failed without aborting siblings!
-    assert_eq!(batch_res.len(), 3);
-    assert_eq!(batch_res[0].target_key, "addon:workshop:3001");
-    assert_eq!(batch_res[1].target_key, "addon:workshop:3001");
-    assert_eq!(batch_res[2].target_key, "addon:workshop:3003");
-    assert!(batch_res[2].flagged);
+    // 4 items returned in input order: 3001 (Completed), 3001 (Completed), 3002 (Failed), 3003 (Completed)
+    assert_eq!(batch_res.items.len(), 4);
+    assert_eq!(batch_res.items[0].target_key, "addon:workshop:3001");
+    assert_eq!(batch_res.items[1].target_key, "addon:workshop:3001");
+    assert_eq!(batch_res.items[2].target_key, "addon:workshop:3002");
+    assert_eq!(batch_res.items[3].target_key, "addon:workshop:3003");
+    assert!(matches!(
+        &batch_res.items[0].outcome,
+        FilterTargetOutcome::Completed {
+            verdict,
+            complete: true
+        } if !verdict.flagged && verdict.complete
+    ));
+    assert!(matches!(
+        &batch_res.items[2].outcome,
+        FilterTargetOutcome::Failed { error } if error.contains("500")
+    ));
+    assert!(matches!(
+        &batch_res.items[3].outcome,
+        FilterTargetOutcome::Completed {
+            verdict,
+            complete: true
+        } if verdict.flagged && verdict.complete
+    ));
     // Dedup ensured only 3 backend /predict calls (3001 once, 3002 once, 3003 once), NOT 4!
     assert_eq!(predict_calls.load(Ordering::SeqCst), 3);
 
-    // Verify FilterVerdictsUpdated event carries non-empty policy_signature
+    // Verify FilterVerdictsUpdated event carries canonical policy_signature matching snapshot
+    let snap = engine.snapshot().unwrap();
+    assert_eq!(snap.filter_policy_signature, batch_res.policy_signature);
     let drained = events.drain();
     assert!(drained.iter().any(|ev| matches!(
         ev,
         CoreEvent::FilterVerdictsUpdated {
             verdicts,
             policy_signature: Some(sig)
-        } if verdicts.len() == 3 && !sig.is_empty()
+        } if verdicts.len() == 3 && sig == &snap.filter_policy_signature
     )));
 
     // Verify snapshot.cached_filter_verdicts is populated immediately at startup / snapshot()!
-    let snap = engine.snapshot().unwrap();
     assert_eq!(snap.cached_filter_verdicts.len(), 2);
 
-    // 2. Fail-open cache poisoning guard: transient image 503 must NOT cache `!flagged`!
+    // 2. Fail-open cache poisoning guard: transient image 503 must return `complete: false`, NOT emit final event, and NOT cache `!flagged`!
     let flaky_url = format!("{base_url}/flaky-nsfw.jpg");
     let first_try = engine
         .evaluate_filter_items(vec![FilterEvaluationTarget {
@@ -1441,37 +1511,57 @@ async fn batch_partial_failure_dedup_fail_open_cache_guard_and_snapshot_verdicts
         }])
         .await
         .unwrap();
+    assert_eq!(first_try.items.len(), 1);
+    match &first_try.items[0].outcome {
+        FilterTargetOutcome::Completed { verdict, complete } => {
+            assert!(
+                !verdict.flagged,
+                "when preview returns 503, text-only score is safe"
+            );
+            assert!(
+                !complete,
+                "incomplete safe verdict must report complete == false"
+            );
+            assert!(!verdict.complete);
+        }
+        other => panic!("expected Completed(complete=false), got {other:?}"),
+    }
+    let incomplete_events = events.drain();
     assert!(
-        !first_try[0].flagged,
-        "when preview returns 503, text-only score is safe"
+        !incomplete_events
+            .iter()
+            .any(|ev| matches!(ev, CoreEvent::FilterVerdictsUpdated { .. })),
+        "incomplete safe evaluation must NOT emit final FilterVerdictsUpdated"
     );
 
     // Now the image server recovers (200 OK). Re-evaluating with `bypass_cache: false` MUST NOT hit a poisoned safe cache!
     img_available.store(true, Ordering::SeqCst);
-    let second_try = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:3099".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "Innocent Title With NSFW Preview".into(),
-            description: None,
-            tags: vec![],
-            image_sources: vec![flaky_url],
-            revision_hint: None,
-            bypass_cache: false,
-        }])
-        .await
-        .unwrap();
+    let second_try = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:3099".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Innocent Title With NSFW Preview".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![flaky_url],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
     assert!(
-        second_try[0].flagged,
+        second_try[0].flagged && second_try[0].complete,
         "transient image failure must not poison filter_verdicts with false-safe!"
     );
 
-    // 3. Stale policy_sig pruning: changing threshold and evaluating a new item prunes old policy rows
+    // 3. Stale policy_sig pruning: changing threshold via save_config prunes old policy rows immediately
     let mut updated_cfg = engine.config();
     updated_cfg.filter.flag_threshold = 0.65;
     engine.save_config_async(updated_cfg).await.unwrap();
-    engine
+    let _ = engine
         .evaluate_filter_items(vec![dup_target])
         .await
         .unwrap();
@@ -1562,20 +1652,22 @@ async fn local_filter_crash_auto_recovery_and_unc_or_empty_commit_guards() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
 
     // Evaluating a new uncached item must automatically reap dead runner, restart once, and succeed!
-    let verdicts = engine
-        .evaluate_filter_items(vec![FilterEvaluationTarget {
-            target_key: "ws:7777".into(),
-            addon_id: None,
-            workshop_id: None,
-            title: "Explicit NSFW After Crash".into(),
-            description: Some("Recovered evaluation".into()),
-            tags: vec![],
-            image_sources: vec![],
-            revision_hint: None,
-            bypass_cache: true,
-        }])
-        .await
-        .unwrap();
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:7777".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Explicit NSFW After Crash".into(),
+                description: Some("Recovered evaluation".into()),
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: true,
+            }])
+            .await
+            .unwrap(),
+    );
     assert_eq!(verdicts.len(), 1);
     assert!(verdicts[0].flagged);
 
@@ -1780,9 +1872,9 @@ preset = "strict"
         )
         .route(
             "/predict",
-            post(|Json(req): Json<FilterPredictRequest>| async move {
+            post(|Json(req): Json<RawFilterPredictRequest>| async move {
                 assert!(
-                    req.images_base64.is_empty() && req.image_urls.is_empty(),
+                    req.images_base64.is_empty() && req.image_base64.is_none(),
                     "blocked SSRF URL must never be forwarded or uploaded"
                 );
                 Json(FilterProbabilities {
@@ -1842,5 +1934,1168 @@ preset = "strict"
         loopback_img_hits.load(Ordering::SeqCst),
         0,
         "production mode must never fetch loopback image URLs without explicit testing flag"
+    );
+}
+
+#[tokio::test]
+async fn raw_predict_snake_case_wire_format_in_local_and_custom_endpoint_modes() {
+    let safe_jpeg = make_tiny_jpeg(10, 200, 10);
+    let nsfw_jpeg = make_tiny_jpeg(245, 12, 195);
+    let nsfw_b64 = STANDARD.encode(&nsfw_jpeg);
+    let safe_data_url = format!("data:image/jpeg;base64,{}", STANDARD.encode(&safe_jpeg));
+    let nsfw_data_url = format!("data:image/jpeg;base64,{nsfw_b64}");
+
+    // 1. CustomEndpoint mode against a strict stock Left4Filters `/predict` mock that REJECTS
+    //    `imagesBase64` / `imageBase64` with HTTP 400 and requires `images_base64`!
+    let strict_nsfw_b64 = nsfw_b64.clone();
+    let saw_snake_images = Arc::new(AtomicUsize::new(0));
+    let saw_ref = saw_snake_images.clone();
+    let strict_app = Router::new().route(
+        "/predict",
+        post(move |Json(raw): Json<Value>| {
+            let strict_nsfw_b64 = strict_nsfw_b64.clone();
+            let saw_ref = saw_ref.clone();
+            async move {
+                if raw.get("imagesBase64").is_some()
+                    || raw.get("imageBase64").is_some()
+                    || raw.get("imageUrls").is_some()
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "camelCase image keys rejected by raw /predict"})),
+                    )
+                        .into_response();
+                }
+                let imgs = raw
+                    .get("images_base64")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if !imgs.is_empty() {
+                    saw_ref.fetch_add(1, Ordering::SeqCst);
+                }
+                let is_nsfw = imgs
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|s| s == strict_nsfw_b64);
+                let p = if is_nsfw { 0.91 } else { 0.02 };
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "prob": p,
+                        "gore_prob": 0.01,
+                        "nsfw_prob": p,
+                    })),
+                )
+                    .into_response()
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, strict_app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}")),
+                subdivide_modalities: true,
+                modality_threshold: 0.30,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let custom_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:9100".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Clean Title".into(),
+                description: Some("Clean desc".into()),
+                tags: vec!["Skin".into()],
+                image_sources: vec![safe_data_url.clone(), nsfw_data_url.clone()],
+                revision_hint: Some("rev-custom".into()),
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert!(custom_verdicts[0].flagged);
+    assert_eq!(custom_verdicts[0].evaluated_image_indices, vec![0, 1]);
+    assert_eq!(custom_verdicts[0].sensitive_image_indices, vec![1]);
+    // Joint + 2 per-image unimodal calls all carried `images_base64`
+    assert!(saw_snake_images.load(Ordering::SeqCst) >= 3);
+
+    // 2. Local mode: replace `filter_runner_path` with a strict Python `/predict` runner that
+    //    returns 400 if `imagesBase64` / `imageBase64` is sent, and requires `images_base64`!
+    let upstream_repo = dir.path().join("upstream-local-snake");
+    std::fs::create_dir_all(&upstream_repo).unwrap();
+    run_git(&upstream_repo, &["init", "-b", "main"]);
+    let deploy_dir = upstream_repo.join("deploy");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    let py_model = format!(
+        r#"import base64
+NSFW_BYTES = base64.b64decode("{nsfw_b64}")
+
+class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        self.config = {{"model_name": "MockSnakeModel", "version": "1.0.0"}}
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        has_nsfw = False
+        if image is not None and image == NSFW_BYTES:
+            has_nsfw = True
+        if images is not None and any(im == NSFW_BYTES for im in images):
+            has_nsfw = True
+        p = 0.93 if has_nsfw else 0.02
+        return {{"prob": p, "gore_prob": 0.01, "nsfw_prob": p}}
+"#
+    );
+    std::fs::write(deploy_dir.join("l4filter.py"), py_model).unwrap();
+    std::fs::write(deploy_dir.join("vision_encoder.onnx"), b"vis").unwrap();
+    std::fs::write(deploy_dir.join("fusion_head.onnx"), b"head").unwrap();
+    std::fs::write(deploy_dir.join("text_vocab.json"), r#"{"vocab":{}}"#).unwrap();
+    std::fs::write(deploy_dir.join("requirements.txt"), "# offline\n").unwrap();
+    run_git(&upstream_repo, &["add", "."]);
+    run_git(
+        &upstream_repo,
+        &["commit", "-m", "feat: snake_case image model"],
+    );
+
+    let mut local_cfg = engine.config();
+    local_cfg.filter.mode = ClientFilterSourceMode::Local;
+    local_cfg.filter.repo_url = upstream_repo.to_str().unwrap().into();
+    local_cfg.filter.local_params.max_images = 4;
+    engine.save_config_async(local_cfg).await.unwrap();
+
+    engine
+        .deploy_local_filter(DeployLocalFilterRequest {
+            repo_url: Some(upstream_repo.to_str().unwrap().into()),
+            track_latest: true,
+            target_commit: None,
+            start_after_deploy: false,
+        })
+        .await
+        .unwrap();
+    install_offline_runner_shims(&engine);
+
+    // Also verify LocalFilterManager sends `images_base64` (never `imagesBase64`) by wrapping
+    // a strict HTTP proxy in front or verifying with `filter_runner.py`: first start runner and
+    // assert multi-image evaluation via `images_base64` identifies image slot 1!
+    engine.start_local_filter_service().await.unwrap();
+    let local_verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:9101".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Clean Local Addon".into(),
+                description: Some("Clean local desc".into()),
+                tags: vec!["Skin".into()],
+                image_sources: vec![safe_data_url, nsfw_data_url],
+                revision_hint: Some("rev-local".into()),
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert!(local_verdicts[0].flagged);
+    assert_eq!(local_verdicts[0].evaluated_image_indices, vec![0, 1]);
+    assert_eq!(local_verdicts[0].sensitive_image_indices, vec![1]);
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn in_place_addon_vpk_rescan_invalidates_snapshot_cached_filter_verdict() {
+    let app = Router::new().route(
+        "/predict",
+        post(|Json(req): Json<RawFilterPredictRequest>| async move {
+            let title = req.title.unwrap_or_default();
+            let p = if title.contains("Explicit V2") {
+                0.94
+            } else {
+                0.03
+            };
+            Json(FilterProbabilities {
+                prob: p,
+                gore_prob: 0.01,
+                nsfw_prob: p,
+                text_prob: Some(p),
+                title_prob: Some(p),
+                ..Default::default()
+            })
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let vpk_path = loading_dir.join("777888.vpk");
+    create_test_vpk(
+        &vpk_path,
+        "Safe V1 Survivor",
+        "Mapper",
+        false,
+        None,
+        b"v1-safe-bytes",
+    );
+
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/predict")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let snap1 = engine.scan().unwrap();
+    assert_eq!(snap1.addons.len(), 1);
+    let addon_v1 = &snap1.addons[0];
+    assert_eq!(addon_v1.id.as_str(), "ws:777888");
+
+    let target_v1 = l4a_core::filter::build_addon_filter_target(addon_v1);
+    let expected_rev_v1 = target_v1.revision_hint.clone();
+    let batch1 = engine.evaluate_filter_items(vec![target_v1]).await.unwrap();
+    let verdicts1 = unwrap_verdicts(batch1);
+    assert!(!verdicts1[0].flagged);
+    assert_eq!(verdicts1[0].revision_hint, expected_rev_v1);
+
+    let snap_cached = engine.snapshot().unwrap();
+    assert_eq!(snap_cached.cached_filter_verdicts.len(), 1);
+    assert_eq!(
+        snap_cached.cached_filter_verdicts[0].revision_hint,
+        expected_rev_v1
+    );
+
+    // Modify 777888.vpk in-place on disk (same AddonId `ws:777888`, new content/title)
+    create_test_vpk(
+        &vpk_path,
+        "Explicit V2 Survivor",
+        "Mapper",
+        false,
+        None,
+        b"v2-modified-nsfw-bytes-longer",
+    );
+    let snap2 = engine.scan().unwrap();
+    assert_eq!(snap2.addons.len(), 1);
+    assert_eq!(snap2.addons[0].id.as_str(), "ws:777888");
+    assert!(
+        snap2.cached_filter_verdicts.is_empty(),
+        "in-place VPK update must immediately drop stale cached verdict from snapshot"
+    );
+
+    let target_v2 = l4a_core::filter::build_addon_filter_target(&snap2.addons[0]);
+    let verdicts2 = unwrap_verdicts(engine.evaluate_filter_items(vec![target_v2]).await.unwrap());
+    assert!(verdicts2[0].flagged);
+    assert_eq!(engine.snapshot().unwrap().cached_filter_verdicts.len(), 1);
+}
+
+#[tokio::test]
+async fn gallery_slot_mapping_with_404_gap_incomplete_safe_and_failed_outcomes() {
+    let safe_jpeg = make_tiny_jpeg(20, 210, 30);
+    let nsfw_jpeg = make_tiny_jpeg(250, 15, 200);
+    let nsfw_b64 = STANDARD.encode(&nsfw_jpeg);
+    let nsfw_b64_pred = nsfw_b64.clone();
+
+    let app = Router::new()
+        .route(
+            "/predict",
+            post(move |Json(req): Json<RawFilterPredictRequest>| {
+                let nsfw_b64_pred = nsfw_b64_pred.clone();
+                async move {
+                    if req.title.as_deref().unwrap_or("").contains("[HARD_FAIL]") {
+                        return (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": "upstream down"})),
+                        )
+                            .into_response();
+                    }
+                    let per_img: Vec<f32> = req
+                        .images_base64
+                        .iter()
+                        .map(|b| if b == &nsfw_b64_pred { 0.94 } else { 0.02 })
+                        .collect();
+                    let max_img = per_img.iter().copied().fold(0.0_f32, f32::max);
+                    (
+                        StatusCode::OK,
+                        Json(FilterProbabilities {
+                            prob: max_img.max(0.02),
+                            gore_prob: 0.01,
+                            nsfw_prob: max_img.max(0.02),
+                            text_prob: Some(0.02),
+                            title_prob: Some(0.02),
+                            image_prob: (!per_img.is_empty()).then_some(max_img),
+                            per_image_probs: per_img,
+                            ..Default::default()
+                        }),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/img/missing_0.jpg",
+            get(|| async { (StatusCode::NOT_FOUND, Vec::<u8>::new()).into_response() }),
+        )
+        .route(
+            "/img/safe_1.jpg",
+            get(move || {
+                let bytes = safe_jpeg.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        bytes,
+                    )
+                        .into_response()
+                }
+            }),
+        )
+        .route(
+            "/img/nsfw_2.jpg",
+            get(move || {
+                let bytes = nsfw_jpeg.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        bytes,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("{base_url}/predict")),
+                subdivide_modalities: true,
+                modality_threshold: 0.30,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.set_allow_loopback_image_urls_for_testing(true);
+
+    let url_0_404 = format!("{base_url}/img/missing_0.jpg");
+    let url_1_safe = format!("{base_url}/img/safe_1.jpg");
+    let url_2_nsfw = format!("{base_url}/img/nsfw_2.jpg");
+
+    let batch = engine
+        .evaluate_filter_items(vec![
+            // Item A: slot 0 404s, slot 1 safe, slot 2 NSFW -> evaluated=[1, 2], sensitive=[2], complete=true
+            FilterEvaluationTarget {
+                target_key: "ws:slot-flagged".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Gallery With Missing Cover".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![url_0_404.clone(), url_1_safe.clone(), url_2_nsfw],
+                revision_hint: Some("r1".into()),
+                bypass_cache: false,
+            },
+            // Item B: slot 0 404s, slot 1 safe -> unflagged with load error -> complete=false!
+            FilterEvaluationTarget {
+                target_key: "ws:slot-incomplete-safe".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Safe Item With Missing Gallery Slot".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![url_0_404, url_1_safe],
+                revision_hint: Some("r1".into()),
+                bypass_cache: false,
+            },
+            // Item C: backend 502 -> FilterTargetOutcome::Failed
+            FilterEvaluationTarget {
+                target_key: "ws:slot-failed".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[HARD_FAIL] Broken Upstream".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: Some("r1".into()),
+                bypass_cache: false,
+            },
+        ])
+        .await
+        .unwrap();
+
+    assert_eq!(batch.items.len(), 3);
+
+    match &batch.items[0].outcome {
+        FilterTargetOutcome::Completed { verdict, complete } => {
+            assert!(verdict.flagged);
+            assert!(*complete && verdict.complete);
+            assert_eq!(verdict.evaluated_image_indices, vec![1, 2]);
+            assert_eq!(verdict.sensitive_image_indices, vec![2]);
+        }
+        other => panic!("expected Completed for item 0, got {other:?}"),
+    }
+
+    match &batch.items[1].outcome {
+        FilterTargetOutcome::Completed { verdict, complete } => {
+            assert!(!verdict.flagged);
+            assert!(!*complete && !verdict.complete);
+            assert_eq!(verdict.evaluated_image_indices, vec![1]);
+            assert!(verdict.sensitive_image_indices.is_empty());
+        }
+        other => panic!("expected Completed(complete=false) for item 1, got {other:?}"),
+    }
+
+    assert!(matches!(
+        &batch.items[2].outcome,
+        FilterTargetOutcome::Failed { error } if error.contains("502")
+    ));
+
+    // Only item 0 (`complete == true`) was persisted to SQLite!
+    let snap = engine.snapshot().unwrap();
+    assert_eq!(snap.cached_filter_verdicts.len(), 1);
+    assert_eq!(snap.cached_filter_verdicts[0].target_key, "ws:slot-flagged");
+}
+
+#[tokio::test]
+async fn catalog_mixed_local_and_remote_images_preserve_exact_gallery_slot_order() {
+    let safe_jpeg = make_tiny_jpeg(25, 200, 25);
+    let nsfw_jpeg = make_tiny_jpeg(245, 25, 210);
+    let nsfw_b64 = STANDARD.encode(&nsfw_jpeg);
+    let nsfw_data_url = format!("data:image/jpeg;base64,{nsfw_b64}");
+
+    let nsfw_b64_pred = nsfw_b64.clone();
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/predict",
+            post(move |Json(req): Json<FilterPredictRequest>| {
+                let nsfw_b64_pred = nsfw_b64_pred.clone();
+                async move {
+                    assert!(
+                        req.image_urls.is_empty(),
+                        "mixed remote + inline sources in Catalog mode must send all images in slot order via images_base64"
+                    );
+                    let per_img: Vec<f32> = req
+                        .images_base64
+                        .iter()
+                        .map(|b| if b == &nsfw_b64_pred { 0.93 } else { 0.02 })
+                        .collect();
+                    Json(FilterProbabilities {
+                        prob: 0.93,
+                        gore_prob: 0.01,
+                        nsfw_prob: 0.93,
+                        text_prob: Some(0.02),
+                        title_prob: Some(0.02),
+                        image_prob: Some(0.93),
+                        per_image_probs: per_img,
+                        ..Default::default()
+                    })
+                }
+            }),
+        )
+        .route(
+            "/remote-safe-slot0.jpg",
+            get(move || {
+                let bytes = safe_jpeg.clone();
+                async move {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "image/jpeg")],
+                        bytes,
+                    )
+                        .into_response()
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            catalog_server_url: Some(base_url.clone()),
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::Catalog,
+                subdivide_modalities: true,
+                modality_threshold: 0.30,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.set_allow_loopback_image_urls_for_testing(true);
+
+    // Slot 0 is a remote URL (safe), Slot 1 is a data URL (NSFW).
+    // Previously Catalog mode sent `images_base64` before `image_urls`, inverting slots 0 and 1!
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:mixed-catalog-slots".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Mixed Gallery Item".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![format!("{base_url}/remote-safe-slot0.jpg"), nsfw_data_url],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(verdicts[0].evaluated_image_indices, vec![0, 1]);
+    assert_eq!(
+        verdicts[0].sensitive_image_indices,
+        vec![1],
+        "slot 1 (inline NSFW) must not shift ahead of slot 0 (remote safe)"
+    );
+}
+
+#[tokio::test]
+async fn configure_failure_restarts_local_runner_instead_of_predicting_with_stale_params() {
+    let dir = tempdir().unwrap();
+    let upstream_repo = dir.path().join("upstream-reconfig-fail-repo");
+    std::fs::create_dir_all(&upstream_repo).unwrap();
+
+    run_git(&upstream_repo, &["init", "-b", "main"]);
+    let deploy_dir = upstream_repo.join("deploy");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    // Mock Left4Filter that fails if re-instantiated on `threads` change inside the SAME process
+    // (`POST /configure` returns HTTP 400), while succeeding on a fresh process spawn!
+    let py = r#"_INIT_CALLS = 0
+
+class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        global _INIT_CALLS
+        _INIT_CALLS += 1
+        if _INIT_CALLS > 1:
+            raise RuntimeError("simulated /configure reinit failure")
+        self.config = {"model_name": "MockStrictSync", "version": "1.0.0"}
+        self.num_threads = num_threads
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        p = 0.88 if "nsfw" in (title or "").lower() else 0.05
+        return {"prob": p, "gore_prob": 0.01, "nsfw_prob": p}
+"#;
+    std::fs::write(deploy_dir.join("l4filter.py"), py).unwrap();
+    std::fs::write(deploy_dir.join("vision_encoder.onnx"), b"vis").unwrap();
+    std::fs::write(deploy_dir.join("fusion_head.onnx"), b"head").unwrap();
+    std::fs::write(deploy_dir.join("text_vocab.json"), r#"{"vocab":{}}"#).unwrap();
+    std::fs::write(deploy_dir.join("requirements.txt"), "# offline\n").unwrap();
+    run_git(&upstream_repo, &["add", "."]);
+    run_git(&upstream_repo, &["commit", "-m", "feat: strict sync model"]);
+
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::Local,
+                auto_start_local_service: false, // Even with auto_start=false, failed /configure on running service must restart cleanly!
+                repo_url: upstream_repo.to_str().unwrap().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    engine
+        .deploy_local_filter(DeployLocalFilterRequest {
+            repo_url: Some(upstream_repo.to_str().unwrap().into()),
+            track_latest: true,
+            target_commit: None,
+            start_after_deploy: false,
+        })
+        .await
+        .unwrap();
+    install_offline_runner_shims(&engine);
+
+    let started = engine.start_local_filter_service().await.unwrap();
+    let pid1 = started.running_pid.expect("initial runner PID");
+
+    let initial_eval = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:sync-test".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Explicit NSFW Outfit".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert!(initial_eval[0].flagged);
+
+    // Change both `threads` (4 -> 2, triggering `POST /configure` HTTP 400 in PID 1!) AND
+    // `nsfw_weight` (1.0 -> 0.0, so stale PID 1 would return 0.88 flagged while fresh PID 2 returns 0.0 safe!).
+    let mut updated = engine.config();
+    updated.filter.local_params.threads = 2;
+    updated.filter.local_params.nsfw_weight = 0.0;
+    updated.filter.local_params.gore_weight = 1.0;
+    engine.save_config_async(updated).await.unwrap();
+
+    let after_reconfig = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:sync-test".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Explicit NSFW Outfit".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !after_reconfig[0].flagged,
+        "must never predict with stale nsfw_weight=1.0 after /configure failure"
+    );
+
+    let status_after = engine.get_local_filter_status().await.unwrap();
+    let pid2 = status_after.running_pid.expect("restarted runner PID");
+    assert_ne!(
+        pid1, pid2,
+        "failed /configure must stop old runner and spawn a fresh runner with updated params"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn catalog_scoring_revision_rotation_and_remote_ttl_invalidate_cached_verdicts() {
+    let active_rev = Arc::new(Mutex::new("rev-alpha".to_string()));
+    let predict_hits = Arc::new(AtomicUsize::new(0));
+
+    let rev_info = active_rev.clone();
+    let rev_pred = active_rev.clone();
+    let hits_pred = predict_hits.clone();
+
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/info",
+            get(move || {
+                let rev = rev_info.lock().unwrap().clone();
+                async move {
+                    Json(CatalogFilterPublicInfo {
+                        enabled: true,
+                        ready: true,
+                        model_name: Some("Left4FiltersModel".into()),
+                        model_version: Some("1.0.0".into()),
+                        max_images: 4,
+                        scoring_revision: Some(rev),
+                    })
+                }
+            }),
+        )
+        .route(
+            "/api/v1/filter/predict",
+            post(move |Json(_req): Json<FilterPredictRequest>| {
+                let rev = rev_pred.lock().unwrap().clone();
+                let hits_pred = hits_pred.clone();
+                async move {
+                    hits_pred.fetch_add(1, Ordering::SeqCst);
+                    let p = if rev == "rev-alpha" { 0.05 } else { 0.91 };
+                    Json(FilterProbabilities {
+                        prob: p,
+                        gore_prob: 0.01,
+                        nsfw_prob: p,
+                        text_prob: Some(p),
+                        title_prob: Some(p),
+                        scoring_revision: Some(rev),
+                        ..Default::default()
+                    })
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            catalog_server_url: Some(base_url),
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::Catalog,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let target = FilterEvaluationTarget {
+        target_key: "ws:cat-rot-1".into(),
+        addon_id: None,
+        workshop_id: None,
+        title: "Mod Sensitive Under Beta Calibration".into(),
+        description: None,
+        tags: vec![],
+        image_sources: vec![],
+        revision_hint: Some("v1".into()),
+        bypass_cache: false,
+    };
+
+    let batch_alpha = engine
+        .evaluate_filter_items(vec![target.clone()])
+        .await
+        .unwrap();
+    let sig_alpha = batch_alpha.policy_signature.clone();
+    let v_alpha = unwrap_verdicts(batch_alpha);
+    assert!(!v_alpha[0].flagged);
+    assert_eq!(predict_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        engine.snapshot().unwrap().filter_policy_signature,
+        sig_alpha
+    );
+    assert_eq!(engine.snapshot().unwrap().cached_filter_verdicts.len(), 1);
+
+    // Rotate Catalog scoring_revision to `rev-beta` and expire 30s info TTL
+    *active_rev.lock().unwrap() = "rev-beta".into();
+    engine.expire_catalog_scoring_cache_for_testing();
+
+    let batch_beta = engine
+        .evaluate_filter_items(vec![target.clone()])
+        .await
+        .unwrap();
+    let sig_beta = batch_beta.policy_signature.clone();
+    assert_ne!(sig_alpha, sig_beta);
+    let v_beta = unwrap_verdicts(batch_beta);
+    assert!(
+        v_beta[0].flagged,
+        "Catalog scoring_revision rotation must invalidate cached rev-alpha safe verdict!"
+    );
+    assert_eq!(predict_hits.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.snapshot().unwrap().filter_policy_signature, sig_beta);
+
+    // Also verify 1-hour max-age expiry on remote verdicts even when policy_sig is unchanged
+    let mut aged = v_beta[0].clone();
+    aged.evaluated_at = chrono::Utc::now() - chrono::TimeDelta::minutes(61);
+    let content_sig = l4a_core::filter::evaluator::compute_content_signature(&target, 8);
+    engine
+        .db()
+        .put_cached_filter_verdict(
+            &target.target_key,
+            &content_sig,
+            None,
+            &sig_beta,
+            &sig_beta,
+            &aged,
+        )
+        .unwrap();
+    assert!(
+        engine.snapshot().unwrap().cached_filter_verdicts.is_empty(),
+        "remote verdict older than 1 hour must expire from snapshot"
+    );
+    let _ = engine.evaluate_filter_items(vec![target]).await.unwrap();
+    assert_eq!(
+        predict_hits.load(Ordering::SeqCst),
+        3,
+        "expired >1h remote verdict must trigger fresh backend evaluation"
+    );
+}
+
+#[tokio::test]
+async fn late_finishing_old_policy_evaluation_never_prunes_active_policy_cache() {
+    let slow_entered = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+
+    let entered_route = slow_entered.clone();
+    let release_route = slow_release.clone();
+
+    let app = Router::new().route(
+        "/predict",
+        post(move |Json(req): Json<RawFilterPredictRequest>| {
+            let entered_route = entered_route.clone();
+            let release_route = release_route.clone();
+            async move {
+                let title = req.title.unwrap_or_default();
+                if title.contains("[SLOW_OLD_POLICY]") {
+                    entered_route.notify_one();
+                    release_route.notified().await;
+                }
+                Json(FilterProbabilities {
+                    prob: 0.80,
+                    gore_prob: 0.01,
+                    nsfw_prob: 0.80,
+                    text_prob: Some(0.80),
+                    title_prob: Some(0.80),
+                    ..Default::default()
+                })
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = Arc::new(make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/predict")),
+                flag_threshold: 0.72,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    ));
+
+    let engine_slow = engine.clone();
+    let slow_task = tokio::spawn(async move {
+        engine_slow
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:slow-old".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[SLOW_OLD_POLICY] In-Flight Item".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap()
+    });
+
+    slow_entered.notified().await;
+
+    // Switch active policy while `ws:slow-old` is in flight, and populate active policy's cache!
+    let mut next_cfg = engine.config();
+    next_cfg.filter.flag_threshold = 0.55;
+    engine.save_config_async(next_cfg).await.unwrap();
+
+    let fast_batch = engine
+        .evaluate_filter_items(vec![FilterEvaluationTarget {
+            target_key: "ws:fast-new".into(),
+            addon_id: None,
+            workshop_id: None,
+            title: "Active Policy Item".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec![],
+            revision_hint: None,
+            bypass_cache: false,
+        }])
+        .await
+        .unwrap();
+    let active_sig = fast_batch.policy_signature.clone();
+    assert_eq!(engine.snapshot().unwrap().cached_filter_verdicts.len(), 1);
+
+    // Now allow the old-policy evaluation to finish late
+    slow_release.notify_one();
+    let slow_batch = slow_task.await.unwrap();
+    assert_ne!(slow_batch.policy_signature, active_sig);
+
+    // Active policy's cached verdict MUST remain intact, and old-policy verdict MUST NOT be persisted!
+    let snap = engine.snapshot().unwrap();
+    assert_eq!(snap.filter_policy_signature, active_sig);
+    assert_eq!(snap.cached_filter_verdicts.len(), 1);
+    assert_eq!(snap.cached_filter_verdicts[0].target_key, "ws:fast-new");
+    assert_eq!(engine.clear_filter_cache().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn deploy_resolves_remote_only_branch_names_for_detached_checkout() {
+    let dir = tempdir().unwrap();
+    let upstream_repo = dir.path().join("upstream-branch-repo");
+    std::fs::create_dir_all(&upstream_repo).unwrap();
+
+    run_git(&upstream_repo, &["init", "-b", "main"]);
+    write_mock_left4filters_deploy(&upstream_repo, "1.0.0", 0.10);
+    run_git(&upstream_repo, &["add", "."]);
+    run_git(&upstream_repo, &["commit", "-m", "feat: main branch model"]);
+    let main_sha = run_git(&upstream_repo, &["rev-parse", "HEAD"]);
+
+    run_git(&upstream_repo, &["checkout", "-b", "feature/test-branch"]);
+    write_mock_left4filters_deploy(&upstream_repo, "2.1.0-branch", 0.25);
+    run_git(&upstream_repo, &["add", "."]);
+    run_git(
+        &upstream_repo,
+        &["commit", "-m", "feat: experimental branch model"],
+    );
+    let branch_sha = run_git(&upstream_repo, &["rev-parse", "HEAD"]);
+    // Switch upstream HEAD back to `main` so `feature/test-branch` is a non-default remote branch
+    run_git(&upstream_repo, &["checkout", "main"]);
+    assert_ne!(main_sha, branch_sha);
+
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                repo_url: upstream_repo.to_str().unwrap().into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let deployed = engine
+        .deploy_local_filter(DeployLocalFilterRequest {
+            repo_url: Some(upstream_repo.to_str().unwrap().into()),
+            track_latest: false,
+            target_commit: Some("feature/test-branch".into()),
+            start_after_deploy: false,
+        })
+        .await
+        .unwrap();
+
+    assert!(deployed.deployed);
+    assert_eq!(
+        deployed.current_commit.as_ref().map(|c| c.sha.as_str()),
+        Some(branch_sha.as_str()),
+        "remote-only branch name must resolve to exact commit SHA in detached HEAD"
+    );
+
+    // Also test a branch created in upstream AFTER clone with single-ref `FETCH_HEAD` resolution
+    run_git(&upstream_repo, &["checkout", "-b", "exp/fetch-head-branch"]);
+    write_mock_left4filters_deploy(&upstream_repo, "3.0.0-exp", 0.35);
+    run_git(&upstream_repo, &["add", "."]);
+    run_git(&upstream_repo, &["commit", "-m", "feat: fetch-head branch"]);
+    let exp_sha = run_git(&upstream_repo, &["rev-parse", "HEAD"]);
+    run_git(&upstream_repo, &["checkout", "main"]);
+
+    // Restrict remote.origin.fetch to main only so `git fetch --all` won't create `refs/remotes/origin/exp/...`,
+    // forcing `git fetch origin exp/fetch-head-branch` + `FETCH_HEAD^{commit}` resolution!
+    run_git(
+        &engine.paths().filter_repo_dir,
+        &[
+            "config",
+            "remote.origin.fetch",
+            "+refs/heads/main:refs/remotes/origin/main",
+        ],
+    );
+
+    let deployed_exp = engine
+        .deploy_local_filter(DeployLocalFilterRequest {
+            repo_url: Some(upstream_repo.to_str().unwrap().into()),
+            track_latest: false,
+            target_commit: Some("exp/fetch-head-branch".into()),
+            start_after_deploy: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        deployed_exp.current_commit.as_ref().map(|c| c.sha.as_str()),
+        Some(exp_sha.as_str()),
+        "FETCH_HEAD^{{commit}} fallback must resolve fetched branch SHA cleanly"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_unicode_data_urls_do_not_panic_and_concurrent_ipc_batches_are_bounded() {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let in_flight_ref = in_flight.clone();
+    let peak_ref = peak_in_flight.clone();
+
+    let app = Router::new().route(
+        "/predict",
+        post(move |Json(_req): Json<RawFilterPredictRequest>| {
+            let in_flight_ref = in_flight_ref.clone();
+            let peak_ref = peak_ref.clone();
+            async move {
+                let cur = in_flight_ref.fetch_add(1, Ordering::SeqCst) + 1;
+                peak_ref.fetch_max(cur, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                in_flight_ref.fetch_sub(1, Ordering::SeqCst);
+                Json(FilterProbabilities {
+                    prob: 0.04,
+                    gore_prob: 0.01,
+                    nsfw_prob: 0.03,
+                    text_prob: Some(0.04),
+                    title_prob: Some(0.04),
+                    ..Default::default()
+                })
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = Arc::new(make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/predict")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    ));
+
+    // 1. Malformed multibyte UTF-8 `data:` image inputs must never panic
+    let unicode_batch = engine
+        .evaluate_filter_items(vec![FilterEvaluationTarget {
+            target_key: "ws:unicode-malformed".into(),
+            addon_id: None,
+            workshop_id: None,
+            title: "Unicode Malformed Data URL Test".into(),
+            description: None,
+            tags: vec![],
+            image_sources: vec![
+                "data:中文;base64,AAA".into(),
+                "data:image/中文;base64,AAA".into(),
+                "中文".into(),
+            ],
+            revision_hint: None,
+            bypass_cache: true,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(unicode_batch.items.len(), 1);
+    match &unicode_batch.items[0].outcome {
+        FilterTargetOutcome::Completed { verdict, complete } => {
+            assert!(!verdict.flagged);
+            assert!(!*complete && !verdict.complete);
+        }
+        other => panic!("expected Completed(complete=false), got {other:?}"),
+    }
+
+    // 2. Spawn 3 concurrent IPC batches of 4 uncached items (12 items total) and verify global
+    //    `filter_eval_semaphore` bounds concurrent backend evaluations to <= 4!
+    let mut handles = Vec::new();
+    for batch_idx in 0..3 {
+        let eng = engine.clone();
+        handles.push(tokio::spawn(async move {
+            let targets: Vec<FilterEvaluationTarget> = (0..4)
+                .map(|i| FilterEvaluationTarget {
+                    target_key: format!("ws:conc-{batch_idx}-{i}"),
+                    addon_id: None,
+                    workshop_id: None,
+                    title: format!("Concurrent Item {batch_idx}-{i}"),
+                    description: None,
+                    tags: vec![],
+                    image_sources: vec![],
+                    revision_hint: None,
+                    bypass_cache: false,
+                })
+                .collect();
+            eng.evaluate_filter_items(targets).await.unwrap()
+        }));
+    }
+    for h in handles {
+        let res = h.await.unwrap();
+        assert_eq!(res.items.len(), 4);
+    }
+    let observed_peak = peak_in_flight.load(Ordering::SeqCst);
+    assert!(
+        observed_peak <= 4,
+        "expected global filter_eval_semaphore to bound concurrent /predict calls to <= 4, got {observed_peak}"
     );
 }

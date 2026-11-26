@@ -4,11 +4,11 @@ use crate::db::ServerRepo;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use l4a_protocol::{
-    CatalogFilterBackendKind, CatalogFilterPublicInfo, CatalogFilterStatus, FilterModelParams,
-    FilterPredictRequest, FilterProbabilities, WorkshopItemStatus, FILTER_RUNNER_PY,
+    CatalogFilterBackendKind, CatalogFilterPublicInfo, CatalogFilterStatus,
+    FilterGalleryAggregation, FilterModelParams, FilterPredictRequest, FilterProbabilities,
+    RawFilterPredictRequest, WorkshopItemStatus,
 };
 use serde::Deserialize;
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -21,11 +21,16 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use url::{Host, Url};
+
+const FILTER_RUNNER_PY: &str = include_str!("../../filter-assets/filter_runner.py");
 
 const MAX_CACHE_ENTRIES: usize = 4_096;
 const MAX_CONCURRENT_PREDICTS: usize = 4;
+pub const MAX_PUBLIC_PREDICT_ADMISSIONS: usize = 8;
+const DEFAULT_PUBLIC_ADMISSION_TIMEOUT_MS: u64 = 1_500;
+pub const MAX_RUNNER_BATCH_RAW_IMAGE_BYTES: usize = 30 * 1024 * 1024;
 const MAX_TITLE_BYTES: usize = 4_096;
 const MAX_DESCRIPTION_BYTES: usize = 65_536;
 const MAX_TAGS_COUNT: usize = 64;
@@ -124,6 +129,8 @@ pub struct CatalogFilterService {
     config_store: Arc<CatalogConfigStore>,
     repo: Arc<ServerRepo>,
     lifecycle_lock: AsyncMutex<Option<ManagedPythonHandle>>,
+    public_admission_semaphore: Arc<Semaphore>,
+    public_admission_timeout_ms: AtomicU64,
     predict_semaphore: Semaphore,
     runtime: RwLock<RuntimeSnapshot>,
     cache: StdMutex<HashMap<[u8; 32], CacheEntry>>,
@@ -162,6 +169,8 @@ impl CatalogFilterService {
             config_store,
             repo,
             lifecycle_lock: AsyncMutex::new(None),
+            public_admission_semaphore: Arc::new(Semaphore::new(MAX_PUBLIC_PREDICT_ADMISSIONS)),
+            public_admission_timeout_ms: AtomicU64::new(DEFAULT_PUBLIC_ADMISSION_TIMEOUT_MS),
             predict_semaphore: Semaphore::new(MAX_CONCURRENT_PREDICTS),
             runtime: RwLock::new(RuntimeSnapshot::default()),
             cache: StdMutex::new(HashMap::new()),
@@ -188,6 +197,26 @@ impl CatalogFilterService {
 
     pub fn is_enabled(&self) -> bool {
         self.config_store.get().filter.enabled
+    }
+
+    /// Acquires a bounded public admission permit before reading/buffering `/api/v1/filter/predict` bodies.
+    pub async fn acquire_public_admission(&self) -> Option<OwnedSemaphorePermit> {
+        let timeout_ms = self.public_admission_timeout_ms.load(Ordering::Acquire);
+        let sem = self.public_admission_semaphore.clone();
+        if timeout_ms == 0 {
+            return sem.try_acquire_owned().ok();
+        }
+        tokio::time::timeout(Duration::from_millis(timeout_ms), sem.acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Overrides the public admission wait timeout strictly for integration tests.
+    pub fn set_public_admission_timeout_for_testing(&self, timeout: Duration) {
+        let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+        self.public_admission_timeout_ms
+            .store(ms, Ordering::Release);
     }
 
     /// Gracefully terminates any managed Python filter runner child process on server shutdown.
@@ -223,18 +252,37 @@ impl CatalogFilterService {
                 model_name: None,
                 model_version: None,
                 max_images: params.max_images,
+                scoring_revision: None,
             };
         }
 
         self.ensure_initialized().await;
         self.refresh_managed_liveness();
+        let cfg = self.current_filter_section();
+        let params = cfg.params();
+        if !cfg.enabled {
+            return CatalogFilterPublicInfo {
+                enabled: false,
+                ready: false,
+                model_name: None,
+                model_version: None,
+                max_images: params.max_images,
+                scoring_revision: None,
+            };
+        }
         let snap = self.runtime.read().unwrap().clone();
+        let scoring_revision = Some(compute_scoring_revision(
+            &cfg,
+            snap.model_name.as_deref(),
+            snap.model_version.as_deref(),
+        ));
         CatalogFilterPublicInfo {
             enabled: true,
             ready: snap.ready,
             model_name: snap.model_name,
             model_version: snap.model_version,
             max_images: params.max_images,
+            scoring_revision,
         }
     }
 
@@ -435,7 +483,7 @@ impl CatalogFilterService {
         };
 
         // 5. Verify backend availability before serving or caching.
-        let (endpoint, backend_kind) = {
+        let (endpoint, backend_kind, scoring_revision) = {
             let snap = self.runtime.read().unwrap();
             if !snap.ready {
                 let detail = snap
@@ -453,13 +501,19 @@ impl CatalogFilterService {
                     "内容过滤模型后端未绑定有效地址".to_string(),
                 ));
             };
-            (ep.clone(), cfg.backend)
+            let rev = compute_scoring_revision(
+                &cfg,
+                snap.model_name.as_deref(),
+                snap.model_version.as_deref(),
+            );
+            (ep.clone(), cfg.backend, rev)
         };
 
         // 6. Check in-memory TTL cache.
         let cache_ttl = Duration::from_secs(cfg.cache_ttl_secs);
         let cache_key = compute_cache_key(
             &cfg,
+            &scoring_revision,
             &effective_title,
             &effective_desc,
             &effective_tags,
@@ -468,7 +522,8 @@ impl CatalogFilterService {
             &effective_db_urls,
         );
         if !cache_ttl.is_zero() {
-            if let Some(hit) = self.get_cached(&cache_key, cache_ttl) {
+            if let Some(mut hit) = self.get_cached(&cache_key, cache_ttl) {
+                hit.scoring_revision = Some(scoring_revision);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(hit);
             }
@@ -495,38 +550,67 @@ impl CatalogFilterService {
         let has_txt = !effective_title.trim().is_empty()
             || !effective_desc.trim().is_empty()
             || !effective_tags.is_empty();
-        let probabilities = if !has_txt && final_images.is_empty() {
+        let mut probabilities = if !has_txt && final_images.is_empty() {
             FilterProbabilities::default()
         } else {
-            let encoded_images: Vec<String> =
-                final_images.iter().map(|b| BASE64_STD.encode(b)).collect();
-            let mut raw_probs = self
-                .call_backend_predict(
-                    &endpoint,
-                    &effective_title,
-                    &effective_desc,
-                    &effective_tags,
-                    &encoded_images,
-                )
-                .await?;
-
             match backend_kind {
                 // ManagedPython runner already applies `FilterModelParams` calibration & unimodal breakdown.
-                CatalogFilterBackendKind::ManagedPython => raw_probs,
-                CatalogFilterBackendKind::UpstreamHttp => {
-                    self.backfill_upstream_unimodal(
+                CatalogFilterBackendKind::ManagedPython => {
+                    self.predict_batched_backend(
                         &endpoint,
                         &effective_title,
                         &effective_desc,
                         &effective_tags,
-                        &encoded_images,
-                        &mut raw_probs,
+                        &final_images,
+                        params.gallery_aggregation,
                     )
-                    .await;
-                    params.adjust_probabilities(&raw_probs)
+                    .await?
+                }
+                CatalogFilterBackendKind::UpstreamHttp => {
+                    if final_images.len() > 1 {
+                        self.predict_upstream_gallery(
+                            &endpoint,
+                            &effective_title,
+                            &effective_desc,
+                            &effective_tags,
+                            &final_images,
+                            &params,
+                        )
+                        .await?
+                    } else {
+                        let encoded_images: Vec<String> =
+                            final_images.iter().map(|b| BASE64_STD.encode(b)).collect();
+                        let mut raw_probs = self
+                            .predict_batched_backend(
+                                &endpoint,
+                                &effective_title,
+                                &effective_desc,
+                                &effective_tags,
+                                &final_images,
+                                params.gallery_aggregation,
+                            )
+                            .await?;
+                        self.backfill_upstream_unimodal(
+                            &endpoint,
+                            &effective_title,
+                            &effective_desc,
+                            &effective_tags,
+                            &encoded_images,
+                            &mut raw_probs,
+                        )
+                        .await;
+                        let mut adjusted = params.adjust_probabilities(&raw_probs);
+                        if adjusted.per_image_probs.len() == 1 {
+                            if let Some(ip) = adjusted.image_prob {
+                                adjusted.per_image_probs[0] = ip;
+                            }
+                        }
+                        adjusted
+                    }
                 }
             }
         };
+        probabilities.scoring_revision = Some(scoring_revision);
 
         // Never cache degraded partial text-only results when a DB preview image failed transiently!
         if !cache_ttl.is_zero() && !db_image_fetch_failed {
@@ -534,6 +618,189 @@ impl CatalogFilterService {
         }
 
         Ok(probabilities)
+    }
+
+    async fn predict_batched_backend(
+        &self,
+        endpoint: &str,
+        title: &str,
+        description: &str,
+        tags: &[String],
+        images: &[Vec<u8>],
+        gallery_aggregation: FilterGalleryAggregation,
+    ) -> Result<FilterProbabilities, FilterServiceError> {
+        if images.is_empty() {
+            return self
+                .call_backend_predict(endpoint, title, description, tags, &[])
+                .await;
+        }
+
+        let ranges = split_image_ranges_by_bytes(images, MAX_RUNNER_BATCH_RAW_IMAGE_BYTES);
+        if ranges.len() == 1 {
+            let encoded: Vec<String> = images.iter().map(|b| BASE64_STD.encode(b)).collect();
+            return self
+                .call_backend_predict(endpoint, title, description, tags, &encoded)
+                .await;
+        }
+
+        let mut joint_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(ranges.len());
+        let mut img_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(ranges.len());
+        let mut all_per_image_probs: Vec<f32> = Vec::with_capacity(images.len());
+        let mut text_prob = None;
+        let mut text_gore_prob = None;
+        let mut text_nsfw_prob = None;
+        let mut title_prob = None;
+        let mut description_prob = None;
+
+        for (batch_idx, range) in ranges.into_iter().enumerate() {
+            let batch_count = range.len();
+            let encoded_batch: Vec<String> =
+                images[range].iter().map(|b| BASE64_STD.encode(b)).collect();
+            let sub = self
+                .call_backend_predict(endpoint, title, description, tags, &encoded_batch)
+                .await?;
+
+            if batch_idx == 0 {
+                text_prob = sub.text_prob;
+                text_gore_prob = sub.text_gore_prob;
+                text_nsfw_prob = sub.text_nsfw_prob;
+                title_prob = sub.title_prob;
+                description_prob = sub.description_prob;
+            }
+
+            joint_batches.push(([sub.prob, sub.gore_prob, sub.nsfw_prob], batch_count));
+
+            let img_trip = match (sub.image_prob, sub.image_gore_prob, sub.image_nsfw_prob) {
+                (Some(ip), Some(ig), Some(in_)) => [ip, ig, in_],
+                (Some(ip), _, _) => [ip, sub.gore_prob, sub.nsfw_prob],
+                _ => [sub.prob, sub.gore_prob, sub.nsfw_prob],
+            };
+            img_batches.push((img_trip, batch_count));
+
+            if !sub.per_image_probs.is_empty() {
+                all_per_image_probs.extend(sub.per_image_probs);
+            } else {
+                let fallback = round6_prob(img_trip[0]);
+                all_per_image_probs.extend(std::iter::repeat_n(fallback, batch_count));
+            }
+        }
+
+        let joint_agg = aggregate_subbatch_triplets(&joint_batches, gallery_aggregation);
+        let img_agg = aggregate_subbatch_triplets(&img_batches, gallery_aggregation);
+
+        Ok(FilterProbabilities {
+            prob: round6_prob(joint_agg[0]),
+            gore_prob: round6_prob(joint_agg[1]),
+            nsfw_prob: round6_prob(joint_agg[2]),
+            text_prob,
+            text_gore_prob,
+            text_nsfw_prob,
+            title_prob,
+            description_prob,
+            image_prob: Some(round6_prob(img_agg[0])),
+            image_gore_prob: Some(round6_prob(img_agg[1])),
+            image_nsfw_prob: Some(round6_prob(img_agg[2])),
+            per_image_probs: all_per_image_probs,
+            scoring_revision: None,
+        })
+    }
+
+    async fn predict_upstream_gallery(
+        &self,
+        endpoint: &str,
+        title: &str,
+        description: &str,
+        tags: &[String],
+        images: &[Vec<u8>],
+        params: &FilterModelParams,
+    ) -> Result<FilterProbabilities, FilterServiceError> {
+        let has_txt =
+            !title.trim().is_empty() || !description.trim().is_empty() || !tags.is_empty();
+        let mut img_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(images.len());
+        let mut joint_batches: Vec<([f32; 3], usize)> =
+            Vec::with_capacity(if has_txt { images.len() } else { 0 });
+
+        let mut text_prob = None;
+        let mut text_gore_prob = None;
+        let mut text_nsfw_prob = None;
+        let mut title_prob = None;
+        let mut description_prob = None;
+
+        for img_bytes in images {
+            let b64 = BASE64_STD.encode(img_bytes);
+            let single_slice = std::slice::from_ref(&b64);
+
+            let img_res = self
+                .call_backend_predict(endpoint, "", "", &[], single_slice)
+                .await?;
+            img_batches.push(([img_res.prob, img_res.gore_prob, img_res.nsfw_prob], 1));
+
+            if has_txt {
+                let joint_res = self
+                    .call_backend_predict(endpoint, title, description, tags, single_slice)
+                    .await?;
+                if text_prob.is_none() && joint_res.text_prob.is_some() {
+                    text_prob = joint_res.text_prob;
+                    text_gore_prob = joint_res.text_gore_prob;
+                    text_nsfw_prob = joint_res.text_nsfw_prob;
+                    title_prob = joint_res.title_prob;
+                    description_prob = joint_res.description_prob;
+                }
+                joint_batches.push((
+                    [joint_res.prob, joint_res.gore_prob, joint_res.nsfw_prob],
+                    1,
+                ));
+            }
+        }
+
+        if has_txt && text_prob.is_none() {
+            if let Ok(txt_res) = self
+                .call_backend_predict_inner(endpoint, title, description, tags, &[], false)
+                .await
+            {
+                text_prob = Some(txt_res.prob);
+                text_gore_prob = Some(txt_res.gore_prob);
+                text_nsfw_prob = Some(txt_res.nsfw_prob);
+                if title_prob.is_none() {
+                    title_prob = txt_res.title_prob;
+                }
+                if description_prob.is_none() {
+                    description_prob = txt_res.description_prob;
+                }
+            }
+        }
+
+        let img_agg = aggregate_subbatch_triplets(&img_batches, params.gallery_aggregation);
+        let joint_agg = if has_txt {
+            aggregate_subbatch_triplets(&joint_batches, params.gallery_aggregation)
+        } else {
+            img_agg
+        };
+
+        let raw_probs = FilterProbabilities {
+            prob: round6_prob(joint_agg[0]),
+            gore_prob: round6_prob(joint_agg[1]),
+            nsfw_prob: round6_prob(joint_agg[2]),
+            text_prob,
+            text_gore_prob,
+            text_nsfw_prob,
+            title_prob,
+            description_prob,
+            image_prob: Some(round6_prob(img_agg[0])),
+            image_gore_prob: Some(round6_prob(img_agg[1])),
+            image_nsfw_prob: Some(round6_prob(img_agg[2])),
+            per_image_probs: img_batches.iter().map(|(r, _)| round6_prob(r[0])).collect(),
+            scoring_revision: None,
+        };
+
+        let mut adjusted = params.adjust_probabilities(&raw_probs);
+        if !params.is_identity_calibration() {
+            adjusted.per_image_probs = img_batches
+                .iter()
+                .map(|(r, _)| params.adjust_triplet(r[0], r[1], r[2]).0)
+                .collect();
+        }
+        Ok(adjusted)
     }
 
     async fn backfill_upstream_unimodal(
@@ -715,24 +982,31 @@ impl CatalogFilterService {
         cfg: &FilterSection,
         force_restart: bool,
     ) {
-        let next_sig = scoring_signature(cfg);
-        let should_clear_cache = force_restart
-            || !cfg.enabled
-            || cfg.cache_ttl_secs == 0
-            || self
-                .runtime
-                .read()
-                .unwrap()
-                .last_scoring_signature
-                .as_deref()
-                != Some(next_sig.as_str());
-        if should_clear_cache {
+        let prev_sig = self.runtime.read().unwrap().last_scoring_signature.clone();
+        let unverified_rev = compute_scoring_revision(cfg, None, None);
+        if force_restart || !cfg.enabled || cfg.cache_ttl_secs == 0 {
             self.clear_cache();
         }
-        let retained_sig = if cfg.enabled && cfg.cache_ttl_secs > 0 {
-            Some(next_sig)
-        } else {
-            None
+        let retained_for = |model_name: Option<&str>, model_version: Option<&str>| {
+            if cfg.enabled && cfg.cache_ttl_secs > 0 {
+                let rev = compute_scoring_revision(cfg, model_name, model_version);
+                if prev_sig.as_deref() != Some(rev.as_str()) {
+                    self.clear_cache();
+                }
+                Some(rev)
+            } else {
+                None
+            }
+        };
+        let retained_unverified = || {
+            if cfg.enabled && cfg.cache_ttl_secs > 0 {
+                if prev_sig.as_deref() != Some(unverified_rev.as_str()) {
+                    self.clear_cache();
+                }
+                Some(unverified_rev.clone())
+            } else {
+                None
+            }
         };
 
         if !cfg.enabled {
@@ -762,10 +1036,11 @@ impl CatalogFilterService {
                     if let Some(mut old) = guard.take() {
                         old.terminate().await;
                     }
+                    let next_sig = retained_unverified();
                     let mut snap = self.runtime.write().unwrap();
                     *snap = RuntimeSnapshot {
                         initialized_config: None,
-                        last_scoring_signature: retained_sig,
+                        last_scoring_signature: next_sig,
                         backoff_config: Some(cfg.clone()),
                         next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
                         last_crash_respawn_at: snap.last_crash_respawn_at,
@@ -797,9 +1072,13 @@ impl CatalogFilterService {
                                 .await
                             {
                                 Ok(()) => {
+                                    let next_sig = retained_for(
+                                        existing.model_name.as_deref(),
+                                        existing.model_version.as_deref(),
+                                    );
                                     let mut snap = self.runtime.write().unwrap();
                                     snap.initialized_config = Some(cfg.clone());
-                                    snap.last_scoring_signature = retained_sig;
+                                    snap.last_scoring_signature = next_sig;
                                     snap.backoff_config = None;
                                     snap.next_retry_after = None;
                                     snap.ready = true;
@@ -833,10 +1112,14 @@ impl CatalogFilterService {
                 .await
                 {
                     Ok(handle) => {
+                        let next_sig = retained_for(
+                            handle.model_name.as_deref(),
+                            handle.model_version.as_deref(),
+                        );
                         let prev_crash_ts = self.runtime.read().unwrap().last_crash_respawn_at;
                         let snap_next = RuntimeSnapshot {
                             initialized_config: Some(cfg.clone()),
-                            last_scoring_signature: retained_sig,
+                            last_scoring_signature: next_sig,
                             backoff_config: None,
                             next_retry_after: None,
                             last_crash_respawn_at: prev_crash_ts,
@@ -851,10 +1134,11 @@ impl CatalogFilterService {
                         *self.runtime.write().unwrap() = snap_next;
                     }
                     Err(err) => {
+                        let next_sig = retained_unverified();
                         let prev_crash_ts = self.runtime.read().unwrap().last_crash_respawn_at;
                         *self.runtime.write().unwrap() = RuntimeSnapshot {
                             initialized_config: None,
-                            last_scoring_signature: retained_sig,
+                            last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
                             last_crash_respawn_at: prev_crash_ts,
@@ -874,9 +1158,10 @@ impl CatalogFilterService {
                 }
 
                 let Some(ref raw_url) = cfg.upstream_url else {
+                    let next_sig = retained_unverified();
                     *self.runtime.write().unwrap() = RuntimeSnapshot {
                         initialized_config: None,
-                        last_scoring_signature: retained_sig,
+                        last_scoring_signature: next_sig,
                         backoff_config: Some(cfg.clone()),
                         next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
                         last_crash_respawn_at: None,
@@ -895,9 +1180,10 @@ impl CatalogFilterService {
                 let base_url = match validate_upstream_base_url(raw_url) {
                     Ok(u) => u,
                     Err(err) => {
+                        let next_sig = retained_unverified();
                         *self.runtime.write().unwrap() = RuntimeSnapshot {
                             initialized_config: None,
-                            last_scoring_signature: retained_sig,
+                            last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
                             last_crash_respawn_at: None,
@@ -914,9 +1200,11 @@ impl CatalogFilterService {
 
                 match self.probe_upstream_health(&base_url).await {
                     Ok((model_name, model_version)) => {
+                        let next_sig =
+                            retained_for(model_name.as_deref(), model_version.as_deref());
                         *self.runtime.write().unwrap() = RuntimeSnapshot {
                             initialized_config: Some(cfg.clone()),
-                            last_scoring_signature: retained_sig,
+                            last_scoring_signature: next_sig,
                             backoff_config: None,
                             next_retry_after: None,
                             last_crash_respawn_at: None,
@@ -929,9 +1217,10 @@ impl CatalogFilterService {
                         };
                     }
                     Err(err) => {
+                        let next_sig = retained_unverified();
                         *self.runtime.write().unwrap() = RuntimeSnapshot {
                             initialized_config: None,
-                            last_scoring_signature: retained_sig,
+                            last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
                             last_crash_respawn_at: None,
@@ -1029,12 +1318,13 @@ impl CatalogFilterService {
         })?;
 
         let url = format!("{}/predict", endpoint.trim_end_matches('/'));
-        let payload = json!({
-            "title": title,
-            "description": description,
-            "tags": tags,
-            "imagesBase64": images_base64,
-        });
+        let payload = RawFilterPredictRequest {
+            title: Some(title.to_string()),
+            description: Some(description.to_string()),
+            tags: tags.to_vec(),
+            image_base64: None,
+            images_base64: images_base64.to_vec(),
+        };
 
         let resp = match self.backend_client.post(&url).json(&payload).send().await {
             Ok(r) => r,
@@ -1626,16 +1916,28 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
 
 fn decode_base64_image(raw: &str) -> Result<Vec<u8>, FilterServiceError> {
     let trimmed = raw.trim();
-    let payload = if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("data:") {
+    let payload = if trimmed
+        .as_bytes()
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"data:"))
+    {
         let Some((header, rest)) = trimmed.split_once(',') else {
             return Err(FilterServiceError::BadRequest(
                 "无效的 data URI 图片格式".to_string(),
             ));
         };
-        let header_trimmed = header.trim();
-        if header_trimmed.len() < 7
-            || !header_trimmed[header_trimmed.len() - 7..].eq_ignore_ascii_case(";base64")
-        {
+        let header_bytes = header.trim().as_bytes();
+        if !header_bytes.is_ascii() {
+            return Err(FilterServiceError::BadRequest(
+                "无效的 data URI 图片媒体类型头".to_string(),
+            ));
+        }
+        let has_base64_suffix = header_bytes
+            .len()
+            .checked_sub(7)
+            .and_then(|start| header_bytes.get(start..))
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b";base64"));
+        if !has_base64_suffix {
             return Err(FilterServiceError::BadRequest(
                 "data URI 图片必须使用 ;base64, 编码".to_string(),
             ));
@@ -1681,6 +1983,81 @@ fn decode_base64_image(raw: &str) -> Result<Vec<u8>, FilterServiceError> {
     }
     validate_image_bytes(&decoded)?;
     Ok(decoded)
+}
+
+fn round6_prob(v: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    ((v.clamp(0.0, 1.0) as f64) * 1_000_000.0).round() as f32 / 1_000_000.0
+}
+
+fn split_image_ranges_by_bytes(
+    images: &[Vec<u8>],
+    max_batch_bytes: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut current_bytes = 0usize;
+    for (idx, img) in images.iter().enumerate() {
+        let len = img.len();
+        if idx > start && current_bytes.saturating_add(len) > max_batch_bytes {
+            ranges.push(start..idx);
+            start = idx;
+            current_bytes = len;
+        } else {
+            current_bytes = current_bytes.saturating_add(len);
+        }
+    }
+    if start < images.len() {
+        ranges.push(start..images.len());
+    }
+    ranges
+}
+
+fn aggregate_subbatch_triplets(
+    batches: &[([f32; 3], usize)],
+    mode: FilterGalleryAggregation,
+) -> [f32; 3] {
+    if batches.is_empty() {
+        return [0.0, 0.0, 0.0];
+    }
+    if batches.len() == 1 {
+        return batches[0].0;
+    }
+    let mut out = [0.0f32; 3];
+    for col in 0..3 {
+        out[col] = match mode {
+            FilterGalleryAggregation::Max => batches
+                .iter()
+                .map(|(trip, _)| trip[col])
+                .fold(0.0f32, f32::max),
+            FilterGalleryAggregation::Mean => {
+                let total_count: usize = batches.iter().map(|(_, count)| *count).sum();
+                let weighted_sum: f32 = batches
+                    .iter()
+                    .map(|(trip, count)| trip[col] * (*count as f32))
+                    .sum();
+                weighted_sum / (total_count.max(1) as f32)
+            }
+            FilterGalleryAggregation::Top2Mean => {
+                let mut expanded = Vec::with_capacity(batches.len() * 2);
+                for (trip, count) in batches {
+                    let copies = (*count).clamp(1, 2);
+                    expanded.extend(std::iter::repeat_n(trip[col], copies));
+                }
+                if expanded.len() <= 2 {
+                    let sum: f32 = expanded.iter().sum();
+                    sum / (expanded.len().max(1) as f32)
+                } else {
+                    expanded.sort_by(|a, b| a.total_cmp(b));
+                    let n = expanded.len();
+                    (expanded[n - 2] + expanded[n - 1]) / 2.0
+                }
+            }
+        };
+    }
+    out
 }
 
 fn collect_item_preview_urls(
@@ -1744,8 +2121,29 @@ fn scoring_signature(cfg: &FilterSection) -> String {
     )
 }
 
+fn compute_scoring_revision(
+    cfg: &FilterSection,
+    model_name: Option<&str>,
+    model_version: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    let sig = scoring_signature(cfg);
+    hasher.update((sig.len() as u64).to_le_bytes());
+    hasher.update(sig.as_bytes());
+    let name = model_name.unwrap_or("");
+    hasher.update((name.len() as u64).to_le_bytes());
+    hasher.update(name.as_bytes());
+    let version = model_version.unwrap_or("");
+    hasher.update((version.len() as u64).to_le_bytes());
+    hasher.update(version.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..8])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compute_cache_key(
     cfg: &FilterSection,
+    scoring_revision: &str,
     title: &str,
     description: &str,
     tags: &[String],
@@ -1757,6 +2155,9 @@ fn compute_cache_key(
     let sig = scoring_signature(cfg);
     hasher.update((sig.len() as u64).to_le_bytes());
     hasher.update(sig.as_bytes());
+
+    hasher.update((scoring_revision.len() as u64).to_le_bytes());
+    hasher.update(scoring_revision.as_bytes());
 
     hasher.update((title.len() as u64).to_le_bytes());
     hasher.update(title.as_bytes());
@@ -1804,10 +2205,19 @@ fn is_batch_shim_path(path: &Path) -> bool {
 }
 
 fn is_executable_file(path: &Path) -> bool {
+    if is_batch_shim_path(path) {
+        return false;
+    }
+    if std::fs::canonicalize(path)
+        .ok()
+        .is_some_and(|real| is_batch_shim_path(&real))
+    {
+        return false;
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() || is_batch_shim_path(path) {
+    if !meta.is_file() {
         return false;
     }
     #[cfg(unix)]
@@ -1825,14 +2235,18 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return std::fs::canonicalize(&candidate).ok().or(Some(candidate));
+        if let Ok(abs_path) = std::path::absolute(&candidate) {
+            if is_executable_file(&abs_path) {
+                return Some(abs_path);
+            }
         }
         #[cfg(windows)]
         if Path::new(name).extension().is_none() {
             let exe = dir.join(format!("{name}.exe"));
-            if is_executable_file(&exe) {
-                return std::fs::canonicalize(&exe).ok().or(Some(exe));
+            if let Ok(abs_exe) = std::path::absolute(&exe) {
+                if is_executable_file(&abs_exe) {
+                    return Some(abs_exe);
+                }
             }
         }
     }
@@ -1841,6 +2255,7 @@ fn find_executable_in_path(name: &str) -> Option<PathBuf> {
 
 fn resolve_and_validate_python_executable(
     configured: Option<&str>,
+    abs_deploy_dir: &Path,
     canonical_deploy_dir: &Path,
 ) -> Result<PathBuf, String> {
     if let Some(explicit) = configured.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1853,25 +2268,38 @@ fn resolve_and_validate_python_executable(
 
         let has_sep = explicit.contains('/') || explicit.contains('\\');
         if has_sep || explicit_path.is_absolute() {
-            let canonical = std::fs::canonicalize(explicit_path)
+            let abs_path = std::path::absolute(explicit_path)
+                .map_err(|e| format!("无法解析 Python 解释器路径 ({explicit}): {e}"))?;
+            let meta = std::fs::metadata(&abs_path)
                 .map_err(|e| format!("指定的 Python 解释器不存在 ({explicit}): {e}"))?;
-            if !is_executable_file(&canonical) {
+            if !meta.is_file() || !is_executable_file(&abs_path) {
                 return Err(format!(
                     "指定的 Python 解释器不是有效可执行文件: {}",
-                    canonical.display()
+                    abs_path.display()
                 ));
             }
-            return Ok(canonical);
+            return Ok(abs_path);
         }
 
         return find_executable_in_path(explicit)
             .ok_or_else(|| format!("在 PATH 中未找到可执行的 Python 解释器: {explicit}"));
     }
 
-    let mut candidate_dirs = vec![canonical_deploy_dir.to_path_buf()];
-    if let Some(parent) = canonical_deploy_dir.parent() {
-        candidate_dirs.push(parent.to_path_buf());
+    let mut candidate_dirs = Vec::with_capacity(4);
+    let mut push_unique = |p: PathBuf| {
+        if !candidate_dirs.contains(&p) {
+            candidate_dirs.push(p);
+        }
+    };
+    push_unique(abs_deploy_dir.to_path_buf());
+    if let Some(parent) = abs_deploy_dir.parent() {
+        push_unique(parent.to_path_buf());
     }
+    push_unique(canonical_deploy_dir.to_path_buf());
+    if let Some(parent) = canonical_deploy_dir.parent() {
+        push_unique(parent.to_path_buf());
+    }
+
     for dir in candidate_dirs {
         #[cfg(windows)]
         let rels = [".venv\\Scripts\\python.exe", "venv\\Scripts\\python.exe"];
@@ -1883,9 +2311,11 @@ fn resolve_and_validate_python_executable(
             "venv/bin/python",
         ];
         for rel in rels {
-            let p = dir.join(rel);
-            if is_executable_file(&p) {
-                return Ok(std::fs::canonicalize(&p).unwrap_or(p));
+            let candidate = dir.join(rel);
+            if let Ok(abs_path) = std::path::absolute(&candidate) {
+                if is_executable_file(&abs_path) {
+                    return Ok(abs_path);
+                }
             }
         }
     }
@@ -1933,9 +2363,18 @@ async fn spawn_managed_python_runner(
     configured_python: Option<&str>,
     params: &FilterModelParams,
 ) -> Result<ManagedPythonHandle, String> {
-    let canonical_deploy_dir = validate_and_canonicalize_deploy_dir(deploy_dir)?;
-    let python_exe =
-        resolve_and_validate_python_executable(configured_python, &canonical_deploy_dir)?;
+    let abs_deploy_dir = std::path::absolute(deploy_dir).map_err(|e| {
+        format!(
+            "无法解析 Left4Filters 部署目录路径 ({}): {e}",
+            deploy_dir.display()
+        )
+    })?;
+    let canonical_deploy_dir = validate_and_canonicalize_deploy_dir(&abs_deploy_dir)?;
+    let python_exe = resolve_and_validate_python_executable(
+        configured_python,
+        &abs_deploy_dir,
+        &canonical_deploy_dir,
+    )?;
 
     let runner_dir = tempfile::Builder::new()
         .prefix("l4a-catalog-filter-")
@@ -2273,5 +2712,142 @@ mod tests {
 
         let bomb_b64 = BASE64_STD.encode(minimal_png(8192, 8192));
         assert!(decode_base64_image(&bomb_b64).is_err());
+    }
+
+    #[test]
+    fn base64_decoder_rejects_malformed_unicode_inputs_without_panicking() {
+        let valid_b64 = BASE64_STD.encode(minimal_png(8, 8));
+        for malformed in [
+            "data:中文;base64,AAAA",
+            &format!("data:中文;base64,{valid_b64}"),
+            "中文中文",
+            "中",
+            "data:中文,AAAA",
+            "data:x中文,AAAA",
+            "DATA:🔥;base64,AAAA",
+        ] {
+            let err = decode_base64_image(malformed).expect_err(malformed);
+            assert!(
+                matches!(err, FilterServiceError::BadRequest(_)),
+                "expected BadRequest for {malformed:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_python_executable_preserves_virtualenv_symlinks_and_rejects_shims() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("Left4Filters");
+        let deploy_dir = repo_root.join("deploy");
+        std::fs::create_dir_all(&deploy_dir).unwrap();
+        std::fs::write(deploy_dir.join("l4filter.py"), "# mock\n").unwrap();
+
+        let sys_python = find_executable_in_path("python3").expect("python3 must exist on PATH");
+        let canonical_sys_python = std::fs::canonicalize(&sys_python).unwrap();
+
+        // Create `<repo_root>/venv/bin/python` as a symlink to the system interpreter.
+        let venv_bin = repo_root.join("venv").join("bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        let venv_python = venv_bin.join("python");
+        symlink(&canonical_sys_python, &venv_python).unwrap();
+
+        let abs_deploy = std::path::absolute(&deploy_dir).unwrap();
+        let canonical_deploy = validate_and_canonicalize_deploy_dir(&abs_deploy).unwrap();
+
+        // 1. Auto-discovery from `<deploy_dir>/../venv/bin/python` preserves symlink path!
+        let auto_resolved =
+            resolve_and_validate_python_executable(None, &abs_deploy, &canonical_deploy).unwrap();
+        assert_eq!(auto_resolved, std::path::absolute(&venv_python).unwrap());
+        assert_ne!(
+            auto_resolved, canonical_sys_python,
+            "must NOT canonicalize symlinked venv/bin/python to system interpreter"
+        );
+
+        // 2. Explicit `python_bin` pointing to symlinked venv also preserves symlink path!
+        let explicit_resolved = resolve_and_validate_python_executable(
+            Some(venv_python.to_str().unwrap()),
+            &abs_deploy,
+            &canonical_deploy,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_resolved,
+            std::path::absolute(&venv_python).unwrap()
+        );
+
+        // 3. Rejects directories and `.bat`/`.cmd`/`.ps1` shims (including symlinks to shims).
+        assert!(resolve_and_validate_python_executable(
+            Some(venv_bin.to_str().unwrap()),
+            &abs_deploy,
+            &canonical_deploy,
+        )
+        .is_err());
+
+        let bat_shim = dir.path().join("shim.bat");
+        std::fs::write(&bat_shim, "@echo off\n").unwrap();
+        std::fs::set_permissions(&bat_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let symlink_to_bat = dir.path().join("python_bat_link");
+        symlink(&bat_shim, &symlink_to_bat).unwrap();
+        assert!(resolve_and_validate_python_executable(
+            Some(bat_shim.to_str().unwrap()),
+            &abs_deploy,
+            &canonical_deploy,
+        )
+        .is_err());
+        assert!(resolve_and_validate_python_executable(
+            Some(symlink_to_bat.to_str().unwrap()),
+            &abs_deploy,
+            &canonical_deploy,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn batch_splitter_and_gallery_aggregator_respect_limits_and_modes() {
+        let mb12 = vec![0u8; 12 * 1024 * 1024];
+        let images = vec![mb12.clone(), mb12.clone(), mb12];
+        let ranges = split_image_ranges_by_bytes(&images, MAX_RUNNER_BATCH_RAW_IMAGE_BYTES);
+        assert_eq!(ranges, vec![0..2, 2..3]);
+
+        let rows = vec![
+            ([0.90, 0.80, 0.20], 1),
+            ([0.30, 0.20, 0.10], 1),
+            ([0.60, 0.50, 0.40], 1),
+        ];
+        let max_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Max);
+        assert!((max_agg[0] - 0.90).abs() < 1e-6);
+        assert!((max_agg[1] - 0.80).abs() < 1e-6);
+        assert!((max_agg[2] - 0.40).abs() < 1e-6);
+
+        let mean_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Mean);
+        assert!((mean_agg[0] - 0.60).abs() < 1e-6);
+        assert!((mean_agg[1] - 0.50).abs() < 1e-6);
+        assert!((mean_agg[2] - 0.70 / 3.0).abs() < 1e-6);
+
+        let top2_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Top2Mean);
+        assert!((top2_agg[0] - 0.75).abs() < 1e-6);
+        assert!((top2_agg[1] - 0.65).abs() < 1e-6);
+        assert!((top2_agg[2] - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn scoring_revision_is_16_hex_chars_and_tracks_params_and_model_metadata() {
+        let mut cfg = FilterSection {
+            enabled: true,
+            ..Default::default()
+        };
+        let r1 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.0.0"));
+        assert_eq!(r1.len(), 16);
+        assert!(r1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let r2 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.1.0"));
+        assert_ne!(r1, r2);
+
+        cfg.bias = 0.25;
+        let r3 = compute_scoring_revision(&cfg, Some("Left4Filters"), Some("1.0.0"));
+        assert_ne!(r1, r3);
     }
 }

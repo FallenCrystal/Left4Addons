@@ -964,6 +964,13 @@ export function FilterPanel({
                   </span>
                 </div>
               )}
+
+              {testResult.scoringRevision && (
+                <div className="cat-kv">
+                  <span className="cat-kv-k">计分修订标识 (scoringRevision)</span>
+                  <span className="cat-kv-v cat-mono">{testResult.scoringRevision}</span>
+                </div>
+              )}
             </div>
           )}
         </section>

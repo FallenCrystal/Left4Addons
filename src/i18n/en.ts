@@ -501,6 +501,7 @@ export const en = {
   filter: {
     evaluatingMedia: 'Evaluating content safety…',
     evalFailedRetry: 'Filter failed · Retry',
+    evalIncompleteRetry: 'Some preview images could not be loaded for safety evaluation',
     imageHidden: 'Sensitive image hidden',
     lazyLoadPreview: 'Load preview',
     blurredImage: 'Sensitive image blurred',

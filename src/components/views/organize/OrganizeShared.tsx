@@ -54,6 +54,7 @@ export interface OrganizeMemberRowProps {
   displayLabel?: string;
   indexBadge?: number;
   showFileName?: boolean;
+  includeHiddenAsRedacted?: boolean;
   badge?: MemberRowBadge;
   onSelectAddon: (addon: AddonSummary) => void;
   onOpenInFileManager: (path: string) => void;
@@ -68,6 +69,7 @@ export function OrganizeMemberRow({
   displayLabel,
   indexBadge,
   showFileName,
+  includeHiddenAsRedacted = false,
   badge,
   onSelectAddon,
   onOpenInFileManager,
@@ -82,13 +84,17 @@ export function OrganizeMemberRow({
   const verdict = verdicts[cardKey];
   const cardFilter = resolveLibraryAddonCardFilter(addon, filterCtx);
 
-  if (cardFilter.hiddenCard) {
+  if (cardFilter.hiddenCard && !includeHiddenAsRedacted) {
     return null;
   }
 
   const installed = addon.installState === 'installed';
   const rawLabel = displayLabel ?? formatAddonDisplayName(addon, namePreference);
-  const resolvedLabel = cardFilter.redactTitle
+  const redactLabel =
+    cardFilter.redactTitle ||
+    (includeHiddenAsRedacted && (cardFilter.hiddenCard || cardFilter.blurWholeCard));
+  const redactAuthor = cardFilter.redactMeta || (includeHiddenAsRedacted && cardFilter.hiddenCard);
+  const resolvedLabel = redactLabel
     ? formatRedactedAddonLabel(addon.workshopId, t)
     : rawLabel;
   const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
@@ -180,9 +186,9 @@ export function OrganizeMemberRow({
             )}
           </div>
           <div className="l4a-addon-meta">
-            {cardFilter.redactMeta ? (
+            {redactAuthor ? (
               <span className="l4a-truncate">{t('filter.redactedAuthor')}</span>
-            ) : showFileName && addon.currentFileName && !cardFilter.redactTitle ? (
+            ) : showFileName && addon.currentFileName && !redactLabel ? (
               <span className="md-mono l4a-truncate">{addon.currentFileName}</span>
             ) : (
               <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>

@@ -582,6 +582,8 @@ pub struct DashboardSnapshot {
     pub filter_exclusions: Vec<FilterExclusionRecord>,
     #[serde(default)]
     pub cached_filter_verdicts: Vec<FilterItemVerdict>,
+    #[serde(default)]
+    pub filter_policy_signature: String,
 }
 
 #[allow(clippy::large_enum_variant)]

@@ -114,13 +114,13 @@ fn think_block_regex() -> &'static Regex {
 fn strip_code_fences(raw: &str) -> &str {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
-        let without_lang = if let Some(idx) = rest.find('\n') {
-            let first_line = rest[..idx].trim();
+        let without_lang = if let Some((first_line, tail)) = rest.split_once('\n') {
+            let first_line = first_line.trim();
             if first_line.is_empty()
                 || first_line.eq_ignore_ascii_case("json")
                 || first_line.eq_ignore_ascii_case("text")
             {
-                &rest[idx + 1..]
+                tail
             } else {
                 rest
             }

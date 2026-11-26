@@ -98,6 +98,9 @@ export function useAppController(onOpenReconcile?: () => void) {
               cachedFilterVerdicts: samePolicy(current.config, next.config)
                 ? next.cachedFilterVerdicts
                 : current.cachedFilterVerdicts,
+              filterPolicySignature: samePolicy(current.config, next.config)
+                ? (next.filterPolicySignature ?? current.filterPolicySignature)
+                : current.filterPolicySignature,
             }
           : next,
       );
@@ -116,12 +119,17 @@ export function useAppController(onOpenReconcile?: () => void) {
       const current = snapshotRef.current;
       if (!current) return;
       lastSavedConfigSeqRef.current = nextSnapshotSeq();
+      const policyUnchanged = samePolicy(current.config, config);
       publishSnapshot({
         ...current,
         config,
-        cachedFilterVerdicts: samePolicy(current.config, config)
-          ? current.cachedFilterVerdicts
-          : [],
+        cachedFilterVerdicts: policyUnchanged ? current.cachedFilterVerdicts : [],
+        filterPolicySignature: policyUnchanged
+          ? current.filterPolicySignature
+          : computeFilterPolicySignature(config.filter, {
+              catalogServerUrl: config.catalogServerUrl,
+              httpsOnly: config.httpsOnly,
+            }),
       });
     },
     [nextSnapshotSeq, publishSnapshot],
@@ -242,6 +250,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   const contentFilter = useContentFilter({
     client,
     snapshot,
+    snapshotRef,
     tRef,
     commitSnapshot,
     commitSavedConfig,

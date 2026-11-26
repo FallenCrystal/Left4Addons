@@ -11,6 +11,7 @@ import {
   type ExclusionDisplayLevel,
   type FilterEvaluationTarget,
   type FilterExclusionRecord,
+  type FilterGalleryAggregation,
   type FilterItemVerdict,
   type FilterModelParams,
   type FilterPresetId,
@@ -203,10 +204,14 @@ function round6(v: number): number {
 
 export function sanitizeModelParams(params: FilterModelParams): FilterModelParams {
   return {
-    threads: Math.min(16, Math.max(1, Math.round(params.threads || 4))),
+    threads: Number.isFinite(params.threads)
+      ? Math.min(16, Math.max(1, Math.round(params.threads)))
+      : 4,
     enableText: Boolean(params.enableText),
     enableImage: Boolean(params.enableImage),
-    maxImages: Math.min(8, Math.max(1, Math.round(params.maxImages || 2))),
+    maxImages: Number.isFinite(params.maxImages)
+      ? Math.min(8, Math.max(1, Math.round(params.maxImages)))
+      : 2,
     galleryAggregation: params.galleryAggregation ?? 'max',
     goreWeight: Number.isFinite(params.goreWeight)
       ? Math.min(3, Math.max(0, params.goreWeight))
@@ -335,6 +340,7 @@ export function adjustProbabilities(
     imageGoreProb,
     imageNsfwProb,
     perImageProbs: raw.perImageProbs?.map((v) => adjustScalar(params, v)),
+    ...(raw.scoringRevision !== undefined ? { scoringRevision: raw.scoringRevision } : {}),
   };
 }
 
@@ -414,17 +420,26 @@ export function hasFilterableWorkshopContent(item: WorkshopItemRecord): boolean 
   );
 }
 
-export function buildAddonFilterTarget(addon: AddonSummary): FilterEvaluationTarget {
+export function buildAddonRevisionHint(addon: AddonSummary): string {
   const imageSources = collectAddonImageSources(addon);
   const title = addon.workshopTitle?.trim() || addon.addonTitle?.trim() || addon.title;
-  const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
-  const revisionHint = [
+  const description = (addon.addonInfo.addondescription ?? addon.addonInfo.description ?? '').trim();
+  return [
     addon.contentHash ?? '',
     addon.localTimeUpdated ?? 0,
     addon.remoteTimeUpdated ?? 0,
     title,
+    fnv1aHex(description),
+    addon.categories.join(','),
     imageSources.join('|'),
   ].join(':');
+}
+
+export function buildAddonFilterTarget(addon: AddonSummary): FilterEvaluationTarget {
+  const imageSources = collectAddonImageSources(addon);
+  const title = addon.workshopTitle?.trim() || addon.addonTitle?.trim() || addon.title;
+  const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
+  const revisionHint = buildAddonRevisionHint(addon);
 
   return {
     targetKey: addonFilterKey(addon.id),
@@ -458,37 +473,93 @@ export function buildWorkshopFilterTarget(item: WorkshopItemRecord): FilterEvalu
   };
 }
 
+const UTF8_ENCODER = new TextEncoder();
+const FNV_PRIME = 0x100000001b3n;
+const MASK_64 = 0xffffffffffffffffn;
+
+function fnv1aHex(input: string): string {
+  const bytes = UTF8_ENCODER.encode(input);
+  let h1 = 0xcbf29ce484222325n;
+  let h2 = 0x84222325cbf29ce4n;
+  for (let idx = 0; idx < bytes.length; idx += 1) {
+    const b = bytes[idx];
+    h1 = ((h1 ^ BigInt(b)) * FNV_PRIME) & MASK_64;
+    const shift = idx % 7;
+    const rot = shift === 0 ? b : ((b << shift) | (b >>> (8 - shift))) & 0xff;
+    h2 = ((h2 ^ BigInt(rot)) * FNV_PRIME) & MASK_64;
+  }
+  return `${h1.toString(16).padStart(16, '0')}${h2.toString(16).padStart(16, '0')}`;
+}
+
+function fmtF32Fixed4(v: number): string {
+  const f = Math.fround(Number.isFinite(v) ? v : 0);
+  const normalized = Object.is(f, -0) ? 0 : f;
+  return normalized.toFixed(4);
+}
+
+function trimTrailingSlashes(s: string): string {
+  return s.trim().replace(/\/+$/, '');
+}
+
+function rustDebugGalleryAgg(agg: FilterGalleryAggregation): string {
+  switch (agg) {
+    case 'top2_mean':
+      return 'Top2Mean';
+    case 'mean':
+      return 'Mean';
+    case 'max':
+    default:
+      return 'Max';
+  }
+}
+
+function rustDebugScoreTarget(target: FilterScoreTarget): string {
+  switch (target) {
+    case 'gore':
+      return 'Gore';
+    case 'nsfw':
+      return 'Nsfw';
+    case 'max_category':
+      return 'MaxCategory';
+    case 'overall':
+    default:
+      return 'Overall';
+  }
+}
+
 export interface FilterPolicySignatureOptions {
   catalogServerUrl?: string | null;
   httpsOnly?: boolean;
+  catalogScoringRevision?: string | null;
 }
 
 export function computeFilterPolicySignature(
   filter: ClientFilterConfig,
   options?: FilterPolicySignatureOptions,
 ): string {
-  return JSON.stringify({
-    mode: filter.mode,
-    catalogServerUrl:
-      filter.mode === 'catalog' ? (options?.catalogServerUrl?.trim() || null) : null,
-    customEndpointUrl:
-      filter.mode === 'custom_endpoint' ? (filter.customEndpointUrl?.trim() || null) : null,
-    httpsOnly: options?.httpsOnly ?? true,
-    localParams: filter.mode === 'local' ? sanitizeModelParams(filter.localParams) : null,
-    scoreTarget: filter.scoreTarget,
-    enableDirectFlag: filter.enableDirectFlag,
-    flagThreshold: filter.flagThreshold,
-    llmEnabled: filter.llmEnabled,
-    llmThreshold: filter.llmThreshold,
-    llmEndpoint: filter.llmEndpoint,
-    llmModel: filter.llmModel,
-    llmSendImages: filter.llmSendImages,
-    llmSystemPrompt: filter.llmSystemPrompt,
-    llmTokenSource: filter.llmTokenSource,
-    llmTokenEnvVar: filter.llmTokenEnvVar,
-    subdivideModalities: filter.subdivideModalities,
-    modalityThreshold: filter.modalityThreshold,
-  });
+  const p = sanitizeModelParams(filter.localParams);
+  const httpsOnly = options?.httpsOnly ?? true;
+
+  let modePart: string;
+  switch (filter.mode) {
+    case 'catalog':
+      modePart = `catalog:url=${trimTrailingSlashes(options?.catalogServerUrl ?? '')}:https=${httpsOnly}:rev=${options?.catalogScoringRevision ?? 'unverified'}`;
+      break;
+    case 'custom_endpoint':
+      modePart = `custom:url=${trimTrailingSlashes(filter.customEndpointUrl ?? '')}:https=${httpsOnly}`;
+      break;
+    case 'local':
+    default:
+      modePart = `local:txt=${p.enableText}:img=${p.enableImage}:max=${p.maxImages}:agg=${rustDebugGalleryAgg(p.galleryAggregation)}:gw=${fmtF32Fixed4(p.goreWeight)}:nw=${fmtF32Fixed4(p.nsfwWeight)}:t=${fmtF32Fixed4(p.temperature)}:b=${fmtF32Fixed4(p.bias)}:commit=${filter.pinnedCommit ?? 'latest'}`;
+      break;
+  }
+
+  const llmPart = filter.llmEnabled
+    ? `1:t=${fmtF32Fixed4(filter.llmThreshold)}:ep=${trimTrailingSlashes(filter.llmEndpoint)}:m=${filter.llmModel.trim()}:img=${filter.llmSendImages}:sys=${fnv1aHex(filter.llmSystemPrompt.trim())}`
+    : '0';
+
+  const raw = `v2|${modePart}|st=${rustDebugScoreTarget(filter.scoreTarget)}|df=${filter.enableDirectFlag}:${fmtF32Fixed4(filter.flagThreshold)}|llm=${llmPart}|sub=${filter.subdivideModalities}:${fmtF32Fixed4(filter.modalityThreshold)}`;
+  return `pol_${fnv1aHex(raw)}`;
 }
 
 function resolveEffectiveModalities(
@@ -501,6 +572,9 @@ function resolveEffectiveModalities(
       totalImages ??
       Math.max(
         verdict.probabilities.perImageProbs?.length ?? 0,
+        (verdict.evaluatedImageIndices?.length ?? 0) > 0
+          ? Math.max(...verdict.evaluatedImageIndices) + 1
+          : 0,
         verdict.sensitiveImageIndices.length > 0
           ? Math.max(...verdict.sensitiveImageIndices) + 1
           : 1,
@@ -627,6 +701,24 @@ export function resolveCardFilterState({
       coverMode: 'hide',
       blurWholeCard:
         config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card',
+    };
+  }
+
+  if (verdict === undefined && hasTargetFailed && hasContent) {
+    if (config.flaggedAction === 'mark_only') {
+      return {
+        ...neutral,
+        exclusionInvalidated,
+      };
+    }
+    const shouldBlur =
+      config.flaggedAction === 'blur_card' || config.flaggedAction === 'hide_card';
+    return {
+      ...neutral,
+      exclusionInvalidated,
+      coverMode: 'hide',
+      blurWholeCard: shouldBlur && !revealed,
+      isBlurCardRevealed: shouldBlur && revealed,
     };
   }
 
@@ -784,6 +876,23 @@ export function resolveDetailFilterState({
     };
   }
 
+  if (verdict === undefined && hasTargetFailed && hasContent) {
+    if (config.flaggedAction === 'mark_only') {
+      return {
+        ...neutral,
+        exclusionInvalidated,
+      };
+    }
+    return {
+      ...neutral,
+      exclusionInvalidated,
+      coverMode: 'blur',
+      mapCoverMode: 'blur',
+      isImageIndexSensitive: () => true,
+      imageModeAt: () => 'blur',
+    };
+  }
+
   if (!verdict?.flagged) {
     return {
       ...neutral,
@@ -792,17 +901,24 @@ export function resolveDetailFilterState({
   }
 
   const modalities = resolveEffectiveModalities(verdict, config.subdivideModalities, totalImages);
-  const isImageIndexSensitive = (index: number): boolean => {
+  const isImageIndexSensitive = (slotIndex: number): boolean => {
     if (!config.subdivideModalities) return true;
     if (!modalities.imageSensitive) return false;
-    const evaluatedCount = verdict.probabilities.perImageProbs?.length ?? 0;
-    if (evaluatedCount === 0 || index >= evaluatedCount) {
+    if (modalities.sensitiveImageIndices.length === 0) {
       return true;
     }
-    if (modalities.sensitiveImageIndices.length > 0) {
-      return modalities.sensitiveImageIndices.includes(index);
+    if (modalities.sensitiveImageIndices.includes(slotIndex)) {
+      return true;
     }
-    return true;
+    const evaluatedIndices = verdict.evaluatedImageIndices ?? [];
+    if (evaluatedIndices.length > 0) {
+      return !evaluatedIndices.includes(slotIndex);
+    }
+    const evaluatedCount = verdict.probabilities.perImageProbs?.length ?? 0;
+    if (evaluatedCount === 0 || slotIndex >= evaluatedCount) {
+      return true;
+    }
+    return false;
   };
   const imageModeAt = (index: number): CoverFilterMode =>
     isImageIndexSensitive(index) ? 'blur' : 'none';
@@ -935,13 +1051,6 @@ export function formatFilteredBundleMemberLabel(
   return formatBundleMemberLabel(addon, siblings, namePreference, bundleName);
 }
 
-const COVER_MODE_SEVERITY: Record<CoverFilterMode, number> = {
-  none: 0,
-  lazy: 1,
-  blur: 2,
-  hide: 3,
-};
-
 export interface BundleCoverPresentation {
   ownerMember?: AddonSummary;
   src?: string;
@@ -956,7 +1065,11 @@ export interface BundleCoverPresentation {
 export function resolveBundleCoverPresentation(
   visibleMembers: readonly AddonSummary[],
   filterCtx: FilterLookupSource,
-  options?: { bundleCoverImage?: string; forceShowHiddenCards?: boolean },
+  options?: {
+    allMembers?: readonly AddonSummary[];
+    bundleCoverImage?: string;
+    forceShowHiddenCards?: boolean;
+  },
 ): BundleCoverPresentation {
   const entries = visibleMembers.map((member) => ({
     member,
@@ -1002,22 +1115,32 @@ export function resolveBundleCoverPresentation(
 
   const fallbackBundleCover = options?.bundleCoverImage?.trim();
   if (fallbackBundleCover && eligible.length > 0) {
-    let strictest: CoverFilterMode = 'none';
-    for (const entry of eligible) {
-      if (COVER_MODE_SEVERITY[entry.state.coverMode] > COVER_MODE_SEVERITY[strictest]) {
-        strictest = entry.state.coverMode;
+    const candidateAllMembers = options?.allMembers ?? visibleMembers;
+    const bundleOwner = candidateAllMembers.find(
+      (m) =>
+        m.coverImage?.trim() === fallbackBundleCover ||
+        m.localCoverImage?.trim() === fallbackBundleCover,
+    );
+    if (bundleOwner) {
+      const bundleOwnerState = resolveLibraryAddonCardFilter(bundleOwner, filterCtx, {
+        forceShowHiddenCards: options?.forceShowHiddenCards,
+      });
+      if (!bundleOwnerState.hiddenCard || options?.forceShowHiddenCards) {
+        return {
+          ownerMember: bundleOwner,
+          src: fallbackBundleCover,
+          fallbackSrc:
+            bundleOwner.localCoverImage?.trim() !== fallbackBundleCover
+              ? bundleOwner.localCoverImage
+              : undefined,
+          coverMode: effectiveBlurWholeCard ? 'hide' : bundleOwnerState.coverMode,
+          pendingEvaluation: bundleOwnerState.pendingEvaluation,
+          redactTitle,
+          redactAuthor,
+          blurWholeCard: effectiveBlurWholeCard,
+        };
       }
     }
-    return {
-      ownerMember: eligible.find((e) => e.member.maps.length > 0)?.member ?? eligible[0].member,
-      src: fallbackBundleCover,
-      fallbackSrc: undefined,
-      coverMode: effectiveBlurWholeCard ? 'hide' : strictest,
-      pendingEvaluation: eligible.some((e) => e.state.pendingEvaluation),
-      redactTitle,
-      redactAuthor,
-      blurWholeCard: effectiveBlurWholeCard,
-    };
   }
 
   return {

@@ -1,5 +1,5 @@
 import type { DashboardSnapshot, WorkshopItemRecord } from '../ipc';
-import { createDefaultFilterConfig } from '../../utils/contentFilter';
+import { computeFilterPolicySignature, createDefaultFilterConfig } from '../../utils/contentFilter';
 
 export const PREVIEW_CATALOG: WorkshopItemRecord[] = [
   {
@@ -545,5 +545,9 @@ export function createInitialSnapshot(): DashboardSnapshot {
     ],
     filterExclusions: [],
     cachedFilterVerdicts: [],
+    filterPolicySignature: computeFilterPolicySignature(createDefaultFilterConfig(), {
+      catalogServerUrl: null,
+      httpsOnly: true,
+    }),
   };
 }

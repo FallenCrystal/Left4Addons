@@ -300,10 +300,55 @@ describe('v2 IPC client wrapper', () => {
         title: 'Sample Addon',
         tags: ['Campaign'],
         imageSources: ['https://example.com/cover.jpg'],
+        revisionHint: 'rev-1',
         bypassCache: true,
       },
+      {
+        targetKey: 'ws:999999999',
+        workshopId: '999999999',
+        title: 'Broken Endpoint Target',
+        tags: [],
+        imageSources: [],
+      },
     ];
-    await evaluateFilterItems(targets);
+    const batchResponse = {
+      policySignature: 'pol_0123456789abcdef0123456789abcdef',
+      items: [
+        {
+          targetKey: 'addon:ws:2814104912',
+          status: 'completed' as const,
+          complete: false,
+          verdict: {
+            targetKey: 'addon:ws:2814104912',
+            revisionHint: 'rev-1',
+            flagged: false,
+            decisionSource: 'model_safe' as const,
+            evaluatedScore: 0.02,
+            probabilities: {
+              prob: 0.02,
+              goreProb: 0.01,
+              nsfwProb: 0.01,
+              scoringRevision: 'cat_r1',
+            },
+            textSensitive: false,
+            titleSensitive: false,
+            descriptionSensitive: false,
+            imageSensitive: false,
+            evaluatedImageIndices: [],
+            sensitiveImageIndices: [],
+            complete: false,
+            evaluatedAt: '2026-11-25T00:00:00Z',
+          },
+        },
+        {
+          targetKey: 'ws:999999999',
+          status: 'failed' as const,
+          error: 'Inference upstream timeout',
+        },
+      ],
+    };
+    invokeMock.mockResolvedValueOnce(batchResponse);
+    expect(await evaluateFilterItems(targets)).toEqual(batchResponse);
     expect(invokeMock).toHaveBeenCalledWith('evaluate_filter_items', { targets });
 
     await clearFilterCache();
@@ -361,6 +406,7 @@ describe('v2 IPC client wrapper', () => {
         verdicts: [
           {
             targetKey: 'ws:3410887766',
+            revisionHint: '1763900000:Crimson:imgs=1:https://example.com/0.jpg',
             flagged: true,
             decisionSource: 'model_direct_flag',
             evaluatedScore: 0.88,
@@ -369,7 +415,9 @@ describe('v2 IPC client wrapper', () => {
             titleSensitive: true,
             descriptionSensitive: false,
             imageSensitive: true,
+            evaluatedImageIndices: [0],
             sensitiveImageIndices: [0],
+            complete: true,
             evaluatedAt: '2026-11-25T00:00:00Z',
           },
         ],
@@ -378,7 +426,7 @@ describe('v2 IPC client wrapper', () => {
     listenCallback?.({
       payload: {
         type: 'filter_verdicts_updated',
-        policySignature: 'sig-v1',
+        policySignature: 'pol_abcdef0123456789abcdef0123456789',
         verdicts: [],
       },
     });
@@ -406,11 +454,11 @@ describe('v2 IPC client wrapper', () => {
     expect(received[2]).toMatchObject({
       type: 'filter_verdicts_updated',
       policySignature: undefined,
-      verdicts: [{ targetKey: 'ws:3410887766', flagged: true }],
+      verdicts: [{ targetKey: 'ws:3410887766', flagged: true, complete: true }],
     });
     expect(received[3]).toEqual({
       type: 'filter_verdicts_updated',
-      policySignature: 'sig-v1',
+      policySignature: 'pol_abcdef0123456789abcdef0123456789',
       verdicts: [],
     });
     unlisten();

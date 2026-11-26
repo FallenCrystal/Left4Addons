@@ -201,38 +201,76 @@ impl LocalDb {
         target_key: &str,
         content_sig: &str,
         policy_sig: &str,
+        expected_addon_state_sig: Option<&str>,
+        max_age: Option<chrono::TimeDelta>,
     ) -> Result<Option<FilterItemVerdict>, CoreError> {
         let conn = self.lock_conn()?;
-        let raw_json: Option<String> = conn
+        let row: Option<(Option<String>, String)> = conn
             .query_row(
-                "SELECT verdict_json FROM filter_verdicts
+                "SELECT addon_state_sig, verdict_json FROM filter_verdicts
                  WHERE target_key = ?1 AND policy_sig = ?2 AND content_sig = ?3",
                 params![target_key, policy_sig, content_sig],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let Some(json_str) = raw_json else {
+        let Some((addon_state_sig, json_str)) = row else {
             return Ok(None);
         };
-        Ok(serde_json::from_str::<FilterItemVerdict>(&json_str).ok())
+        let Ok(verdict) = serde_json::from_str::<FilterItemVerdict>(&json_str) else {
+            return Ok(None);
+        };
+        if !verdict.complete {
+            return Ok(None);
+        }
+        if let Some(limit) = max_age {
+            if Utc::now() - verdict.evaluated_at >= limit {
+                return Ok(None);
+            }
+        }
+        match expected_addon_state_sig {
+            Some(expected) if addon_state_sig.as_deref() != Some(expected) => return Ok(None),
+            None if addon_state_sig.is_some() => return Ok(None),
+            _ => {}
+        }
+        Ok(Some(verdict))
     }
 
     pub fn list_filter_verdicts_for_policy(
         &self,
         policy_sig: &str,
-    ) -> Result<Vec<FilterItemVerdict>, CoreError> {
+        max_age: Option<chrono::TimeDelta>,
+    ) -> Result<Vec<CachedFilterVerdictRow>, CoreError> {
         let conn = self.lock_conn()?;
         let mut stmt = conn.prepare(
-            "SELECT verdict_json FROM filter_verdicts
+            "SELECT content_sig, addon_state_sig, verdict_json FROM filter_verdicts
              WHERE policy_sig = ?1
              ORDER BY target_key ASC",
         )?;
-        let rows = stmt.query_map(params![policy_sig], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![policy_sig], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let now = Utc::now();
         let mut out = Vec::new();
         for row in rows {
-            let raw = row?;
+            let (content_sig, addon_state_sig, raw) = row?;
             if let Ok(verdict) = serde_json::from_str::<FilterItemVerdict>(&raw) {
-                out.push(verdict);
+                if !verdict.complete {
+                    continue;
+                }
+                if let Some(limit) = max_age {
+                    if now - verdict.evaluated_at >= limit {
+                        continue;
+                    }
+                }
+                out.push(CachedFilterVerdictRow {
+                    content_sig,
+                    addon_state_sig,
+                    verdict,
+                });
             }
         }
         Ok(out)
@@ -242,31 +280,56 @@ impl LocalDb {
         &self,
         target_key: &str,
         content_sig: &str,
-        policy_sig: &str,
+        addon_state_sig: Option<&str>,
+        verdict_policy_sig: &str,
+        active_policy_sig: &str,
         verdict: &FilterItemVerdict,
-    ) -> Result<(), CoreError> {
+    ) -> Result<bool, CoreError> {
+        if !verdict.complete {
+            return Ok(false);
+        }
         let verdict_json = serde_json::to_string(verdict)
             .map_err(|e| CoreError::Config(format!("序列化过滤判定结果失败: {e}")))?;
         let now = Utc::now().to_rfc3339();
         self.write(|tx| {
             tx.execute(
                 "DELETE FROM filter_verdicts WHERE policy_sig != ?1",
-                params![policy_sig],
+                params![active_policy_sig],
             )?;
+            if verdict_policy_sig != active_policy_sig {
+                return Ok(false);
+            }
             tx.execute(
                 r#"
                 INSERT INTO filter_verdicts (
-                    target_key, content_sig, policy_sig, verdict_json, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    target_key, content_sig, policy_sig, verdict_json, updated_at, addon_state_sig
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(target_key, policy_sig) DO UPDATE SET
                     content_sig = excluded.content_sig,
                     verdict_json = excluded.verdict_json,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    addon_state_sig = excluded.addon_state_sig
                 "#,
-                params![target_key, content_sig, policy_sig, verdict_json, now],
+                params![
+                    target_key,
+                    content_sig,
+                    verdict_policy_sig,
+                    verdict_json,
+                    now,
+                    addon_state_sig,
+                ],
             )?;
-            Ok(())
+            Ok(true)
         })
+    }
+
+    pub fn prune_filter_verdicts_except(&self, active_policy_sig: &str) -> Result<u64, CoreError> {
+        let conn = self.lock_conn()?;
+        let removed = conn.execute(
+            "DELETE FROM filter_verdicts WHERE policy_sig != ?1",
+            params![active_policy_sig],
+        )?;
+        Ok(removed as u64)
     }
 
     pub fn clear_filter_verdicts(&self) -> Result<u64, CoreError> {
@@ -274,4 +337,11 @@ impl LocalDb {
         let removed = conn.execute("DELETE FROM filter_verdicts", [])?;
         Ok(removed as u64)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedFilterVerdictRow {
+    pub content_sig: String,
+    pub addon_state_sig: Option<String>,
+    pub verdict: FilterItemVerdict,
 }

@@ -84,6 +84,7 @@ describe('catalog web console helpers', () => {
             goreProb: 0.0,
             nsfwProb: 0.85,
             textProb: 0.85,
+            scoringRevision: '0123456789abcdef',
           });
         }
         throw new Error(`Unexpected request ${path}`);
@@ -102,6 +103,7 @@ describe('catalog web console helpers', () => {
 
     const probs = await testFilterPredict({ title: 'Test Mod' });
     expect(probs.prob).toBeCloseTo(0.85);
+    expect(probs.scoringRevision).toBe('0123456789abcdef');
 
     expect(calls[1]).toMatchObject({
       path: '/api/v1/admin/config/filter',

@@ -179,6 +179,16 @@ export interface FilterProbabilities {
   imageGoreProb?: number;
   imageNsfwProb?: number;
   perImageProbs?: number[];
+  scoringRevision?: string;
+}
+
+export interface CatalogFilterPublicInfo {
+  enabled: boolean;
+  ready: boolean;
+  modelName?: string;
+  modelVersion?: string;
+  maxImages: number;
+  scoringRevision?: string;
 }
 
 export interface FilterPredictRequest {

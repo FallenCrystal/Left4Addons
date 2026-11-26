@@ -107,6 +107,7 @@ export function BundleDetailSheet({
   const summary = bundle ? summarizeBundle(members) : null;
   const coverPres = bundle
     ? resolveBundleCoverPresentation(members, filterCtx, {
+        allMembers,
         bundleCoverImage: bundle.coverImage,
       })
     : null;

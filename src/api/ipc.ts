@@ -277,6 +277,7 @@ export interface FilterProbabilities {
   imageGoreProb?: number;
   imageNsfwProb?: number;
   perImageProbs?: number[];
+  scoringRevision?: string;
 }
 
 export interface ClientFilterConfig {
@@ -386,6 +387,7 @@ export interface FilterEvaluationTarget {
 
 export interface FilterItemVerdict {
   targetKey: string;
+  revisionHint?: string;
   flagged: boolean;
   decisionSource: FilterDecisionSource;
   evaluatedScore: number;
@@ -394,8 +396,23 @@ export interface FilterItemVerdict {
   titleSensitive: boolean;
   descriptionSensitive: boolean;
   imageSensitive: boolean;
+  evaluatedImageIndices: number[];
   sensitiveImageIndices: number[];
+  complete: boolean;
   evaluatedAt: string;
+}
+
+export type FilterTargetOutcome =
+  | { status: 'completed'; verdict: FilterItemVerdict; complete: boolean }
+  | { status: 'failed'; error: string };
+
+export type FilterEvaluationItemResult = {
+  targetKey: string;
+} & FilterTargetOutcome;
+
+export interface FilterEvaluationBatchResponse {
+  policySignature: string;
+  items: FilterEvaluationItemResult[];
 }
 
 export interface AppConfig {
@@ -428,6 +445,7 @@ export interface DashboardSnapshot {
   tasks: TaskRecord[];
   filterExclusions: FilterExclusionRecord[];
   cachedFilterVerdicts?: FilterItemVerdict[];
+  filterPolicySignature?: string;
 }
 
 export interface SteamCapabilities {
@@ -824,8 +842,8 @@ export async function setFilterLlmToken(token: string | null): Promise<FilterTok
 
 export async function evaluateFilterItems(
   targets: FilterEvaluationTarget[],
-): Promise<FilterItemVerdict[]> {
-  return invokeCommand<FilterItemVerdict[]>('evaluate_filter_items', { targets });
+): Promise<FilterEvaluationBatchResponse> {
+  return invokeCommand<FilterEvaluationBatchResponse>('evaluate_filter_items', { targets });
 }
 
 export async function clearFilterCache(): Promise<number> {

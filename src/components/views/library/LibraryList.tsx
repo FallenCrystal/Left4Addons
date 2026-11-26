@@ -87,6 +87,7 @@ function BundleListRow({
   const firstPath = visibleSummary.firstPath;
 
   const coverPres = resolveBundleCoverPresentation(visibleMembers, filterCtx, {
+    allMembers,
     bundleCoverImage: bundle.coverImage,
     forceShowHiddenCards,
   });
@@ -103,6 +104,7 @@ function BundleListRow({
       data-selected={selected ? 'true' : 'false'}
       data-muted={muted ? 'true' : 'false'}
       data-blur-card={coverPres.blurWholeCard ? 'true' : 'false'}
+      data-pending-eval={coverPres.pendingEvaluation ? 'true' : undefined}
     >
       {coverPres.blurWholeCard &&
         (coverPres.pendingEvaluation ? (
@@ -306,6 +308,7 @@ function AddonListRow({
       data-selected={selected ? 'true' : 'false'}
       data-muted={installed && !addon.enabled ? 'true' : 'false'}
       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
+      data-pending-eval={cardFilter.pendingEvaluation ? 'true' : undefined}
     >
       {cardFilter.blurWholeCard &&
         (cardFilter.pendingEvaluation ? (

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -243,6 +243,11 @@ export function FilterSettingsSection({
   const sandboxDescId = useId();
 
   const filter = effectiveConfig.filter;
+  const filterRef = useRef(filter);
+  useEffect(() => {
+    filterRef.current = filter;
+  }, [filter]);
+
   const [applyPresetThresholds, setApplyPresetThresholds] = useState(true);
   const [tokenInput, setTokenInput] = useState('');
   const [revealedExclusionIds, setRevealedExclusionIds] = useState<Set<string>>(new Set());
@@ -324,12 +329,13 @@ export function FilterSettingsSection({
       const saved = await onSaveDraftFirst();
       if (!saved) return;
     }
-    const trackLatest = forceLatest ? true : filter.trackLatest;
+    const currentFilter = filterRef.current;
+    const trackLatest = forceLatest ? true : currentFilter.trackLatest;
     await onDeployLocalFilter({
-      repoUrl: filter.repoUrl.trim() || undefined,
+      repoUrl: currentFilter.repoUrl.trim() || undefined,
       trackLatest,
-      targetCommit: trackLatest ? undefined : filter.pinnedCommit?.trim() || undefined,
-      startAfterDeploy: filter.autoStartLocalService,
+      targetCommit: trackLatest ? undefined : currentFilter.pinnedCommit?.trim() || undefined,
+      startAfterDeploy: currentFilter.autoStartLocalService,
     });
   };
 

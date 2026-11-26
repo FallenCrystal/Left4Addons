@@ -2,9 +2,15 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import './i18n';
 import { setAppLanguage } from './i18n';
-import type { CoreEvent, DashboardSnapshot } from './api/ipc';
+import type {
+  AppConfig,
+  CoreEvent,
+  DashboardSnapshot,
+  FilterEvaluationTarget,
+} from './api/ipc';
 import { previewEngine } from './api/previewStore';
 import { App } from './App';
+import { buildAddonRevisionHint, computeFilterPolicySignature } from './utils/contentFilter';
 
 const invokeMock = vi.fn();
 let eventHandler: ((ev: { payload: CoreEvent }) => void) | null = null;
@@ -809,16 +815,44 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     ];
 
     const requestedCacheKeys: string[] = [];
-    invokeMock.mockImplementation(async (cmd: string, args?: { cacheKey?: string }) => {
-      if (cmd === 'read_cached_image') {
-        if (args?.cacheKey) requestedCacheKeys.push(args.cacheKey);
-        return [0xff, 0xd8, 0xff];
-      }
-      if (cmd === 'evaluate_filter_items') {
-        return [];
-      }
-      return snapshot;
-    });
+    invokeMock.mockImplementation(
+      async (
+        cmd: string,
+        args?: { cacheKey?: string; targets?: FilterEvaluationTarget[] },
+      ) => {
+        if (cmd === 'read_cached_image') {
+          if (args?.cacheKey) requestedCacheKeys.push(args.cacheKey);
+          return [0xff, 0xd8, 0xff];
+        }
+        if (cmd === 'evaluate_filter_items') {
+          return {
+            policySignature: snapshot.filterPolicySignature ?? '',
+            items: (args?.targets ?? []).map((t) => ({
+              targetKey: t.targetKey,
+              status: 'completed' as const,
+              complete: true,
+              verdict: {
+                targetKey: t.targetKey,
+                revisionHint: t.revisionHint,
+                flagged: false,
+                decisionSource: 'model_safe' as const,
+                evaluatedScore: 0.01,
+                probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+                textSensitive: false,
+                titleSensitive: false,
+                descriptionSensitive: false,
+                imageSensitive: false,
+                evaluatedImageIndices: [],
+                sensitiveImageIndices: [],
+                complete: true,
+                evaluatedAt: nowIso,
+              },
+            })),
+          };
+        }
+        return snapshot;
+      },
+    );
 
     render(<App />);
     const yamaBtn = await screen.findByRole('button', { name: 'Yama Campaign Remastered' });
@@ -930,7 +964,11 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     });
 
     const { container } = render(<App />);
-    fireEvent.click(await screen.findByRole('button', { name: 'Chernobyl: Chapter One' }));
+    await screen.findByText('Chernobyl: Chapter One');
+    await waitFor(() => {
+      expect(container.querySelector('[data-pending-eval="true"]')).toBeNull();
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Chernobyl: Chapter One' }));
     const detailSheet = await screen.findByRole('dialog', { name: 'Chernobyl: Chapter One' });
 
     // Select Hide Images & Text and add fingerprint-bound exclusion
@@ -968,6 +1006,9 @@ describe('Left4Addons v2 Material 3 frontend', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Library' }));
     expect(await screen.findByText('Exclusion hash expired')).toBeTruthy();
+    await waitFor(() => {
+      expect(container.querySelector('[data-pending-eval="true"]')).toBeNull();
+    });
 
     // Open detail sheet and click Rebind Current Fingerprint -> restores valid exclusion!
     fireEvent.click(screen.getByRole('button', { name: 'Chernobyl: Chapter One' }));
@@ -1020,9 +1061,11 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     snapshot.config.filter.enabled = false;
     snapshot.config.filter.applyToLibrary = false;
     snapshot.config.collapseCampaignBundles = true;
-    // Populate explicit bundle.coverImage while members have no individual coverImage
-    snapshot.bundles[0].coverImage =
+    // Populate explicit bundle.coverImage owned by member addons[0] (which has hide_image exclusion)
+    const explicitCoverSvg =
       'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%23991111"/></svg>';
+    snapshot.addons[0].coverImage = explicitCoverSvg;
+    snapshot.bundles[0].coverImage = explicitCoverSvg;
     const nowIso = '2026-11-25T00:00:00Z';
     snapshot.filterExclusions = [
       {
@@ -1048,7 +1091,9 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     ];
 
     invokeMock.mockImplementation(async (cmd: string) => {
-      if (cmd === 'evaluate_filter_items') return [];
+      if (cmd === 'evaluate_filter_items') {
+        return { policySignature: snapshot.filterPolicySignature ?? '', items: [] };
+      }
       if (cmd === 'get_local_filter_status') {
         return {
           env: {
@@ -1156,6 +1201,489 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(
       (screen.getByRole('button', { name: 'Deploy Now' }) as HTMLButtonElement).disabled,
     ).toBe(true);
+  });
+
+  it('ignores stale cachedFilterVerdicts revisions, bounds batch concurrency, keeps failed and incomplete items retryable, and accepts native pol_ verdict events', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.collapseCampaignBundles = false;
+    snapshot.config.filter.enabled = true;
+    snapshot.config.filter.applyToLibrary = true;
+    snapshot.config.filter.flaggedAction = 'blur_card';
+    const canonicalSig = computeFilterPolicySignature(snapshot.config.filter, {
+      catalogServerUrl: snapshot.config.catalogServerUrl,
+      httpsOnly: snapshot.config.httpsOnly,
+    });
+    expect(canonicalSig).toMatch(/^pol_[0-9a-f]{32}$/);
+    snapshot.filterPolicySignature = canonicalSig;
+
+    // Add extra addons so total uncached items > 16 (verifies bounded 1-batch-at-a-time concurrency)
+    const templateAddon = snapshot.addons[3];
+    for (let idx = 0; idx < 15; idx += 1) {
+      const wid = `990000${idx}`;
+      snapshot.addons.push({
+        ...structuredClone(templateAddon),
+        id: `ws:${wid}`,
+        workshopId: wid,
+        title: `Extra Safe Addon ${idx}`,
+        addonTitle: `Extra Safe Addon ${idx}`,
+        workshopTitle: `Extra Safe Addon ${idx}`,
+        contentHash: `hash_extra_${idx}`,
+      });
+    }
+
+    const nowIso = '2026-11-26T00:00:00Z';
+    const validAddon1Rev = buildAddonRevisionHint(snapshot.addons[1]);
+    snapshot.cachedFilterVerdicts = [
+      {
+        // Stale revisionHint for addons[0] (ws:2814104912) -> MUST be ignored and re-evaluated!
+        targetKey: 'addon:ws:2814104912',
+        revisionHint: 'stale_outdated_revision_000',
+        flagged: false,
+        decisionSource: 'model_safe',
+        evaluatedScore: 0.01,
+        probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+        textSensitive: false,
+        titleSensitive: false,
+        descriptionSensitive: false,
+        imageSensitive: false,
+        evaluatedImageIndices: [],
+        sensitiveImageIndices: [],
+        complete: true,
+        evaluatedAt: nowIso,
+      },
+      {
+        // Matching current revisionHint for addons[1] (ws:2814105100) -> hydrated without re-evaluation!
+        targetKey: 'addon:ws:2814105100',
+        revisionHint: validAddon1Rev,
+        flagged: false,
+        decisionSource: 'model_safe',
+        evaluatedScore: 0.01,
+        probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+        textSensitive: false,
+        titleSensitive: false,
+        descriptionSensitive: false,
+        imageSensitive: false,
+        evaluatedImageIndices: [],
+        sensitiveImageIndices: [],
+        complete: true,
+        evaluatedAt: nowIso,
+      },
+    ];
+
+    let inFlightEvalCount = 0;
+    let maxObservedConcurrency = 0;
+    let evalRound = 0;
+    const evaluatedTargetBatches: string[][] = [];
+    let releaseFirstBatch: (() => void) | null = null;
+
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: { targets?: FilterEvaluationTarget[] }) => {
+        if (cmd === 'evaluate_filter_items') {
+          const targets = args?.targets ?? [];
+          evaluatedTargetBatches.push(targets.map((t) => t.targetKey));
+          inFlightEvalCount += 1;
+          maxObservedConcurrency = Math.max(maxObservedConcurrency, inFlightEvalCount);
+          const currentCallIndex = evaluatedTargetBatches.length;
+
+          if (currentCallIndex === 1) {
+            await new Promise<void>((resolve) => {
+              releaseFirstBatch = resolve;
+            });
+          }
+
+          inFlightEvalCount -= 1;
+          return {
+            policySignature: canonicalSig,
+            items: targets.map((t) => {
+              if (evalRound === 0 && t.targetKey === 'addon:ws:2814104912') {
+                return {
+                  targetKey: t.targetKey,
+                  status: 'completed' as const,
+                  complete: false,
+                  verdict: {
+                    targetKey: t.targetKey,
+                    revisionHint: t.revisionHint,
+                    flagged: false,
+                    decisionSource: 'model_safe' as const,
+                    evaluatedScore: 0.03,
+                    probabilities: { prob: 0.03, goreProb: 0.01, nsfwProb: 0.02 },
+                    textSensitive: false,
+                    titleSensitive: false,
+                    descriptionSensitive: false,
+                    imageSensitive: false,
+                    evaluatedImageIndices: [],
+                    sensitiveImageIndices: [],
+                    complete: false,
+                    evaluatedAt: nowIso,
+                  },
+                };
+              }
+              if (evalRound === 0 && t.targetKey === 'addon:ws:3011942811') {
+                return {
+                  targetKey: t.targetKey,
+                  status: 'failed' as const,
+                  error: 'Preview image fetch failed',
+                };
+              }
+              return {
+                targetKey: t.targetKey,
+                status: 'completed' as const,
+                complete: true,
+                verdict: {
+                  targetKey: t.targetKey,
+                  revisionHint: t.revisionHint,
+                  flagged: false,
+                  decisionSource: 'model_safe' as const,
+                  evaluatedScore: 0.01,
+                  probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+                  textSensitive: false,
+                  titleSensitive: false,
+                  descriptionSensitive: false,
+                  imageSensitive: false,
+                  evaluatedImageIndices: [],
+                  sensitiveImageIndices: [],
+                  complete: true,
+                  evaluatedAt: nowIso,
+                },
+              };
+            }),
+          };
+        }
+        return snapshot;
+      },
+    );
+
+    render(<App />);
+
+    // Wait for first batch (16 items) to start; verify chunk 2 has NOT started while chunk 1 is in-flight!
+    await waitFor(() => {
+      expect(evaluatedTargetBatches.length).toBe(1);
+    });
+    expect(evaluatedTargetBatches[0].length).toBe(16);
+    expect(inFlightEvalCount).toBe(1);
+
+    // Release chunk 1 -> chunk 2 pumps sequentially after chunk 1 settles
+    await act(async () => {
+      releaseFirstBatch?.();
+    });
+    await waitFor(() => {
+      expect(evaluatedTargetBatches.length).toBe(2);
+    });
+    expect(maxObservedConcurrency).toBe(1);
+
+    const allFirstPassTargets = evaluatedTargetBatches.flat();
+    // Stale cached addon:ws:2814104912 WAS re-evaluated; valid cached addon:ws:2814105100 was NOT!
+    expect(allFirstPassTargets).toContain('addon:ws:2814104912');
+    expect(allFirstPassTargets).not.toContain('addon:ws:2814105100');
+
+    // Failed & incomplete (complete: false) items keep conservative blur and surface Retry chip!
+    const retryChip = await screen.findByRole('button', { name: 'Filter failed · Retry' });
+    expect(retryChip).toBeTruthy();
+    const chernobylCard = screen.getByText('Chernobyl: Chapter One').closest('article')!;
+    const yamaCard = screen.getByText('Yama Campaign Remastered').closest('article')!;
+    expect(chernobylCard.getAttribute('data-blur-card')).toBe('true');
+    expect(yamaCard.getAttribute('data-blur-card')).toBe('true');
+
+    // Clicking Retry re-evaluates ONLY the incomplete (ws:2814104912) and failed (ws:3011942811) items!
+    evalRound = 1;
+    fireEvent.click(retryChip);
+
+    await waitFor(() => {
+      expect(evaluatedTargetBatches.length).toBe(3);
+      expect(chernobylCard.getAttribute('data-blur-card')).toBe('false');
+      expect(yamaCard.getAttribute('data-blur-card')).toBe('false');
+    });
+    expect([...evaluatedTargetBatches[2]].sort()).toEqual([
+      'addon:ws:2814104912',
+      'addon:ws:3011942811',
+    ]);
+    expect(screen.queryByRole('button', { name: 'Filter failed · Retry' })).toBeNull();
+
+    // Native CoreEvent filter_verdicts_updated with canonical pol_... policySignature is accepted!
+    await act(async () => {
+      eventHandler?.({
+        payload: {
+          type: 'filter_verdicts_updated',
+          policySignature: canonicalSig,
+          verdicts: [
+            {
+              targetKey: 'addon:ws:3120481120',
+              revisionHint: buildAddonRevisionHint(snapshot.addons[3]),
+              flagged: true,
+              decisionSource: 'model_direct_flag',
+              evaluatedScore: 0.93,
+              probabilities: { prob: 0.93, goreProb: 0.92, nsfwProb: 0.01 },
+              textSensitive: true,
+              titleSensitive: true,
+              descriptionSensitive: false,
+              imageSensitive: true,
+              evaluatedImageIndices: [],
+              sensitiveImageIndices: [],
+              complete: true,
+              evaluatedAt: '2026-11-26T00:01:00Z',
+            },
+          ],
+        },
+      });
+    });
+
+    const m4Card = screen.getByText('Tactical M4A1 SOPMOD').closest('article')!;
+    expect(m4Card.getAttribute('data-blur-card')).toBe('true');
+  });
+
+  it('preserves newly saved enabled state and thresholds when deploying local filter from dirty settings', async () => {
+    setTauriMode(true);
+    const snapshot = await previewEngine.getDashboardSnapshot();
+    snapshot.config.filter.enabled = false;
+    snapshot.config.filter.flagThreshold = 0.72;
+    const savedConfigs: AppConfig[] = [];
+
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: { config?: AppConfig; targets?: FilterEvaluationTarget[] }) => {
+        if (cmd === 'save_config' && args?.config) {
+          const cloned = structuredClone(args.config);
+          savedConfigs.push(cloned);
+          snapshot.config = cloned;
+          return cloned;
+        }
+        if (cmd === 'deploy_local_filter') {
+          return {
+            env: {
+              gitAvailable: true,
+              gitVersion: '2.45.2',
+              pythonAvailable: true,
+              pythonVersion: '3.12.3',
+              venvAvailable: true,
+            },
+            deployed: true,
+            repoDir: '/tmp/left4filters/repo',
+            venvDir: '/tmp/left4filters/venv',
+            serviceState: 'running',
+            serviceEndpoint: 'http://127.0.0.1:18791',
+            runningPid: 12345,
+            updateAvailable: false,
+            recentCommits: [],
+            stageMessage: 'Deployed latest commit',
+          };
+        }
+        if (cmd === 'get_local_filter_status') {
+          return {
+            env: {
+              gitAvailable: true,
+              gitVersion: '2.45.2',
+              pythonAvailable: true,
+              pythonVersion: '3.12.3',
+              venvAvailable: true,
+            },
+            deployed: false,
+            repoDir: '/tmp/left4filters/repo',
+            venvDir: '/tmp/left4filters/venv',
+            serviceState: 'stopped',
+            updateAvailable: false,
+            recentCommits: [],
+          };
+        }
+        if (cmd === 'get_filter_token_status') {
+          return {
+            hasEncryptedToken: false,
+            envVarName: 'L4A_LLM_API_KEY',
+            envVarPresent: false,
+          };
+        }
+        if (cmd === 'evaluate_filter_items') {
+          return {
+            policySignature: computeFilterPolicySignature(snapshot.config.filter, {
+              catalogServerUrl: snapshot.config.catalogServerUrl,
+              httpsOnly: snapshot.config.httpsOnly,
+            }),
+            items: (args?.targets ?? []).map((t) => ({
+              targetKey: t.targetKey,
+              status: 'completed' as const,
+              complete: true,
+              verdict: {
+                targetKey: t.targetKey,
+                revisionHint: t.revisionHint,
+                flagged: false,
+                decisionSource: 'model_safe' as const,
+                evaluatedScore: 0.01,
+                probabilities: { prob: 0.01, goreProb: 0.005, nsfwProb: 0.005 },
+                textSensitive: false,
+                titleSensitive: false,
+                descriptionSensitive: false,
+                imageSensitive: false,
+                evaluatedImageIndices: [],
+                sensitiveImageIndices: [],
+                complete: true,
+                evaluatedAt: '2026-11-26T00:00:00Z',
+              },
+            })),
+          };
+        }
+        return snapshot;
+      },
+    );
+
+    render(<App />);
+    await screen.findByText('Chernobyl: Chapter One');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+
+    const enableSwitch = await screen.findByRole('switch', {
+      name: 'Enable Sensitive Content Filter',
+    });
+    expect(enableSwitch.getAttribute('aria-checked')).toBe('false');
+
+    // Dirty edits: enable filter + set Direct Flag Threshold to 0.55, then immediately click Deploy Now!
+    fireEvent.click(enableSwitch);
+    const flagInput = screen.getByLabelText('Direct Flag Threshold (0–1)') as HTMLInputElement;
+    fireEvent.focus(flagInput);
+    fireEvent.change(flagInput, { target: { value: '0.55' } });
+    fireEvent.blur(flagInput);
+
+    const deployBtn = await screen.findByRole('button', { name: 'Deploy Now' });
+    fireEvent.click(deployBtn);
+
+    await screen.findByText('Deployed latest commit');
+    expect(savedConfigs.length).toBeGreaterThanOrEqual(1);
+    expect(savedConfigs[0].filter.enabled).toBe(true);
+    expect(savedConfigs[0].filter.flagThreshold).toBe(0.55);
+
+    // After deploy completes, newly saved enabled=true and flagThreshold=0.55 MUST remain intact!
+    expect(
+      screen
+        .getByRole('switch', { name: 'Enable Sensitive Content Filter' })
+        .getAttribute('aria-checked'),
+    ).toBe('true');
+    expect((screen.getByLabelText('Direct Flag Threshold (0–1)') as HTMLInputElement).value).toBe(
+      '0.55',
+    );
+  });
+
+  it('omits hidden-member bundle.coverImage on UI cards and includes hiddenCard addon changes in ProfilesTab and OrganizeInspectorSheet with redacted names', async () => {
+    const initial = await previewEngine.getDashboardSnapshot();
+    // Make addons[1] (ws:2814105100, in Chernobyl bundle) an explicit NSFW item that will become hiddenCard under hide_card!
+    const hiddenMemberCover =
+      'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%25" height="100%25" fill="%23ff00aa"/></svg>';
+    initial.addons[0].coverImage = undefined;
+    initial.addons[0].localCoverImage = undefined;
+    initial.addons[1].title = 'Explicit R18 Bikini Assets Pack';
+    initial.addons[1].addonTitle = 'Explicit R18 Bikini Assets Pack';
+    initial.addons[1].workshopTitle = 'Explicit R18 Bikini Assets Pack';
+    initial.addons[1].enabled = false;
+    initial.addons[1].coverImage = hiddenMemberCover;
+    // Bundle cover points to the hidden member's image!
+    initial.bundles[0].coverImage = hiddenMemberCover;
+
+    // Profile enables ONLY already-enabled addons PLUS the disabled hidden addon (ws:2814105100), so ONLY the hidden addon is in toEnable!
+    const currentlyEnabledLoadingIds = initial.addons
+      .filter((a) => a.installState === 'installed' && a.primaryDir === 'loading' && a.enabled)
+      .map((a) => a.id);
+    await previewEngine.saveProfile({
+      id: 'prof-hidden-diff',
+      name: 'Hidden Diff Loadout',
+      description: 'Toggles a hidden addon on disk',
+      enabledAddonIds: ['ws:2814105100', ...currentlyEnabledLoadingIds],
+    });
+
+    // Mutate previewEngine state via saveConfig + updating addons/bundles through previewEngine reset/snapshot
+    // Wait: previewEngine.getDashboardSnapshot() clones state, so let's run in Tauri mock mode with full snapshot control!
+    setTauriMode(true);
+    initial.profiles = [
+      {
+        id: 'prof-hidden-diff',
+        name: 'Hidden Diff Loadout',
+        description: 'Toggles a hidden addon on disk',
+        enabledAddonIds: ['ws:2814105100', ...currentlyEnabledLoadingIds],
+      },
+    ];
+    initial.config.collapseCampaignBundles = true;
+    initial.config.filter.enabled = true;
+    initial.config.filter.applyToLibrary = true;
+    initial.config.filter.flaggedAction = 'hide_card';
+    const sig = computeFilterPolicySignature(initial.config.filter, {
+      catalogServerUrl: initial.config.catalogServerUrl,
+      httpsOnly: initial.config.httpsOnly,
+    });
+    initial.filterPolicySignature = sig;
+
+    invokeMock.mockImplementation(
+      async (cmd: string, args?: { targets?: FilterEvaluationTarget[] }) => {
+        if (cmd === 'evaluate_filter_items') {
+          return {
+            policySignature: sig,
+            items: (args?.targets ?? []).map((t) => {
+              const isFlagged = t.targetKey === 'addon:ws:2814105100';
+              return {
+                targetKey: t.targetKey,
+                status: 'completed' as const,
+                complete: true,
+                verdict: {
+                  targetKey: t.targetKey,
+                  revisionHint: t.revisionHint,
+                  flagged: isFlagged,
+                  decisionSource: isFlagged
+                    ? ('model_direct_flag' as const)
+                    : ('model_safe' as const),
+                  evaluatedScore: isFlagged ? 0.94 : 0.01,
+                  probabilities: {
+                    prob: isFlagged ? 0.94 : 0.01,
+                    goreProb: 0.01,
+                    nsfwProb: isFlagged ? 0.94 : 0.005,
+                  },
+                  textSensitive: isFlagged,
+                  titleSensitive: isFlagged,
+                  descriptionSensitive: false,
+                  imageSensitive: isFlagged,
+                  evaluatedImageIndices: isFlagged ? [0] : [],
+                  sensitiveImageIndices: isFlagged ? [0] : [],
+                  complete: true,
+                  evaluatedAt: '2026-11-26T00:00:00Z',
+                },
+              };
+            }),
+          };
+        }
+        return initial;
+      },
+    );
+
+    const { container } = render(<App />);
+    const bundleTitle = await screen.findByText('Chernobyl: Chapter One');
+    await waitFor(() => {
+      expect(container.querySelector('[data-pending-eval="true"]')).toBeNull();
+    });
+
+    // 1. Collapsed bundle in Library MUST NOT display the hidden member's cover image!
+    const libBundleCard = bundleTitle.closest('article')!;
+    expect(libBundleCard.querySelector('img')).toBeNull();
+
+    // 2. Organize -> Bundles tab also omits the hidden member's cover image!
+    fireEvent.click(screen.getByRole('button', { name: 'Organize' }));
+    const orgBundleMatches = await screen.findAllByText('Chernobyl: Chapter One');
+    const orgBundleCard = orgBundleMatches[0].closest('article')!;
+    expect(orgBundleCard.querySelector('img')).toBeNull();
+
+    // 3. Organize -> Profiles tab includes the hidden addon in Enable +1 (NOT 'No changes'!) and redacts its chip name!
+    fireEvent.click(screen.getByRole('tab', { name: /Profiles/ }));
+    const profileTitle = await screen.findByText('Hidden Diff Loadout');
+    const profileCard = profileTitle.closest('article')!;
+    expect(within(profileCard).queryByText('No changes')).toBeNull();
+    expect(within(profileCard).getByText('Enable +1')).toBeTruthy();
+    expect(
+      within(profileCard).getByText('Sensitive title hidden · #2814105100'),
+    ).toBeTruthy();
+    expect(within(profileCard).queryByText('Explicit R18 Bikini Assets Pack')).toBeNull();
+
+    // 4. Clicking the profile opens OrganizeInspectorSheet showing Enable +1 and the redacted row!
+    fireEvent.click(within(profileCard).getByRole('button', { name: /Hidden Diff Loadout/ }));
+    const inspector = await screen.findByRole('dialog', { name: 'Hidden Diff Loadout' });
+    expect(within(inspector).getAllByText('Enable +1').length).toBeGreaterThanOrEqual(1);
+    expect(
+      within(inspector).getByText('Sensitive title hidden · #2814105100'),
+    ).toBeTruthy();
+    expect(within(inspector).queryByText('Explicit R18 Bikini Assets Pack')).toBeNull();
   });
 });
 

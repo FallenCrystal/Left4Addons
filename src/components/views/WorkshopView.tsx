@@ -709,6 +709,7 @@ export function WorkshopView({
                       className="md-card"
                       data-clickable="true"
                       data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
+                      data-pending-eval={cardFilter.pendingEvaluation ? 'true' : undefined}
                     >
                       {cardFilter.blurWholeCard &&
                         (cardFilter.pendingEvaluation ? (

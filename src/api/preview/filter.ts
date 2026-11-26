@@ -6,6 +6,8 @@ import {
   type DeployLocalFilterRequest,
   type FilterCommitInfo,
   type FilterDecisionSource,
+  type FilterEvaluationBatchResponse,
+  type FilterEvaluationItemResult,
   type FilterEvaluationTarget,
   type FilterExclusionRecord,
   type FilterGalleryAggregation,
@@ -17,7 +19,6 @@ import {
 } from '../ipc';
 import {
   adjustProbabilities,
-  buildAddonFilterTarget,
   computeFilterPolicySignature,
   createDefaultModelParams,
   sanitizeModelParams,
@@ -199,13 +200,11 @@ export class PreviewFilterRuntime {
       catalogServerUrl: state.config.catalogServerUrl,
       httpsOnly: state.config.httpsOnly,
     });
+    const prefix = `${policySig}::`;
     const out: FilterItemVerdict[] = [];
-    for (const addon of state.addons) {
-      const target = buildAddonFilterTarget(addon);
-      const cacheKey = `${policySig}::${target.targetKey}::${target.revisionHint ?? ''}`;
-      const hit = this.cache.get(cacheKey);
-      if (hit) {
-        out.push(structuredClone(hit));
+    for (const [cacheKey, verdict] of this.cache) {
+      if (cacheKey.startsWith(prefix)) {
+        out.push(structuredClone(verdict));
       }
     }
     return out;
@@ -310,7 +309,7 @@ export class PreviewFilterRuntime {
     config: ClientFilterConfig,
     emit: PreviewEmit,
     policyOptions?: FilterPolicySignatureOptions,
-  ): FilterItemVerdict[] {
+  ): FilterEvaluationBatchResponse {
     if (config.mode === 'local' && this.status.serviceState !== 'running') {
       throw new IpcError('config', 'Local Left4Filters service is not running');
     }
@@ -321,14 +320,22 @@ export class PreviewFilterRuntime {
         ? sanitizeModelParams(config.localParams)
         : createDefaultModelParams();
 
-    const verdicts: FilterItemVerdict[] = [];
+    const items: FilterEvaluationItemResult[] = [];
+    const emittedVerdicts: FilterItemVerdict[] = [];
 
     for (const target of targets) {
-      const cacheKey = `${policySig}::${target.targetKey}::${target.revisionHint ?? ''}`;
+      const cacheKey = `${policySig}::${target.targetKey}`;
       if (!target.bypassCache) {
         const hit = this.cache.get(cacheKey);
-        if (hit) {
-          verdicts.push(structuredClone(hit));
+        if (hit && hit.complete !== false && (hit.revisionHint ?? '') === (target.revisionHint ?? '')) {
+          const cloned = structuredClone(hit);
+          items.push({
+            targetKey: target.targetKey,
+            status: 'completed',
+            verdict: cloned,
+            complete: true,
+          });
+          emittedVerdicts.push(cloned);
           continue;
         }
       }
@@ -345,10 +352,24 @@ export class PreviewFilterRuntime {
       const textNsfw = Math.max(titleScores.nsfw, descScores.nsfw);
       const textOv = Number((1 - (1 - textGore) * (1 - textNsfw)).toFixed(6));
 
-      const rawSources = params.enableImage
-        ? target.imageSources.slice(0, params.maxImages)
-        : [];
-      const perImageRaw = rawSources.map((src) => scoreSnippet(src));
+      const evaluatedSlots: { slotIndex: number; src: string }[] = [];
+      let hadImageLoadError = false;
+      if (params.enableImage) {
+        for (let slotIndex = 0; slotIndex < target.imageSources.length; slotIndex += 1) {
+          if (evaluatedSlots.length >= params.maxImages) {
+            break;
+          }
+          const src = target.imageSources[slotIndex]?.trim();
+          if (!src) continue;
+          if (src.startsWith('error://')) {
+            hadImageLoadError = true;
+            continue;
+          }
+          evaluatedSlots.push({ slotIndex, src });
+        }
+      }
+      const evaluatedImageIndices = evaluatedSlots.map((s) => s.slotIndex);
+      const perImageRaw = evaluatedSlots.map((s) => scoreSnippet(s.src));
       const perImageProbs = perImageRaw.map((s) => s.ov);
       const imageGore = aggregateGallery(
         perImageRaw.map((s) => s.gore),
@@ -374,10 +395,10 @@ export class PreviewFilterRuntime {
         titleProb: params.enableText ? titleScores.ov : undefined,
         descriptionProb:
           params.enableText && target.description ? descScores.ov : undefined,
-        imageProb: rawSources.length > 0 ? Number(imageOv.toFixed(6)) : undefined,
-        imageGoreProb: rawSources.length > 0 ? Number(imageGore.toFixed(6)) : undefined,
-        imageNsfwProb: rawSources.length > 0 ? Number(imageNsfw.toFixed(6)) : undefined,
-        perImageProbs: rawSources.length > 0 ? perImageProbs : undefined,
+        imageProb: evaluatedSlots.length > 0 ? Number(imageOv.toFixed(6)) : undefined,
+        imageGoreProb: evaluatedSlots.length > 0 ? Number(imageGore.toFixed(6)) : undefined,
+        imageNsfwProb: evaluatedSlots.length > 0 ? Number(imageNsfw.toFixed(6)) : undefined,
+        perImageProbs: evaluatedSlots.length > 0 ? perImageProbs : undefined,
       };
 
       const probabilities =
@@ -391,7 +412,7 @@ export class PreviewFilterRuntime {
         flagged = true;
         decisionSource = 'model_direct_flag';
       } else if (config.llmEnabled && evaluatedScore >= config.llmThreshold) {
-        const combinedText = `${target.title} ${target.description ?? ''} ${target.imageSources.join(' ')}`;
+        const combinedText = `${target.title} ${target.description ?? ''} ${evaluatedSlots.map((s) => s.src).join(' ')}`;
         const llmFlag =
           NSFW_REGEX.test(combinedText) ||
           GORE_REGEX.test(combinedText) ||
@@ -414,14 +435,14 @@ export class PreviewFilterRuntime {
         const hasTitle = Boolean(target.title.trim() || target.tags.length > 0);
         const hasDesc = Boolean(target.description?.trim());
         const hasText = hasTitle || hasDesc;
-        const nImgs = rawSources.length;
+        const nImgs = evaluatedSlots.length;
 
         if (!config.subdivideModalities) {
           textSensitive = hasText || nImgs === 0;
           titleSensitive = hasTitle || (!hasDesc && textSensitive);
           descriptionSensitive = hasDesc;
           imageSensitive = nImgs > 0;
-          sensitiveImageIndices = Array.from({ length: nImgs }, (_, idx) => idx);
+          sensitiveImageIndices = [...evaluatedImageIndices];
         } else {
           const modThresh = Number.isFinite(config.modalityThreshold)
             ? Math.min(0.95, Math.max(0.05, config.modalityThreshold))
@@ -434,8 +455,9 @@ export class PreviewFilterRuntime {
 
           const adjPerImage = probabilities.perImageProbs ?? [];
           adjPerImage.forEach((p, idx) => {
-            if (p >= modThresh) {
-              sensitiveImageIndices.push(idx);
+            const slot = evaluatedSlots[idx];
+            if (p >= modThresh && slot) {
+              sensitiveImageIndices.push(slot.slotIndex);
             }
           });
           imageSensitive =
@@ -460,16 +482,21 @@ export class PreviewFilterRuntime {
               adjPerImage.forEach((p, idx) => {
                 if (p > (adjPerImage[bestIdx] ?? -1)) bestIdx = idx;
               });
-              sensitiveImageIndices.push(bestIdx);
+              const slot = evaluatedSlots[bestIdx];
+              if (slot) {
+                sensitiveImageIndices.push(slot.slotIndex);
+              }
             } else {
-              sensitiveImageIndices = Array.from({ length: nImgs }, (_, idx) => idx);
+              sensitiveImageIndices = [...evaluatedImageIndices];
             }
           }
         }
       }
 
+      const complete = !hadImageLoadError;
       const verdict: FilterItemVerdict = {
         targetKey: target.targetKey,
+        revisionHint: target.revisionHint,
         flagged,
         decisionSource,
         evaluatedScore,
@@ -478,23 +505,36 @@ export class PreviewFilterRuntime {
         titleSensitive,
         descriptionSensitive,
         imageSensitive,
+        evaluatedImageIndices,
         sensitiveImageIndices,
+        complete,
         evaluatedAt: new Date().toISOString(),
       };
 
-      if (!target.bypassCache) {
+      if (!target.bypassCache && complete) {
         this.cache.set(cacheKey, structuredClone(verdict));
       }
-      verdicts.push(verdict);
+      items.push({
+        targetKey: target.targetKey,
+        status: 'completed',
+        verdict,
+        complete,
+      });
+      if (complete || flagged) {
+        emittedVerdicts.push(verdict);
+      }
     }
 
-    if (verdicts.length > 0) {
+    if (emittedVerdicts.length > 0) {
       emit({
         type: 'filter_verdicts_updated',
-        verdicts: structuredClone(verdicts),
+        verdicts: structuredClone(emittedVerdicts),
         policySignature: policySig,
       });
     }
-    return verdicts;
+    return {
+      policySignature: policySig,
+      items,
+    };
   }
 }
