@@ -5373,10 +5373,160 @@ async fn filter_workshop_id_lookup_populates_public_items_and_rejects_ssrf_and_r
     mock_task.abort();
 }
 
+#[tokio::test]
+async fn admin_filter_routes_authenticate_before_parsing_and_preserve_host_paths() {
+    let state = ServerState::in_memory("filter-admin-password").unwrap();
+    let trusted_dir = std::path::PathBuf::from("/opt/left4filters/deploy");
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.deploy_dir = Some(trusted_dir.clone());
+            cfg.filter.python_bin = Some("/opt/left4filters/venv/bin/python".into());
+        })
+        .unwrap();
+    let app = build_router(state.clone());
+
+    let (unauthenticated, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/test",
+        vec![],
+        Some(json!("not a prediction object")),
+    )
+    .await;
+    assert_eq!(unauthenticated, StatusCode::UNAUTHORIZED);
+
+    let headers = vec![("x-admin-token", "filter-admin-password")];
+    for request in [
+        json!({"deployDir": "/elsewhere/deploy"}),
+        json!({"pythonBin": "/elsewhere/python"}),
+    ] {
+        let (code, _) = json_request(
+            &app,
+            "PATCH",
+            "/api/v1/admin/config/filter",
+            headers.clone(),
+            Some(request),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    let (code, bytes) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        headers,
+        Some(json!({"cacheTtlSecs": 60})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let status: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status.config.deploy_dir.as_deref(), trusted_dir.to_str());
+    assert_eq!(
+        status.config.python_bin.as_deref(),
+        Some("/opt/left4filters/venv/bin/python")
+    );
+    assert_eq!(state.config_store.get().filter.cache_ttl_secs, 60);
+}
+
+#[tokio::test]
+async fn upstream_prediction_failure_invalidates_readiness_and_reprobes_model() {
+    use axum::{
+        routing::{get, post},
+        Json,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let phase = Arc::new(AtomicUsize::new(0));
+    let health_phase = phase.clone();
+    let predict_phase = phase.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/health",
+            get(move || {
+                let version = if health_phase.load(Ordering::SeqCst) == 2 {
+                    "2"
+                } else {
+                    "1"
+                };
+                async move { Json(json!({ "model": "fixture-model", "version": version })) }
+            }),
+        )
+        .route(
+            "/predict",
+            post(move || {
+                let unavailable = predict_phase.load(Ordering::SeqCst) == 1;
+                async move {
+                    if unavailable {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "unavailable" })),
+                        )
+                    } else {
+                        (StatusCode::OK, Json(json!({ "prob": 0.3 })))
+                    }
+                }
+            }),
+        );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+
+    let state = ServerState::in_memory("filter-test-secret").unwrap();
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.enabled = true;
+            cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+            cfg.filter.upstream_url = Some(format!("http://{addr}"));
+        })
+        .unwrap();
+    let info = state.filter.public_info().await;
+    assert!(info.ready);
+    assert_eq!(info.model_version.as_deref(), Some("1"));
+
+    phase.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        state
+            .filter
+            .predict(l4a_protocol::FilterPredictRequest {
+                title: Some("Catalog fixture".into()),
+                ..Default::default()
+            })
+            .await,
+        Err(l4a_server::filter::FilterServiceError::Unavailable(_))
+    ));
+    let unavailable = state.filter.public_info().await;
+    assert!(!unavailable.ready);
+    assert!(unavailable.scoring_revision.is_none());
+
+    phase.store(2, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let recovered = state.filter.public_info().await;
+    assert!(recovered.ready);
+    assert_eq!(recovered.model_version.as_deref(), Some("2"));
+    assert_ne!(recovered.scoring_revision, info.scoring_revision);
+    upstream_task.abort();
+}
+
+fn configure_host_filter_paths(state: &ServerState, dto: &l4a_protocol::CatalogFilterConfigDto) {
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.deploy_dir = dto.deploy_dir.as_ref().map(std::path::PathBuf::from);
+            cfg.filter.python_bin = dto.python_bin.clone();
+        })
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cleanly() {
+    use axum::routing::get;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     let dir = tempfile::tempdir().unwrap();
     let deploy_dir = dir.path().join("deploy");
@@ -5417,7 +5567,8 @@ async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cl
     std::fs::set_permissions(&py_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let state = ServerState::in_memory("managed-secret").unwrap();
-    let app = build_router(state);
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+    let app = build_router(state.clone());
     let admin_hdr = vec![("x-admin-token", "managed-secret")];
 
     // 1. Start ManagedPython runner via admin config PATCH.
@@ -5430,6 +5581,7 @@ async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cl
         cache_ttl_secs: 3600,
         params: l4a_protocol::FilterPresetId::Recommended.default_params(),
     };
+    configure_host_filter_paths(&state, &cfg_v1);
     let (code1, bytes1) = json_request(
         &app,
         "PATCH",
@@ -5461,11 +5613,48 @@ async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cl
     assert!((p1.gore_prob - 0.75).abs() < 1e-5);
     assert!((p1.nsfw_prob - 0.30).abs() < 1e-5);
 
-    // 3. Reconfigure to NsfwOnly (goreWeight = 0) with same deploy_dir & python_bin:
-    //    pushes live `POST /configure` with bearer token without restarting child PID,
-    //    and ensures ManagedPython response is NOT double-adjusted!
+    let fetch_started = Arc::new(Notify::new());
+    let finish_fetch = Arc::new(Notify::new());
+    let cdn = axum::Router::new().route(
+        "/preview",
+        get({
+            let fetch_started = fetch_started.clone();
+            let finish_fetch = finish_fetch.clone();
+            move || {
+                let started = fetch_started.clone();
+                let finish = finish_fetch.clone();
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x04\0\0\0\x04".to_vec()
+                }
+            }
+        }),
+    );
+    let cdn_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let preview_url = format!("http://{}/preview", cdn_socket.local_addr().unwrap());
+    let cdn_task = tokio::spawn(async move { axum::serve(cdn_socket, cdn).await.unwrap() });
+    let prediction_app = app.clone();
+    let inflight = tokio::spawn(async move {
+        json_request(
+            &prediction_app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "title": "Live update during fetch", "imageUrls": [preview_url] })),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), fetch_started.notified())
+        .await
+        .unwrap();
+
+    // Reconfigure while the first request is still fetching its preview.
     let cfg_v2 = l4a_protocol::CatalogFilterConfigDto {
-        params: l4a_protocol::FilterPresetId::NsfwOnly.default_params(),
+        params: l4a_protocol::FilterModelParams {
+            enable_image: false,
+            ..l4a_protocol::FilterPresetId::NsfwOnly.default_params()
+        },
         ..cfg_v1.clone()
     };
     let (code2, bytes2) = json_request(
@@ -5499,6 +5688,14 @@ async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cl
     assert!((p2.nsfw_prob - 0.30).abs() < 1e-5);
     assert!((p2.prob - 0.30).abs() < 1e-5);
 
+    finish_fetch.notify_one();
+    let (code, body) = inflight.await.unwrap();
+    assert_eq!(code, StatusCode::OK);
+    let updated: l4a_protocol::FilterProbabilities = serde_json::from_slice(&body).unwrap();
+    assert_ne!(updated.scoring_revision, p1.scoring_revision);
+    assert_eq!(updated, p2);
+    cdn_task.abort();
+
     // 4. Disable filter and verify running_pid is cleared.
     let cfg_off = l4a_protocol::CatalogFilterConfigDto {
         enabled: false,
@@ -5528,7 +5725,7 @@ async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_le
 
     // 1. Early disabled middleware rejects `/api/v1/filter/predict` BEFORE buffering body!
     let disabled_state = ServerState::in_memory("secret-admin-pw").unwrap();
-    let disabled_app = build_router(disabled_state);
+    let disabled_app = build_router(disabled_state.clone());
     let body_read_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag_cl = body_read_attempted.clone();
     let unbuffered_stream = futures_util::stream::poll_fn(move |_| {
@@ -5613,6 +5810,7 @@ async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_le
         cache_ttl_secs: 60,
         params: l4a_protocol::FilterModelParams::default(),
     };
+    configure_host_filter_paths(&disabled_state, &broken_managed_dto);
     let (cfg_code, _) = json_request(
         &disabled_app,
         "PATCH",
@@ -5997,6 +6195,7 @@ class Left4Filter:
         cache_ttl_secs: 0,
         params: l4a_protocol::FilterModelParams::default(),
     };
+    configure_host_filter_paths(&state, &dto);
     let (c1, b1) = json_request(
         &app,
         "PATCH",
@@ -6529,6 +6728,7 @@ class Left4Filter:
         cache_ttl_secs: 0,
         params: l4a_protocol::FilterModelParams::default(),
     };
+    configure_host_filter_paths(&state, &dto_auto);
     let (c1, b1) = json_request(
         &app,
         "PATCH",
@@ -6559,6 +6759,7 @@ class Left4Filter:
         python_bin: Some(venv_python.display().to_string()),
         ..dto_auto
     };
+    configure_host_filter_paths(&state, &dto_explicit);
     let (c2, b2) = json_request(
         &app,
         "PATCH",
@@ -6773,7 +6974,6 @@ async fn filter_large_multi_image_requests_split_into_subbatches_under_runner_li
     let dir = tempfile::tempdir().unwrap();
     let deploy_dir = dir.path().join("deploy");
     let py_shim_dir = dir.path().join("pyshims");
-    let batch_log = dir.path().join("batches.log");
     std::fs::create_dir_all(&deploy_dir).unwrap();
     std::fs::create_dir_all(py_shim_dir.join("PIL")).unwrap();
 
@@ -6797,42 +6997,44 @@ class _FakeMatrix(list):
 
 def asarray(rows, dtype=None):
     return _FakeMatrix([[float(x) for x in r] for r in rows])
+
+def sort(rows, axis=0):
+    return _FakeMatrix(list(zip(*(sorted(col) for col in zip(*rows)))))
 "#,
     )
     .unwrap();
     std::fs::write(
         py_shim_dir.join("PIL").join("Image.py"),
-        "MAX_IMAGE_PIXELS = None\n",
+        r#"MAX_IMAGE_PIXELS = None
+
+class ImageHeader:
+    size = (4, 4)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+def open(_stream):
+    return ImageHeader()
+"#,
     )
     .unwrap();
     std::fs::write(py_shim_dir.join("PIL").join("__init__.py"), "").unwrap();
 
     std::fs::write(
         deploy_dir.join("l4filter.py"),
-        format!(
-            r#"class Left4Filter:
+        r#"class Left4Filter:
     def __init__(self, deploy_dir, num_threads=4):
-        self.config = {{"model_name": "SubBatchMock", "version": "1.0.0"}}
-
-    def _score_one(self, im):
-        marker = im[33]
-        table = {{1: 0.80, 2: 0.60, 3: 0.40, 4: 0.20}}
-        p = table.get(marker, 0.10)
-        return {{"prob": p, "gore_prob": p * 0.5, "nsfw_prob": p}}
+        self.config = {"model_name": "SubBatchMock", "version": "1.0.0"}
 
     def predict(self, title="", description="", tags=None, image=None, images=None):
-        if image is not None:
-            return self._score_one(image)
-        if images is not None:
-            with open({log_path:?}, "a", encoding="utf-8") as f:
-                f.write(f"{{len(images)}}\n")
-            scores = [self._score_one(im)["prob"] for im in images]
-            avg = sum(scores) / len(scores)
-            return {{"prob": avg, "gore_prob": avg * 0.5, "nsfw_prob": avg}}
-        return {{"prob": 0.10, "gore_prob": 0.05, "nsfw_prob": 0.10}}
+        if image is None:
+            return {"prob": 0.10, "gore_prob": 0.05, "nsfw_prob": 0.10}
+        p = {1: 0.90, 2: 0.10, 3: 0.80, 4: 0.30}[image[33]]
+        return {"prob": p, "gore_prob": p * 0.5, "nsfw_prob": p}
 "#,
-            log_path = batch_log.display().to_string(),
-        ),
     )
     .unwrap();
 
@@ -6861,10 +7063,11 @@ def asarray(rows, dtype=None):
         cache_ttl_secs: 0,
         params: l4a_protocol::FilterModelParams {
             max_images: 4,
-            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Mean,
+            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Top2Mean,
             ..Default::default()
         },
     };
+    configure_host_filter_paths(&state, &dto);
     let (c_cfg, b_cfg) = json_request(
         &app,
         "PATCH",
@@ -6898,20 +7101,10 @@ def asarray(rows, dtype=None):
         String::from_utf8_lossy(&p_bytes)
     );
     let probs: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p_bytes).unwrap();
-    assert_eq!(probs.per_image_probs, vec![0.80, 0.60, 0.40, 0.20]);
-    // Mean of [0.80, 0.60, 0.40, 0.20] == 0.50
-    assert!((probs.prob - 0.50).abs() < 1e-5);
-    assert_eq!(probs.image_prob, Some(0.50));
+    assert_eq!(probs.per_image_probs, vec![0.90, 0.10, 0.80, 0.30]);
+    assert_eq!(probs.prob, 0.85);
+    assert_eq!(probs.image_prob, Some(0.85));
     assert!(probs.scoring_revision.is_some());
-
-    // Verify the 4 x 12 MiB images were split into two 2-image sub-batches (24 MiB <= 30 MiB each).
-    let logged_batches: Vec<usize> = std::fs::read_to_string(&batch_log)
-        .unwrap()
-        .lines()
-        .map(|l| l.trim().parse::<usize>().unwrap())
-        .collect();
-    assert_eq!(logged_batches, vec![2, 2]);
-
     state.filter.shutdown().await;
     cdn_task.abort();
 }

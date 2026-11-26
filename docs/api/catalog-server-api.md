@@ -69,8 +69,10 @@
 ```
 - **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
 - **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
+- 公开预测和管理员试算共用并发配额，JSON 请求体上限为 48 MiB。读取超时返回 `408 Request Timeout`，配额已满时返回 `429 Too Many Requests`。管理员试算在读取请求体前验证身份。
 - **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。
-- **SSRF 与载荷限制**：`imageUrls` 仅允许 `https://` 协议及受信任的 Steam CDN 域名白名单（`steamuserimages-a.akamaihd.net`、`images.steamusercontent.com`、`steamcdn-a.akamaihd.net`、`cdn.cloudflare.steamstatic.com`、`shared.cloudflare.steamstatic.com`、`shared.fastly.steamstatic.com`），禁止跨域名重定向至非白名单主机，单图上限 `10 MiB`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+- **SSRF 与载荷限制**：`imageUrls` 仅允许 `https://` 协议及受信任的 Steam CDN 域名白名单（`steamuserimages-a.akamaihd.net`、`images.steamusercontent.com`、`steamcdn-a.akamaihd.net`、`cdn.cloudflare.steamstatic.com`、`shared.cloudflare.steamstatic.com`、`shared.fastly.steamstatic.com`），禁止跨域名重定向至非白名单主机，单图上限 `16 MiB`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+- 当服务端无法读取请求中的预览图 URL 时，响应附带 `code: "image_fetch_failed"`。客户端可以读取预览图后用 `imagesBase64` 重试。
 
 ---
 
@@ -101,7 +103,7 @@
 
 ### 内容过滤模型服务
 - `GET /api/v1/admin/filter/status` — 获取内容过滤后端配置、就绪态、运行 PID / 活动端点、请求与缓存命中计数及最近错误 (`CatalogFilterStatus`)
-- `PATCH /api/v1/admin/config/filter` — 更新 `[filter]` 后端模式与模型校准参数，持久化写回 `catalog.toml`，热更新 `ManagedPython` 参数或切换后端，并写入 `filter_config_update` 审计日志
+- `PATCH /api/v1/admin/config/filter` — 更新 `[filter]` 后端模式与模型校准参数，持久化写回 `catalog.toml`，热更新 `ManagedPython` 参数或切换后端，并写入 `filter_config_update` 审计日志。`deployDir` 和 `pythonBin` 只能通过主机上的 `catalog.toml` 修改，控制台显示当前值。
 - `POST /api/v1/admin/filter/restart` — 重启托管 Python 过滤子进程或重新探测 `UpstreamHttp` 健康状态，清空推理缓存并写入 `filter_restart` 审计日志
 - `POST /api/v1/admin/filter/test` — 管理员在线概率试算沙盒接口（输入 `FilterPredictRequest`，返回 `FilterProbabilities`）
 

@@ -3,11 +3,12 @@ use l4a_core::{validate_external_url, CoreError};
 use l4a_protocol::{
     AddonBatchReport, AddonDirType, AddonId, AddonSummary, AppConfig, BundleId, BundleRecord,
     DashboardSnapshot, DeployLocalFilterRequest, DesktopError, DesktopErrorCode,
-    FilterEvaluationBatchResponse, FilterEvaluationTarget, FilterTokenStatus, GroupId, IssueId,
-    LoadoutProfile, LocalFilterDeploymentStatus, ProfileApplyReport, ProfileId, ReconcileAction,
-    ReconcileBatchItem, ReconcileBatchReport, RenamePreviewItem, RenameRuleConfig, SearchQuery,
-    SearchResponse, SyncReport, TrackedCollectionRecord, UpsertFilterExclusionRequest, UserGroup,
-    WorkshopId, WorkshopItemRecord,
+    FilterCacheClearResult, FilterEvaluationBatchResponse, FilterEvaluationTarget,
+    FilterTokenStatus, GroupId, IssueId, LoadoutProfile, LocalFilterDeploymentStatus,
+    ProfileApplyReport, ProfileId, ReconcileAction, ReconcileBatchItem, ReconcileBatchReport,
+    RenamePreviewItem, RenameRuleConfig, SearchQuery, SearchResponse, SyncReport,
+    TrackedCollectionRecord, UpsertFilterExclusionRequest, UserGroup, WorkshopId,
+    WorkshopItemRecord,
 };
 use l4a_steam::SteamCapabilities;
 use std::io;
@@ -594,17 +595,21 @@ pub async fn set_filter_llm_token(
 #[tauri::command]
 pub async fn evaluate_filter_items(
     targets: Vec<FilterEvaluationTarget>,
+    automatic: Option<bool>,
     state: State<'_, TauriState>,
 ) -> Result<FilterEvaluationBatchResponse, DesktopError> {
-    state
-        .engine
-        .evaluate_filter_items(targets)
-        .await
-        .map_err(Into::into)
+    if automatic.unwrap_or(false) {
+        state.engine.evaluate_automatic_filter_items(targets).await
+    } else {
+        state.engine.evaluate_filter_items(targets).await
+    }
+    .map_err(Into::into)
 }
 
 #[tauri::command]
-pub async fn clear_filter_cache(state: State<'_, TauriState>) -> Result<u64, DesktopError> {
+pub async fn clear_filter_cache(
+    state: State<'_, TauriState>,
+) -> Result<FilterCacheClearResult, DesktopError> {
     state.engine.clear_filter_cache().map_err(Into::into)
 }
 

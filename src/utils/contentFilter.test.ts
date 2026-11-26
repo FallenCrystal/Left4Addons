@@ -11,15 +11,20 @@ import { zh } from '../i18n/zh';
 import {
   adjustProbabilities,
   adjustTriplet,
+  buildAddonFilterTarget,
+  buildAddonRevisionHint,
+  buildWorkshopFilterTarget,
   collectWorkshopImageUrls,
   computeFilterPolicySignature,
   createDefaultFilterConfig,
   formatDiagnosticVerdictBadge,
+  getFilteredAddonFallbackCover,
   getPresetDefaultParams,
   resolveBundleCoverPresentation,
   resolveCardFilterState,
   resolveDetailFilterState,
   resolveLookupVerdict,
+  resolveWorkshopVerdict,
 } from './contentFilter';
 
 function makeEnabledConfig(overrides: Partial<ClientFilterConfig> = {}): ClientFilterConfig {
@@ -566,6 +571,44 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(presVisibleOwner.src).toBe('https://img.example.com/visible_blurred.jpg');
     expect(presVisibleOwner.ownerMember?.id).toBe('ws:400');
     expect(presVisibleOwner.coverMode).toBe('blur');
+
+    const hiddenAuthor = { ...memberWithCover, id: 'ws:2814104912', author: 'Redacted author' };
+    const publicAuthor = { ...safeMemberWithoutCover, author: 'Visible author' };
+    const authorCtx = {
+      filterConfig: makeEnabledConfig(),
+      verdicts: {},
+      exclusionsByAddonId: new Map([[hiddenAuthor.id, makeExclusion('hide_text')]]),
+    };
+    expect(resolveBundleCoverPresentation([hiddenAuthor, publicAuthor], authorCtx).author)
+      .toBe('Visible author');
+    expect(resolveBundleCoverPresentation([hiddenAuthor, safeMemberWithoutCover], authorCtx).author)
+      .toBeUndefined();
+
+    const withFallback = {
+      ...memberWithCover,
+      workshopTitle: 'Workshop title',
+      addonTitle: 'VPK title',
+      currentFileName: 'Alternate filename.vpk.disabled',
+      localCoverImage: 'local-cover.jpg',
+    };
+    const target = buildAddonFilterTarget(withFallback);
+    expect(target.title.split('\n')).toEqual([
+      'Workshop title', 'VPK title', withFallback.title, 'Alternate filename',
+    ]);
+    expect(buildAddonRevisionHint({ ...withFallback, addonTitle: 'Changed title' }))
+      .not.toBe(target.revisionHint);
+    expect(target.imageSources).toEqual([withFallback.coverImage, withFallback.localCoverImage]);
+
+    const safe = makeFlaggedVerdict({
+      targetKey: target.targetKey,
+      revisionHint: target.revisionHint,
+      flagged: false,
+      evaluatedImageIndices: [0],
+    });
+    const coverCtx = { ...authorCtx, verdicts: { [target.targetKey]: safe } };
+    expect(getFilteredAddonFallbackCover(withFallback, coverCtx)).toBeUndefined();
+    safe.evaluatedImageIndices = [0, 1];
+    expect(getFilteredAddonFallbackCover(withFallback, coverCtx)).toBe(withFallback.localCoverImage);
   });
 
   it('matches Rust FilterPresetId calibration math, deduplicates Workshop gallery URLs, and computes canonical pol_<32hex> policy signatures', () => {
@@ -586,11 +629,12 @@ describe('contentFilter pure resolution & calibration logic', () => {
     expect(Math.abs(ov - n)).toBeLessThan(1e-5);
     expect(adjustProbabilities(nsfwOnly, raw).scoringRevision).toBe('rev1');
 
-    const urls = collectWorkshopImageUrls({
+    const workshopTarget = {
       workshopId: '1',
-      fileType: 'item',
-      status: 'active',
+      fileType: 'item' as const,
+      status: 'active' as const,
       title: 'Gallery Test',
+      description: 'English description',
       previewUrl: 'https://img.example.com/0.jpg',
       previews: [
         { url: 'https://img.example.com/0.jpg', previewType: 0 },
@@ -601,14 +645,24 @@ describe('contentFilter pure resolution & calibration logic', () => {
       tags: [],
       dependencies: [],
       collectionChildren: [],
-      source: 'catalog_server',
+      source: 'catalog_server' as const,
       fetchedAt: '2026-11-25T00:00:00Z',
-    });
+    };
+    const urls = collectWorkshopImageUrls(workshopTarget);
     expect(urls).toEqual([
       'https://img.example.com/0.jpg',
       'https://img.example.com/1.jpg',
       'https://img.example.com/2.jpg',
     ]);
+    const evaluated = buildWorkshopFilterTarget(workshopTarget);
+    const verdict = makeFlaggedVerdict({
+      targetKey: evaluated.targetKey,
+      revisionHint: evaluated.revisionHint,
+    });
+    const lookup = { verdicts: { [evaluated.targetKey]: verdict } };
+    expect(resolveWorkshopVerdict(workshopTarget, lookup)).toBe(verdict);
+    expect(resolveWorkshopVerdict({ ...workshopTarget, description: '新描述' }, lookup)).toBeUndefined();
+    expect(resolveWorkshopVerdict({ ...workshopTarget, tags: ['Campaign'] }, lookup)).toBeUndefined();
 
     const c1 = makeEnabledConfig({ flaggedAction: 'blur_card' });
     const c2 = makeEnabledConfig({ flaggedAction: 'hide_image' });

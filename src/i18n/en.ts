@@ -601,6 +601,7 @@ export const en = {
       stopServiceBtn: 'Stop Local Service',
       refreshStatusBtn: 'Refresh Status',
       paramsTitle: 'Model Parameters & Calibration Presets',
+      customEndpointParamsHint: 'The custom endpoint controls the model, input modalities, and calibration.',
       catalogParamsBanner:
         'Catalog Server mode is active: model runtime and calibration parameters are controlled exclusively on the Catalog Server.',
       preset: 'Parameter Preset',
@@ -644,8 +645,7 @@ export const en = {
         'Scores below LLM threshold pass; scores in between escalate to the LLM judge; scores at or above Direct Flag threshold flag immediately.',
       routingThresholdOverlapWarning:
         'Warning: LLM Escalation Threshold is greater than or equal to Direct Flag Threshold — items reaching Direct Flag Threshold will flag immediately without ever escalating to the LLM judge.',
-      routingBothDisabledWarning:
-        'Warning: Both High-Score Direct Flagging and External LLM Review are disabled; evaluation falls back to the Direct Flag Threshold.',
+      routingBothDisabledWarning: 'Both decision routes are disabled. Every item passes regardless of its score.',
       llmEndpoint: 'OpenAI-Compatible Endpoint',
       llmModel: 'Model Name',
       llmSendImages: 'Send Preview Images to Vision LLM',

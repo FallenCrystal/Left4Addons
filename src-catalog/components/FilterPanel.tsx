@@ -161,8 +161,8 @@ function probBarColor(val: number): string {
 function buildConfigPayload(cfg: CatalogFilterConfigDto): CatalogFilterConfigDto {
   return {
     ...cfg,
-    deployDir: cfg.deployDir?.trim() ? cfg.deployDir.trim() : undefined,
-    pythonBin: cfg.pythonBin?.trim() ? cfg.pythonBin.trim() : undefined,
+    deployDir: undefined,
+    pythonBin: undefined,
     upstreamUrl: cfg.upstreamUrl?.trim() ? cfg.upstreamUrl.trim() : undefined,
   };
 }
@@ -555,11 +555,9 @@ export function FilterPanel({
                 <input
                   id="cat-filter-deploy-dir"
                   className="cat-input cat-mono"
-                  placeholder="如 ./Left4Filters 或 /opt/Left4Filters/deploy"
+                  placeholder="在主机的 catalog.toml 中配置"
                   value={effective.deployDir ?? ''}
-                  onChange={(e) =>
-                    updateDraft((d) => ({ ...d, deployDir: e.target.value }))
-                  }
+                  readOnly
                 />
               </div>
               <div className="cat-field">
@@ -571,9 +569,7 @@ export function FilterPanel({
                   className="cat-input cat-mono"
                   placeholder="留空自动探测 .venv / python3"
                   value={effective.pythonBin ?? ''}
-                  onChange={(e) =>
-                    updateDraft((d) => ({ ...d, pythonBin: e.target.value }))
-                  }
+                  readOnly
                 />
               </div>
             </div>

@@ -110,6 +110,7 @@ impl TokenVault {
                 .map(Zeroizing::new)
                 .is_ok_and(|val| !val.trim().is_empty());
         FilterTokenStatus {
+            cache_generation: 0,
             has_encrypted_token: self.has_sealed_token(),
             env_var_name: trimmed.to_string(),
             env_var_present,

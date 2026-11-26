@@ -351,7 +351,9 @@ describe('v2 IPC client wrapper', () => {
     expect(await evaluateFilterItems(targets)).toEqual(batchResponse);
     expect(invokeMock).toHaveBeenCalledWith('evaluate_filter_items', { targets });
 
-    await clearFilterCache();
+    const cacheClear = { count: 2, cacheGeneration: 1 };
+    invokeMock.mockResolvedValueOnce(cacheClear);
+    expect(await clearFilterCache()).toEqual(cacheClear);
     expect(invokeMock).toHaveBeenCalledWith('clear_filter_cache');
 
     const exclusionReq = {

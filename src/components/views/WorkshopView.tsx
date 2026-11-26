@@ -37,7 +37,7 @@ import {
   isAddonTitleRedacted,
   resolveCardFilterState,
   resolveDetailFilterState,
-  resolveLookupVerdict,
+  resolveWorkshopVerdict,
   workshopFilterKey,
 } from '../../utils/contentFilter';
 import {
@@ -224,29 +224,34 @@ export function WorkshopView({
     }
   }
 
+  // Use the fetched detail in the list as well so a visible item has a single scored revision.
+  const displayedItems = useMemo(
+    () => (response?.items ?? []).map((item) =>
+      activeItem?.workshopId === item.workshopId ? activeItem : item,
+    ),
+    [activeItem, response?.items],
+  );
+
   useEffect(() => {
     const batch: WorkshopItemRecord[] = [];
-    if (response?.items) {
-      batch.push(...response.items);
-    }
-    if (activeItem) {
+    batch.push(...displayedItems);
+    if (activeItem && !batch.includes(activeItem)) {
       batch.push(activeItem);
     }
     if (batch.length > 0) {
       registerWorkshopItems(batch);
     }
-  }, [response, activeItem, registerWorkshopItems]);
+  }, [displayedItems, activeItem, registerWorkshopItems]);
 
   const { visibleItems, filteredOutCount } = useMemo(() => {
-    const rawItems = response?.items ?? [];
     let hiddenCount = 0;
     const out: WorkshopItemRecord[] = [];
-    for (const item of rawItems) {
+    for (const item of displayedItems) {
       const key = workshopFilterKey(item.workshopId);
       const state = resolveCardFilterState({
         config: filterConfig,
         scope: 'workshop',
-        verdict: resolveLookupVerdict(key, { verdicts, evaluatedRevisions }),
+        verdict: resolveWorkshopVerdict(item, { verdicts, evaluatedRevisions }),
         hasTargetFailed: failedTargetKeys.has(key),
         hasContent: hasFilterableWorkshopContent(item),
       });
@@ -260,7 +265,7 @@ export function WorkshopView({
     }
     return { visibleItems: out, filteredOutCount: hiddenCount };
   }, [
-    response,
+    displayedItems,
     filterConfig,
     verdicts,
     evaluatedRevisions,
@@ -273,15 +278,13 @@ export function WorkshopView({
     [activeItem],
   );
   const activeKey = activeItem ? workshopFilterKey(activeItem.workshopId) : undefined;
-  const activeVerdict = activeKey ? verdicts[activeKey] : undefined;
+  const activeVerdict = activeItem ? resolveWorkshopVerdict(activeItem, filterCtx) : undefined;
   const activeDetailFilter = useMemo(
     () =>
       resolveDetailFilterState({
         config: filterConfig,
         scope: 'workshop',
-        verdict: activeKey
-          ? resolveLookupVerdict(activeKey, { verdicts, evaluatedRevisions })
-          : null,
+        verdict: activeVerdict,
         totalImages: activeGalleryUrls.length,
         hasTargetFailed: activeKey ? failedTargetKeys.has(activeKey) : false,
         hasContent: activeItem ? hasFilterableWorkshopContent(activeItem) : false,
@@ -289,8 +292,7 @@ export function WorkshopView({
     [
       filterConfig,
       activeKey,
-      verdicts,
-      evaluatedRevisions,
+      activeVerdict,
       activeGalleryUrls.length,
       failedTargetKeys,
       activeItem,
@@ -354,7 +356,7 @@ export function WorkshopView({
     const itemCardFilter = resolveCardFilterState({
       config: filterConfig,
       scope: 'workshop',
-      verdict: resolveLookupVerdict(itemKey, { verdicts, evaluatedRevisions }),
+      verdict: resolveWorkshopVerdict(item, filterCtx),
       revealed: revealedCardIds.has(itemKey),
       forceShowHiddenCards: showingFilteredCards,
       hasTargetFailed: failedTargetKeys.has(itemKey),
@@ -689,11 +691,11 @@ export function WorkshopView({
                   const dl = liveDownloads[item.workshopId];
                   const isTracked = item.fileType === 'collection' && trackedIds.has(item.workshopId);
                   const cardKey = workshopFilterKey(item.workshopId);
-                  const verdict = verdicts[cardKey];
+                  const verdict = resolveWorkshopVerdict(item, filterCtx);
                   const cardFilter = resolveCardFilterState({
                     config: filterConfig,
                     scope: 'workshop',
-                    verdict: resolveLookupVerdict(cardKey, { verdicts, evaluatedRevisions }),
+                    verdict: verdict,
                     revealed: revealedCardIds.has(cardKey),
                     forceShowHiddenCards: showingFilteredCards,
                     hasTargetFailed: failedTargetKeys.has(cardKey),

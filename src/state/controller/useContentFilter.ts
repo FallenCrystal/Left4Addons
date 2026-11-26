@@ -19,6 +19,8 @@ import {
   buildAddonFilterTarget,
   buildAddonRevisionHint,
   buildWorkshopFilterTarget,
+  filterVerdictExpiresAt,
+  isAutomaticFilterTargetEnabled,
   computeFilterPolicySignature,
   createDefaultFilterConfig,
 } from '../../utils/contentFilter';
@@ -41,6 +43,8 @@ export interface UseContentFilterParams {
 }
 
 const EMPTY_STRING_SET = new Set<string>();
+const EMPTY_VERDICTS: Record<string, FilterItemVerdict> = {};
+const EMPTY_REVISIONS: Record<string, string> = {};
 
 export function useContentFilter({
   client,
@@ -67,6 +71,10 @@ export function useContentFilter({
     [filterConfig, catalogServerUrl, httpsOnly],
   );
   const basePolicySignature = snapshot?.filterPolicySignature?.trim() || computedPolicySignature;
+  const [cacheGenerationFloor, setCacheGenerationFloor] = useState(0);
+  const [verdictsExpiredThrough, setVerdictsExpiredThrough] = useState(() => Date.now());
+  const snapshotCacheGeneration = snapshot?.filterCacheGeneration ?? 0;
+  const cacheGeneration = Math.max(cacheGenerationFloor, snapshotCacheGeneration);
 
   const [runtimePolicyOverride, setRuntimePolicyOverride] = useState<{
     baseSig: string;
@@ -80,10 +88,12 @@ export function useContentFilter({
 
   const [verdictStore, setVerdictStore] = useState<{
     policySig: string;
+    cacheGeneration: number;
     map: Record<string, FilterItemVerdict>;
     revisions: Record<string, string>;
   }>(() => ({
     policySig: policySignature,
+    cacheGeneration,
     map: {},
     revisions: {},
   }));
@@ -92,22 +102,26 @@ export function useContentFilter({
     addons: DashboardSnapshot['addons'] | undefined;
     cached: FilterItemVerdict[] | undefined;
     policySig: string;
+    cacheGeneration: number;
   }>({
     addons: undefined,
     cached: undefined,
     policySig: policySignature,
+    cacheGeneration,
   });
 
   // Reconcile addon revisions and hydrate complete revision-matching cachedFilterVerdicts at t = 0ms
   if (
     snapshot?.addons !== hydrationTracker.addons ||
     snapshot?.cachedFilterVerdicts !== hydrationTracker.cached ||
-    policySignature !== hydrationTracker.policySig
+    policySignature !== hydrationTracker.policySig ||
+    cacheGeneration !== hydrationTracker.cacheGeneration
   ) {
     setHydrationTracker({
       addons: snapshot?.addons,
       cached: snapshot?.cachedFilterVerdicts,
       policySig: policySignature,
+      cacheGeneration,
     });
 
     const currentRevByKey = new Map<string, string>();
@@ -116,10 +130,14 @@ export function useContentFilter({
         currentRevByKey.set(addonFilterKey(addon.id), buildAddonRevisionHint(addon));
       }
     }
-    const cached = snapshot?.cachedFilterVerdicts ?? [];
+    const cached =
+      basePolicySignature === policySignature && snapshotCacheGeneration === cacheGeneration
+        ? snapshot?.cachedFilterVerdicts ?? []
+        : [];
 
     setVerdictStore((prev) => {
-      const samePolicy = prev.policySig === policySignature;
+      const samePolicy =
+        prev.policySig === policySignature && prev.cacheGeneration === cacheGeneration;
       const baseMap = samePolicy ? prev.map : {};
       const baseRevs = samePolicy ? prev.revisions : {};
       const nextMap = { ...baseMap };
@@ -128,10 +146,10 @@ export function useContentFilter({
 
       if (snapshot) {
         for (const key of Object.keys(nextMap)) {
-          if (!key.startsWith('addon:')) continue;
-          const currentRev = currentRevByKey.get(key);
-          const knownRev = nextRevs[key] ?? nextMap[key]?.revisionHint;
-          if (currentRev === undefined || knownRev !== currentRev) {
+          if (
+            filterVerdictExpiresAt(nextMap[key], filterConfig.mode) <= verdictsExpiredThrough ||
+            (key.startsWith('addon:') && nextMap[key].revisionHint !== currentRevByKey.get(key))
+          ) {
             delete nextMap[key];
             delete nextRevs[key];
             changed = true;
@@ -150,7 +168,11 @@ export function useContentFilter({
 
       for (const v of cached) {
         if (v.targetKey.startsWith('sandbox:')) continue;
-        if (v.complete === false || v.revisionHint == null) continue;
+        if (
+          v.complete === false ||
+          v.revisionHint == null ||
+          filterVerdictExpiresAt(v, filterConfig.mode) <= verdictsExpiredThrough
+        ) continue;
         const currentRev = currentRevByKey.get(v.targetKey);
         if (currentRev === undefined || v.revisionHint !== currentRev) {
           continue;
@@ -165,7 +187,9 @@ export function useContentFilter({
         }
       }
 
-      return changed ? { policySig: policySignature, map: nextMap, revisions: nextRevs } : prev;
+      return changed
+        ? { policySig: policySignature, cacheGeneration, map: nextMap, revisions: nextRevs }
+        : prev;
     });
   }
 
@@ -185,14 +209,10 @@ export function useContentFilter({
   }>(() => ({ policySig: policySignature, keys: new Set() }));
   const [evalRetryNonce, setEvalRetryNonce] = useState(0);
 
-  const filterVerdicts = useMemo(
-    () => (verdictStore.policySig === policySignature ? verdictStore.map : {}),
-    [verdictStore.policySig, verdictStore.map, policySignature],
-  );
-  const evaluatedRevisions = useMemo(
-    () => (verdictStore.policySig === policySignature ? verdictStore.revisions : {}),
-    [verdictStore.policySig, verdictStore.revisions, policySignature],
-  );
+  const verdictStoreIsCurrent =
+    verdictStore.policySig === policySignature && verdictStore.cacheGeneration === cacheGeneration;
+  const filterVerdicts = verdictStoreIsCurrent ? verdictStore.map : EMPTY_VERDICTS;
+  const evaluatedRevisions = verdictStoreIsCurrent ? verdictStore.revisions : EMPTY_REVISIONS;
   const revealedCardIds = useMemo(
     () => (revealedStore.policySig === policySignature ? revealedStore.keys : EMPTY_STRING_SET),
     [revealedStore, policySignature],
@@ -213,8 +233,7 @@ export function useContentFilter({
   const basePolicySigRef = useRef(basePolicySignature);
   const policySigRef = useRef(policySignature);
   const filterConfigRef = useRef(filterConfig);
-  const catalogServerUrlRef = useRef(catalogServerUrl);
-  const httpsOnlyRef = useRef(httpsOnly);
+  const cacheGenerationRef = useRef(cacheGeneration);
   const latestConfigRef = useRef<AppConfig | null>(snapshot?.config ?? null);
   const currentRevByKeyRef = useRef<Map<string, string>>(new Map());
   const prevEnabledRef = useRef(filterConfig.enabled);
@@ -226,16 +245,14 @@ export function useContentFilter({
   const failedTargetKeysRef = useRef<Set<string>>(new Set());
   const evaluatedRevisionsRef = useRef<Record<string, string>>({});
   const filterVerdictsRef = useRef<Record<string, FilterItemVerdict>>({});
-  const workshopRegistryRef = useRef<Map<string, WorkshopItemRecord>>(new Map());
+  const workshopRegistryRef = useRef<Map<string, FilterEvaluationTarget>>(new Map());
   const flushTimerRef = useRef<number | null>(null);
   const prevServiceStateRef = useRef<string | undefined>(undefined);
 
   useEffect(() => {
     basePolicySigRef.current = basePolicySignature;
     filterConfigRef.current = filterConfig;
-    catalogServerUrlRef.current = catalogServerUrl;
-    httpsOnlyRef.current = httpsOnly;
-  }, [basePolicySignature, catalogServerUrl, filterConfig, httpsOnly]);
+  }, [basePolicySignature, filterConfig]);
 
   useEffect(() => {
     if (snapshot?.config) {
@@ -252,8 +269,9 @@ export function useContentFilter({
   }, [snapshot?.addons]);
 
   useEffect(() => {
-    if (policySigRef.current !== policySignature) {
+    if (policySigRef.current !== policySignature || cacheGenerationRef.current !== cacheGeneration) {
       policySigRef.current = policySignature;
+      cacheGenerationRef.current = cacheGeneration;
       evalEpochRef.current += 1;
       activeBatchCountRef.current = 0;
       pendingTargetsRef.current.clear();
@@ -262,9 +280,11 @@ export function useContentFilter({
       failedTargetKeysRef.current = new Set();
       evaluatedRevisionsRef.current = {};
       filterVerdictsRef.current = {};
+      setFailedStore({ policySig: policySignature, keys: new Set() });
+      setRevealedStore({ policySig: policySignature, keys: new Set() });
       setFilterEvalError(null);
     }
-  }, [policySignature]);
+  }, [policySignature, cacheGeneration]);
 
   useEffect(() => {
     evaluatedRevisionsRef.current = { ...evaluatedRevisions };
@@ -295,20 +315,23 @@ export function useContentFilter({
   }, []);
 
   const adoptRuntimePolicySignature = useCallback((nextSig: string) => {
-    const prevSig = policySigRef.current;
-    if (!nextSig || nextSig === prevSig) return;
+    if (!nextSig || nextSig === policySigRef.current) return;
     policySigRef.current = nextSig;
-    const baseSig = basePolicySigRef.current;
-    setRuntimePolicyOverride({ baseSig, sig: nextSig });
-    setVerdictStore((prev) =>
-      prev.policySig === prevSig ? { ...prev, policySig: nextSig } : prev,
-    );
-    setRevealedStore((prev) =>
-      prev.policySig === prevSig ? { ...prev, policySig: nextSig } : prev,
-    );
-    setFailedStore((prev) =>
-      prev.policySig === prevSig ? { ...prev, policySig: nextSig } : prev,
-    );
+    pendingTargetsRef.current.clear();
+    failedSigsRef.current.clear();
+    failedTargetKeysRef.current = new Set();
+    evaluatedRevisionsRef.current = {};
+    filterVerdictsRef.current = {};
+    setRuntimePolicyOverride({ baseSig: basePolicySigRef.current, sig: nextSig });
+    setVerdictStore({
+      policySig: nextSig,
+      cacheGeneration: cacheGenerationRef.current,
+      map: {},
+      revisions: {},
+    });
+    setRevealedStore({ policySig: nextSig, keys: new Set() });
+    setFailedStore({ policySig: nextSig, keys: new Set() });
+    setFilterEvalError(null);
   }, []);
 
   const retryFailedEvaluations = useCallback(() => {
@@ -319,87 +342,118 @@ export function useContentFilter({
     setEvalRetryNonce((n) => n + 1);
   }, []);
 
-  const mergeVerdicts = useCallback(
-    (incoming: FilterItemVerdict[], completedRevisions?: Map<string, string>) => {
-      const storeableVerdicts: FilterItemVerdict[] = [];
-      const resolvedRevs = new Map<string, string>(completedRevisions ?? []);
+  const targetStillEligible = useCallback((targetKey: string, revision?: string) => {
+    const latest = snapshotRef?.current;
+    if (!isAutomaticFilterTargetEnabled(targetKey, latest?.config.filter ?? filterConfigRef.current)) {
+      return false;
+    }
+    if (targetKey.startsWith('addon:')) {
+      return revision !== undefined && currentRevByKeyRef.current.get(targetKey) === revision &&
+        !latest?.filterExclusions.some((entry) =>
+          entry.fingerprintValid && addonFilterKey(entry.addonId) === targetKey,
+        );
+    }
+    const registered = workshopRegistryRef.current.get(targetKey);
+    return !registered || registered.revisionHint === revision;
+  }, [snapshotRef]);
 
-      for (const v of incoming) {
-        if (v.targetKey.startsWith('sandbox:')) continue;
-        // Skip verdicts whose revisionHint is already outdated for a known local addon
-        if (
-          v.revisionHint != null &&
-          currentRevByKeyRef.current.has(v.targetKey) &&
-          currentRevByKeyRef.current.get(v.targetKey) !== v.revisionHint
-        ) {
-          continue;
-        }
-        const isComplete = v.complete !== false;
-        if (!isComplete && !v.flagged) {
-          // Never cache or treat an unflagged incomplete verdict as safe
-          continue;
-        }
-        storeableVerdicts.push(v);
-        if (isComplete && v.revisionHint != null && !resolvedRevs.has(v.targetKey)) {
-          resolvedRevs.set(v.targetKey, v.revisionHint);
+  const mergeVerdicts = useCallback((incoming: FilterItemVerdict[]) => {
+    const mode = filterConfigRef.current.mode;
+    const now = Date.now();
+    const relevant = incoming.filter((verdict) =>
+      !verdict.targetKey.startsWith('sandbox:') &&
+      targetStillEligible(verdict.targetKey, verdict.revisionHint) &&
+      (verdict.complete !== false || verdict.flagged) &&
+      filterVerdictExpiresAt(verdict, mode) > now,
+    );
+    if (relevant.length === 0) return;
+
+    const sig = policySigRef.current;
+    const generation = cacheGenerationRef.current;
+    const accepted: FilterItemVerdict[] = [];
+    for (const verdict of relevant) {
+      const existing = filterVerdictsRef.current[verdict.targetKey];
+      if (
+        existing &&
+        existing.revisionHint === verdict.revisionHint &&
+        Date.parse(existing.evaluatedAt) > Date.parse(verdict.evaluatedAt)
+      ) continue;
+      filterVerdictsRef.current[verdict.targetKey] = verdict;
+      accepted.push(verdict);
+      if (verdict.complete !== false && verdict.revisionHint != null) {
+        evaluatedRevisionsRef.current[verdict.targetKey] = verdict.revisionHint;
+      } else {
+        delete evaluatedRevisionsRef.current[verdict.targetKey];
+      }
+    }
+
+    setVerdictStore((prev) => {
+      if (policySigRef.current !== sig || cacheGenerationRef.current !== generation) return prev;
+      const samePolicy = prev.policySig === sig && prev.cacheGeneration === generation;
+      const map = { ...(samePolicy ? prev.map : {}) };
+      const revisions = { ...(samePolicy ? prev.revisions : {}) };
+      for (const verdict of accepted) {
+        const { targetKey } = verdict;
+        map[targetKey] = verdict;
+        if (verdict.complete !== false && verdict.revisionHint != null) {
+          revisions[targetKey] = verdict.revisionHint;
+        } else {
+          delete revisions[targetKey];
         }
       }
+      return { policySig: sig, cacheGeneration: generation, map, revisions };
+    });
+  }, [targetStillEligible]);
 
-      if (storeableVerdicts.length === 0 && resolvedRevs.size === 0) return;
+  const isCurrentEvaluation = useCallback((targetKey: string, revision: string) => {
+    const verdict = filterVerdictsRef.current[targetKey];
+    return evaluatedRevisionsRef.current[targetKey] === revision &&
+      verdict && filterVerdictExpiresAt(verdict, filterConfigRef.current.mode) > Date.now();
+  }, []);
+
+  useEffect(() => {
+    if (filterConfig.mode === 'local') return;
+    const expireVerdicts = () => {
+      const now = Date.now();
+      const expired = Object.keys(filterVerdictsRef.current).filter((key) =>
+        filterVerdictExpiresAt(filterVerdictsRef.current[key], filterConfig.mode) <= now,
+      );
+      if (expired.length === 0) return;
+      for (const key of expired) {
+        const verdict = filterVerdictsRef.current[key];
+        failedSigsRef.current.delete(`${policySigRef.current}::${key}::${verdict.revisionHint ?? ''}`);
+        delete filterVerdictsRef.current[key];
+        delete evaluatedRevisionsRef.current[key];
+      }
+      setVerdictsExpiredThrough(now);
       const sig = policySigRef.current;
-
-      // Eagerly update refs so microtasks never double-dispatch or re-enqueue
-      for (const v of storeableVerdicts) {
-        filterVerdictsRef.current[v.targetKey] = v;
-      }
-      for (const [key, rev] of resolvedRevs) {
-        if (!key.startsWith('sandbox:')) {
-          evaluatedRevisionsRef.current[key] = rev;
-        }
-      }
-
+      const generation = cacheGenerationRef.current;
       setVerdictStore((prev) => {
-        const baseMap = prev.policySig === sig ? prev.map : {};
-        const baseRevs = prev.policySig === sig ? prev.revisions : {};
-        let mapChanged = prev.policySig !== sig;
-        let revsChanged = prev.policySig !== sig;
-        const nextMap = { ...baseMap };
-        const nextRevs = { ...baseRevs };
-
-        for (const v of storeableVerdicts) {
-          const existing = baseMap[v.targetKey];
-          if (
-            !existing ||
-            existing.evaluatedAt !== v.evaluatedAt ||
-            existing.flagged !== v.flagged ||
-            existing.evaluatedScore !== v.evaluatedScore ||
-            existing.decisionSource !== v.decisionSource ||
-            existing.complete !== v.complete ||
-            existing.revisionHint !== v.revisionHint
-          ) {
-            nextMap[v.targetKey] = v;
-            mapChanged = true;
-          }
+        if (prev.policySig !== sig || prev.cacheGeneration !== generation) return prev;
+        const map = { ...prev.map };
+        const revisions = { ...prev.revisions };
+        for (const key of expired) {
+          if (!map[key] || filterVerdictExpiresAt(map[key], filterConfig.mode) > now) continue;
+          delete map[key];
+          delete revisions[key];
         }
-        for (const [key, rev] of resolvedRevs) {
-          if (!key.startsWith('sandbox:') && baseRevs[key] !== rev) {
-            nextRevs[key] = rev;
-            revsChanged = true;
-          }
-        }
-
-        if (!mapChanged && !revsChanged) {
-          return prev;
-        }
-        return {
-          policySig: sig,
-          map: mapChanged ? nextMap : baseMap,
-          revisions: revsChanged ? nextRevs : baseRevs,
-        };
+        return { ...prev, map, revisions };
       });
-    },
-    [],
-  );
+      setEvalRetryNonce((n) => n + 1);
+    };
+
+    const deadline = Object.values(filterVerdicts).reduce(
+      (soonest, verdict) => Math.min(soonest, filterVerdictExpiresAt(verdict, filterConfig.mode)),
+      Infinity,
+    );
+    if (!Number.isFinite(deadline)) return;
+    const timer = window.setTimeout(expireVerdicts, Math.max(0, deadline - Date.now()));
+    document.addEventListener('visibilitychange', expireVerdicts);
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('visibilitychange', expireVerdicts);
+    };
+  }, [filterConfig.mode, filterVerdicts]);
 
   const flushEvaluationQueue = useCallback(() => {
     if (flushTimerRef.current !== null) {
@@ -419,10 +473,7 @@ export function useContentFilter({
           pendingTargetsRef.current.delete(key);
           const rev = target.revisionHint ?? '';
           const itemSig = `${sigNow}::${target.targetKey}::${rev}`;
-          if (
-            target.targetKey in evaluatedRevisionsRef.current &&
-            evaluatedRevisionsRef.current[target.targetKey] === rev
-          ) {
+          if (!targetStillEligible(key, target.revisionHint) || isCurrentEvaluation(key, rev)) {
             continue;
           }
           if (inFlightSigsRef.current.has(itemSig) || failedSigsRef.current.has(itemSig)) {
@@ -453,18 +504,19 @@ export function useContentFilter({
         activeBatchCountRef.current += 1;
 
         void client
-          .evaluateFilterItems(chunk)
+          .evaluateFilterItems(chunk, true)
           .then((response) => {
-            if (evalEpochRef.current !== epoch) {
+            if (evalEpochRef.current !== epoch || dispatchSig !== policySigRef.current ||
+                (response.cacheGeneration ?? 0) !== cacheGenerationRef.current) {
               return;
             }
             if (response.policySignature && response.policySignature !== policySigRef.current) {
+              if (filterConfigRef.current.mode !== 'catalog') return;
               adoptRuntimePolicySignature(response.policySignature);
             }
             const sig = policySigRef.current;
 
             const completedVerdicts: FilterItemVerdict[] = [];
-            const completedRevisions = new Map<string, string>();
             const clearedKeys: string[] = [];
             const failedKeys: string[] = [];
             let explicitFailureMsg: string | null = null;
@@ -472,6 +524,7 @@ export function useContentFilter({
 
             for (const item of response.items) {
               const reqRev = requestedRevByKey.get(item.targetKey) ?? '';
+              if (!targetStillEligible(item.targetKey, reqRev)) continue;
               const itemSig = `${sig}::${item.targetKey}::${reqRev}`;
               const dispatchItemSig = `${dispatchSig}::${item.targetKey}::${reqRev}`;
 
@@ -479,10 +532,6 @@ export function useContentFilter({
                 const isComplete = item.complete !== false && item.verdict.complete !== false;
                 if (isComplete) {
                   completedVerdicts.push(item.verdict);
-                  completedRevisions.set(
-                    item.targetKey,
-                    item.verdict.revisionHint ?? reqRev,
-                  );
                   failedSigsRef.current.delete(itemSig);
                   failedSigsRef.current.delete(dispatchItemSig);
                   clearedKeys.push(item.targetKey);
@@ -490,13 +539,9 @@ export function useContentFilter({
                   failedSigsRef.current.add(itemSig);
                   if (item.verdict.flagged) {
                     completedVerdicts.push(item.verdict);
-                    clearedKeys.push(item.targetKey);
-                  } else {
-                    failedKeys.push(item.targetKey);
-                    if (!incompleteNoticeMsg) {
-                      incompleteNoticeMsg = tRef.current('filter.evalIncompleteRetry');
-                    }
                   }
+                  failedKeys.push(item.targetKey);
+                  incompleteNoticeMsg ??= tRef.current('filter.evalIncompleteRetry');
                 }
               } else {
                 failedSigsRef.current.add(itemSig);
@@ -530,16 +575,20 @@ export function useContentFilter({
               setFilterEvalError(null);
             }
 
-            mergeVerdicts(completedVerdicts, completedRevisions);
+            mergeVerdicts(completedVerdicts);
           })
           .catch((err) => {
             if (evalEpochRef.current !== epoch) return;
             const sig = policySigRef.current;
             const nextFailedSet = new Set(failedTargetKeysRef.current);
+            let hasEligibleTarget = false;
             for (const t of chunk) {
+              if (!targetStillEligible(t.targetKey, t.revisionHint)) continue;
+              hasEligibleTarget = true;
               failedSigsRef.current.add(`${sig}::${t.targetKey}::${t.revisionHint ?? ''}`);
               nextFailedSet.add(t.targetKey);
             }
+            if (!hasEligibleTarget) return;
             failedTargetKeysRef.current = nextFailedSet;
             setFailedStore({ policySig: sig, keys: nextFailedSet });
             setFilterEvalError(err instanceof Error ? err.message : String(err));
@@ -562,7 +611,9 @@ export function useContentFilter({
     };
 
     pump();
-  }, [adoptRuntimePolicySignature, client, mergeVerdicts, tRef]);
+  }, [
+    adoptRuntimePolicySignature, client, isCurrentEvaluation, mergeVerdicts, tRef, targetStillEligible,
+  ]);
 
   const enqueueTargets = useCallback(
     (targets: FilterEvaluationTarget[]) => {
@@ -573,10 +624,7 @@ export function useContentFilter({
       for (const target of targets) {
         const rev = target.revisionHint ?? '';
         const itemSig = `${sig}::${target.targetKey}::${rev}`;
-        if (
-          target.targetKey in evaluatedRevisionsRef.current &&
-          evaluatedRevisionsRef.current[target.targetKey] === rev
-        ) {
+        if (isCurrentEvaluation(target.targetKey, rev)) {
           continue;
         }
         if (inFlightSigsRef.current.has(itemSig) || failedSigsRef.current.has(itemSig)) {
@@ -594,7 +642,7 @@ export function useContentFilter({
         flushTimerRef.current = window.setTimeout(flushEvaluationQueue, EVAL_DEBOUNCE_MS);
       }
     },
-    [flushEvaluationQueue],
+    [flushEvaluationQueue, isCurrentEvaluation],
   );
 
   // Automatic Library evaluation (skipping addons with a valid fingerprint exclusion)
@@ -613,6 +661,7 @@ export function useContentFilter({
     enqueueTargets(targets);
   }, [
     enqueueTargets,
+    cacheGeneration,
     evalRetryNonce,
     exclusionsByAddonId,
     filterConfig.applyToLibrary,
@@ -626,22 +675,23 @@ export function useContentFilter({
     if (!filterConfig.enabled || !filterConfig.applyToWorkshop) {
       return;
     }
-    const items = Array.from(workshopRegistryRef.current.values());
-    if (items.length === 0) return;
-    enqueueTargets(items.map((item) => buildWorkshopFilterTarget(item)));
+    enqueueTargets(Array.from(workshopRegistryRef.current.values()));
   }, [
     enqueueTargets,
+    cacheGeneration,
     evalRetryNonce,
     filterConfig.applyToWorkshop,
     filterConfig.enabled,
     policySignature,
+    snapshot?.cachedFilterVerdicts,
   ]);
 
   const registerWorkshopItems = useCallback(
     (items: WorkshopItemRecord[]) => {
       if (items.length === 0) return;
-      for (const item of items) {
-        workshopRegistryRef.current.set(item.workshopId, item);
+      const targets = items.map((item) => buildWorkshopFilterTarget(item));
+      for (const target of targets) {
+        workshopRegistryRef.current.set(target.targetKey, target);
       }
       if (workshopRegistryRef.current.size > 160) {
         const keys = Array.from(workshopRegistryRef.current.keys());
@@ -650,38 +700,19 @@ export function useContentFilter({
         }
       }
       if (filterConfig.enabled && filterConfig.applyToWorkshop) {
-        enqueueTargets(items.map((item) => buildWorkshopFilterTarget(item)));
+        enqueueTargets(targets);
       }
     },
     [enqueueTargets, filterConfig.applyToWorkshop, filterConfig.enabled],
   );
 
   const handleFilterVerdictsUpdated = useCallback(
-    (verdicts: FilterItemVerdict[], eventPolicySignature?: string) => {
-      if (!eventPolicySignature) {
-        return;
+    (verdicts: FilterItemVerdict[], eventPolicySignature?: string, generation = 0) => {
+      if (eventPolicySignature === policySigRef.current && generation === cacheGenerationRef.current) {
+        mergeVerdicts(verdicts);
       }
-      if (eventPolicySignature !== policySigRef.current) {
-        const scoringRev = verdicts.find((v) => v.probabilities.scoringRevision)?.probabilities
-          .scoringRevision;
-        const filterNow = filterConfigRef.current;
-        const expectedCatalogSig =
-          scoringRev && filterNow.mode === 'catalog'
-            ? computeFilterPolicySignature(filterNow, {
-                catalogServerUrl: catalogServerUrlRef.current,
-                httpsOnly: httpsOnlyRef.current,
-                catalogScoringRevision: scoringRev,
-              })
-            : null;
-        if (expectedCatalogSig && expectedCatalogSig === eventPolicySignature) {
-          adoptRuntimePolicySignature(eventPolicySignature);
-        } else {
-          return;
-        }
-      }
-      mergeVerdicts(verdicts);
     },
-    [adoptRuntimePolicySignature, mergeVerdicts],
+    [mergeVerdicts],
   );
 
   const handleLocalFilterStatusChanged = useCallback(
@@ -707,7 +738,11 @@ export function useContentFilter({
     });
   }, []);
 
-  const resetLocalVerdicts = useCallback(() => {
+  const resetLocalVerdicts = useCallback((generation?: number) => {
+    if (generation != null) {
+      cacheGenerationRef.current = Math.max(cacheGenerationRef.current, generation);
+      setCacheGenerationFloor((floor) => Math.max(floor, generation));
+    }
     evalEpochRef.current += 1;
     activeBatchCountRef.current = 0;
     pendingTargetsRef.current.clear();
@@ -717,7 +752,12 @@ export function useContentFilter({
     evaluatedRevisionsRef.current = {};
     filterVerdictsRef.current = {};
     setFilterEvalError(null);
-    setVerdictStore({ policySig: policySigRef.current, map: {}, revisions: {} });
+    setVerdictStore({
+      policySig: policySigRef.current,
+      cacheGeneration: cacheGenerationRef.current,
+      map: {},
+      revisions: {},
+    });
     setRevealedStore({ policySig: policySigRef.current, keys: new Set() });
     setFailedStore({ policySig: policySigRef.current, keys: new Set() });
     setEvalRetryNonce((n) => n + 1);
@@ -843,12 +883,7 @@ export function useContentFilter({
       try {
         const status = await client.setFilterLlmToken(token);
         setFilterTokenStatus(status);
-        const latestLlmEnabled =
-          (snapshotRef?.current?.config ?? latestConfigRef.current)?.filter.llmEnabled ??
-          filterConfig.llmEnabled;
-        if (latestLlmEnabled) {
-          resetLocalVerdicts();
-        }
+        resetLocalVerdicts(status.cacheGeneration);
         notify(
           token ? tRef.current('filter.toastTokenSaved') : tRef.current('filter.toastTokenCleared'),
         );
@@ -860,14 +895,14 @@ export function useContentFilter({
         setBusy(false);
       }
     },
-    [client, filterConfig.llmEnabled, notify, resetLocalVerdicts, setBusy, snapshotRef, tRef],
+    [client, notify, resetLocalVerdicts, setBusy, tRef],
   );
 
   const clearFilterCache = useCallback(async () => {
     setBusy(true);
     try {
-      const count = await client.clearFilterCache();
-      resetLocalVerdicts();
+      const { count, cacheGeneration: generation } = await client.clearFilterCache();
+      resetLocalVerdicts(generation);
       notify(tRef.current('filter.toastCacheCleared', { count }));
       return count;
     } catch (err) {

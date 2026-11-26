@@ -4,6 +4,7 @@ import {
   type ClientFilterConfig,
   type DashboardSnapshot,
   type DeployLocalFilterRequest,
+  type FilterCacheClearResult,
   type FilterCommitInfo,
   type FilterDecisionSource,
   type FilterEvaluationBatchResponse,
@@ -21,6 +22,8 @@ import {
   adjustProbabilities,
   computeFilterPolicySignature,
   createDefaultModelParams,
+  filterVerdictExpiresAt,
+  isAutomaticFilterTargetEnabled,
   sanitizeModelParams,
   scoreForTarget,
   type FilterPolicySignatureOptions,
@@ -117,11 +120,18 @@ export function upsertPreviewFilterExclusion(
   request: UpsertFilterExclusionRequest,
 ): DashboardSnapshot {
   const addon = state.addons.find((a) => a.id === request.addonId);
+  if (!addon) throw new IpcError('not_found', 'Addon not found');
   const now = new Date().toISOString();
-  const activeHash = addon?.installState === 'installed' ? addon.contentHash : undefined;
-  const bindFingerprint = Boolean(request.bindFingerprint && activeHash);
-  const boundFingerprint = bindFingerprint ? activeHash : undefined;
+  const activeHash = addon.installState === 'installed' ? addon.contentHash : undefined;
   const existingIdx = state.filterExclusions.findIndex((e) => e.addonId === request.addonId);
+  const existing = state.filterExclusions[existingIdx];
+  if (request.bindFingerprint && !activeHash) {
+    throw new IpcError('invalid_input', 'No installed VPK fingerprint');
+  }
+  const bindFingerprint = request.bindFingerprint ?? existing?.bindFingerprint ?? false;
+  const boundFingerprint = request.bindFingerprint === undefined
+    ? existing?.boundFingerprint
+    : request.bindFingerprint ? activeHash : undefined;
 
   const nextRecord: FilterExclusionRecord = {
     addonId: request.addonId,
@@ -129,7 +139,7 @@ export function upsertPreviewFilterExclusion(
     bindFingerprint,
     boundFingerprint,
     currentFingerprint: activeHash,
-    fingerprintValid: !bindFingerprint || Boolean(boundFingerprint),
+    fingerprintValid: !bindFingerprint || Boolean(boundFingerprint && activeHash === boundFingerprint),
     note: request.note?.trim() || undefined,
     createdAt: existingIdx >= 0 ? state.filterExclusions[existingIdx].createdAt : now,
     updatedAt: now,
@@ -159,6 +169,7 @@ export class PreviewFilterRuntime {
   private status: LocalFilterDeploymentStatus = this.createInitialStatus();
   private hasEncryptedToken = false;
   private cache = new Map<string, FilterItemVerdict>();
+  cacheGeneration = 0;
 
   private createInitialStatus(): LocalFilterDeploymentStatus {
     return {
@@ -189,6 +200,7 @@ export class PreviewFilterRuntime {
     this.status = this.createInitialStatus();
     this.hasEncryptedToken = false;
     this.cache.clear();
+    this.cacheGeneration = 0;
   }
 
   getStatus(): LocalFilterDeploymentStatus {
@@ -203,7 +215,7 @@ export class PreviewFilterRuntime {
     const prefix = `${policySig}::`;
     const out: FilterItemVerdict[] = [];
     for (const [cacheKey, verdict] of this.cache) {
-      if (cacheKey.startsWith(prefix)) {
+      if (cacheKey.startsWith(prefix) && filterVerdictExpiresAt(verdict, state.config.filter.mode) > Date.now()) {
         out.push(structuredClone(verdict));
       }
     }
@@ -258,7 +270,7 @@ export class PreviewFilterRuntime {
       this.status.stageMessage = `Deployed ${targetCommit.shortSha} (service stopped)`;
     }
 
-    this.cache.clear();
+    this.clearCache();
     emit({ type: 'local_filter_status_changed', status: this.getStatus() });
     return this.getStatus();
   }
@@ -290,18 +302,26 @@ export class PreviewFilterRuntime {
       hasEncryptedToken: this.hasEncryptedToken,
       envVarName: config.llmTokenEnvVar?.trim() || DEFAULT_LLM_TOKEN_ENV_VAR,
       envVarPresent: false,
+      cacheGeneration: this.cacheGeneration,
     };
   }
 
   setLlmToken(token: string | null, config: ClientFilterConfig): FilterTokenStatus {
     this.hasEncryptedToken = Boolean(token && token.trim().length > 0);
+    this.cacheGeneration += 1;
+    for (const [key, verdict] of this.cache) {
+      if (verdict.decisionSource === 'llm_flagged_true' || verdict.decisionSource === 'llm_flagged_false') {
+        this.cache.delete(key);
+      }
+    }
     return this.getTokenStatus(config);
   }
 
-  clearCache(): number {
+  clearCache(): FilterCacheClearResult {
     const count = this.cache.size;
     this.cache.clear();
-    return count;
+    this.cacheGeneration += 1;
+    return { count, cacheGeneration: this.cacheGeneration };
   }
 
   evaluateItems(
@@ -309,6 +329,7 @@ export class PreviewFilterRuntime {
     config: ClientFilterConfig,
     emit: PreviewEmit,
     policyOptions?: FilterPolicySignatureOptions,
+    automatic = false,
   ): FilterEvaluationBatchResponse {
     if (config.mode === 'local' && this.status.serviceState !== 'running') {
       throw new IpcError('config', 'Local Left4Filters service is not running');
@@ -318,16 +339,26 @@ export class PreviewFilterRuntime {
     const params =
       config.mode === 'local'
         ? sanitizeModelParams(config.localParams)
-        : createDefaultModelParams();
+        : {
+            ...createDefaultModelParams(),
+            maxImages: config.mode === 'custom_endpoint'
+              ? sanitizeModelParams(config.localParams).maxImages
+              : createDefaultModelParams().maxImages,
+          };
 
     const items: FilterEvaluationItemResult[] = [];
     const emittedVerdicts: FilterItemVerdict[] = [];
 
     for (const target of targets) {
+      if (automatic && !isAutomaticFilterTargetEnabled(target.targetKey, config)) {
+        items.push({ targetKey: target.targetKey, status: 'failed', error: 'Content filtering is disabled for this scope' });
+        continue;
+      }
       const cacheKey = `${policySig}::${target.targetKey}`;
       if (!target.bypassCache) {
         const hit = this.cache.get(cacheKey);
-        if (hit && hit.complete !== false && (hit.revisionHint ?? '') === (target.revisionHint ?? '')) {
+        if (hit && hit.complete !== false && (hit.revisionHint ?? '') === (target.revisionHint ?? '') &&
+            filterVerdictExpiresAt(hit, config.mode) > Date.now()) {
           const cloned = structuredClone(hit);
           items.push({
             targetKey: target.targetKey,
@@ -530,10 +561,12 @@ export class PreviewFilterRuntime {
         type: 'filter_verdicts_updated',
         verdicts: structuredClone(emittedVerdicts),
         policySignature: policySig,
+        cacheGeneration: this.cacheGeneration,
       });
     }
     return {
       policySignature: policySig,
+      cacheGeneration: this.cacheGeneration,
       items,
     };
   }

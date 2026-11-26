@@ -3,6 +3,7 @@ import { AlertTriangle, Eye, FolderOpen, Map as MapIcon, X } from 'lucide-react'
 import type { AddonNamePreference, AddonSummary } from '../../../api/ipc';
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import {
+  getFilteredAddonFallbackCover,
   addonFilterKey,
   formatDiagnosticVerdictBadge,
   formatRedactedAddonLabel,
@@ -137,7 +138,7 @@ export function OrganizeMemberRow({
           <AddonCover
             compact
             src={addon.coverImage}
-            fallbackSrc={addon.localCoverImage}
+            fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
             title={resolvedLabel}
             category={addon.categories[0]}
             filterMode={cardFilter.coverMode}

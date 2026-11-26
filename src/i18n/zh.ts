@@ -599,6 +599,7 @@ export const zh = {
       stopServiceBtn: '停止本地推理服务',
       refreshStatusBtn: '刷新状态',
       paramsTitle: '本地模型参数与校准预设',
+      customEndpointParamsHint: '模型、输入模态和校准参数由自定义端点控制。',
       catalogParamsBanner:
         '当前使用 Catalog 服务端过滤源：模型线程、图像聚合及校准权重均由 Catalog 服务端统一控制，客户端不会覆盖服务端模型参数。',
       preset: '参数预设',
@@ -642,8 +643,7 @@ export const zh = {
         '低于复核阈值直接放行；介于复核阈值与直接标记阈值之间交由大模型二次裁决；达到直接标记阈值立即拦截。',
       routingThresholdOverlapWarning:
         '注意：大模型复核阈值大于或等于直接标记阈值，疑似复核区间为空，达到直接标记阈值的条目将直接拦截而不会触发大模型复核。',
-      routingBothDisabledWarning:
-        '注意：高分直接标记与外部大模型复核均已关闭，系统将回退为按直接标记阈值进行基础模型判定。',
+      routingBothDisabledWarning: '高分直接标记和大模型复核均已关闭，所有条目都会放行。',
       llmEndpoint: 'OpenAI 兼容接口地址',
       llmModel: '模型名称',
       llmSendImages: '向多模态大模型附带预览图片',

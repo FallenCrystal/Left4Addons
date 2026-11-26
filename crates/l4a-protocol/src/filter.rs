@@ -3,6 +3,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_FILTER_REPO_URL: &str = "https://github.com/FallenCrystal/Left4Filters.git";
+pub const CATALOG_FILTER_MAX_BODY_BYTES: usize = 48 * 1024 * 1024;
+pub const CATALOG_FILTER_IMAGE_FETCH_FAILED: &str = "image_fetch_failed";
+pub const FILTER_REMOTE_VERDICT_MAX_AGE_SECS: i64 = 3_600;
 pub const DEFAULT_LLM_ENDPOINT: &str = "https://api.openai.com/v1";
 pub const DEFAULT_LLM_MODEL: &str = "gpt-4o-mini";
 pub const DEFAULT_LLM_TOKEN_ENV_VAR: &str = "L4A_LLM_API_KEY";
@@ -408,6 +411,75 @@ pub struct FilterProbabilities {
     pub scoring_revision: Option<String>,
 }
 
+/// Private scoring response from the managed runner. Raw rows are used only to
+/// combine byte-budget subbatches and never serialized by the public Catalog API.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedFilterPrediction {
+    #[serde(flatten)]
+    pub probabilities: FilterProbabilities,
+    #[serde(default)]
+    pub image_rows: Vec<[f32; 3]>,
+    #[serde(default)]
+    pub joint_rows: Vec<[f32; 3]>,
+}
+
+pub fn aggregate_gallery_triplets(rows: &[[f32; 3]], mode: FilterGalleryAggregation) -> [f32; 3] {
+    if rows.is_empty() {
+        return [0.0; 3];
+    }
+    std::array::from_fn(|col| match mode {
+        FilterGalleryAggregation::Max => rows.iter().map(|r| r[col]).fold(0.0, f32::max),
+        FilterGalleryAggregation::Mean => {
+            rows.iter().map(|r| r[col]).sum::<f32>() / rows.len() as f32
+        }
+        FilterGalleryAggregation::Top2Mean => {
+            let mut values: Vec<_> = rows.iter().map(|r| r[col]).collect();
+            values.sort_unstable_by(|a, b| b.total_cmp(a));
+            let top = &values[..values.len().min(2)];
+            top.iter().sum::<f32>() / top.len() as f32
+        }
+    })
+}
+
+pub fn merge_managed_predictions(
+    mut parts: Vec<(usize, ManagedFilterPrediction)>,
+    params: &FilterModelParams,
+) -> Option<FilterProbabilities> {
+    let has_missing_rows = parts
+        .iter()
+        .any(|(count, part)| part.image_rows.len() != *count || part.joint_rows.len() != *count);
+    if has_missing_rows && parts.len() > 1 {
+        return None;
+    }
+    let mut probabilities = std::mem::take(&mut parts.first_mut()?.1.probabilities);
+    if parts.len() == 1 && (parts[0].0 == 0 || has_missing_rows) {
+        return Some(probabilities);
+    }
+    let mut image_rows = Vec::new();
+    let mut joint_rows = Vec::new();
+    for (_, part) in parts {
+        image_rows.extend(part.image_rows);
+        joint_rows.extend(part.joint_rows);
+    }
+    let [ov, g, n] = aggregate_gallery_triplets(&joint_rows, params.gallery_aggregation);
+    (
+        probabilities.prob,
+        probabilities.gore_prob,
+        probabilities.nsfw_prob,
+    ) = params.adjust_triplet(ov, g, n);
+    let [ov, g, n] = aggregate_gallery_triplets(&image_rows, params.gallery_aggregation);
+    let (ov, g, n) = params.adjust_triplet(ov, g, n);
+    probabilities.image_prob = Some(ov);
+    probabilities.image_gore_prob = Some(g);
+    probabilities.image_nsfw_prob = Some(n);
+    probabilities.per_image_probs = image_rows
+        .into_iter()
+        .map(|[ov, g, n]| params.adjust_triplet(ov, g, n).0)
+        .collect();
+    Some(probabilities)
+}
+
 impl FilterProbabilities {
     pub fn score_for(&self, target: FilterScoreTarget) -> f32 {
         match target {
@@ -692,6 +764,15 @@ pub struct FilterTokenStatus {
     pub has_encrypted_token: bool,
     pub env_var_name: String,
     pub env_var_present: bool,
+    #[serde(default)]
+    pub cache_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCacheClearResult {
+    pub count: u64,
+    pub cache_generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -790,8 +871,9 @@ pub struct FilterExclusionRecord {
 pub struct UpsertFilterExclusionRequest {
     pub addon_id: AddonId,
     pub display_level: ExclusionDisplayLevel,
-    #[serde(default)]
-    pub bind_fingerprint: bool,
+    /// An omitted value preserves the existing binding on a display-only edit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_fingerprint: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -848,8 +930,7 @@ pub struct FilterItemVerdict {
     /// Original slot indices in `FilterEvaluationTarget.image_sources` marked sensitive.
     #[serde(default)]
     pub sensitive_image_indices: Vec<usize>,
-    /// `true` when all candidate media loaded and the verdict is complete/cacheable; `false` when
-    /// e.g. a preview image failed to load on a non-flagged item so the UI should keep it retryable.
+    /// Whether all selected media were scored and the verdict can be reused.
     #[serde(default = "default_true")]
     pub complete: bool,
     pub evaluated_at: DateTime<Utc>,
@@ -884,6 +965,8 @@ pub struct FilterEvaluationItemResult {
 #[serde(rename_all = "camelCase")]
 pub struct FilterEvaluationBatchResponse {
     pub policy_signature: String,
+    #[serde(default)]
+    pub cache_generation: u64,
     pub items: Vec<FilterEvaluationItemResult>,
 }
 
@@ -919,29 +1002,39 @@ impl ClientFilterConfig {
                 catalog_scoring_revision.unwrap_or("unverified")
             ),
             ClientFilterSourceMode::CustomEndpoint => format!(
-                "custom:url={}:https={}",
+                "custom:url={}:https={}:max={}",
                 self.custom_endpoint_url
                     .as_deref()
                     .unwrap_or("")
                     .trim()
                     .trim_end_matches('/'),
-                https_only
+                https_only,
+                p.max_images
             ),
         };
         let llm_part = if self.llm_enabled {
             format!(
-                "1:t={:.4}:ep={}:m={}:img={}:sys={}",
+                "1:t={:.4}:ep={}:m={}:img={}:sys={}:token={}:env={}",
                 self.llm_threshold,
                 self.llm_endpoint.trim().trim_end_matches('/'),
                 self.llm_model.trim(),
                 self.llm_send_images,
-                fnv1a_hex(self.llm_system_prompt.trim().as_bytes())
+                fnv1a_hex(self.llm_system_prompt.trim().as_bytes()),
+                match self.llm_token_source {
+                    LlmTokenSource::EnvVar => "env_var",
+                    LlmTokenSource::EncryptedLocal => "encrypted_local",
+                },
+                if self.llm_token_source == LlmTokenSource::EnvVar {
+                    self.llm_token_env_var.trim()
+                } else {
+                    ""
+                }
             )
         } else {
             "0".to_string()
         };
         let raw = format!(
-            "v2|{mode_part}|st={:?}|df={}:{:.4}|llm={llm_part}|sub={}:{:.4}",
+            "v3|{mode_part}|st={:?}|df={}:{:.4}|llm={llm_part}|sub={}:{:.4}",
             self.score_target,
             self.enable_direct_flag,
             self.flag_threshold,

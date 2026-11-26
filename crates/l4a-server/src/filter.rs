@@ -4,9 +4,9 @@ use crate::db::ServerRepo;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use l4a_protocol::{
-    CatalogFilterBackendKind, CatalogFilterPublicInfo, CatalogFilterStatus,
-    FilterGalleryAggregation, FilterModelParams, FilterPredictRequest, FilterProbabilities,
-    RawFilterPredictRequest, WorkshopItemStatus,
+    aggregate_gallery_triplets, merge_managed_predictions, CatalogFilterBackendKind,
+    CatalogFilterPublicInfo, CatalogFilterStatus, FilterModelParams, FilterPredictRequest,
+    FilterProbabilities, ManagedFilterPrediction, RawFilterPredictRequest, WorkshopItemStatus,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, RwLock as AsyncRwLock, Semaphore};
 use url::{Host, Url};
 
 const FILTER_RUNNER_PY: &str = include_str!("../../filter-assets/filter_runner.py");
@@ -47,6 +47,7 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(10);
 const PREDICT_TIMEOUT: Duration = Duration::from_secs(20);
 const CRASH_RESTART_BACKOFF: Duration = Duration::from_secs(3);
+const UPSTREAM_HEALTH_TTL: Duration = Duration::from_secs(60);
 const MAX_STDERR_BYTES: usize = 8 * 1024;
 const MAX_READY_LINE_BYTES: usize = 64 * 1024;
 const MAX_BACKEND_RESPONSE_BYTES: usize = 64 * 1024;
@@ -61,6 +62,10 @@ pub enum FilterServiceError {
     NotFound(String),
     #[error("{0}")]
     BadRequest(String),
+    #[error("{0}")]
+    ImageFetch(String),
+    #[error("内容过滤评分配置已更新，请重试")]
+    ScoringChanged,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -77,6 +82,7 @@ struct RuntimeSnapshot {
     last_scoring_signature: Option<String>,
     backoff_config: Option<FilterSection>,
     next_retry_after: Option<Instant>,
+    upstream_verified_at: Option<Instant>,
     last_crash_respawn_at: Option<Instant>,
     ready: bool,
     running_pid: Option<u32>,
@@ -84,6 +90,21 @@ struct RuntimeSnapshot {
     model_name: Option<String>,
     model_version: Option<String>,
     last_error: Option<String>,
+}
+
+impl RuntimeSnapshot {
+    fn initialization_is_current(&self, cfg: &FilterSection) -> bool {
+        if self.initialized_config.as_ref() == Some(cfg) {
+            return !cfg.enabled
+                || cfg.backend != CatalogFilterBackendKind::UpstreamHttp
+                || self
+                    .upstream_verified_at
+                    .is_some_and(|at| at.elapsed() < UPSTREAM_HEALTH_TTL);
+        }
+        cfg.enabled
+            && self.backoff_config.as_ref() == Some(cfg)
+            && self.next_retry_after.is_some_and(|at| Instant::now() < at)
+    }
 }
 
 struct ManagedPythonHandle {
@@ -129,6 +150,8 @@ pub struct CatalogFilterService {
     config_store: Arc<CatalogConfigStore>,
     repo: Arc<ServerRepo>,
     lifecycle_lock: AsyncMutex<Option<ManagedPythonHandle>>,
+    backend_execution: AsyncRwLock<()>,
+    backend_generation: AtomicU64,
     public_admission_semaphore: Arc<Semaphore>,
     public_admission_timeout_ms: AtomicU64,
     predict_semaphore: Semaphore,
@@ -169,6 +192,8 @@ impl CatalogFilterService {
             config_store,
             repo,
             lifecycle_lock: AsyncMutex::new(None),
+            backend_execution: AsyncRwLock::new(()),
+            backend_generation: AtomicU64::new(0),
             public_admission_semaphore: Arc::new(Semaphore::new(MAX_PUBLIC_PREDICT_ADMISSIONS)),
             public_admission_timeout_ms: AtomicU64::new(DEFAULT_PUBLIC_ADMISSION_TIMEOUT_MS),
             predict_semaphore: Semaphore::new(MAX_CONCURRENT_PREDICTS),
@@ -199,8 +224,8 @@ impl CatalogFilterService {
         self.config_store.get().filter.enabled
     }
 
-    /// Acquires a bounded public admission permit before reading/buffering `/api/v1/filter/predict` bodies.
-    pub async fn acquire_public_admission(&self) -> Option<OwnedSemaphorePermit> {
+    /// Both prediction routes share admission slots, including while reading their bodies.
+    pub async fn acquire_request_admission(&self) -> Option<OwnedSemaphorePermit> {
         let timeout_ms = self.public_admission_timeout_ms.load(Ordering::Acquire);
         let sem = self.public_admission_semaphore.clone();
         if timeout_ms == 0 {
@@ -222,6 +247,8 @@ impl CatalogFilterService {
     /// Gracefully terminates any managed Python filter runner child process on server shutdown.
     pub async fn shutdown(&self) {
         let mut guard = self.lifecycle_lock.lock().await;
+        let _execution = self.backend_execution.write().await;
+        self.backend_generation.fetch_add(1, Ordering::AcqRel);
         if let Some(mut handle) = guard.take() {
             handle.terminate().await;
         }
@@ -258,6 +285,7 @@ impl CatalogFilterService {
 
         self.ensure_initialized().await;
         self.refresh_managed_liveness();
+        let _execution = self.backend_execution.read().await;
         let cfg = self.current_filter_section();
         let params = cfg.params();
         if !cfg.enabled {
@@ -271,16 +299,19 @@ impl CatalogFilterService {
             };
         }
         let snap = self.runtime.read().unwrap().clone();
-        let scoring_revision = Some(compute_scoring_revision(
-            &cfg,
-            snap.model_name.as_deref(),
-            snap.model_version.as_deref(),
-        ));
+        let ready = snap.ready && snap.initialized_config.as_ref() == Some(&cfg);
+        let scoring_revision = ready.then(|| {
+            compute_scoring_revision(
+                &cfg,
+                snap.model_name.as_deref(),
+                snap.model_version.as_deref(),
+            )
+        });
         CatalogFilterPublicInfo {
             enabled: true,
-            ready: snap.ready,
-            model_name: snap.model_name,
-            model_version: snap.model_version,
+            ready,
+            model_name: ready.then_some(snap.model_name).flatten(),
+            model_version: ready.then_some(snap.model_version).flatten(),
             max_images: params.max_images,
             scoring_revision,
         }
@@ -292,11 +323,12 @@ impl CatalogFilterService {
             self.ensure_initialized().await;
             self.refresh_managed_liveness();
         }
+        let _execution = self.backend_execution.read().await;
         let cfg = self.current_filter_section();
         let snap = self.runtime.read().unwrap().clone();
         CatalogFilterStatus {
             config: cfg.to_dto(),
-            ready: cfg.enabled && snap.ready,
+            ready: cfg.enabled && snap.ready && snap.initialized_config.as_ref() == Some(&cfg),
             running_pid: if cfg.enabled { snap.running_pid } else { None },
             active_endpoint: if cfg.enabled {
                 snap.active_endpoint
@@ -340,16 +372,23 @@ impl CatalogFilterService {
         &self,
         req: FilterPredictRequest,
     ) -> Result<FilterProbabilities, FilterServiceError> {
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        validate_predict_request_bounds(&req)?;
+        match self.predict_once(&req).await {
+            Err(FilterServiceError::ScoringChanged) => self.predict_once(&req).await,
+            result => result,
+        }
+    }
+
+    async fn predict_once(
+        &self,
+        req: &FilterPredictRequest,
+    ) -> Result<FilterProbabilities, FilterServiceError> {
         if !self.is_enabled() {
             return Err(FilterServiceError::Disabled(
                 "内容过滤服务未启用".to_string(),
             ));
         }
-
-        self.total_requests.fetch_add(1, Ordering::Relaxed);
-
-        // 1. Enforce strict input bounds on caller-supplied text and image list counts upfront.
-        validate_predict_request_bounds(&req)?;
 
         self.ensure_initialized().await;
         self.refresh_managed_liveness();
@@ -408,9 +447,9 @@ impl CatalogFilterService {
         let has_req_tags = !req.tags.is_empty();
         let has_req_text = has_req_title || has_req_desc || has_req_tags;
 
-        let mut title = req.title.unwrap_or_default();
-        let mut description = req.description.unwrap_or_default();
-        let mut tags = req.tags;
+        let mut title = req.title.clone().unwrap_or_default();
+        let mut description = req.description.clone().unwrap_or_default();
+        let mut tags = req.tags.clone();
         let mut db_preview_urls: Vec<Url> = Vec::new();
 
         if let Some(wid) = req.workshop_id {
@@ -483,7 +522,8 @@ impl CatalogFilterService {
         };
 
         // 5. Verify backend availability before serving or caching.
-        let (endpoint, backend_kind, scoring_revision) = {
+        let (endpoint, scoring_revision, generation, cache_key) = {
+            let _execution = self.backend_execution.read().await;
             let snap = self.runtime.read().unwrap();
             if !snap.ready {
                 let detail = snap
@@ -494,6 +534,9 @@ impl CatalogFilterService {
                 return Err(FilterServiceError::Unavailable(format!(
                     "内容过滤模型后端暂不可用: {detail}"
                 )));
+            }
+            if snap.initialized_config.as_ref() != Some(&cfg) {
+                return Err(FilterServiceError::ScoringChanged);
             }
             let Some(ref ep) = snap.active_endpoint else {
                 self.failed_requests.fetch_add(1, Ordering::Relaxed);
@@ -506,33 +549,40 @@ impl CatalogFilterService {
                 snap.model_name.as_deref(),
                 snap.model_version.as_deref(),
             );
-            (ep.clone(), cfg.backend, rev)
-        };
-
-        // 6. Check in-memory TTL cache.
-        let cache_ttl = Duration::from_secs(cfg.cache_ttl_secs);
-        let cache_key = compute_cache_key(
-            &cfg,
-            &scoring_revision,
-            &effective_title,
-            &effective_desc,
-            &effective_tags,
-            &decoded_b64_images,
-            &effective_req_urls,
-            &effective_db_urls,
-        );
-        if !cache_ttl.is_zero() {
-            if let Some(mut hit) = self.get_cached(&cache_key, cache_ttl) {
-                hit.scoring_revision = Some(scoring_revision);
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Ok(hit);
+            // Check the cache while the backend and its revision are still verified.
+            let cache_key = compute_cache_key(
+                &cfg,
+                &rev,
+                &effective_title,
+                &effective_desc,
+                &effective_tags,
+                &decoded_b64_images,
+                &effective_req_urls,
+                &effective_db_urls,
+            );
+            if cfg.cache_ttl_secs > 0 {
+                if let Some(hit) =
+                    self.get_cached(&cache_key, Duration::from_secs(cfg.cache_ttl_secs))
+                {
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(hit);
+                }
             }
-        }
+            (
+                ep.clone(),
+                rev,
+                self.backend_generation.load(Ordering::Acquire),
+                cache_key,
+            )
+        };
 
         // 7. Fetch remote images (strictly SSRF-checked + header/dimension bomb validated).
         let mut final_images = decoded_b64_images;
         for url in &effective_req_urls {
-            let bytes = self.fetch_allowed_image(url, allow_loopback).await?;
+            let bytes = self
+                .fetch_allowed_image(url, allow_loopback)
+                .await
+                .map_err(|err| FilterServiceError::ImageFetch(err.to_string()))?;
             final_images.push(bytes);
         }
         let mut db_image_fetch_failed = false;
@@ -546,14 +596,20 @@ impl CatalogFilterService {
             }
         }
 
-        // 8. Dispatch inference to backend (`ManagedPython` or `UpstreamHttp`), gated by semaphore.
+        // Hold the backend generation through every inference call, including gallery subbatches.
+        let _execution = self.backend_execution.read().await;
+        if self.backend_generation.load(Ordering::Acquire) != generation
+            || self.current_filter_section() != cfg
+        {
+            return Err(FilterServiceError::ScoringChanged);
+        }
         let has_txt = !effective_title.trim().is_empty()
             || !effective_desc.trim().is_empty()
             || !effective_tags.is_empty();
         let mut probabilities = if !has_txt && final_images.is_empty() {
             FilterProbabilities::default()
         } else {
-            match backend_kind {
+            match cfg.backend {
                 // ManagedPython runner already applies `FilterModelParams` calibration & unimodal breakdown.
                 CatalogFilterBackendKind::ManagedPython => {
                     self.predict_batched_backend(
@@ -562,7 +618,7 @@ impl CatalogFilterService {
                         &effective_desc,
                         &effective_tags,
                         &final_images,
-                        params.gallery_aggregation,
+                        &params,
                     )
                     .await?
                 }
@@ -581,13 +637,12 @@ impl CatalogFilterService {
                         let encoded_images: Vec<String> =
                             final_images.iter().map(|b| BASE64_STD.encode(b)).collect();
                         let mut raw_probs = self
-                            .predict_batched_backend(
+                            .call_backend_predict(
                                 &endpoint,
                                 &effective_title,
                                 &effective_desc,
                                 &effective_tags,
-                                &final_images,
-                                params.gallery_aggregation,
+                                &encoded_images,
                             )
                             .await?;
                         self.backfill_upstream_unimodal(
@@ -610,9 +665,14 @@ impl CatalogFilterService {
                 }
             }
         };
+        let snap = self.runtime.read().unwrap();
+        if !snap.ready || self.backend_generation.load(Ordering::Acquire) != generation {
+            return Err(FilterServiceError::ScoringChanged);
+        }
         probabilities.scoring_revision = Some(scoring_revision);
 
         // Never cache degraded partial text-only results when a DB preview image failed transiently!
+        let cache_ttl = Duration::from_secs(cfg.cache_ttl_secs);
         if !cache_ttl.is_zero() && !db_image_fetch_failed {
             self.put_cached(cache_key, probabilities.clone(), cache_ttl);
         }
@@ -627,7 +687,7 @@ impl CatalogFilterService {
         description: &str,
         tags: &[String],
         images: &[Vec<u8>],
-        gallery_aggregation: FilterGalleryAggregation,
+        params: &FilterModelParams,
     ) -> Result<FilterProbabilities, FilterServiceError> {
         if images.is_empty() {
             return self
@@ -636,72 +696,18 @@ impl CatalogFilterService {
         }
 
         let ranges = split_image_ranges_by_bytes(images, MAX_RUNNER_BATCH_RAW_IMAGE_BYTES);
-        if ranges.len() == 1 {
-            let encoded: Vec<String> = images.iter().map(|b| BASE64_STD.encode(b)).collect();
-            return self
-                .call_backend_predict(endpoint, title, description, tags, &encoded)
-                .await;
-        }
-
-        let mut joint_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(ranges.len());
-        let mut img_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(ranges.len());
-        let mut all_per_image_probs: Vec<f32> = Vec::with_capacity(images.len());
-        let mut text_prob = None;
-        let mut text_gore_prob = None;
-        let mut text_nsfw_prob = None;
-        let mut title_prob = None;
-        let mut description_prob = None;
-
-        for (batch_idx, range) in ranges.into_iter().enumerate() {
-            let batch_count = range.len();
+        let mut parts = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let count = range.len();
             let encoded_batch: Vec<String> =
                 images[range].iter().map(|b| BASE64_STD.encode(b)).collect();
-            let sub = self
-                .call_backend_predict(endpoint, title, description, tags, &encoded_batch)
+            let part = self
+                .call_backend_prediction(endpoint, title, description, tags, &encoded_batch, true)
                 .await?;
-
-            if batch_idx == 0 {
-                text_prob = sub.text_prob;
-                text_gore_prob = sub.text_gore_prob;
-                text_nsfw_prob = sub.text_nsfw_prob;
-                title_prob = sub.title_prob;
-                description_prob = sub.description_prob;
-            }
-
-            joint_batches.push(([sub.prob, sub.gore_prob, sub.nsfw_prob], batch_count));
-
-            let img_trip = match (sub.image_prob, sub.image_gore_prob, sub.image_nsfw_prob) {
-                (Some(ip), Some(ig), Some(in_)) => [ip, ig, in_],
-                (Some(ip), _, _) => [ip, sub.gore_prob, sub.nsfw_prob],
-                _ => [sub.prob, sub.gore_prob, sub.nsfw_prob],
-            };
-            img_batches.push((img_trip, batch_count));
-
-            if !sub.per_image_probs.is_empty() {
-                all_per_image_probs.extend(sub.per_image_probs);
-            } else {
-                let fallback = round6_prob(img_trip[0]);
-                all_per_image_probs.extend(std::iter::repeat_n(fallback, batch_count));
-            }
+            parts.push((count, part));
         }
-
-        let joint_agg = aggregate_subbatch_triplets(&joint_batches, gallery_aggregation);
-        let img_agg = aggregate_subbatch_triplets(&img_batches, gallery_aggregation);
-
-        Ok(FilterProbabilities {
-            prob: round6_prob(joint_agg[0]),
-            gore_prob: round6_prob(joint_agg[1]),
-            nsfw_prob: round6_prob(joint_agg[2]),
-            text_prob,
-            text_gore_prob,
-            text_nsfw_prob,
-            title_prob,
-            description_prob,
-            image_prob: Some(round6_prob(img_agg[0])),
-            image_gore_prob: Some(round6_prob(img_agg[1])),
-            image_nsfw_prob: Some(round6_prob(img_agg[2])),
-            per_image_probs: all_per_image_probs,
-            scoring_revision: None,
+        merge_managed_predictions(parts, params).ok_or_else(|| {
+            FilterServiceError::Unavailable("托管过滤模型未返回完整的逐图评分".into())
         })
     }
 
@@ -716,9 +722,8 @@ impl CatalogFilterService {
     ) -> Result<FilterProbabilities, FilterServiceError> {
         let has_txt =
             !title.trim().is_empty() || !description.trim().is_empty() || !tags.is_empty();
-        let mut img_batches: Vec<([f32; 3], usize)> = Vec::with_capacity(images.len());
-        let mut joint_batches: Vec<([f32; 3], usize)> =
-            Vec::with_capacity(if has_txt { images.len() } else { 0 });
+        let mut image_rows = Vec::with_capacity(images.len());
+        let mut joint_rows = Vec::with_capacity(if has_txt { images.len() } else { 0 });
 
         let mut text_prob = None;
         let mut text_gore_prob = None;
@@ -733,7 +738,7 @@ impl CatalogFilterService {
             let img_res = self
                 .call_backend_predict(endpoint, "", "", &[], single_slice)
                 .await?;
-            img_batches.push(([img_res.prob, img_res.gore_prob, img_res.nsfw_prob], 1));
+            image_rows.push([img_res.prob, img_res.gore_prob, img_res.nsfw_prob]);
 
             if has_txt {
                 let joint_res = self
@@ -746,10 +751,7 @@ impl CatalogFilterService {
                     title_prob = joint_res.title_prob;
                     description_prob = joint_res.description_prob;
                 }
-                joint_batches.push((
-                    [joint_res.prob, joint_res.gore_prob, joint_res.nsfw_prob],
-                    1,
-                ));
+                joint_rows.push([joint_res.prob, joint_res.gore_prob, joint_res.nsfw_prob]);
             }
         }
 
@@ -770,9 +772,9 @@ impl CatalogFilterService {
             }
         }
 
-        let img_agg = aggregate_subbatch_triplets(&img_batches, params.gallery_aggregation);
+        let img_agg = aggregate_gallery_triplets(&image_rows, params.gallery_aggregation);
         let joint_agg = if has_txt {
-            aggregate_subbatch_triplets(&joint_batches, params.gallery_aggregation)
+            aggregate_gallery_triplets(&joint_rows, params.gallery_aggregation)
         } else {
             img_agg
         };
@@ -789,15 +791,15 @@ impl CatalogFilterService {
             image_prob: Some(round6_prob(img_agg[0])),
             image_gore_prob: Some(round6_prob(img_agg[1])),
             image_nsfw_prob: Some(round6_prob(img_agg[2])),
-            per_image_probs: img_batches.iter().map(|(r, _)| round6_prob(r[0])).collect(),
+            per_image_probs: image_rows.iter().map(|r| round6_prob(r[0])).collect(),
             scoring_revision: None,
         };
 
         let mut adjusted = params.adjust_probabilities(&raw_probs);
         if !params.is_identity_calibration() {
-            adjusted.per_image_probs = img_batches
+            adjusted.per_image_probs = image_rows
                 .iter()
-                .map(|(r, _)| params.adjust_triplet(r[0], r[1], r[2]).0)
+                .map(|r| params.adjust_triplet(r[0], r[1], r[2]).0)
                 .collect();
         }
         Ok(adjusted)
@@ -906,13 +908,7 @@ impl CatalogFilterService {
         {
             let fast_cfg = self.current_filter_section();
             let snap = self.runtime.read().unwrap();
-            if snap.initialized_config.as_ref() == Some(&fast_cfg) {
-                return;
-            }
-            if fast_cfg.enabled
-                && snap.backoff_config.as_ref() == Some(&fast_cfg)
-                && snap.next_retry_after.is_some_and(|t| Instant::now() < t)
-            {
+            if snap.initialization_is_current(&fast_cfg) {
                 return;
             }
         }
@@ -922,13 +918,7 @@ impl CatalogFilterService {
         let cfg = self.current_filter_section();
         {
             let snap = self.runtime.read().unwrap();
-            if snap.initialized_config.as_ref() == Some(&cfg) {
-                return;
-            }
-            if cfg.enabled
-                && snap.backoff_config.as_ref() == Some(&cfg)
-                && snap.next_retry_after.is_some_and(|t| Instant::now() < t)
-            {
+            if snap.initialization_is_current(&cfg) {
                 return;
             }
         }
@@ -956,6 +946,7 @@ impl CatalogFilterService {
             let current_cfg = self.current_filter_section();
             let now = Instant::now();
             let mut snap = self.runtime.write().unwrap();
+            self.backend_generation.fetch_add(1, Ordering::AcqRel);
             snap.initialized_config = None;
             snap.ready = false;
             snap.running_pid = None;
@@ -982,6 +973,8 @@ impl CatalogFilterService {
         cfg: &FilterSection,
         force_restart: bool,
     ) {
+        let _execution = self.backend_execution.write().await;
+        self.backend_generation.fetch_add(1, Ordering::AcqRel);
         let prev_sig = self.runtime.read().unwrap().last_scoring_signature.clone();
         let unverified_rev = compute_scoring_revision(cfg, None, None);
         if force_restart || !cfg.enabled || cfg.cache_ttl_secs == 0 {
@@ -1019,6 +1012,7 @@ impl CatalogFilterService {
                 last_scoring_signature: None,
                 backoff_config: None,
                 next_retry_after: None,
+                upstream_verified_at: None,
                 last_crash_respawn_at: None,
                 ready: false,
                 running_pid: None,
@@ -1043,6 +1037,7 @@ impl CatalogFilterService {
                         last_scoring_signature: next_sig,
                         backoff_config: Some(cfg.clone()),
                         next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                        upstream_verified_at: None,
                         last_crash_respawn_at: snap.last_crash_respawn_at,
                         ready: false,
                         running_pid: None,
@@ -1122,6 +1117,7 @@ impl CatalogFilterService {
                             last_scoring_signature: next_sig,
                             backoff_config: None,
                             next_retry_after: None,
+                            upstream_verified_at: None,
                             last_crash_respawn_at: prev_crash_ts,
                             ready: true,
                             running_pid: handle.pid,
@@ -1141,6 +1137,7 @@ impl CatalogFilterService {
                             last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                            upstream_verified_at: None,
                             last_crash_respawn_at: prev_crash_ts,
                             ready: false,
                             running_pid: None,
@@ -1164,6 +1161,7 @@ impl CatalogFilterService {
                         last_scoring_signature: next_sig,
                         backoff_config: Some(cfg.clone()),
                         next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                        upstream_verified_at: None,
                         last_crash_respawn_at: None,
                         ready: false,
                         running_pid: None,
@@ -1186,6 +1184,7 @@ impl CatalogFilterService {
                             last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                            upstream_verified_at: None,
                             last_crash_respawn_at: None,
                             ready: false,
                             running_pid: None,
@@ -1207,6 +1206,7 @@ impl CatalogFilterService {
                             last_scoring_signature: next_sig,
                             backoff_config: None,
                             next_retry_after: None,
+                            upstream_verified_at: Some(Instant::now()),
                             last_crash_respawn_at: None,
                             ready: true,
                             running_pid: None,
@@ -1223,6 +1223,7 @@ impl CatalogFilterService {
                             last_scoring_signature: next_sig,
                             backoff_config: Some(cfg.clone()),
                             next_retry_after: Some(Instant::now() + CRASH_RESTART_BACKOFF),
+                            upstream_verified_at: None,
                             last_crash_respawn_at: None,
                             ready: false,
                             running_pid: None,
@@ -1313,6 +1314,28 @@ impl CatalogFilterService {
         images_base64: &[String],
         record_failure: bool,
     ) -> Result<FilterProbabilities, FilterServiceError> {
+        Ok(self
+            .call_backend_prediction(
+                endpoint,
+                title,
+                description,
+                tags,
+                images_base64,
+                record_failure,
+            )
+            .await?
+            .probabilities)
+    }
+
+    async fn call_backend_prediction(
+        &self,
+        endpoint: &str,
+        title: &str,
+        description: &str,
+        tags: &[String],
+        images_base64: &[String],
+        record_failure: bool,
+    ) -> Result<ManagedFilterPrediction, FilterServiceError> {
         let _permit = self.predict_semaphore.acquire().await.map_err(|_| {
             FilterServiceError::Unavailable("内容过滤推理并发限流器已关闭".to_string())
         })?;
@@ -1332,7 +1355,7 @@ impl CatalogFilterService {
                 self.refresh_managed_liveness();
                 let msg = format!("调用过滤推理后端失败: {err}");
                 if record_failure {
-                    self.record_backend_failure(msg.clone());
+                    self.record_backend_failure(endpoint, msg.clone());
                 }
                 return Err(FilterServiceError::Unavailable(msg));
             }
@@ -1344,7 +1367,7 @@ impl CatalogFilterService {
             let msg = format!("过滤推理后端返回 HTTP {status}: {detail}");
             if status.is_server_error() {
                 if record_failure {
-                    self.record_backend_failure(msg.clone());
+                    self.record_backend_failure(endpoint, msg.clone());
                 }
                 return Err(FilterServiceError::Unavailable(msg));
             }
@@ -1359,24 +1382,41 @@ impl CatalogFilterService {
             Err(err) => {
                 let msg = format!("读取过滤推理后端响应失败: {err}");
                 if record_failure {
-                    self.record_backend_failure(msg.clone());
+                    self.record_backend_failure(endpoint, msg.clone());
                 }
                 return Err(FilterServiceError::Unavailable(msg));
             }
         };
 
-        serde_json::from_slice::<FilterProbabilities>(&body).map_err(|err| {
+        serde_json::from_slice::<ManagedFilterPrediction>(&body).map_err(|err| {
             let msg = format!("解析过滤推理后端响应失败: {err}");
             if record_failure {
-                self.record_backend_failure(msg.clone());
+                self.record_backend_failure(endpoint, msg.clone());
             }
             FilterServiceError::Unavailable(msg)
         })
     }
 
-    fn record_backend_failure(&self, message: String) {
+    fn record_backend_failure(&self, endpoint: &str, message: String) {
         self.failed_requests.fetch_add(1, Ordering::Relaxed);
         let mut snap = self.runtime.write().unwrap();
+        if snap.active_endpoint.as_deref() != Some(endpoint) {
+            return;
+        }
+        if snap
+            .initialized_config
+            .as_ref()
+            .is_some_and(|cfg| cfg.backend == CatalogFilterBackendKind::UpstreamHttp)
+        {
+            self.backend_generation.fetch_add(1, Ordering::AcqRel);
+            snap.backoff_config = snap.initialized_config.take();
+            snap.upstream_verified_at = None;
+            snap.next_retry_after = Some(Instant::now() + CRASH_RESTART_BACKOFF);
+            snap.ready = false;
+            snap.model_name = None;
+            snap.model_version = None;
+            self.clear_cache();
+        }
         snap.last_error = Some(message);
     }
 
@@ -2015,51 +2055,6 @@ fn split_image_ranges_by_bytes(
     ranges
 }
 
-fn aggregate_subbatch_triplets(
-    batches: &[([f32; 3], usize)],
-    mode: FilterGalleryAggregation,
-) -> [f32; 3] {
-    if batches.is_empty() {
-        return [0.0, 0.0, 0.0];
-    }
-    if batches.len() == 1 {
-        return batches[0].0;
-    }
-    let mut out = [0.0f32; 3];
-    for col in 0..3 {
-        out[col] = match mode {
-            FilterGalleryAggregation::Max => batches
-                .iter()
-                .map(|(trip, _)| trip[col])
-                .fold(0.0f32, f32::max),
-            FilterGalleryAggregation::Mean => {
-                let total_count: usize = batches.iter().map(|(_, count)| *count).sum();
-                let weighted_sum: f32 = batches
-                    .iter()
-                    .map(|(trip, count)| trip[col] * (*count as f32))
-                    .sum();
-                weighted_sum / (total_count.max(1) as f32)
-            }
-            FilterGalleryAggregation::Top2Mean => {
-                let mut expanded = Vec::with_capacity(batches.len() * 2);
-                for (trip, count) in batches {
-                    let copies = (*count).clamp(1, 2);
-                    expanded.extend(std::iter::repeat_n(trip[col], copies));
-                }
-                if expanded.len() <= 2 {
-                    let sum: f32 = expanded.iter().sum();
-                    sum / (expanded.len().max(1) as f32)
-                } else {
-                    expanded.sort_by(|a, b| a.total_cmp(b));
-                    let n = expanded.len();
-                    (expanded[n - 2] + expanded[n - 1]) / 2.0
-                }
-            }
-        };
-    }
-    out
-}
-
 fn collect_item_preview_urls(
     record: &l4a_protocol::WorkshopItemRecord,
     max_images: usize,
@@ -2107,7 +2102,7 @@ fn scoring_signature(cfg: &FilterSection) -> String {
         CatalogFilterBackendKind::UpstreamHttp => cfg.upstream_url.clone().unwrap_or_default(),
     };
     format!(
-        "{:?}|{}|t={}|i={}|m={}|{:?}|gw={:08x}|nw={:08x}|temp={:08x}|bias={:08x}",
+        "v2|{:?}|{}|t={}|i={}|m={}|{:?}|gw={:08x}|nw={:08x}|temp={:08x}|bias={:08x}",
         cfg.backend,
         target,
         p.enable_text,
@@ -2812,22 +2807,21 @@ mod tests {
         let ranges = split_image_ranges_by_bytes(&images, MAX_RUNNER_BATCH_RAW_IMAGE_BYTES);
         assert_eq!(ranges, vec![0..2, 2..3]);
 
-        let rows = vec![
-            ([0.90, 0.80, 0.20], 1),
-            ([0.30, 0.20, 0.10], 1),
-            ([0.60, 0.50, 0.40], 1),
-        ];
-        let max_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Max);
+        let rows = vec![[0.90, 0.80, 0.20], [0.30, 0.20, 0.10], [0.60, 0.50, 0.40]];
+        let max_agg =
+            aggregate_gallery_triplets(&rows, l4a_protocol::FilterGalleryAggregation::Max);
         assert!((max_agg[0] - 0.90).abs() < 1e-6);
         assert!((max_agg[1] - 0.80).abs() < 1e-6);
         assert!((max_agg[2] - 0.40).abs() < 1e-6);
 
-        let mean_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Mean);
+        let mean_agg =
+            aggregate_gallery_triplets(&rows, l4a_protocol::FilterGalleryAggregation::Mean);
         assert!((mean_agg[0] - 0.60).abs() < 1e-6);
         assert!((mean_agg[1] - 0.50).abs() < 1e-6);
         assert!((mean_agg[2] - 0.70 / 3.0).abs() < 1e-6);
 
-        let top2_agg = aggregate_subbatch_triplets(&rows, FilterGalleryAggregation::Top2Mean);
+        let top2_agg =
+            aggregate_gallery_triplets(&rows, l4a_protocol::FilterGalleryAggregation::Top2Mean);
         assert!((top2_agg[0] - 0.75).abs() < 1e-6);
         assert!((top2_agg[1] - 0.65).abs() < 1e-6);
         assert!((top2_agg[2] - 0.30).abs() < 1e-6);

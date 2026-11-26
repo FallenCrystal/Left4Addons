@@ -438,6 +438,7 @@ export function LibraryView({
 
       <BundleDetailSheet
         bundle={inspectedBundle}
+        forceShowHiddenCards={showingFilteredCards}
         addonsById={addonsById}
         namePreference={namePreference}
         liveDownloads={liveDownloads}

@@ -321,6 +321,7 @@ export function FilterSettingsSection({
   const serviceTransitioning =
     localStatus?.serviceState === 'deploying' || localStatus?.serviceState === 'starting';
   const catalogParamsLocked = filter.mode === 'catalog';
+  const customEndpoint = filter.mode === 'custom_endpoint';
   const missingPinnedCommit = !filter.trackLatest && !filter.pinnedCommit?.trim();
 
   const handleDeploy = async (forceLatest = false) => {
@@ -769,87 +770,96 @@ export function FilterSettingsSection({
           </div>
         )}
 
-        <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
-          <span className="md-title-small">{t('filter.settings.preset')}</span>
-          <Select<FilterPresetId>
-            ariaLabel={t('filter.settings.preset')}
-            value={filter.preset}
-            onChange={handleSelectPreset}
-            options={PRESET_OPTIONS.map((p) => ({
-              value: p,
-              label: t(`filter.settings.presets.${p}`),
-            }))}
-          />
-        </div>
+        {!customEndpoint && (
+          <>
+            <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+              <span className="md-title-small">{t('filter.settings.preset')}</span>
+              <Select<FilterPresetId>
+                ariaLabel={t('filter.settings.preset')}
+                value={filter.preset}
+                onChange={handleSelectPreset}
+                options={PRESET_OPTIONS.map((p) => ({
+                  value: p,
+                  label: t(`filter.settings.presets.${p}`),
+                }))}
+              />
+            </div>
 
-        <div className="l4a-setting-row">
-          <span className="md-body-medium">{t('filter.settings.applyPresetThresholds')}</span>
-          <Switch
-            compact
-            checked={applyPresetThresholds}
-            label={t('filter.settings.applyPresetThresholds')}
-            onChange={setApplyPresetThresholds}
-          />
-        </div>
+            <div className="l4a-setting-row">
+              <span className="md-body-medium">{t('filter.settings.applyPresetThresholds')}</span>
+              <Switch
+                compact
+                checked={applyPresetThresholds}
+                label={t('filter.settings.applyPresetThresholds')}
+                onChange={setApplyPresetThresholds}
+              />
+            </div>
 
-        <div className="l4a-divider" />
+            <div className="l4a-divider" />
 
-        <div className="l4a-setting-row">
-          <span className="md-title-small">{t('filter.settings.enableText')}</span>
-          <Switch
-            checked={filter.localParams.enableText}
-            disabled={catalogParamsLocked}
-            label={t('filter.settings.enableText')}
-            onChange={(next) => updateParams((p) => ({ ...p, enableText: next }))}
-          />
-        </div>
+            <div className="l4a-setting-row">
+              <span className="md-title-small">{t('filter.settings.enableText')}</span>
+              <Switch
+                checked={filter.localParams.enableText}
+                disabled={catalogParamsLocked}
+                label={t('filter.settings.enableText')}
+                onChange={(next) => updateParams((p) => ({ ...p, enableText: next }))}
+              />
+            </div>
 
-        <div className="l4a-setting-row">
-          <span className="md-title-small">{t('filter.settings.enableImage')}</span>
-          <Switch
-            checked={filter.localParams.enableImage}
-            disabled={catalogParamsLocked}
-            label={t('filter.settings.enableImage')}
-            onChange={(next) => updateParams((p) => ({ ...p, enableImage: next }))}
-          />
-        </div>
+            <div className="l4a-setting-row">
+              <span className="md-title-small">{t('filter.settings.enableImage')}</span>
+              <Switch
+                checked={filter.localParams.enableImage}
+                disabled={catalogParamsLocked}
+                label={t('filter.settings.enableImage')}
+                onChange={(next) => updateParams((p) => ({ ...p, enableImage: next }))}
+              />
+            </div>
 
-        <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
-          <span className="md-title-small">{t('filter.settings.galleryAggregation')}</span>
-          <SegmentedButton<FilterGalleryAggregation>
-            ariaLabel={t('filter.settings.galleryAggregation')}
-            value={filter.localParams.galleryAggregation}
-            onChange={(next) => updateParams((p) => ({ ...p, galleryAggregation: next }))}
-            options={[
-              {
-                value: 'max',
-                label: t('filter.settings.aggregations.max'),
-                disabled: catalogParamsLocked,
-              },
-              {
-                value: 'top2_mean',
-                label: t('filter.settings.aggregations.top2_mean'),
-                disabled: catalogParamsLocked,
-              },
-              {
-                value: 'mean',
-                label: t('filter.settings.aggregations.mean'),
-                disabled: catalogParamsLocked,
-              },
-            ]}
-          />
-        </div>
+            <div className="l4a-setting-row" style={{ flexWrap: 'wrap' }}>
+              <span className="md-title-small">{t('filter.settings.galleryAggregation')}</span>
+              <SegmentedButton<FilterGalleryAggregation>
+                ariaLabel={t('filter.settings.galleryAggregation')}
+                value={filter.localParams.galleryAggregation}
+                onChange={(next) => updateParams((p) => ({ ...p, galleryAggregation: next }))}
+                options={[
+                  {
+                    value: 'max',
+                    label: t('filter.settings.aggregations.max'),
+                    disabled: catalogParamsLocked,
+                  },
+                  {
+                    value: 'top2_mean',
+                    label: t('filter.settings.aggregations.top2_mean'),
+                    disabled: catalogParamsLocked,
+                  },
+                  {
+                    value: 'mean',
+                    label: t('filter.settings.aggregations.mean'),
+                    disabled: catalogParamsLocked,
+                  },
+                ]}
+              />
+            </div>
+          </>
+        )}
+        {customEndpoint && (
+          <p className="md-body-small">{t('filter.settings.customEndpointParamsHint')}</p>
+        )}
 
         <div className="l4a-filter-param-grid">
-          <NumericTextField
-            label={t('filter.settings.threads')}
-            min={1}
-            max={16}
-            integer
-            disabled={catalogParamsLocked}
-            value={filter.localParams.threads}
-            onCommit={(threads) => updateParams((p) => ({ ...p, threads }))}
-          />
+          {!customEndpoint && (
+            <NumericTextField
+              label={t('filter.settings.threads')}
+              min={1}
+              max={16}
+              integer
+              disabled={catalogParamsLocked}
+              value={filter.localParams.threads}
+              onCommit={(threads) => updateParams((p) => ({ ...p, threads }))}
+            />
+          )}
           <NumericTextField
             label={t('filter.settings.maxImages')}
             min={1}
@@ -859,38 +869,42 @@ export function FilterSettingsSection({
             value={filter.localParams.maxImages}
             onCommit={(maxImages) => updateParams((p) => ({ ...p, maxImages }))}
           />
-          <NumericTextField
-            label={t('filter.settings.goreWeight')}
-            min={0}
-            max={3}
-            disabled={catalogParamsLocked}
-            value={filter.localParams.goreWeight}
-            onCommit={(goreWeight) => updateParams((p) => ({ ...p, goreWeight }))}
-          />
-          <NumericTextField
-            label={t('filter.settings.nsfwWeight')}
-            min={0}
-            max={3}
-            disabled={catalogParamsLocked}
-            value={filter.localParams.nsfwWeight}
-            onCommit={(nsfwWeight) => updateParams((p) => ({ ...p, nsfwWeight }))}
-          />
-          <NumericTextField
-            label={t('filter.settings.temperature')}
-            min={0.25}
-            max={4}
-            disabled={catalogParamsLocked}
-            value={filter.localParams.temperature}
-            onCommit={(temperature) => updateParams((p) => ({ ...p, temperature }))}
-          />
-          <NumericTextField
-            label={t('filter.settings.bias')}
-            min={-5}
-            max={5}
-            disabled={catalogParamsLocked}
-            value={filter.localParams.bias}
-            onCommit={(bias) => updateParams((p) => ({ ...p, bias }))}
-          />
+          {!customEndpoint && (
+            <>
+              <NumericTextField
+                label={t('filter.settings.goreWeight')}
+                min={0}
+                max={3}
+                disabled={catalogParamsLocked}
+                value={filter.localParams.goreWeight}
+                onCommit={(goreWeight) => updateParams((p) => ({ ...p, goreWeight }))}
+              />
+              <NumericTextField
+                label={t('filter.settings.nsfwWeight')}
+                min={0}
+                max={3}
+                disabled={catalogParamsLocked}
+                value={filter.localParams.nsfwWeight}
+                onCommit={(nsfwWeight) => updateParams((p) => ({ ...p, nsfwWeight }))}
+              />
+              <NumericTextField
+                label={t('filter.settings.temperature')}
+                min={0.25}
+                max={4}
+                disabled={catalogParamsLocked}
+                value={filter.localParams.temperature}
+                onCommit={(temperature) => updateParams((p) => ({ ...p, temperature }))}
+              />
+              <NumericTextField
+                label={t('filter.settings.bias')}
+                min={-5}
+                max={5}
+                disabled={catalogParamsLocked}
+                value={filter.localParams.bias}
+                onCommit={(bias) => updateParams((p) => ({ ...p, bias }))}
+              />
+            </>
+          )}
         </div>
       </section>
 

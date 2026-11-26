@@ -6,9 +6,10 @@ use crate::filter::secret::validate_env_var_name;
 use crate::filter::{evaluate_targets, TokenVault};
 use l4a_protocol::{
     AddonId, ClientFilterConfig, CoreEvent, DashboardSnapshot, DeployLocalFilterRequest,
-    FilterEvaluationBatchResponse, FilterEvaluationTarget, FilterTokenStatus,
-    LocalFilterDeploymentStatus, UpsertFilterExclusionRequest, DEFAULT_FILTER_REPO_URL,
-    DEFAULT_LLM_ENDPOINT, DEFAULT_LLM_MODEL, DEFAULT_LLM_SYSTEM_PROMPT, DEFAULT_LLM_TOKEN_ENV_VAR,
+    FilterCacheClearResult, FilterEvaluationBatchResponse, FilterEvaluationTarget,
+    FilterTokenStatus, LocalFilterDeploymentStatus, UpsertFilterExclusionRequest,
+    DEFAULT_FILTER_REPO_URL, DEFAULT_LLM_ENDPOINT, DEFAULT_LLM_MODEL, DEFAULT_LLM_SYSTEM_PROMPT,
+    DEFAULT_LLM_TOKEN_ENV_VAR,
 };
 
 fn sanitize_filter_basics(cfg: &mut ClientFilterConfig) {
@@ -184,11 +185,14 @@ impl L4aEngine {
             updated_cfg.filter.pinned_commit = next_pinned;
             changed = true;
         }
+        let mut generation = self.filter_cache_generation.lock().unwrap();
         if changed {
             save_config(&self.paths.settings_path, &updated_cfg)?;
             *self.config.write().unwrap() = updated_cfg;
         }
-        let _ = self.db.clear_filter_verdicts();
+        self.db.clear_filter_verdicts()?;
+        *generation += 1;
+        drop(generation);
         drop(workspace);
         self.emit_workspace_update();
 
@@ -211,34 +215,59 @@ impl L4aEngine {
     }
 
     pub fn get_filter_token_status(&self) -> Result<FilterTokenStatus, CoreError> {
+        let generation = self.filter_cache_generation.lock().unwrap();
         let cfg = self.config();
         let vault = self.token_vault.read().unwrap();
-        Ok(vault.status(&cfg.filter.llm_token_env_var))
+        Ok(FilterTokenStatus {
+            cache_generation: *generation,
+            ..vault.status(&cfg.filter.llm_token_env_var)
+        })
     }
 
     pub fn set_filter_llm_token(
         &self,
         token: Option<String>,
     ) -> Result<FilterTokenStatus, CoreError> {
+        let mut generation = self.filter_cache_generation.lock().unwrap();
+        self.db.clear_llm_filter_verdicts()?;
         let vault = self.token_vault.read().unwrap();
         match token.as_deref().map(str::trim) {
             Some(s) if !s.is_empty() => vault.seal(s)?,
             _ => vault.clear()?,
         }
+        *generation += 1;
         let cfg = self.config();
-        Ok(vault.status(&cfg.filter.llm_token_env_var))
+        Ok(FilterTokenStatus {
+            cache_generation: *generation,
+            ..vault.status(&cfg.filter.llm_token_env_var)
+        })
     }
 
     pub async fn evaluate_filter_items(
         &self,
         targets: Vec<FilterEvaluationTarget>,
     ) -> Result<FilterEvaluationBatchResponse, CoreError> {
-        evaluate_targets(self, targets).await
+        evaluate_targets(self, targets, false).await
     }
 
-    pub fn clear_filter_cache(&self) -> Result<u64, CoreError> {
-        *self.catalog_scoring_cache.lock().unwrap() = None;
-        self.db.clear_filter_verdicts()
+    pub async fn evaluate_automatic_filter_items(
+        &self,
+        targets: Vec<FilterEvaluationTarget>,
+    ) -> Result<FilterEvaluationBatchResponse, CoreError> {
+        evaluate_targets(self, targets, true).await
+    }
+
+    pub fn clear_filter_cache(&self) -> Result<FilterCacheClearResult, CoreError> {
+        let mut generation = self.filter_cache_generation.lock().unwrap();
+        let count = self.db.clear_filter_verdicts()?;
+        *generation += 1;
+        if let Some(entry) = self.catalog_scoring_cache.lock().unwrap().as_mut() {
+            entry.checked_at = None;
+        }
+        Ok(FilterCacheClearResult {
+            count,
+            cache_generation: *generation,
+        })
     }
 
     pub fn upsert_filter_exclusion(

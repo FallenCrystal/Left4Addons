@@ -150,7 +150,24 @@ def sort(arr, axis=0):
     let pil_dir = site_dir.join("PIL");
     std::fs::create_dir_all(&pil_dir).unwrap();
     std::fs::write(pil_dir.join("__init__.py"), "from . import Image\n").unwrap();
-    std::fs::write(pil_dir.join("Image.py"), "MAX_IMAGE_PIXELS = 16777216\n").unwrap();
+    std::fs::write(
+        pil_dir.join("Image.py"),
+        r#"MAX_IMAGE_PIXELS = 16777216
+
+class ImageHeader:
+    size = (4, 4)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+def open(_stream):
+    return ImageHeader()
+"#,
+    )
+    .unwrap();
 }
 
 #[test]
@@ -770,8 +787,22 @@ async fn two_stage_evaluator_openai_judge_and_modality_subdivision_end_to_end() 
         calls_before_cached
     );
 
-    let cleared = engine.clear_filter_cache().unwrap();
-    assert_eq!(cleared, 6);
+    let status = engine.set_filter_llm_token(None).unwrap();
+    assert!(!status.has_encrypted_token);
+    assert!(status.cache_generation > tok_status.cache_generation);
+    let after_token_clear = engine.snapshot().unwrap();
+    assert_eq!(
+        after_token_clear.filter_cache_generation,
+        status.cache_generation
+    );
+    assert_eq!(after_token_clear.cached_filter_verdicts.len(), 4);
+    assert!(after_token_clear.cached_filter_verdicts.iter().all(|v| {
+        !matches!(
+            v.decision_source,
+            FilterDecisionSource::LlmFlaggedTrue | FilterDecisionSource::LlmFlaggedFalse
+        )
+    }));
+    assert_eq!(engine.clear_filter_cache().unwrap().count, 4);
 }
 
 #[test]
@@ -808,7 +839,7 @@ fn library_exclusions_and_vpk_fingerprint_invalidation() {
         .upsert_filter_exclusion(UpsertFilterExclusionRequest {
             addon_id: addon.id.clone(),
             display_level: ExclusionDisplayLevel::BlurImage,
-            bind_fingerprint: true,
+            bind_fingerprint: Some(true),
             note: Some("Safe skin verified manually".into()),
         })
         .unwrap();
@@ -847,6 +878,20 @@ fn library_exclusions_and_vpk_fingerprint_invalidation() {
         !invalidated.fingerprint_valid,
         "modifying VPK on disk must invalidate fingerprint-bound exclusion"
     );
+
+    let display_edit = engine
+        .upsert_filter_exclusion(UpsertFilterExclusionRequest {
+            addon_id: invalidated.addon_id.clone(),
+            display_level: ExclusionDisplayLevel::HideText,
+            bind_fingerprint: None,
+            note: invalidated.note.clone(),
+        })
+        .unwrap();
+    let edited = &display_edit.filter_exclusions[0];
+    assert_eq!(edited.display_level, ExclusionDisplayLevel::HideText);
+    assert!(edited.bind_fingerprint);
+    assert!(!edited.fingerprint_valid);
+    assert_eq!(edited.bound_fingerprint, invalidated.bound_fingerprint);
 
     let snap_deleted = engine.delete_filter_exclusion(&addon.id).unwrap();
     assert!(snap_deleted.filter_exclusions.is_empty());
@@ -1488,8 +1533,9 @@ async fn batch_partial_failure_dedup_fail_open_cache_guard_and_snapshot_verdicts
         ev,
         CoreEvent::FilterVerdictsUpdated {
             verdicts,
-            policy_signature: Some(sig)
-        } if verdicts.len() == 3 && sig == &snap.filter_policy_signature
+            policy_signature: Some(sig),
+            cache_generation,
+        } if verdicts.len() == 3 && sig == &snap.filter_policy_signature && *cache_generation == snap.filter_cache_generation
     )));
 
     // Verify snapshot.cached_filter_verdicts is populated immediately at startup / snapshot()!
@@ -1566,7 +1612,7 @@ async fn batch_partial_failure_dedup_fail_open_cache_guard_and_snapshot_verdicts
         .await
         .unwrap();
     // Total rows across entire `filter_verdicts` table must only belong to the new policy_sig (1 row)!
-    assert_eq!(engine.clear_filter_cache().unwrap(), 1);
+    assert_eq!(engine.clear_filter_cache().unwrap().count, 1);
 }
 
 #[tokio::test]
@@ -1743,7 +1789,7 @@ fn local_non_workshop_vpk_in_place_edit_migrates_unbound_and_bound_exclusions() 
         .upsert_filter_exclusion(UpsertFilterExclusionRequest {
             addon_id: alpha_v1.id.clone(),
             display_level: ExclusionDisplayLevel::HideImage,
-            bind_fingerprint: false,
+            bind_fingerprint: Some(false),
             note: Some("Unbound local exclusion".into()),
         })
         .unwrap();
@@ -1753,7 +1799,7 @@ fn local_non_workshop_vpk_in_place_edit_migrates_unbound_and_bound_exclusions() 
         .upsert_filter_exclusion(UpsertFilterExclusionRequest {
             addon_id: beta_v1.id.clone(),
             display_level: ExclusionDisplayLevel::BlurImage,
-            bind_fingerprint: true,
+            bind_fingerprint: Some(true),
             note: Some("Bound local exclusion".into()),
         })
         .unwrap();
@@ -2376,7 +2422,7 @@ async fn gallery_slot_mapping_with_404_gap_incomplete_safe_and_failed_outcomes()
     match &batch.items[0].outcome {
         FilterTargetOutcome::Completed { verdict, complete } => {
             assert!(verdict.flagged);
-            assert!(*complete && verdict.complete);
+            assert!(!*complete && !verdict.complete);
             assert_eq!(verdict.evaluated_image_indices, vec![1, 2]);
             assert_eq!(verdict.sensitive_image_indices, vec![2]);
         }
@@ -2398,10 +2444,7 @@ async fn gallery_slot_mapping_with_404_gap_incomplete_safe_and_failed_outcomes()
         FilterTargetOutcome::Failed { error } if error.contains("502")
     ));
 
-    // Only item 0 (`complete == true`) was persisted to SQLite!
-    let snap = engine.snapshot().unwrap();
-    assert_eq!(snap.cached_filter_verdicts.len(), 1);
-    assert_eq!(snap.cached_filter_verdicts[0].target_key, "ws:slot-flagged");
+    assert!(engine.snapshot().unwrap().cached_filter_verdicts.is_empty());
 }
 
 #[tokio::test]
@@ -2508,6 +2551,245 @@ async fn catalog_mixed_local_and_remote_images_preserve_exact_gallery_slot_order
         vec![1],
         "slot 1 (inline NSFW) must not shift ahead of slot 0 (remote safe)"
     );
+}
+
+#[tokio::test]
+async fn catalog_uses_advertised_image_cap_and_retries_with_available_inline_data() {
+    let jpeg = make_tiny_jpeg(35, 80, 180);
+    let encoded = STANDARD.encode(&jpeg);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/info",
+            get(|| async {
+                Json(CatalogFilterPublicInfo {
+                    enabled: true,
+                    ready: true,
+                    model_name: None,
+                    model_version: None,
+                    max_images: 1,
+                    scoring_revision: Some("rev-one".into()),
+                })
+            }),
+        )
+        .route(
+            "/api/v1/filter/predict",
+            post(move |Json(req): Json<FilterPredictRequest>| {
+                captured.lock().unwrap().push(req.clone());
+                async move {
+                    if !req.image_urls.is_empty() {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "code": l4a_protocol::CATALOG_FILTER_IMAGE_FETCH_FAILED,
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(FilterProbabilities {
+                        prob: 0.05,
+                        image_prob: Some(0.05),
+                        per_image_probs: vec![0.05],
+                        scoring_revision: Some("rev-one".into()),
+                        ..Default::default()
+                    })
+                    .into_response()
+                }
+            }),
+        )
+        .route(
+            "/preview.jpg",
+            get(move || {
+                let jpeg = jpeg.clone();
+                async move { ([(header::CONTENT_TYPE, "image/jpeg")], jpeg) }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempdir().unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            https_only: false,
+            catalog_server_url: Some(base.clone()),
+            filter: ClientFilterConfig {
+                mode: ClientFilterSourceMode::Catalog,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    engine.set_allow_loopback_image_urls_for_testing(true);
+
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:catalog-retry".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Catalog gallery".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![
+                    format!("{base}/preview.jpg"),
+                    "data:image/png;base64,unused".into(),
+                ],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+    assert!(verdicts[0].complete);
+    assert_eq!(verdicts[0].evaluated_image_indices, vec![0]);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].image_urls, vec![format!("{base}/preview.jpg")]);
+    assert!(requests[0].images_base64.is_empty());
+    assert!(requests[1].image_urls.is_empty());
+    assert_eq!(requests[1].images_base64, vec![encoded]);
+    task.abort();
+}
+
+#[tokio::test]
+async fn catalog_revision_change_during_llm_review_rechecks_the_old_prediction() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let newer = Arc::new(AtomicBool::new(false));
+    let health_revision = newer.clone();
+    let predict_revision = newer.clone();
+    let review_started = Arc::new(Notify::new());
+    let finish_review = Arc::new(Notify::new());
+    let review_route_started = review_started.clone();
+    let review_route_finish = finish_review.clone();
+    let fake_catalog = Router::new()
+        .route(
+            "/api/v1/filter/info",
+            get(move || {
+                let revision = if health_revision.load(Ordering::SeqCst) {
+                    "b"
+                } else {
+                    "a"
+                };
+                async move {
+                    Json(CatalogFilterPublicInfo {
+                        enabled: true,
+                        ready: true,
+                        model_name: None,
+                        model_version: None,
+                        max_images: 2,
+                        scoring_revision: Some(revision.into()),
+                    })
+                }
+            }),
+        )
+        .route(
+            "/api/v1/filter/predict",
+            post(move || {
+                let (revision, prob) = if predict_revision.load(Ordering::SeqCst) {
+                    ("b", 0.91)
+                } else {
+                    ("a", 0.4)
+                };
+                async move {
+                    Json(FilterProbabilities {
+                        prob,
+                        scoring_revision: Some(revision.into()),
+                        ..Default::default()
+                    })
+                }
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post(move || {
+                let started = review_route_started.clone();
+                let finish = review_route_finish.clone();
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Json(json!({ "choices": [{ "message": { "content": "false" } }] }))
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, fake_catalog).await.unwrap() });
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(make_engine(
+        dir.path(),
+        AppConfig {
+            https_only: false,
+            catalog_server_url: Some(base.clone()),
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::Catalog,
+                llm_enabled: true,
+                llm_endpoint: format!("{base}/v1"),
+                llm_token_source: LlmTokenSource::EncryptedLocal,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    ));
+    engine.set_token_vault(TokenVault::with_custom_identity(
+        &engine.paths().llm_token_path,
+        dir.path().join("test.key"),
+        "machine",
+        "account",
+    ));
+    engine
+        .set_filter_llm_token(Some("fixture-key".into()))
+        .unwrap();
+
+    fn target(id: &str) -> FilterEvaluationTarget {
+        FilterEvaluationTarget {
+            target_key: format!("ws:{id}"),
+            addon_id: None,
+            workshop_id: None,
+            title: format!("Fixture {id}"),
+            description: None,
+            tags: vec![],
+            image_sources: vec![],
+            revision_hint: None,
+            bypass_cache: false,
+        }
+    }
+
+    let old_engine = engine.clone();
+    let old_batch = tokio::spawn(async move {
+        old_engine
+            .evaluate_filter_items(vec![target("1")])
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), review_started.notified())
+        .await
+        .unwrap();
+    newer.store(true, Ordering::SeqCst);
+    let new_batch = engine
+        .evaluate_filter_items(vec![target("2")])
+        .await
+        .unwrap();
+    finish_review.notify_one();
+    let old_batch = old_batch.await.unwrap();
+    assert_eq!(old_batch.policy_signature, new_batch.policy_signature);
+    assert_eq!(
+        unwrap_verdicts(old_batch)[0].decision_source,
+        FilterDecisionSource::ModelDirectFlag
+    );
+    let cached = engine.snapshot().unwrap().cached_filter_verdicts;
+    assert_eq!(cached.len(), 2);
+    assert!(cached
+        .iter()
+        .all(|v| v.probabilities.scoring_revision.as_deref() == Some("b")));
+    server.abort();
 }
 
 #[tokio::test]
@@ -2887,7 +3169,35 @@ async fn late_finishing_old_policy_evaluation_never_prunes_active_policy_cache()
     assert_eq!(snap.filter_policy_signature, active_sig);
     assert_eq!(snap.cached_filter_verdicts.len(), 1);
     assert_eq!(snap.cached_filter_verdicts[0].target_key, "ws:fast-new");
-    assert_eq!(engine.clear_filter_cache().unwrap(), 1);
+    let engine_slow = engine.clone();
+    let slow_task = tokio::spawn(async move {
+        engine_slow
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:before-clear".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[SLOW_OLD_POLICY] Waiting during cache clear".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap()
+    });
+    slow_entered.notified().await;
+    let cleared = engine.clear_filter_cache().unwrap();
+    assert_eq!(cleared.count, 1);
+    slow_release.notify_one();
+    let stale = slow_task.await.unwrap();
+    assert_eq!(stale.policy_signature, active_sig);
+    assert!(stale.cache_generation < cleared.cache_generation);
+    assert!(matches!(
+        stale.items[0].outcome,
+        FilterTargetOutcome::Failed { .. }
+    ));
+    assert!(engine.snapshot().unwrap().cached_filter_verdicts.is_empty());
 }
 
 #[tokio::test]

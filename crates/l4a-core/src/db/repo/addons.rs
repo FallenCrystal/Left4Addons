@@ -10,7 +10,7 @@ use l4a_protocol::{
     AddonDirType, AddonId, AddonSummary, FileRole, InstallState, MapEntry, PhysicalFileRecord,
     WorkshopId, WorkshopItemStatus,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Params};
 use std::collections::{BTreeMap, HashMap};
 
 impl LocalDb {
@@ -88,16 +88,24 @@ impl LocalDb {
     }
 
     pub fn list_addons(&self) -> Result<Vec<AddonSummary>, CoreError> {
+        self.query_addons("ORDER BY a.title COLLATE NOCASE ASC, a.id ASC", [])
+    }
+
+    fn query_addons(
+        &self,
+        selection: &str,
+        params: impl Params,
+    ) -> Result<Vec<AddonSummary>, CoreError> {
         let conn = self.lock_conn()?;
-        let snapshots = Self::load_snapshots_map(&conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, workshop_id, title, author, version, install_state, primary_dir,
-                    enabled, current_file_name, current_path, content_hash, file_size,
-                    files_count, cover_image, categories_json, maps_json, addon_info_json,
-                    has_dummy_bypass, local_time_updated
-             FROM addons ORDER BY title COLLATE NOCASE ASC, id ASC",
-        )?;
-        let rows = stmt.query_map([], |r| {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT a.id, a.workshop_id, a.title, a.author, a.version, a.install_state, a.primary_dir,
+                    a.enabled, a.current_file_name, a.current_path, a.content_hash, a.file_size,
+                    a.files_count, a.cover_image, a.categories_json, a.maps_json, a.addon_info_json,
+                    a.has_dummy_bypass, a.local_time_updated,
+                    s.status, s.time_updated, s.preview_url, s.title, s.creator_name, s.tags_json
+             FROM addons a LEFT JOIN workshop_snapshots s ON a.workshop_id = s.workshop_id {selection}"
+        ))?;
+        let rows = stmt.query_map(params, |r| {
             let id_str: String = r.get(0)?;
             let wid_raw: Option<i64> = r.get(1)?;
             let wid = wid_raw.and_then(|v| WorkshopId::new(v as u64).ok());
@@ -109,11 +117,12 @@ impl LocalDb {
             let local_ts: Option<i64> = r.get(18)?;
 
             let install_state = parse_enum(&state_str, InstallState::Installed);
-            let snap = wid.and_then(|w| snapshots.get(&w));
-            let remote_status = snap
-                .map(|s| s.status)
+            let remote_status = r
+                .get::<_, Option<String>>(19)?
+                .as_deref()
+                .map(|status| parse_enum(status, WorkshopItemStatus::Unknown))
                 .unwrap_or(WorkshopItemStatus::Unknown);
-            let remote_ts = snap.and_then(|s| s.time_updated);
+            let remote_ts = r.get::<_, Option<i64>>(20)?;
             let update_available = match (install_state, local_ts, remote_ts) {
                 (InstallState::Installed, Some(l), Some(rt)) => rt > l,
                 _ => false,
@@ -124,8 +133,9 @@ impl LocalDb {
                 .map(str::trim)
                 .filter(|c| is_valid_local_cover_key(c))
                 .map(str::to_owned);
-            let workshop_cover = snap
-                .and_then(|s| s.preview_url.as_deref())
+            let workshop_cover = r
+                .get::<_, Option<String>>(21)?
+                .as_deref()
                 .and_then(normalize_valid_remote_cover_url);
             let cover = workshop_cover
                 .or_else(|| {
@@ -144,7 +154,8 @@ impl LocalDb {
                 serde_json::from_str(&info_json).unwrap_or_default();
 
             let addon_title = clean_addon_title(addon_info.get("addontitle").map(String::as_str));
-            let workshop_title = snap.and_then(|s| clean_workshop_title(Some(s.title.as_str())));
+            let workshop_title = clean_workshop_title(r.get::<_, Option<String>>(22)?.as_deref());
+            let creator_name = r.get::<_, Option<String>>(23)?;
             let title = workshop_title
                 .clone()
                 .or_else(|| addon_title.clone())
@@ -165,13 +176,12 @@ impl LocalDb {
                             .map(String::as_str),
                     )
                 })
-                .or_else(|| snap.and_then(|s| clean_author_name(s.creator_name.as_deref())));
-            let categories = merge_categories(
-                &stored_cats,
-                &addon_info,
-                &maps,
-                snap.map(|s| s.tags.as_slice()).unwrap_or(&[]),
-            );
+                .or_else(|| clean_author_name(creator_name.as_deref()));
+            let workshop_tags: Vec<String> = r
+                .get::<_, Option<String>>(24)?
+                .and_then(|tags| serde_json::from_str(&tags).ok())
+                .unwrap_or_default();
+            let categories = merge_categories(&stored_cats, &addon_info, &maps, &workshop_tags);
 
             Ok(AddonSummary {
                 id: AddonId(id_str),
@@ -210,7 +220,7 @@ impl LocalDb {
     }
 
     pub fn get_addon(&self, id: &AddonId) -> Result<Option<AddonSummary>, CoreError> {
-        Ok(self.list_addons()?.into_iter().find(|a| &a.id == id))
+        Ok(self.query_addons("WHERE a.id = ?1", [id.as_str()])?.pop())
     }
 
     pub fn get_addon_by_workshop_id(
@@ -218,9 +228,11 @@ impl LocalDb {
         wid: WorkshopId,
     ) -> Result<Option<AddonSummary>, CoreError> {
         Ok(self
-            .list_addons()?
-            .into_iter()
-            .find(|a| a.workshop_id == Some(wid)))
+            .query_addons(
+                "WHERE a.workshop_id = ?1 ORDER BY a.title COLLATE NOCASE, a.id LIMIT 1",
+                [wid.as_u64() as i64],
+            )?
+            .pop())
     }
 
     pub(crate) fn cached_workshop_title(

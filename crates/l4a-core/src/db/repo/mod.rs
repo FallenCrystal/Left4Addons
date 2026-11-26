@@ -6,6 +6,7 @@ mod reconcile_tasks;
 mod workshop;
 
 pub use filter::CachedFilterVerdictRow;
+pub(crate) use metadata::strip_vpk_file_stem;
 pub use metadata::{
     clean_addon_title, clean_author_name, clean_workshop_title, collect_installed_addon_maps,
     derive_categories_from_info, is_remote_image_url, is_valid_local_cover_key, merge_categories,

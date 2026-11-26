@@ -584,6 +584,8 @@ pub struct DashboardSnapshot {
     pub cached_filter_verdicts: Vec<FilterItemVerdict>,
     #[serde(default)]
     pub filter_policy_signature: String,
+    #[serde(default)]
+    pub filter_cache_generation: u64,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -618,6 +620,8 @@ pub enum CoreEvent {
         verdicts: Vec<FilterItemVerdict>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_signature: Option<String>,
+        #[serde(default)]
+        cache_generation: u64,
     },
     LocalFilterStatusChanged {
         status: LocalFilterDeploymentStatus,

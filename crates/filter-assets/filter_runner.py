@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hmac
+import io
 import json
 import math
 import os
@@ -27,6 +28,8 @@ import numpy as np
 from PIL import Image
 
 MAX_IMAGE_PIXELS = 16_777_216  # 4096 x 4096 cap against decompression bombs
+MAX_IMAGE_DIMENSION = 4096
+MAX_SDK_RESIZE_ASPECT = 8
 MAX_SINGLE_IMAGE_BYTES = 16 * 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 MAX_TITLE_CHARS = 4096
@@ -160,6 +163,35 @@ def decode_b64_image(raw_item: Any) -> bytes:
     return decoded
 
 
+def check_image_dimensions(image: Image.Image) -> None:
+    w, h = image.size
+    if not (0 < w <= MAX_IMAGE_DIMENSION and 0 < h <= MAX_IMAGE_DIMENSION
+            and w * h <= MAX_IMAGE_PIXELS):
+        raise ValueError("image_dimensions_out_of_bounds")
+
+
+def preprocess_bounded(image: Image.Image, size: int) -> np.ndarray:
+    # Sample the same center crop as the SDK without allocating the enlarged long edge.
+    w, h = image.size
+    scale = size / min(w, h)
+    rw, rh = max(size, round(w * scale)), max(size, round(h * scale))
+    x, y = (rw - size) // 2, (rh - size) // 2
+    box = (x * w / rw, y * h / rh, (x + size) * w / rw, (y + size) * h / rh)
+    resized = image.resize((size, size), Image.Resampling.BILINEAR, box=box)
+    return np.asarray(resized, dtype=np.float32).transpose(2, 0, 1) / 255.0
+
+
+def bounded_sdk_input(raw: bytes) -> bytes | Image.Image:
+    with Image.open(io.BytesIO(raw)) as im:
+        check_image_dimensions(im)
+        w, h = im.size
+        edge = min(w, h)
+        if max(w, h) <= MAX_SDK_RESIZE_ASPECT * edge:
+            return raw
+        x, y = (w - edge) // 2, (h - edge) // 2
+        return im.crop((x, y, x + edge, y + edge)).convert("RGB")
+
+
 class RunnerEngine:
     def __init__(self, deploy_dir: Path, initial_params: dict[str, Any], max_concurrency: int = 4) -> None:
         self.deploy_dir = deploy_dir
@@ -266,7 +298,7 @@ class RunnerEngine:
                 hasattr(clf, attr) for attr in ("vis_sess", "head_sess", "vocab_data", "txt_dim", "img_size")
             ) and all(
                 hasattr(lf, fn)
-                for fn in ("extract_text_features", "extract_visual_priors", "preprocess_image", "_load_pil")
+                for fn in ("extract_text_features", "extract_visual_priors")
             )
 
             if fast_attrs:
@@ -348,12 +380,18 @@ class RunnerEngine:
             }
 
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-        pils = [lf._load_pil(im) for im in imgs]
-        px_batch = np.stack([lf.preprocess_image(im, clf.img_size) for im in pils], axis=0)
-        pri_batch = np.stack([lf.extract_visual_priors(im) for im in pils], axis=0)
+        pixels, priors = [], []
+        for raw in imgs:
+            with Image.open(io.BytesIO(raw)) as source:
+                check_image_dimensions(source)
+                with source.convert("RGB") as image:
+                    pixels.append(preprocess_bounded(image, clf.img_size))
+                    priors.append(lf.extract_visual_priors(image))
+        px_batch = np.stack(pixels, axis=0)
+        pri_batch = np.stack(priors, axis=0)
         emb_batch = clf.vis_sess.run(["img_emb"], {"pixel_values": px_batch})[0]
 
-        n = len(pils)
+        n = len(imgs)
         zero_th = np.zeros((n, clf.txt_dim), dtype=np.float32)
         zero_tl = np.zeros((n, lex_dim), dtype=np.float32)
         ones_n = np.ones((n, 1), dtype=np.float32)
@@ -391,6 +429,7 @@ class RunnerEngine:
             joint_agg_raw = aggregate_rows(joint_rows, p["gallery_aggregation"])
             joint_trip = self._adjust(joint_agg_raw, p)
         else:
+            joint_rows = img_only_rows
             joint_trip = img_trip
 
         return {
@@ -406,6 +445,8 @@ class RunnerEngine:
             "imageGoreProb": img_trip[1],
             "imageNsfwProb": img_trip[2],
             "perImageProbs": per_image_probs,
+            "imageRows": img_only_rows.tolist(),
+            "jointRows": joint_rows.tolist(),
         }
 
     def _predict_sdk_fallback(
@@ -434,23 +475,29 @@ class RunnerEngine:
 
         per_image_probs: list[float] = []
         img_trip = None
-        if imgs:
-            rows = []
-            for im in imgs:
-                ri = clf.predict(image=im)
-                row = [ri["prob"], ri["gore_prob"], ri["nsfw_prob"]]
-                rows.append(row)
-                per_image_probs.append(self._adjust(row, p)[0])
+        rows, joint_rows = [], []
+        for raw in imgs:
+            im = bounded_sdk_input(raw)
+            ri = clf.predict(image=im)
+            row = [ri["prob"], ri["gore_prob"], ri["nsfw_prob"]]
+            rows.append(row)
+            per_image_probs.append(self._adjust(row, p)[0])
+            if has_txt:
+                rj = clf.predict(title=title, description=desc, tags=tags, image=im)
+                joint_rows.append([rj["prob"], rj["gore_prob"], rj["nsfw_prob"]])
+        if rows:
             agg = aggregate_rows(np.asarray(rows, dtype=np.float32), p["gallery_aggregation"])
             img_trip = self._adjust(agg, p)
 
-        if not has_txt and img_trip is not None:
-            joint_trip = img_trip
-        elif not imgs and text_trip is not None:
-            joint_trip = text_trip
+        if joint_rows:
+            joint_trip = self._adjust(
+                aggregate_rows(np.asarray(joint_rows, dtype=np.float32), p["gallery_aggregation"]),
+                p,
+            )
         else:
-            rj = clf.predict(title=title, description=desc, tags=tags, images=imgs or None)
-            joint_trip = self._adjust([rj["prob"], rj["gore_prob"], rj["nsfw_prob"]], p)
+            joint_rows = rows
+            joint_trip = img_trip if img_trip is not None else text_trip
+            assert joint_trip is not None
 
         return {
             "prob": joint_trip[0],
@@ -465,6 +512,8 @@ class RunnerEngine:
             "imageGoreProb": img_trip[1] if img_trip else None,
             "imageNsfwProb": img_trip[2] if img_trip else None,
             "perImageProbs": per_image_probs,
+            "imageRows": rows,
+            "jointRows": joint_rows,
         }
 
 

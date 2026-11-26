@@ -5,7 +5,9 @@ use crate::sync::with_catalog_source;
 use crate::web_assets;
 use crate::ServerState;
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{
+        rejection::JsonRejection, DefaultBodyLimit, FromRequest, Path, Query, Request, State,
+    },
     http::{
         header::{ACCEPT_LANGUAGE, CACHE_CONTROL, SET_COOKIE, VARY},
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
@@ -24,15 +26,16 @@ use l4a_protocol::{
     FilterProbabilities, SearchQuery, SearchResponse, SetRefreshTokenRequest,
     StartCredentialsAuthRequest, SteamAuthFlowStatus, SubmitSteamGuardRequest,
     WorkshopCollectionRecord, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    CATALOG_FILTER_MAX_BODY_BYTES,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::time::Duration;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 const MAX_BATCH_SIZE: usize = 200;
-const MAX_FILTER_PREDICT_BODY_BYTES: usize = 48 * 1024 * 1024;
 
 #[derive(Clone)]
 struct RouteState {
@@ -67,10 +70,16 @@ pub fn router(state: ServerState) -> Router {
         .layer(middleware::from_fn(append_search_vary));
 
     let filter_predict_route = post(filter_predict)
-        .layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(CATALOG_FILTER_MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             guard_filter_enabled,
+        ));
+    let admin_filter_test_route = post(admin_test_filter)
+        .layer(DefaultBodyLimit::max(CATALOG_FILTER_MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_admin_filter_test,
         ));
 
     let public_routes = Router::new()
@@ -108,10 +117,7 @@ pub fn router(state: ServerState) -> Router {
             patch(admin_update_filter_config),
         )
         .route("/api/v1/admin/filter/restart", post(admin_restart_filter))
-        .route(
-            "/api/v1/admin/filter/test",
-            post(admin_test_filter).layer(DefaultBodyLimit::max(MAX_FILTER_PREDICT_BODY_BYTES)),
-        )
+        .route("/api/v1/admin/filter/test", admin_filter_test_route)
         .route("/api/v1/admin/steam/status", get(admin_steam_status))
         .route("/api/v1/admin/steam/reconnect", post(admin_steam_reconnect))
         .route(
@@ -907,10 +913,27 @@ async fn guard_filter_enabled(
             "内容过滤服务未启用",
         ));
     }
+    admit_filter_request(&state, request, next).await
+}
+
+async fn guard_admin_filter_test(
+    State(state): State<RouteState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    state.require_admin(request.headers())?;
+    admit_filter_request(&state, request, next).await
+}
+
+async fn admit_filter_request(
+    state: &RouteState,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
     let _admission_permit = state
         .server
         .filter
-        .acquire_public_admission()
+        .acquire_request_admission()
         .await
         .ok_or_else(|| {
             err_resp(
@@ -919,6 +942,44 @@ async fn guard_filter_enabled(
             )
         })?;
     Ok(next.run(request).await)
+}
+
+struct FilterPredictJson(FilterPredictRequest);
+
+enum FilterJsonRejection {
+    Json(JsonRejection),
+    Timeout,
+}
+
+impl IntoResponse for FilterJsonRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Json(rejection) => rejection.into_response(),
+            Self::Timeout => {
+                err_resp(StatusCode::REQUEST_TIMEOUT, "读取内容过滤请求超时").into_response()
+            }
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for FilterPredictJson {
+    type Rejection = FilterJsonRejection;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        read_filter_json(request, state, Duration::from_secs(10)).await
+    }
+}
+
+async fn read_filter_json<S: Send + Sync>(
+    request: Request,
+    state: &S,
+    deadline: Duration,
+) -> Result<FilterPredictJson, FilterJsonRejection> {
+    match tokio::time::timeout(deadline, Json::from_request(request, state)).await {
+        Ok(Ok(Json(body))) => Ok(FilterPredictJson(body)),
+        Ok(Err(rejection)) => Err(FilterJsonRejection::Json(rejection)),
+        Err(_) => Err(FilterJsonRejection::Timeout),
+    }
 }
 
 fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
@@ -932,6 +993,10 @@ fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
         }
         FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
         FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
+        FilterServiceError::ScoringChanged => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
         FilterServiceError::Internal(err) => internal_err(err),
     }
 }
@@ -942,8 +1007,19 @@ fn admin_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
         FilterServiceError::Unavailable(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
         FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
         FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
+        FilterServiceError::ScoringChanged => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
         FilterServiceError::Internal(err) => internal_err(err),
     }
+}
+
+fn filter_image_fetch_err(msg: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg, "code": l4a_protocol::CATALOG_FILTER_IMAGE_FETCH_FAILED })),
+    )
 }
 
 async fn filter_info(State(state): State<RouteState>) -> ApiResult<CatalogFilterPublicInfo> {
@@ -952,7 +1028,7 @@ async fn filter_info(State(state): State<RouteState>) -> ApiResult<CatalogFilter
 
 async fn filter_predict(
     State(state): State<RouteState>,
-    Json(req): Json<FilterPredictRequest>,
+    FilterPredictJson(req): FilterPredictJson,
 ) -> ApiResult<FilterProbabilities> {
     let probs = state
         .server
@@ -977,6 +1053,18 @@ async fn admin_update_filter_config(
     Json(dto): Json<CatalogFilterConfigDto>,
 ) -> ApiResult<CatalogFilterStatus> {
     let actor = state.require_admin(&headers)?;
+    if !state
+        .server
+        .config_store
+        .get()
+        .filter
+        .host_paths_match(&dto)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "请在主机的 catalog.toml 中配置过滤模型部署路径和 Python 解释器",
+        ));
+    }
     if let Some(raw_url) = dto
         .upstream_url
         .as_deref()
@@ -989,7 +1077,7 @@ async fn admin_update_filter_config(
     state
         .server
         .config_store
-        .update(|cfg| cfg.filter.apply_dto(&dto))
+        .update(|cfg| cfg.filter.apply_admin_dto(&dto))
         .map_err(internal_err)?;
     let status = state.server.filter.reconfigure().await;
 
@@ -1034,10 +1122,8 @@ async fn admin_restart_filter(
 
 async fn admin_test_filter(
     State(state): State<RouteState>,
-    headers: HeaderMap,
-    Json(req): Json<FilterPredictRequest>,
+    FilterPredictJson(req): FilterPredictJson,
 ) -> ApiResult<FilterProbabilities> {
-    state.require_admin(&headers)?;
     let probs = state
         .server
         .filter
@@ -1045,4 +1131,26 @@ async fn admin_test_filter(
         .await
         .map_err(admin_filter_err)?;
     Ok(Json(probs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[tokio::test]
+    async fn filter_json_read_has_a_deadline() {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let result = read_filter_json(request, &(), Duration::from_millis(1)).await;
+        assert_eq!(
+            result.err().unwrap().into_response().status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+    }
 }

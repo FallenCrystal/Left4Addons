@@ -9,6 +9,7 @@ import type {
 } from '../../api/ipc';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
 import {
+  getFilteredAddonFallbackCover,
   formatFilteredAddonTitle,
   formatRedactedAddonLabel,
   getAddonSearchRedaction,
@@ -178,7 +179,7 @@ function AddonPicker({
                   <AddonCover
                     compact
                     src={addon.coverImage}
-                    fallbackSrc={addon.localCoverImage}
+                    fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
                     title={displayName}
                     category={addon.categories[0]}
                     filterMode={cardFilter.coverMode}

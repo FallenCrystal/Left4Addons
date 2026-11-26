@@ -23,6 +23,7 @@ import type {
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
 import {
+  getFilteredAddonFallbackCover,
   addonFilterKey,
   buildFilteredBundleMaps,
   formatDiagnosticVerdictBadge,
@@ -46,6 +47,7 @@ export interface BundleDetailSheetProps {
   liveDownloads: Record<string, LiveDownloadState>;
   busy: boolean;
   bundleTab: 'members' | 'maps';
+  forceShowHiddenCards?: boolean;
   onBundleTabChange: (tab: 'members' | 'maps') => void;
   onClose: () => void;
   onSelectAddon: (addon: AddonSummary) => void;
@@ -66,6 +68,7 @@ export function BundleDetailSheet({
   liveDownloads,
   busy,
   bundleTab,
+  forceShowHiddenCards,
   onBundleTabChange,
   onClose,
   onSelectAddon,
@@ -96,7 +99,7 @@ export function BundleDetailSheet({
       member,
       key,
       verdict,
-      state: resolveLibraryAddonCardFilter(member, filterCtx),
+      state: resolveLibraryAddonCardFilter(member, filterCtx, { forceShowHiddenCards }),
     };
   });
 
@@ -109,6 +112,7 @@ export function BundleDetailSheet({
     ? resolveBundleCoverPresentation(members, filterCtx, {
         allMembers,
         bundleCoverImage: bundle.coverImage,
+        forceShowHiddenCards,
       })
     : null;
   const sheetTitle = bundle
@@ -319,7 +323,7 @@ export function BundleDetailSheet({
                             <AddonCover
                               compact
                               src={member.coverImage}
-                              fallbackSrc={member.localCoverImage}
+                              fallbackSrc={getFilteredAddonFallbackCover(member, filterCtx)}
                               title={memberLabel}
                               category={member.categories[0]}
                               filterMode={cardFilter.coverMode}

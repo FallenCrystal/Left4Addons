@@ -3,9 +3,9 @@ use crate::config::AppPaths;
 use crate::engine::EventSink;
 use crate::error::CoreError;
 use l4a_protocol::{
-    CoreEvent, DeployLocalFilterRequest, FilterCommitInfo, FilterEnvReport,
-    FilterGalleryAggregation, FilterModelParams, FilterProbabilities, LocalFilterDeploymentStatus,
-    LocalFilterServiceState, RawFilterPredictRequest,
+    merge_managed_predictions, CoreEvent, DeployLocalFilterRequest, FilterCommitInfo,
+    FilterEnvReport, FilterModelParams, FilterProbabilities, LocalFilterDeploymentStatus,
+    LocalFilterServiceState, ManagedFilterPrediction, RawFilterPredictRequest,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::Deserialize;
@@ -1205,8 +1205,7 @@ impl LocalFilterManager {
 
         let sub_batches =
             split_images_by_raw_budget(effective_imgs, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES);
-        let mut sub_results: Vec<(usize, FilterProbabilities)> =
-            Vec::with_capacity(sub_batches.len());
+        let mut sub_results = Vec::with_capacity(sub_batches.len());
 
         for sub_imgs in sub_batches {
             let sub_count = sub_imgs.len();
@@ -1223,10 +1222,8 @@ impl LocalFilterManager {
             sub_results.push((sub_count, probs));
         }
 
-        Ok(merge_subbatch_probabilities(
-            sub_results,
-            sanitized.gallery_aggregation,
-        ))
+        merge_managed_predictions(sub_results, &sanitized)
+            .ok_or_else(|| CoreError::Network("本地过滤模型未返回完整的逐图评分".into()))
     }
 
     async fn ensure_synced_endpoint_for_predict(
@@ -1297,7 +1294,7 @@ impl LocalFilterManager {
         payload: &RawFilterPredictRequest,
         auto_restart: bool,
         sanitized_params: &FilterModelParams,
-    ) -> Result<FilterProbabilities, CoreError> {
+    ) -> Result<ManagedFilterPrediction, CoreError> {
         let endpoint = self
             .ensure_synced_endpoint_for_predict(sanitized_params, auto_restart)
             .await?;
@@ -1367,7 +1364,7 @@ impl LocalFilterManager {
         &self,
         endpoint: &str,
         payload: &RawFilterPredictRequest,
-    ) -> Result<FilterProbabilities, PredictLocalError> {
+    ) -> Result<ManagedFilterPrediction, PredictLocalError> {
         let url = format!("{}/predict", endpoint.trim_end_matches('/'));
         let resp = self
             .http_client
@@ -1388,7 +1385,7 @@ impl LocalFilterManager {
                 "本地过滤模型推理返回 HTTP {status}: {detail}"
             ))));
         }
-        resp.json::<FilterProbabilities>().await.map_err(|e| {
+        resp.json::<ManagedFilterPrediction>().await.map_err(|e| {
             PredictLocalError::HttpStatus(CoreError::Network(format!(
                 "解析本地过滤模型输出失败: {e}"
             )))
@@ -2005,119 +2002,34 @@ pub(crate) fn split_images_by_raw_budget(
     batches
 }
 
-fn aggregate_subbatch_scalars(
-    values: &[(usize, f32)],
-    aggregation: FilterGalleryAggregation,
-) -> f32 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    if values.len() == 1 {
-        return values[0].1;
-    }
-    match aggregation {
-        FilterGalleryAggregation::Mean => {
-            let total_weight: usize = values.iter().map(|(c, _)| (*c).max(1)).sum();
-            let weighted_sum: f32 = values.iter().map(|(c, v)| (*c).max(1) as f32 * *v).sum();
-            (weighted_sum / total_weight as f32).clamp(0.0, 1.0)
-        }
-        FilterGalleryAggregation::Top2Mean => {
-            let mut expanded: Vec<f32> = Vec::new();
-            for &(count, val) in values {
-                expanded.push(val);
-                if count >= 2 {
-                    expanded.push(val);
-                }
-            }
-            expanded.sort_by(f32::total_cmp);
-            let n = expanded.len();
-            if n >= 2 {
-                ((expanded[n - 1] + expanded[n - 2]) * 0.5).clamp(0.0, 1.0)
-            } else {
-                expanded[0].clamp(0.0, 1.0)
-            }
-        }
-        FilterGalleryAggregation::Max => values
-            .iter()
-            .map(|(_, v)| *v)
-            .fold(0.0_f32, f32::max)
-            .clamp(0.0, 1.0),
-    }
-}
-
-pub(crate) fn merge_subbatch_probabilities(
-    parts: Vec<(usize, FilterProbabilities)>,
-    aggregation: FilterGalleryAggregation,
-) -> FilterProbabilities {
-    if parts.is_empty() {
+// A raw endpoint owns its calibration and exposes no raw gallery rows.
+pub(crate) fn merge_raw_max(parts: Vec<(usize, FilterProbabilities)>) -> FilterProbabilities {
+    let mut parts = parts.into_iter();
+    let Some((count, mut merged)) = parts.next() else {
         return FilterProbabilities::default();
-    }
-    if parts.len() == 1 {
-        return parts.into_iter().next().unwrap().1;
-    }
-
-    let first = &parts[0].1;
-    let mut all_per_image = Vec::new();
-    let mut all_have_per_image = true;
-    for (count, p) in &parts {
-        if *count > 0 && p.per_image_probs.len() == *count {
-            all_per_image.extend_from_slice(&p.per_image_probs);
-        } else {
-            all_have_per_image = false;
-        }
-    }
-    if !all_have_per_image {
-        all_per_image.clear();
-    }
-
-    let ov_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.prob)).collect();
-    let gore_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.gore_prob)).collect();
-    let nsfw_vals: Vec<(usize, f32)> = parts.iter().map(|(c, p)| (*c, p.nsfw_prob)).collect();
-
-    let img_vals: Vec<(usize, f32)> = parts
-        .iter()
-        .filter_map(|(c, p)| p.image_prob.map(|v| (*c, v)))
-        .collect();
-    let img_gore_vals: Vec<(usize, f32)> = parts
-        .iter()
-        .filter_map(|(c, p)| p.image_gore_prob.map(|v| (*c, v)))
-        .collect();
-    let img_nsfw_vals: Vec<(usize, f32)> = parts
-        .iter()
-        .filter_map(|(c, p)| p.image_nsfw_prob.map(|v| (*c, v)))
-        .collect();
-
-    let image_prob = if !all_per_image.is_empty()
-        && aggregation == FilterGalleryAggregation::Top2Mean
-        && all_per_image.len() >= 2
-    {
-        let mut sorted = all_per_image.clone();
-        sorted.sort_by(f32::total_cmp);
-        let n = sorted.len();
-        Some(((sorted[n - 1] + sorted[n - 2]) * 0.5).clamp(0.0, 1.0))
-    } else if !img_vals.is_empty() {
-        Some(aggregate_subbatch_scalars(&img_vals, aggregation))
-    } else {
-        None
     };
-
-    FilterProbabilities {
-        prob: aggregate_subbatch_scalars(&ov_vals, aggregation),
-        gore_prob: aggregate_subbatch_scalars(&gore_vals, aggregation),
-        nsfw_prob: aggregate_subbatch_scalars(&nsfw_vals, aggregation),
-        text_prob: first.text_prob,
-        text_gore_prob: first.text_gore_prob,
-        text_nsfw_prob: first.text_nsfw_prob,
-        title_prob: first.title_prob,
-        description_prob: first.description_prob,
-        image_prob,
-        image_gore_prob: (!img_gore_vals.is_empty())
-            .then(|| aggregate_subbatch_scalars(&img_gore_vals, aggregation)),
-        image_nsfw_prob: (!img_nsfw_vals.is_empty())
-            .then(|| aggregate_subbatch_scalars(&img_nsfw_vals, aggregation)),
-        per_image_probs: all_per_image,
-        scoring_revision: first.scoring_revision.clone(),
+    if parts.len() == 0 {
+        return merged;
     }
+    let mut aligned = count == merged.per_image_probs.len();
+    let max_optional = |a: Option<f32>, b: Option<f32>| match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    for (count, part) in parts {
+        merged.prob = merged.prob.max(part.prob);
+        merged.gore_prob = merged.gore_prob.max(part.gore_prob);
+        merged.nsfw_prob = merged.nsfw_prob.max(part.nsfw_prob);
+        merged.image_prob = max_optional(merged.image_prob, part.image_prob);
+        merged.image_gore_prob = max_optional(merged.image_gore_prob, part.image_gore_prob);
+        merged.image_nsfw_prob = max_optional(merged.image_nsfw_prob, part.image_nsfw_prob);
+        aligned &= count == part.per_image_probs.len();
+        merged.per_image_probs.extend(part.per_image_probs);
+    }
+    if !aligned {
+        merged.per_image_probs.clear();
+    }
+    merged
 }
 
 async fn resolve_remote_default_ref_async(
@@ -2318,35 +2230,32 @@ mod tests {
         assert_eq!(batches[0].len(), 2);
         assert_eq!(batches[1].len(), 1);
 
-        let merged = merge_subbatch_probabilities(
-            vec![
-                (
-                    2,
-                    FilterProbabilities {
-                        prob: 0.12,
-                        gore_prob: 0.02,
-                        nsfw_prob: 0.11,
-                        text_prob: Some(0.03),
-                        image_prob: Some(0.12),
-                        per_image_probs: vec![0.04, 0.12],
-                        ..Default::default()
-                    },
-                ),
-                (
-                    1,
-                    FilterProbabilities {
-                        prob: 0.91,
-                        gore_prob: 0.01,
-                        nsfw_prob: 0.90,
-                        text_prob: Some(0.03),
-                        image_prob: Some(0.91),
-                        per_image_probs: vec![0.91],
-                        ..Default::default()
-                    },
-                ),
-            ],
-            FilterGalleryAggregation::Max,
-        );
+        let merged = merge_raw_max(vec![
+            (
+                2,
+                FilterProbabilities {
+                    prob: 0.12,
+                    gore_prob: 0.02,
+                    nsfw_prob: 0.11,
+                    text_prob: Some(0.03),
+                    image_prob: Some(0.12),
+                    per_image_probs: vec![0.04, 0.12],
+                    ..Default::default()
+                },
+            ),
+            (
+                1,
+                FilterProbabilities {
+                    prob: 0.91,
+                    gore_prob: 0.01,
+                    nsfw_prob: 0.90,
+                    text_prob: Some(0.03),
+                    image_prob: Some(0.91),
+                    per_image_probs: vec![0.91],
+                    ..Default::default()
+                },
+            ),
+        ]);
         assert_eq!(merged.prob, 0.91);
         assert_eq!(merged.nsfw_prob, 0.90);
         assert_eq!(merged.image_prob, Some(0.91));
@@ -2450,10 +2359,11 @@ mod tests {
             image_base64: None,
             images_base64: vec!["aW1nMA==".into(), "aW1nMQ==".into()],
         };
-        let probs = mgr
+        let prediction = mgr
             .send_predict_http(&format!("http://{addr}"), &payload)
             .await
             .unwrap_or_else(|_| panic!("expected strict snake_case /predict to succeed"));
+        let probs = prediction.probabilities;
         assert_eq!(probs.prob, 0.88);
         assert_eq!(probs.per_image_probs, vec![0.10, 0.88]);
 

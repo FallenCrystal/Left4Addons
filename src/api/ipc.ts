@@ -312,6 +312,12 @@ export interface FilterTokenStatus {
   hasEncryptedToken: boolean;
   envVarName: string;
   envVarPresent: boolean;
+  cacheGeneration?: number;
+}
+
+export interface FilterCacheClearResult {
+  count: number;
+  cacheGeneration: number;
 }
 
 export interface FilterEnvReport {
@@ -412,6 +418,7 @@ export type FilterEvaluationItemResult = {
 
 export interface FilterEvaluationBatchResponse {
   policySignature: string;
+  cacheGeneration?: number;
   items: FilterEvaluationItemResult[];
 }
 
@@ -446,6 +453,7 @@ export interface DashboardSnapshot {
   filterExclusions: FilterExclusionRecord[];
   cachedFilterVerdicts?: FilterItemVerdict[];
   filterPolicySignature?: string;
+  filterCacheGeneration?: number;
 }
 
 export interface SteamCapabilities {
@@ -581,6 +589,7 @@ export type CoreEvent =
       type: 'filter_verdicts_updated';
       verdicts: FilterItemVerdict[];
       policySignature?: string | null;
+      cacheGeneration?: number;
     }
   | { type: 'local_filter_status_changed'; status: LocalFilterDeploymentStatus };
 
@@ -842,12 +851,16 @@ export async function setFilterLlmToken(token: string | null): Promise<FilterTok
 
 export async function evaluateFilterItems(
   targets: FilterEvaluationTarget[],
+  automatic = false,
 ): Promise<FilterEvaluationBatchResponse> {
-  return invokeCommand<FilterEvaluationBatchResponse>('evaluate_filter_items', { targets });
+  return invokeCommand<FilterEvaluationBatchResponse>(
+    'evaluate_filter_items',
+    automatic ? { targets, automatic } : { targets },
+  );
 }
 
-export async function clearFilterCache(): Promise<number> {
-  return invokeCommand<number>('clear_filter_cache');
+export async function clearFilterCache(): Promise<FilterCacheClearResult> {
+  return invokeCommand<FilterCacheClearResult>('clear_filter_cache');
 }
 
 export async function upsertFilterExclusion(

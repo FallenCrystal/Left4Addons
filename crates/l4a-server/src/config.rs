@@ -267,21 +267,20 @@ impl FilterSection {
         }
     }
 
-    pub fn apply_dto(&mut self, dto: &CatalogFilterConfigDto) {
+    pub fn host_paths_match(&self, dto: &CatalogFilterConfigDto) -> bool {
+        let configured = self.to_dto();
+        dto.deploy_dir
+            .as_deref()
+            .is_none_or(|path| Some(path.trim()) == configured.deploy_dir.as_deref())
+            && dto
+                .python_bin
+                .as_deref()
+                .is_none_or(|path| Some(path.trim()) == configured.python_bin.as_deref())
+    }
+
+    pub fn apply_admin_dto(&mut self, dto: &CatalogFilterConfigDto) {
         self.enabled = dto.enabled;
         self.backend = dto.backend;
-        self.deploy_dir = dto
-            .deploy_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from);
-        self.python_bin = dto
-            .python_bin
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
         self.upstream_url = dto
             .upstream_url
             .as_deref()

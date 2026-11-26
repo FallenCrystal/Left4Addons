@@ -14,6 +14,7 @@ import type { AddonNamePreference, AddonSummary, BundleRecord } from '../../../a
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
 import {
+  getFilteredAddonFallbackCover,
   addonFilterKey,
   formatDiagnosticVerdictBadge,
   formatRedactedAddonLabel,
@@ -96,7 +97,7 @@ function BundleListRow({
     : bundle.name;
   const authorText = coverPres.redactAuthor
     ? t('filter.redactedAuthor')
-    : summary.firstAuthor || t('common.unknown');
+    : coverPres.author || t('common.unknown');
 
   return (
     <div
@@ -348,7 +349,7 @@ function AddonListRow({
           <AddonCover
             compact
             src={addon.coverImage}
-            fallbackSrc={addon.localCoverImage}
+            fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
             title={displayName}
             category={addon.categories[0]}
             filterMode={cardFilter.coverMode}

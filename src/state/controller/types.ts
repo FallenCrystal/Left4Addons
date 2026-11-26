@@ -143,8 +143,9 @@ export interface DesktopClient {
   setFilterLlmToken: (token: string | null) => Promise<FilterTokenStatus>;
   evaluateFilterItems: (
     targets: FilterEvaluationTarget[],
+    automatic?: boolean,
   ) => Promise<FilterEvaluationBatchResponse>;
-  clearFilterCache: () => Promise<number>;
+  clearFilterCache: () => Promise<ipc.FilterCacheClearResult>;
   upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<DashboardSnapshot>;
   deleteFilterExclusion: (addonId: AddonId) => Promise<DashboardSnapshot>;
   subscribeCoreEvents: (handler: (ev: CoreEvent) => void) => Promise<() => void>;
@@ -244,7 +245,7 @@ export function getClient(tauri: boolean): DesktopClient {
     stopLocalFilterService: () => previewEngine.stopLocalFilterService(),
     getFilterTokenStatus: () => previewEngine.getFilterTokenStatus(),
     setFilterLlmToken: (tok) => previewEngine.setFilterLlmToken(tok),
-    evaluateFilterItems: (targets) => previewEngine.evaluateFilterItems(targets),
+    evaluateFilterItems: (targets, automatic) => previewEngine.evaluateFilterItems(targets, automatic),
     clearFilterCache: () => previewEngine.clearFilterCache(),
     upsertFilterExclusion: (req) => previewEngine.upsertFilterExclusion(req),
     deleteFilterExclusion: (id) => previewEngine.deleteFilterExclusion(id),

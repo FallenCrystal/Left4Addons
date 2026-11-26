@@ -29,6 +29,7 @@ import type {
 } from '../../api/ipc';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
 import {
+  getFilteredAddonFallbackCover,
   addonFilterKey,
   collectAddonImageSources,
   formatRedactedAddonLabel,
@@ -292,7 +293,7 @@ export function AddonDetailSheet({
             >
               <AddonCover
                 src={addon.coverImage}
-                fallbackSrc={addon.localCoverImage}
+                fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
                 title={displayName}
                 category={addon.categories[0]}
                 filterMode={detailFilter.coverMode}
@@ -591,7 +592,6 @@ export function AddonDetailSheet({
                       void upsertFilterExclusion({
                         addonId: addon.id,
                         displayLevel: nextLevel,
-                        bindFingerprint: exclusion.bindFingerprint && canBindFingerprint,
                         note: exclusion.note,
                       });
                     }
@@ -618,7 +618,7 @@ export function AddonDetailSheet({
                 <Switch
                   compact
                   checked={effectiveDraftBind}
-                  disabled={busy || !canBindFingerprint}
+                  disabled={busy || (!canBindFingerprint && !effectiveDraftBind)}
                   label={t('filter.bindFingerprint')}
                   onChange={(nextBind) => {
                     setDraftExclAddonId(addon.id);
@@ -627,7 +627,7 @@ export function AddonDetailSheet({
                       void upsertFilterExclusion({
                         addonId: addon.id,
                         displayLevel: exclusion.displayLevel,
-                        bindFingerprint: nextBind && canBindFingerprint,
+                        bindFingerprint: nextBind,
                         note: exclusion.note,
                       });
                     }

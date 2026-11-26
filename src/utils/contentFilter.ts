@@ -24,10 +24,30 @@ import {
 import {
   formatAddonDisplayName,
   formatBundleMemberLabel,
+  stripVpkExtension,
   type AddonSearchRedactionOptions,
 } from './format';
 
 export type CoverFilterMode = 'none' | 'lazy' | 'blur' | 'hide';
+
+export const FILTER_REMOTE_VERDICT_MAX_AGE_MS = 60 * 60 * 1000;
+
+export function filterVerdictExpiresAt(
+  verdict: FilterItemVerdict,
+  mode: ClientFilterConfig['mode'],
+): number {
+  if (mode === 'local') return Infinity;
+  const evaluatedAt = Date.parse(verdict.evaluatedAt);
+  return Number.isFinite(evaluatedAt) ? evaluatedAt + FILTER_REMOTE_VERDICT_MAX_AGE_MS : 0;
+}
+
+export function isAutomaticFilterTargetEnabled(
+  targetKey: string,
+  config: Pick<ClientFilterConfig, 'enabled' | 'applyToLibrary' | 'applyToWorkshop'>,
+): boolean {
+  return config.enabled &&
+    (targetKey.startsWith('addon:') ? config.applyToLibrary : config.applyToWorkshop);
+}
 
 export type FilterTranslateFn = (key: string, options?: Record<string, unknown>) => string;
 
@@ -379,6 +399,7 @@ export function collectAddonImageSources(addon: AddonSummary): string[] {
   for (const m of addon.maps) {
     pushUnique(m.imagePath);
   }
+  pushUnique(addon.localCoverImage);
   return urls;
 }
 
@@ -405,6 +426,7 @@ export function hasFilterableAddonContent(addon: AddonSummary): boolean {
     addon.title?.trim() ||
       addon.addonTitle?.trim() ||
       addon.workshopTitle?.trim() ||
+      addon.currentFileName?.trim() ||
       desc?.trim() ||
       addon.categories.length > 0 ||
       collectAddonImageSources(addon).length > 0,
@@ -420,15 +442,21 @@ export function hasFilterableWorkshopContent(item: WorkshopItemRecord): boolean 
   );
 }
 
+function addonFilterTitle(addon: AddonSummary): string {
+  const fileStem = addon.currentFileName && stripVpkExtension(addon.currentFileName);
+  const titles = [addon.workshopTitle, addon.addonTitle, addon.title, fileStem];
+  return [...new Set(titles.map((title) => title?.trim()).filter(Boolean))].join('\n');
+}
+
 export function buildAddonRevisionHint(addon: AddonSummary): string {
   const imageSources = collectAddonImageSources(addon);
-  const title = addon.workshopTitle?.trim() || addon.addonTitle?.trim() || addon.title;
   const description = (addon.addonInfo.addondescription ?? addon.addonInfo.description ?? '').trim();
   return [
+    'v2',
     addon.contentHash ?? '',
     addon.localTimeUpdated ?? 0,
     addon.remoteTimeUpdated ?? 0,
-    title,
+    fnv1aHex(addonFilterTitle(addon)),
     fnv1aHex(description),
     addon.categories.join(','),
     imageSources.join('|'),
@@ -437,7 +465,7 @@ export function buildAddonRevisionHint(addon: AddonSummary): string {
 
 export function buildAddonFilterTarget(addon: AddonSummary): FilterEvaluationTarget {
   const imageSources = collectAddonImageSources(addon);
-  const title = addon.workshopTitle?.trim() || addon.addonTitle?.trim() || addon.title;
+  const title = addonFilterTitle(addon);
   const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
   const revisionHint = buildAddonRevisionHint(addon);
 
@@ -453,15 +481,17 @@ export function buildAddonFilterTarget(addon: AddonSummary): FilterEvaluationTar
   };
 }
 
+export function buildWorkshopRevisionHint(
+  item: WorkshopItemRecord,
+  imageSources = collectWorkshopImageUrls(item),
+): string {
+  return fnv1aHex(JSON.stringify([
+    item.timeUpdated ?? 0, item.title, item.description?.trim() ?? '', item.tags, imageSources,
+  ]));
+}
+
 export function buildWorkshopFilterTarget(item: WorkshopItemRecord): FilterEvaluationTarget {
   const imageSources = collectWorkshopImageUrls(item);
-  const revisionHint = [
-    item.timeUpdated ?? 0,
-    item.title,
-    `imgs=${imageSources.length}`,
-    imageSources.join('|'),
-  ].join(':');
-
   return {
     targetKey: workshopFilterKey(item.workshopId),
     workshopId: item.workshopId,
@@ -469,7 +499,7 @@ export function buildWorkshopFilterTarget(item: WorkshopItemRecord): FilterEvalu
     description: item.description?.trim() || undefined,
     tags: [...item.tags],
     imageSources,
-    revisionHint,
+    revisionHint: buildWorkshopRevisionHint(item, imageSources),
   };
 }
 
@@ -546,7 +576,7 @@ export function computeFilterPolicySignature(
       modePart = `catalog:url=${trimTrailingSlashes(options?.catalogServerUrl ?? '')}:https=${httpsOnly}:rev=${options?.catalogScoringRevision ?? 'unverified'}`;
       break;
     case 'custom_endpoint':
-      modePart = `custom:url=${trimTrailingSlashes(filter.customEndpointUrl ?? '')}:https=${httpsOnly}`;
+      modePart = `custom:url=${trimTrailingSlashes(filter.customEndpointUrl ?? '')}:https=${httpsOnly}:max=${p.maxImages}`;
       break;
     case 'local':
     default:
@@ -555,10 +585,10 @@ export function computeFilterPolicySignature(
   }
 
   const llmPart = filter.llmEnabled
-    ? `1:t=${fmtF32Fixed4(filter.llmThreshold)}:ep=${trimTrailingSlashes(filter.llmEndpoint)}:m=${filter.llmModel.trim()}:img=${filter.llmSendImages}:sys=${fnv1aHex(filter.llmSystemPrompt.trim())}`
+    ? `1:t=${fmtF32Fixed4(filter.llmThreshold)}:ep=${trimTrailingSlashes(filter.llmEndpoint)}:m=${filter.llmModel.trim()}:img=${filter.llmSendImages}:sys=${fnv1aHex(filter.llmSystemPrompt.trim())}:token=${filter.llmTokenSource}:env=${filter.llmTokenSource === 'env_var' ? filter.llmTokenEnvVar.trim() : ''}`
     : '0';
 
-  const raw = `v2|${modePart}|st=${rustDebugScoreTarget(filter.scoreTarget)}|df=${filter.enableDirectFlag}:${fmtF32Fixed4(filter.flagThreshold)}|llm=${llmPart}|sub=${filter.subdivideModalities}:${fmtF32Fixed4(filter.modalityThreshold)}`;
+  const raw = `v3|${modePart}|st=${rustDebugScoreTarget(filter.scoreTarget)}|df=${filter.enableDirectFlag}:${fmtF32Fixed4(filter.flagThreshold)}|llm=${llmPart}|sub=${filter.subdivideModalities}:${fmtF32Fixed4(filter.modalityThreshold)}`;
   return `pol_${fnv1aHex(raw)}`;
 }
 
@@ -951,13 +981,28 @@ export interface FilterLookupSource {
 export function resolveLookupVerdict(
   targetKey: string,
   filterCtx: Pick<FilterLookupSource, 'verdicts' | 'evaluatedRevisions'>,
+  expectedRevision?: string,
 ): FilterItemVerdict | null | undefined {
   const verdict = filterCtx.verdicts[targetKey];
-  if (verdict) return verdict;
-  if (filterCtx.evaluatedRevisions && targetKey in filterCtx.evaluatedRevisions) {
+  if (verdict && (expectedRevision === undefined || verdict.revisionHint === expectedRevision)) {
+    return verdict;
+  }
+  const completedRevision = filterCtx.evaluatedRevisions?.[targetKey];
+  if (completedRevision !== undefined && (expectedRevision === undefined || completedRevision === expectedRevision)) {
     return null;
   }
   return undefined;
+}
+
+export function resolveWorkshopVerdict(
+  item: WorkshopItemRecord,
+  filterCtx: Pick<FilterLookupSource, 'verdicts' | 'evaluatedRevisions'>,
+): FilterItemVerdict | null | undefined {
+  return resolveLookupVerdict(
+    workshopFilterKey(item.workshopId),
+    filterCtx,
+    buildWorkshopRevisionHint(item),
+  );
 }
 
 export function resolveLibraryAddonCardFilter(
@@ -993,6 +1038,26 @@ export function resolveLibraryAddonDetailFilter(
     hasTargetFailed: filterCtx.failedTargetKeys?.has(key) ?? false,
     hasContent: hasFilterableAddonContent(addon),
   });
+}
+
+export function getFilteredAddonFallbackCover(
+  addon: AddonSummary,
+  filterCtx: FilterLookupSource,
+): string | undefined {
+  const local = addon.localCoverImage?.trim();
+  const primary = addon.coverImage?.trim();
+  if (!local || !primary || primary === local) return local;
+  const config = filterCtx.filterConfig;
+  if (!config.enabled || !config.applyToLibrary || config.flaggedAction === 'mark_only' ||
+      filterCtx.exclusionsByAddonId.get(addon.id)?.fingerprintValid) {
+    return local;
+  }
+  const slot = collectAddonImageSources(addon).indexOf(local);
+  const verdict = resolveLookupVerdict(addonFilterKey(addon.id), filterCtx, buildAddonRevisionHint(addon));
+  if (!verdict?.evaluatedImageIndices?.includes(slot)) return undefined;
+  return resolveLibraryAddonDetailFilter(addon, filterCtx).imageModeAt(slot) === 'none'
+    ? local
+    : undefined;
 }
 
 export function getAddonSearchRedaction(
@@ -1059,6 +1124,7 @@ export interface BundleCoverPresentation {
   pendingEvaluation: boolean;
   redactTitle: boolean;
   redactAuthor: boolean;
+  author?: string;
   blurWholeCard: boolean;
 }
 
@@ -1082,7 +1148,8 @@ export function resolveBundleCoverPresentation(
   );
 
   const redactTitle = eligible.length > 0 && eligible.every((e) => e.state.redactTitle);
-  const redactAuthor = eligible.length > 0 && eligible.every((e) => e.state.redactMeta);
+  const author = eligible.find((e) => !e.state.redactMeta && e.member.author?.trim())?.member.author;
+  const redactAuthor = !author && eligible.some((e) => e.state.redactMeta && e.member.author?.trim());
   const blurWholeCard =
     eligible.length > 0 &&
     eligible.every((e) => e.state.blurWholeCard && !e.state.pendingEvaluation);
@@ -1104,11 +1171,12 @@ export function resolveBundleCoverPresentation(
     return {
       ownerMember: ownerEntry.member,
       src: ownerEntry.member.coverImage,
-      fallbackSrc: ownerEntry.member.localCoverImage,
+      fallbackSrc: getFilteredAddonFallbackCover(ownerEntry.member, filterCtx),
       coverMode: effectiveBlurWholeCard ? 'hide' : ownerEntry.state.coverMode,
       pendingEvaluation: ownerEntry.state.pendingEvaluation,
       redactTitle,
       redactAuthor,
+      author,
       blurWholeCard: effectiveBlurWholeCard,
     };
   }
@@ -1131,12 +1199,13 @@ export function resolveBundleCoverPresentation(
           src: fallbackBundleCover,
           fallbackSrc:
             bundleOwner.localCoverImage?.trim() !== fallbackBundleCover
-              ? bundleOwner.localCoverImage
+              ? getFilteredAddonFallbackCover(bundleOwner, filterCtx)
               : undefined,
           coverMode: effectiveBlurWholeCard ? 'hide' : bundleOwnerState.coverMode,
           pendingEvaluation: bundleOwnerState.pendingEvaluation,
           redactTitle,
           redactAuthor,
+          author,
           blurWholeCard: effectiveBlurWholeCard,
         };
       }
@@ -1151,6 +1220,7 @@ export function resolveBundleCoverPresentation(
     pendingEvaluation: allPendingBlur,
     redactTitle,
     redactAuthor,
+    author,
     blurWholeCard: effectiveBlurWholeCard,
   };
 }

@@ -21,7 +21,11 @@ export interface UseLiveDownloadsParams {
   onOpenReconcileRef: RefObject<(() => void) | undefined>;
   notify: NotifyFn;
   refresh: () => Promise<boolean>;
-  onFilterVerdictsUpdated?: (verdicts: FilterItemVerdict[], policySignature?: string) => void;
+  onFilterVerdictsUpdated?: (
+    verdicts: FilterItemVerdict[],
+    policySignature?: string,
+    cacheGeneration?: number,
+  ) => void;
   onLocalFilterStatusChanged?: (status: LocalFilterDeploymentStatus) => void;
 }
 
@@ -112,7 +116,7 @@ export function useLiveDownloads({
         } else if (ev.type === 'watch_error') {
           notify(ev.message, { tone: 'error' });
         } else if (ev.type === 'filter_verdicts_updated') {
-          onFilterVerdictsUpdated?.(ev.verdicts, ev.policySignature ?? undefined);
+          onFilterVerdictsUpdated?.(ev.verdicts, ev.policySignature ?? undefined, ev.cacheGeneration);
         } else if (ev.type === 'local_filter_status_changed') {
           onLocalFilterStatusChanged?.(ev.status);
         }

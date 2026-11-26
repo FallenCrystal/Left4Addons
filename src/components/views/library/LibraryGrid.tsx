@@ -16,6 +16,7 @@ import type { AddonNamePreference, AddonSummary, BundleRecord } from '../../../a
 import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
 import {
+  getFilteredAddonFallbackCover,
   addonFilterKey,
   formatDiagnosticVerdictBadge,
   formatRedactedAddonLabel,
@@ -101,7 +102,7 @@ function BundleGridCard({
     : bundle.name;
   const authorText = coverPres.redactAuthor
     ? t('filter.redactedAuthor')
-    : summary.firstAuthor || t('common.unknown');
+    : coverPres.author || t('common.unknown');
 
   const handleOpenOrSelect = () => {
     if (batchMode) onToggleSelectMany(visibleIds);
@@ -394,7 +395,7 @@ function AddonGridCard({
           >
             <AddonCover
               src={addon.coverImage}
-              fallbackSrc={addon.localCoverImage}
+              fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
               title={displayName}
               category={addon.categories[0]}
               filterMode={cardFilter.coverMode}

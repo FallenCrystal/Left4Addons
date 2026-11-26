@@ -1,10 +1,11 @@
 use crate::db::repo::{
     is_remote_image_url, is_valid_local_cover_key, normalize_valid_remote_cover_url,
+    strip_vpk_file_stem,
 };
 use crate::engine::L4aEngine;
 use crate::error::CoreError;
 use crate::filter::deploy::{
-    merge_subbatch_probabilities, split_images_by_raw_budget, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES,
+    merge_raw_max, split_images_by_raw_budget, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES,
 };
 use crate::filter::llm::{is_loopback_url, judge_with_openai_llm, LoadedImage};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
@@ -12,10 +13,12 @@ use base64::Engine as _;
 use chrono::{TimeDelta, Utc};
 use futures_util::stream::{self, StreamExt};
 use l4a_protocol::{
-    AddonSummary, AppConfig, CatalogFilterPublicInfo, ClientFilterConfig, ClientFilterSourceMode,
-    CoreEvent, FilterDecisionSource, FilterEvaluationBatchResponse, FilterEvaluationItemResult,
-    FilterEvaluationTarget, FilterGalleryAggregation, FilterItemVerdict, FilterPredictRequest,
+    AddonId, AddonSummary, AppConfig, CatalogFilterPublicInfo, ClientFilterConfig,
+    ClientFilterSourceMode, CoreEvent, FilterDecisionSource, FilterEvaluationBatchResponse,
+    FilterEvaluationItemResult, FilterEvaluationTarget, FilterItemVerdict, FilterPredictRequest,
     FilterProbabilities, FilterTargetOutcome, RawFilterPredictRequest,
+    CATALOG_FILTER_IMAGE_FETCH_FAILED, CATALOG_FILTER_MAX_BODY_BYTES,
+    FILTER_REMOTE_VERDICT_MAX_AGE_SECS,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -31,7 +34,7 @@ pub(crate) fn remote_verdict_cache_max_age(cfg: &ClientFilterConfig) -> Option<T
     match cfg.mode {
         ClientFilterSourceMode::Local => None,
         ClientFilterSourceMode::Catalog | ClientFilterSourceMode::CustomEndpoint => {
-            Some(TimeDelta::hours(1))
+            Some(TimeDelta::seconds(FILTER_REMOTE_VERDICT_MAX_AGE_SECS))
         }
     }
 }
@@ -62,25 +65,34 @@ pub fn collect_addon_image_sources(addon: &AddonSummary) -> Vec<String> {
     for map in &addon.maps {
         push_unique(map.image_path.as_deref());
     }
+    push_unique(addon.local_cover_image.as_deref());
     urls
+}
+
+fn addon_filter_title(addon: &AddonSummary) -> String {
+    let file_stem = addon.current_file_name.as_deref().map(strip_vpk_file_stem);
+    let mut titles = Vec::new();
+    for title in [
+        addon.workshop_title.as_deref(),
+        addon.addon_title.as_deref(),
+        Some(addon.title.as_str()),
+        file_stem.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|title| !title.is_empty())
+    {
+        if !titles.contains(&title) {
+            titles.push(title);
+        }
+    }
+    titles.join("\n")
 }
 
 pub fn build_addon_filter_target(addon: &AddonSummary) -> FilterEvaluationTarget {
     let image_sources = collect_addon_image_sources(addon);
-    let title = addon
-        .workshop_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            addon
-                .addon_title
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or(&addon.title)
-        .to_string();
+    let title = addon_filter_title(addon);
     let description = addon
         .addon_info
         .get("addondescription")
@@ -105,19 +117,7 @@ pub fn build_addon_filter_target(addon: &AddonSummary) -> FilterEvaluationTarget
 
 pub fn build_addon_revision_hint(addon: &AddonSummary) -> String {
     let image_sources = collect_addon_image_sources(addon);
-    let title = addon
-        .workshop_title
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            addon
-                .addon_title
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or(&addon.title);
+    let title = addon_filter_title(addon);
     let description = addon
         .addon_info
         .get("addondescription")
@@ -125,11 +125,11 @@ pub fn build_addon_revision_hint(addon: &AddonSummary) -> String {
         .map(|s| s.trim())
         .unwrap_or("");
     format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "v2:{}:{}:{}:{}:{}:{}:{}",
         addon.content_hash.as_deref().unwrap_or(""),
         addon.local_time_updated.unwrap_or(0),
         addon.remote_time_updated.unwrap_or(0),
-        title,
+        l4a_protocol::fnv1a_hex(title.as_bytes()),
         l4a_protocol::fnv1a_hex(description.as_bytes()),
         addon.categories.join(","),
         image_sources.join("|")
@@ -157,6 +157,8 @@ pub fn compute_addon_state_sig(addon: &AddonSummary) -> String {
     hasher.update(addon.local_time_updated.unwrap_or(-1).to_le_bytes());
     hasher.update(addon.remote_time_updated.unwrap_or(-1).to_le_bytes());
     hasher.update(addon.title.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(addon.current_file_name.as_deref().unwrap_or("").as_bytes());
     hasher.update(b"\0");
     hasher.update(addon.addon_title.as_deref().unwrap_or("").as_bytes());
     hasher.update(b"\0");
@@ -245,28 +247,79 @@ fn normalize_catalog_base_key(raw: &str) -> String {
     raw.trim().trim_end_matches('/').to_string()
 }
 
-fn record_catalog_scoring_revision(
+#[derive(Default, Clone)]
+pub(crate) struct CatalogScoringState {
+    pub url: String,
+    pub checked_at: Option<Instant>,
+    pub revision: Option<String>,
+    max_images: Option<usize>,
+}
+
+fn catalog_scoring_state(engine: &L4aEngine, cfg: &AppConfig) -> CatalogScoringState {
+    let url = normalize_catalog_base_key(cfg.catalog_server_url.as_deref().unwrap_or_default());
+    engine
+        .catalog_scoring_cache
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|entry| entry.url == url)
+        .cloned()
+        .unwrap_or(CatalogScoringState {
+            url,
+            ..Default::default()
+        })
+}
+
+fn record_catalog_observation(
     engine: &L4aEngine,
-    normalized_catalog_url: &str,
-    new_rev: Option<String>,
-) -> bool {
-    if normalized_catalog_url.is_empty() {
-        return false;
+    cfg: &AppConfig,
+    generation: u64,
+    expected: &CatalogScoringState,
+    revision: Option<&str>,
+    info_max_images: Option<usize>,
+) {
+    let gate = engine.filter_cache_generation.lock().unwrap();
+    let live = engine.config();
+    if *gate != generation
+        || live.filter.mode != ClientFilterSourceMode::Catalog
+        || live.https_only != cfg.https_only
+        || normalize_catalog_base_key(live.catalog_server_url.as_deref().unwrap_or_default())
+            != expected.url
+    {
+        return;
     }
+
     let changed = {
         let mut guard = engine.catalog_scoring_cache.lock().unwrap();
-        let prev_rev = match &*guard {
-            Some((cached_url, _, rev)) if cached_url == normalized_catalog_url => rev.clone(),
-            _ => None,
-        };
-        let did_change = prev_rev != new_rev;
-        *guard = Some((normalized_catalog_url.to_string(), Instant::now(), new_rev));
-        did_change
+        let mut state = guard
+            .as_ref()
+            .filter(|entry| entry.url == expected.url)
+            .cloned()
+            .unwrap_or_else(|| CatalogScoringState {
+                url: expected.url.clone(),
+                ..Default::default()
+            });
+        // A late response may carry an older model revision. Only let a request
+        // advance the revision it started with, or confirm the one now active.
+        if state.revision != expected.revision && state.revision.as_deref() != revision {
+            return;
+        }
+        let changed = revision.is_some() && revision != state.revision.as_deref();
+        if changed {
+            state.revision = revision.map(str::to_owned);
+            state.checked_at = None;
+            state.max_images = None;
+        }
+        if let Some(cap) = info_max_images {
+            state.max_images = Some(cap.min(MAX_CATALOG_IMAGES));
+            state.checked_at = Some(Instant::now());
+        }
+        *guard = Some(state);
+        changed
     };
 
     if changed {
-        let live_cfg = engine.config();
-        let active_sig = engine.current_filter_policy_signature(&live_cfg);
+        let active_sig = engine.current_filter_policy_signature(&live);
         if let Err(err) = engine.db().prune_filter_verdicts_except(&active_sig) {
             tracing::warn!(error = %err, "更新目录服务器评分版本后清理旧缓存失败");
         }
@@ -274,7 +327,6 @@ fn record_catalog_scoring_revision(
             external_change: false,
         });
     }
-    changed
 }
 
 fn resolve_catalog_info_url(raw_base: &str) -> Result<String, CoreError> {
@@ -301,56 +353,57 @@ fn resolve_catalog_info_url(raw_base: &str) -> Result<String, CoreError> {
     Ok(parsed.into())
 }
 
-async fn ensure_catalog_scoring_revision_fresh(engine: &L4aEngine, app_cfg: &AppConfig) {
-    if app_cfg.filter.mode != ClientFilterSourceMode::Catalog {
+async fn ensure_catalog_scoring_revision_fresh(
+    engine: &L4aEngine,
+    app_cfg: &AppConfig,
+    generation: u64,
+) {
+    let _probe = engine.catalog_scoring_probe.lock().await;
+    let expected = catalog_scoring_state(engine, app_cfg);
+    if expected.url.is_empty()
+        || expected
+            .checked_at
+            .is_some_and(|at| at.elapsed() < CATALOG_SCORING_INFO_TTL)
+    {
         return;
     }
-    let Some(raw_base) = app_cfg
-        .catalog_server_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return;
-    };
-    let normalized_url = normalize_catalog_base_key(raw_base);
-
-    let prev_rev = {
-        let guard = engine.catalog_scoring_cache.lock().unwrap();
-        if let Some((ref cached_url, fetched_at, ref rev)) = *guard {
-            if cached_url == &normalized_url && fetched_at.elapsed() < CATALOG_SCORING_INFO_TTL {
-                return;
-            }
-            if cached_url == &normalized_url {
-                rev.clone()
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-
-    let Ok(info_url) = resolve_catalog_info_url(raw_base) else {
+    let Ok(info_url) = resolve_catalog_info_url(&expected.url) else {
         return;
     };
     let Ok(req) = engine.prepare_routed_get(&info_url, Duration::from_secs(5)) else {
         return;
     };
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => {
+    if let Ok(resp) = req.send().await {
+        if resp.status().is_success() {
             if let Ok(info) = resp.json::<CatalogFilterPublicInfo>().await {
-                record_catalog_scoring_revision(engine, &normalized_url, info.scoring_revision);
+                record_catalog_observation(
+                    engine,
+                    app_cfg,
+                    generation,
+                    &expected,
+                    info.scoring_revision.as_deref(),
+                    Some(info.max_images as usize),
+                );
                 return;
             }
         }
-        _ => {}
     }
 
-    // Touch timestamp without altering the last known revision when /info is unreachable or 404.
-    let mut guard = engine.catalog_scoring_cache.lock().unwrap();
-    *guard = Some((normalized_url, Instant::now(), prev_rev));
+    // Rate-limit info probes if an older Catalog has no /info endpoint.
+    let gate = engine.filter_cache_generation.lock().unwrap();
+    if *gate == generation {
+        let mut guard = engine.catalog_scoring_cache.lock().unwrap();
+        if guard
+            .as_ref()
+            .is_none_or(|state| state.url == expected.url && state.revision == expected.revision)
+        {
+            *guard = Some(CatalogScoringState {
+                checked_at: Some(Instant::now()),
+                ..expected
+            });
+        }
+    }
 }
 
 struct DeduplicatedMiss {
@@ -362,56 +415,151 @@ struct DeduplicatedMiss {
     persist_cache: bool,
 }
 
-struct RecordedCacheHit {
-    idx: usize,
-    target: FilterEvaluationTarget,
-    content_sig: String,
-    expected_addon_sig: Option<String>,
-    has_local_addon: bool,
+const POLICY_CHANGED: &str = "过滤评估策略已更新，请重试";
+
+struct EvaluationPolicy {
+    signature: String,
+    cache_generation: u64,
+    catalog: Option<CatalogScoringState>,
+    max_images: usize,
+    automatic: bool,
+}
+
+impl EvaluationPolicy {
+    fn check_target(
+        &self,
+        engine: &L4aEngine,
+        target: &FilterEvaluationTarget,
+    ) -> Result<(), CoreError> {
+        let generation = engine.filter_cache_generation.lock().unwrap();
+        let live = engine.config();
+        if *generation != self.cache_generation
+            || self.signature != engine.current_filter_policy_signature(&live)
+        {
+            return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
+        }
+        if self.automatic
+            && (!live.filter.enabled
+                || (target.target_key.starts_with("addon:") && !live.filter.apply_to_library)
+                || (target.target_key.starts_with("ws:") && !live.filter.apply_to_workshop))
+        {
+            return Err(CoreError::InvalidInput("该范围的自动内容过滤已停用".into()));
+        }
+        Ok(())
+    }
 }
 
 pub async fn evaluate_targets(
     engine: &L4aEngine,
     targets: Vec<FilterEvaluationTarget>,
+    automatic: bool,
 ) -> Result<FilterEvaluationBatchResponse, CoreError> {
-    let app_cfg = engine.config();
-    if app_cfg.filter.mode == ClientFilterSourceMode::Catalog {
-        ensure_catalog_scoring_revision_fresh(engine, &app_cfg).await;
-    }
+    let (generation, app_cfg) = {
+        let gate = engine.filter_cache_generation.lock().unwrap();
+        (*gate, engine.config())
+    };
+    let is_catalog = app_cfg.filter.mode == ClientFilterSourceMode::Catalog;
 
-    let initial_policy_sig = engine.current_filter_policy_signature(&app_cfg);
-    if targets.is_empty() {
+    for attempt in 0..2 {
+        if is_catalog && !targets.is_empty() {
+            ensure_catalog_scoring_revision_fresh(engine, &app_cfg, generation).await;
+        }
+        let catalog = is_catalog.then(|| catalog_scoring_state(engine, &app_cfg));
+        let policy = EvaluationPolicy {
+            signature: app_cfg.filter.canonical_policy_signature(
+                app_cfg.catalog_server_url.as_deref(),
+                app_cfg.https_only,
+                catalog.as_ref().and_then(|state| state.revision.as_deref()),
+            ),
+            cache_generation: generation,
+            max_images: catalog
+                .as_ref()
+                .and_then(|state| state.max_images)
+                .unwrap_or_else(|| effective_max_images(&app_cfg.filter)),
+            catalog,
+            automatic,
+        };
+        let items = evaluate_on_policy(engine, &app_cfg, &targets, &policy).await?;
+        let gate = engine.filter_cache_generation.lock().unwrap();
+        let live = engine.config();
+        let current_policy = engine.current_filter_policy_signature(&live);
+
+        if *gate == generation && current_policy == policy.signature {
+            let verdicts: Vec<_> = items
+                .iter()
+                .filter_map(|item| match &item.outcome {
+                    FilterTargetOutcome::Completed {
+                        verdict,
+                        complete: true,
+                    } => Some(verdict.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !verdicts.is_empty() {
+                engine.emit_event(CoreEvent::FilterVerdictsUpdated {
+                    verdicts,
+                    policy_signature: Some(policy.signature.clone()),
+                    cache_generation: generation,
+                });
+            }
+            return Ok(FilterEvaluationBatchResponse {
+                policy_signature: policy.signature,
+                cache_generation: generation,
+                items,
+            });
+        }
+
+        let latest_catalog_sig = engine.current_filter_policy_signature(&app_cfg);
+        if is_catalog
+            && *gate == generation
+            && attempt == 0
+            && current_policy == latest_catalog_sig
+            && policy.signature != latest_catalog_sig
+        {
+            // Re-evaluate the entire batch against one revision, including prior cache hits.
+            continue;
+        }
+
         return Ok(FilterEvaluationBatchResponse {
-            policy_signature: initial_policy_sig,
-            items: Vec::new(),
+            policy_signature: policy.signature,
+            cache_generation: generation,
+            items: targets
+                .into_iter()
+                .map(|target| FilterEvaluationItemResult {
+                    target_key: target.target_key,
+                    outcome: FilterTargetOutcome::Failed {
+                        error: POLICY_CHANGED.into(),
+                    },
+                })
+                .collect(),
         });
     }
+    unreachable!("at most one policy retry")
+}
 
+async fn evaluate_on_policy(
+    engine: &L4aEngine,
+    app_cfg: &AppConfig,
+    targets: &[FilterEvaluationTarget],
+    policy: &EvaluationPolicy,
+) -> Result<Vec<FilterEvaluationItemResult>, CoreError> {
     let cfg = &app_cfg.filter;
-    let max_images = effective_max_images(cfg);
     let max_age = remote_verdict_cache_max_age(cfg);
 
-    let needs_addons = targets
-        .iter()
-        .any(|t| t.addon_id.is_some() || t.target_key.starts_with("addon:"));
-    let addons_by_key: HashMap<String, AddonSummary> = if needs_addons {
-        engine
-            .db()
-            .list_addons()?
-            .into_iter()
-            .map(|a| (format!("addon:{}", a.id.as_str()), a))
-            .collect()
-    } else {
-        HashMap::new()
-    };
+    let mut addons = HashMap::new();
+    for id in targets.iter().filter_map(target_addon_id) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = addons.entry(id) {
+            let addon = engine.db().get_addon(entry.key())?;
+            entry.insert(addon);
+        }
+    }
 
     let mut target_keys: Vec<String> = Vec::with_capacity(targets.len());
     let mut ordered_outcomes: Vec<Option<FilterTargetOutcome>> = vec![None; targets.len()];
     let mut miss_groups: Vec<DeduplicatedMiss> = Vec::new();
     let mut miss_index_by_key: HashMap<(String, String), usize> = HashMap::new();
-    let mut cache_hits: Vec<RecordedCacheHit> = Vec::new();
 
-    for (idx, target) in targets.into_iter().enumerate() {
+    for (idx, target) in targets.iter().cloned().enumerate() {
         target_keys.push(target.target_key.clone());
 
         if target.target_key.trim().is_empty() {
@@ -423,27 +571,25 @@ pub async fn evaluate_targets(
             continue;
         }
 
-        let lookup_key = if target.target_key.starts_with("addon:") {
-            Some(target.target_key.clone())
-        } else {
-            target
-                .addon_id
-                .as_ref()
-                .map(|aid| format!("addon:{}", aid.as_str()))
-        };
-        let matched_addon = lookup_key.as_deref().and_then(|key| addons_by_key.get(key));
+        if let Err(err) = policy.check_target(engine, &target) {
+            ordered_outcomes[idx] = Some(FilterTargetOutcome::Failed {
+                error: err.to_string(),
+            });
+            continue;
+        }
+        let matched_addon = target_addon_id(&target).and_then(|id| addons.get(&id)?.as_ref());
         let has_local_addon = matched_addon.is_some();
         let expected_addon_sig = matched_addon.and_then(|addon| {
             (!target_is_stale_for_addon(&target, addon)).then(|| compute_addon_state_sig(addon))
         });
         let stale_addon_target = has_local_addon && expected_addon_sig.is_none();
 
-        let content_sig = compute_content_signature(&target, max_images);
+        let content_sig = compute_content_signature(&target, policy.max_images);
         if !target.bypass_cache && !stale_addon_target {
             if let Some(mut cached) = engine.db().get_cached_filter_verdict(
                 &target.target_key,
                 &content_sig,
-                &initial_policy_sig,
+                &policy.signature,
                 expected_addon_sig.as_deref(),
                 max_age,
             )? {
@@ -451,13 +597,6 @@ pub async fn evaluate_targets(
                 ordered_outcomes[idx] = Some(FilterTargetOutcome::Completed {
                     verdict: cached,
                     complete: true,
-                });
-                cache_hits.push(RecordedCacheHit {
-                    idx,
-                    target,
-                    content_sig,
-                    expected_addon_sig,
-                    has_local_addon,
                 });
                 continue;
             }
@@ -508,7 +647,7 @@ pub async fn evaluate_targets(
                 }
             }
         } else {
-            let computed = run_deduplicated_misses(engine, &app_cfg, miss_groups, max_images).await;
+            let computed = run_deduplicated_misses(engine, app_cfg, miss_groups, policy).await;
             for (indices, outcome) in computed {
                 for idx in indices {
                     ordered_outcomes[idx] = Some(outcome.clone());
@@ -517,95 +656,31 @@ pub async fn evaluate_targets(
         }
     }
 
-    let mut final_policy_sig = engine.current_filter_policy_signature(&app_cfg);
-
-    // If Catalog `scoring_revision` rotated mid-flight during `/predict`, re-evaluate any hits
-    // that had been served from the pre-rotation SQLite cache so the batch is 100% consistent.
-    if final_policy_sig != initial_policy_sig && !cache_hits.is_empty() {
-        let mut retry_groups: Vec<DeduplicatedMiss> = Vec::new();
-        let mut retry_map: HashMap<(String, String), usize> = HashMap::new();
-        for hit in cache_hits {
-            if let Ok(Some(mut fresh_hit)) = engine.db().get_cached_filter_verdict(
-                &hit.target.target_key,
-                &hit.content_sig,
-                &final_policy_sig,
-                hit.expected_addon_sig.as_deref(),
-                max_age,
-            ) {
-                fresh_hit.complete = true;
-                ordered_outcomes[hit.idx] = Some(FilterTargetOutcome::Completed {
-                    verdict: fresh_hit,
-                    complete: true,
-                });
-                continue;
-            }
-            let key = (hit.target.target_key.clone(), hit.content_sig.clone());
-            if let Some(&g_idx) = retry_map.get(&key) {
-                retry_groups[g_idx].indices.push(hit.idx);
-            } else {
-                let g_idx = retry_groups.len();
-                retry_map.insert(key, g_idx);
-                retry_groups.push(DeduplicatedMiss {
-                    indices: vec![hit.idx],
-                    target: hit.target,
-                    content_sig: hit.content_sig,
-                    expected_addon_sig: hit.expected_addon_sig,
-                    has_local_addon: hit.has_local_addon,
-                    persist_cache: true,
-                });
-            }
-        }
-        if !retry_groups.is_empty() {
-            let recomputed =
-                run_deduplicated_misses(engine, &app_cfg, retry_groups, max_images).await;
-            for (indices, outcome) in recomputed {
-                for idx in indices {
-                    ordered_outcomes[idx] = Some(outcome.clone());
-                }
-            }
-            final_policy_sig = engine.current_filter_policy_signature(&app_cfg);
-        }
-    }
-
-    let mut complete_verdicts: Vec<FilterItemVerdict> = Vec::new();
-    let mut items: Vec<FilterEvaluationItemResult> = Vec::with_capacity(target_keys.len());
-
-    for (target_key, outcome_opt) in target_keys.into_iter().zip(ordered_outcomes) {
-        let outcome = outcome_opt.unwrap_or_else(|| FilterTargetOutcome::Failed {
-            error: "过滤评估未返回结果".into(),
-        });
-        if let FilterTargetOutcome::Completed {
-            ref verdict,
-            complete: true,
-        } = outcome
-        {
-            complete_verdicts.push(verdict.clone());
-        }
-        items.push(FilterEvaluationItemResult {
+    Ok(target_keys
+        .into_iter()
+        .zip(ordered_outcomes)
+        .map(|(target_key, outcome)| FilterEvaluationItemResult {
             target_key,
-            outcome,
-        });
-    }
+            outcome: outcome.unwrap_or_else(|| FilterTargetOutcome::Failed {
+                error: "过滤评估未返回结果".into(),
+            }),
+        })
+        .collect())
+}
 
-    let live_active_sig = engine.current_filter_policy_signature(&engine.config());
-    if !complete_verdicts.is_empty() && final_policy_sig == live_active_sig {
-        engine.emit_event(CoreEvent::FilterVerdictsUpdated {
-            verdicts: complete_verdicts,
-            policy_signature: Some(final_policy_sig.clone()),
-        });
-    }
-
-    Ok(FilterEvaluationBatchResponse {
-        policy_signature: final_policy_sig,
-        items,
-    })
+fn target_addon_id(target: &FilterEvaluationTarget) -> Option<AddonId> {
+    target
+        .target_key
+        .strip_prefix("addon:")
+        .map(|id| AddonId(id.to_string()))
+        .or_else(|| target.addon_id.clone())
 }
 
 async fn run_deduplicated_misses(
     engine: &L4aEngine,
     app_cfg: &AppConfig,
     miss_groups: Vec<DeduplicatedMiss>,
-    max_images: usize,
+    policy: &EvaluationPolicy,
 ) -> Vec<(Vec<usize>, FilterTargetOutcome)> {
     stream::iter(miss_groups)
         .map(|group| async move {
@@ -619,21 +694,17 @@ async fn run_deduplicated_misses(
                 );
             };
 
-            match evaluate_single_target(engine, app_cfg, &group.target, max_images).await {
-                Ok((mut verdict, had_load_error)) => {
-                    let is_complete = verdict.flagged || !had_load_error;
-                    verdict.complete = is_complete;
-                    verdict.revision_hint = group.target.revision_hint.clone();
-
-                    if is_complete && group.persist_cache {
-                        persist_verdict_if_still_valid(engine, app_cfg, &group, &verdict);
+            match evaluate_single_target(engine, app_cfg, &group.target, policy).await {
+                Ok(verdict) => {
+                    if verdict.complete && group.persist_cache {
+                        persist_verdict_if_still_valid(engine, policy, &group, &verdict);
                     }
 
                     (
                         group.indices,
                         FilterTargetOutcome::Completed {
+                            complete: verdict.complete,
                             verdict,
-                            complete: is_complete,
                         },
                     )
                 }
@@ -659,40 +730,30 @@ async fn run_deduplicated_misses(
 
 fn persist_verdict_if_still_valid(
     engine: &L4aEngine,
-    eval_app_cfg: &AppConfig,
+    policy: &EvaluationPolicy,
     group: &DeduplicatedMiss,
     verdict: &FilterItemVerdict,
 ) {
+    let gate = engine.filter_cache_generation.lock().unwrap();
+    let live_active_sig = engine.current_filter_policy_signature(&engine.config());
+    if *gate != policy.cache_generation || live_active_sig != policy.signature {
+        return;
+    }
     if group.has_local_addon {
-        let Some(ref expected_sig) = group.expected_addon_sig else {
-            return;
-        };
-        let lookup_key = if group.target.target_key.starts_with("addon:") {
-            group.target.target_key.clone()
-        } else if let Some(ref aid) = group.target.addon_id {
-            format!("addon:{}", aid.as_str())
-        } else {
-            return;
-        };
-        let addon_still_matches = engine.db().list_addons().ok().is_some_and(|addons| {
-            addons
-                .iter()
-                .find(|a| format!("addon:{}", a.id.as_str()) == lookup_key)
-                .is_some_and(|a| &compute_addon_state_sig(a) == expected_sig)
-        });
+        let addon_still_matches = target_addon_id(&group.target)
+            .and_then(|id| engine.db().get_addon(&id).ok().flatten())
+            .zip(group.expected_addon_sig.as_ref())
+            .is_some_and(|(addon, sig)| &compute_addon_state_sig(&addon) == sig);
         if !addon_still_matches {
             return;
         }
     }
 
-    let verdict_policy_sig = engine.current_filter_policy_signature(eval_app_cfg);
-    let live_active_sig = engine.current_filter_policy_signature(&engine.config());
-
     if let Err(db_err) = engine.db().put_cached_filter_verdict(
         &group.target.target_key,
         &group.content_sig,
         group.expected_addon_sig.as_deref(),
-        &verdict_policy_sig,
+        &policy.signature,
         &live_active_sig,
         verdict,
     ) {
@@ -732,11 +793,7 @@ enum CatalogImagePlan {
         remotes: Vec<(usize, ValidatedRemoteImage)>,
         had_load_error: bool,
     },
-    InlineBase64 {
-        slot_indices: Vec<usize>,
-        loaded: Vec<(usize, LoadedImage)>,
-        had_load_error: bool,
-    },
+    InlineBase64,
 }
 
 #[derive(Debug, Clone)]
@@ -749,14 +806,16 @@ async fn evaluate_single_target(
     engine: &L4aEngine,
     app_cfg: &AppConfig,
     target: &FilterEvaluationTarget,
-    max_images: usize,
-) -> Result<(FilterItemVerdict, bool), CoreError> {
+    policy: &EvaluationPolicy,
+) -> Result<FilterItemVerdict, CoreError> {
+    policy.check_target(engine, target)?;
     let cfg = &app_cfg.filter;
+    let max_images = policy.max_images;
 
     let mut had_load_error;
     let mut loaded_images: Vec<LoadedImage> = Vec::new();
     let mut deferred_remotes: Vec<(usize, ValidatedRemoteImage)> = Vec::new();
-    let mut submitted_slot_indices: Vec<usize>;
+    let submitted_slot_indices: Vec<usize>;
 
     let (mut probs, custom_endpoint) = if cfg.mode == ClientFilterSourceMode::Catalog {
         let base = app_cfg
@@ -765,7 +824,6 @@ async fn evaluate_single_target(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| CoreError::Config("未配置目录服务器地址 (catalogServerUrl)".into()))?;
-        let normalized_catalog_url = normalize_catalog_base_key(base);
         let url = resolve_filter_endpoint_url(
             base,
             "/api/v1/filter/predict",
@@ -773,90 +831,76 @@ async fn evaluate_single_target(
             "目录服务器地址",
         )?;
 
-        let probs = match prepare_catalog_images(engine, target, max_images).await {
-            CatalogImagePlan::RemoteUrls {
-                slot_indices,
-                image_urls,
-                remotes,
-                had_load_error: prep_err,
-            } => {
-                had_load_error = prep_err;
-                submitted_slot_indices = slot_indices;
-                deferred_remotes = remotes;
-
-                let req = FilterPredictRequest {
-                    workshop_id: target.workshop_id,
-                    title: Some(target.title.clone()),
-                    description: target.description.clone(),
-                    tags: target.tags.clone(),
-                    image_base64: None,
-                    images_base64: Vec::new(),
-                    image_urls: image_urls.clone(),
-                };
-                match post_predict_request(engine, &url, &req).await {
-                    Ok(p) => p,
-                    Err(first_err)
-                        if !image_urls.is_empty()
-                            && !matches!(first_err, CoreError::NotFound(_)) =>
-                    {
-                        let (fallback_loaded, fallback_err) =
-                            resolve_target_images(engine, target, max_images).await;
-                        if !fallback_err {
-                            return Err(first_err);
-                        }
-                        had_load_error = true;
-                        deferred_remotes.clear();
-                        submitted_slot_indices =
-                            fallback_loaded.iter().map(|(idx, _)| *idx).collect();
-                        let images_b64: Vec<String> = fallback_loaded
-                            .iter()
-                            .map(|(_, img)| img.b64.clone())
-                            .collect();
-                        loaded_images = fallback_loaded.into_iter().map(|(_, img)| img).collect();
-                        let retry_req = FilterPredictRequest {
-                            workshop_id: target.workshop_id,
-                            title: Some(target.title.clone()),
-                            description: target.description.clone(),
-                            tags: target.tags.clone(),
-                            image_base64: None,
-                            images_base64: images_b64,
-                            image_urls: Vec::new(),
-                        };
-                        post_predict_request(engine, &url, &retry_req).await?
-                    }
-                    Err(err) => return Err(err),
-                }
+        let mut req = FilterPredictRequest {
+            workshop_id: target.workshop_id,
+            title: Some(target.title.clone()),
+            description: target.description.clone(),
+            tags: target.tags.clone(),
+            ..Default::default()
+        };
+        let plan = prepare_catalog_images(engine, target, max_images);
+        let remote_result = if let CatalogImagePlan::RemoteUrls {
+            slot_indices,
+            image_urls,
+            remotes,
+            had_load_error: prep_err,
+        } = plan
+        {
+            deferred_remotes = remotes;
+            req.image_urls = image_urls;
+            if req.image_urls.is_empty() && !target.image_sources.is_empty() {
+                req.workshop_id = None;
             }
-            CatalogImagePlan::InlineBase64 {
-                slot_indices,
-                loaded,
-                had_load_error: prep_err,
-            } => {
-                had_load_error = prep_err;
-                submitted_slot_indices = slot_indices;
-                let images_b64: Vec<String> =
-                    loaded.iter().map(|(_, img)| img.b64.clone()).collect();
-                loaded_images = loaded.into_iter().map(|(_, img)| img).collect();
+            policy.check_target(engine, target)?;
+            match post_catalog_predict(engine, &url, &req).await {
+                Ok(probs) => Some((probs, slot_indices, prep_err)),
+                Err(PredictHttpOutcome::ImageFetch(_)) if !req.image_urls.is_empty() => None,
+                Err(err) => return Err(err.into_core_error(&url)),
+            }
+        } else {
+            None
+        };
 
-                let req = FilterPredictRequest {
-                    workshop_id: target.workshop_id,
-                    title: Some(target.title.clone()),
-                    description: target.description.clone(),
-                    tags: target.tags.clone(),
-                    image_base64: None,
-                    images_base64: images_b64,
-                    image_urls: Vec::new(),
-                };
-                post_predict_request(engine, &url, &req).await?
+        let probs = match remote_result {
+            Some((probs, slots, missing)) => {
+                submitted_slot_indices = slots;
+                had_load_error = missing;
+                probs
+            }
+            None => {
+                req.image_urls.clear();
+                let (loaded, load_err) =
+                    resolve_catalog_inline_images(engine, target, max_images, &req).await?;
+                had_load_error = load_err;
+                deferred_remotes.clear();
+                submitted_slot_indices = loaded.iter().map(|(slot, _)| *slot).collect();
+                if loaded.is_empty() && !target.image_sources.is_empty() {
+                    req.workshop_id = None;
+                }
+                req.images_base64 = loaded.iter().map(|(_, img)| img.b64.clone()).collect();
+                loaded_images = loaded.into_iter().map(|(_, img)| img).collect();
+                policy.check_target(engine, target)?;
+                post_catalog_predict(engine, &url, &req)
+                    .await
+                    .map_err(|err| err.into_core_error(&url))?
             }
         };
 
-        if probs.scoring_revision.is_some() {
-            record_catalog_scoring_revision(
-                engine,
-                &normalized_catalog_url,
-                probs.scoring_revision.clone(),
-            );
+        let catalog = policy
+            .catalog
+            .as_ref()
+            .expect("Catalog mode has a scoring snapshot");
+        let returned_revision = probs.scoring_revision.as_deref();
+        record_catalog_observation(
+            engine,
+            app_cfg,
+            policy.cache_generation,
+            catalog,
+            returned_revision,
+            None,
+        );
+        if returned_revision != catalog.revision.as_deref() {
+            return Err(CoreError::Network(POLICY_CHANGED.into()));
         }
 
         (probs, None)
@@ -866,6 +910,7 @@ async fn evaluate_single_target(
         submitted_slot_indices = imgs.iter().map(|(idx, _)| *idx).collect();
         let images_b64: Vec<String> = imgs.iter().map(|(_, img)| img.b64.clone()).collect();
         loaded_images = imgs.into_iter().map(|(_, img)| img).collect();
+        policy.check_target(engine, target)?;
         let (probs, custom_ep) =
             fetch_non_catalog_probabilities(engine, app_cfg, target, &images_b64).await?;
         (probs, custom_ep)
@@ -899,6 +944,7 @@ async fn evaluate_single_target(
             }
             loaded_images = materialized;
         }
+        policy.check_target(engine, target)?;
         let vault = engine.token_vault();
         let is_sensitive = judge_with_openai_llm(
             engine,
@@ -923,6 +969,7 @@ async fn evaluate_single_target(
     // issue follow-up unimodal /predict calls when flagged & subdivide_modalities is true.
     if flagged && cfg.subdivide_modalities {
         if let Some(ref ep) = custom_endpoint {
+            policy.check_target(engine, target)?;
             let images_b64: Vec<String> = loaded_images.iter().map(|img| img.b64.clone()).collect();
             populate_missing_unimodal_scores(engine, ep, target, &images_b64, &mut probs).await;
         }
@@ -939,27 +986,22 @@ async fn evaluate_single_target(
         sensitive_image_indices,
     ) = compute_modality_subdivision(cfg, target, &evaluated_image_indices, &probs, flagged);
 
-    let is_complete = flagged || !had_load_error;
-
-    Ok((
-        FilterItemVerdict {
-            target_key: target.target_key.clone(),
-            revision_hint: target.revision_hint.clone(),
-            flagged,
-            decision_source,
-            evaluated_score,
-            probabilities: probs,
-            text_sensitive,
-            title_sensitive,
-            description_sensitive,
-            image_sensitive,
-            evaluated_image_indices,
-            sensitive_image_indices,
-            complete: is_complete,
-            evaluated_at: Utc::now(),
-        },
-        had_load_error,
-    ))
+    Ok(FilterItemVerdict {
+        target_key: target.target_key.clone(),
+        revision_hint: target.revision_hint.clone(),
+        flagged,
+        decision_source,
+        evaluated_score,
+        probabilities: probs,
+        text_sensitive,
+        title_sensitive,
+        description_sensitive,
+        image_sensitive,
+        evaluated_image_indices,
+        sensitive_image_indices,
+        complete: !had_load_error,
+        evaluated_at: Utc::now(),
+    })
 }
 
 fn compute_evaluated_image_indices(
@@ -988,49 +1030,34 @@ fn compute_evaluated_image_indices(
     submitted_slot_indices.to_vec()
 }
 
-async fn prepare_catalog_images(
+fn catalog_image_sources(
+    target: &FilterEvaluationTarget,
+    max_images: usize,
+) -> impl Iterator<Item = (usize, &str)> {
+    target
+        .image_sources
+        .iter()
+        .enumerate()
+        .map(|(slot, src)| (slot, src.trim()))
+        .filter(|(_, src)| !src.is_empty())
+        .take(max_images)
+}
+
+fn prepare_catalog_images(
     engine: &L4aEngine,
     target: &FilterEvaluationTarget,
     max_images: usize,
 ) -> CatalogImagePlan {
-    if max_images == 0 || target.image_sources.is_empty() {
-        return CatalogImagePlan::RemoteUrls {
-            slot_indices: Vec::new(),
-            image_urls: Vec::new(),
-            remotes: Vec::new(),
-            had_load_error: false,
-        };
-    }
-
-    let mut requires_inline_mode = false;
-    for raw_src in &target.image_sources {
-        let trimmed = raw_src.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if is_valid_local_cover_key(trimmed) || has_ascii_prefix_ignore_case(trimmed, b"data:") {
-            requires_inline_mode = true;
-            break;
-        }
-        if is_remote_image_url(trimmed)
-            && matches!(
-                validate_remote_filter_image_url(engine, trimmed),
+    let requires_inline_mode = catalog_image_sources(target, max_images).any(|(_, src)| {
+        is_valid_local_cover_key(src)
+            || has_ascii_prefix_ignore_case(src, b"data:")
+            || matches!(
+                validate_remote_filter_image_url(engine, src),
                 Ok(ValidatedRemoteImage::Mirrored(_))
             )
-        {
-            requires_inline_mode = true;
-            break;
-        }
-    }
-
+    });
     if requires_inline_mode {
-        let (loaded, had_load_error) = resolve_target_images(engine, target, max_images).await;
-        let slot_indices = loaded.iter().map(|(idx, _)| *idx).collect();
-        return CatalogImagePlan::InlineBase64 {
-            slot_indices,
-            loaded,
-            had_load_error,
-        };
+        return CatalogImagePlan::InlineBase64;
     }
 
     let mut slot_indices = Vec::new();
@@ -1038,14 +1065,7 @@ async fn prepare_catalog_images(
     let mut remotes = Vec::new();
     let mut had_load_error = false;
 
-    for (slot_idx, raw_src) in target.image_sources.iter().enumerate() {
-        if slot_indices.len() >= max_images {
-            break;
-        }
-        let trimmed = raw_src.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+    for (slot_idx, trimmed) in catalog_image_sources(target, max_images) {
         if is_remote_image_url(trimmed) {
             match validate_remote_filter_image_url(engine, trimmed) {
                 Ok(
@@ -1061,7 +1081,7 @@ async fn prepare_catalog_images(
                     image_urls.push(url_str);
                     remotes.push((slot_idx, remote));
                 }
-                Ok(ValidatedRemoteImage::Mirrored(_)) => unreachable!("handled above"),
+                Ok(ValidatedRemoteImage::Mirrored(_)) => return CatalogImagePlan::InlineBase64,
                 Err(err) => {
                     had_load_error = true;
                     tracing::debug!(source = %trimmed, error = %err, "拒绝不安全的远程过滤预览图地址");
@@ -1079,6 +1099,36 @@ async fn prepare_catalog_images(
         remotes,
         had_load_error,
     }
+}
+
+async fn resolve_catalog_inline_images(
+    engine: &L4aEngine,
+    target: &FilterEvaluationTarget,
+    max_images: usize,
+    request_without_images: &FilterPredictRequest,
+) -> Result<(Vec<(usize, LoadedImage)>, bool), CoreError> {
+    // Base64 uses only JSON-safe ASCII. Account for the new field, quotes and commas.
+    let base_json =
+        serialize_catalog_request(request_without_images).map_err(|err| err.into_core_error(""))?;
+    let mut remaining = CATALOG_FILTER_MAX_BODY_BYTES
+        .saturating_sub(base_json.len() + b",\"imagesBase64\":[]".len());
+    drop(base_json);
+    let mut loaded = Vec::new();
+    let mut missing = false;
+    for (slot, src) in catalog_image_sources(target, max_images) {
+        match load_single_image(engine, src).await {
+            Ok(img) if img.b64.len() + 3 <= remaining => {
+                remaining -= img.b64.len() + 3;
+                loaded.push((slot, img));
+            }
+            Ok(_) => missing = true,
+            Err(err) => {
+                missing = true;
+                tracing::debug!(slot, error = %err, "无法加载 Catalog 过滤预览图");
+            }
+        }
+    }
+    Ok((loaded, missing))
 }
 
 async fn materialize_deferred_remotes_for_llm(
@@ -1444,7 +1494,9 @@ async fn fetch_non_catalog_probabilities(
                     images_base64: images_b64.to_vec(),
                     image_urls: Vec::new(),
                 };
-                let probs = post_predict_request(engine, &direct_catalog_url, &req).await?;
+                let probs = post_catalog_predict(engine, &direct_catalog_url, &req)
+                    .await
+                    .map_err(|err| err.into_core_error(&direct_catalog_url))?;
                 return Ok((
                     probs,
                     Some(CustomEndpointUsed {
@@ -1484,7 +1536,7 @@ async fn fetch_non_catalog_probabilities(
                 images_base64: images_b64.to_vec(),
                 image_urls: Vec::new(),
             };
-            match post_predict_with_status(engine, &catalog_style_url, &catalog_req).await {
+            match post_catalog_predict(engine, &catalog_style_url, &catalog_req).await {
                 Ok(probs) => Ok((
                     probs,
                     Some(CustomEndpointUsed {
@@ -1506,7 +1558,7 @@ async fn fetch_non_catalog_probabilities(
                         }),
                     ))
                 }
-                Err(PredictHttpOutcome::Other(err)) => Err(err),
+                Err(err) => Err(err.into_core_error(&catalog_style_url)),
             }
         }
     }
@@ -1532,15 +1584,50 @@ async fn post_raw_predict_subbatched(
         let probs = post_predict_request(engine, url, &req).await?;
         parts.push((count, probs));
     }
-    Ok(merge_subbatch_probabilities(
-        parts,
-        FilterGalleryAggregation::Max,
-    ))
+    Ok(merge_raw_max(parts))
 }
 
 enum PredictHttpOutcome {
     NotFound,
+    ImageFetch(CoreError),
     Other(CoreError),
+}
+
+impl PredictHttpOutcome {
+    fn into_core_error(self, url: &str) -> CoreError {
+        match self {
+            Self::NotFound => CoreError::NotFound(format!("过滤预测接口不存在 (404): {url}")),
+            Self::ImageFetch(err) | Self::Other(err) => err,
+        }
+    }
+}
+
+fn serialize_catalog_request(req: &FilterPredictRequest) -> Result<Vec<u8>, PredictHttpOutcome> {
+    let body = serde_json::to_vec(req)
+        .map_err(|e| PredictHttpOutcome::Other(CoreError::InvalidInput(e.to_string())))?;
+    if body.len() > CATALOG_FILTER_MAX_BODY_BYTES {
+        return Err(PredictHttpOutcome::Other(CoreError::InvalidInput(
+            "内容过滤请求超过 Catalog 的 48 MiB 体积限制".into(),
+        )));
+    }
+    Ok(body)
+}
+
+async fn post_catalog_predict(
+    engine: &L4aEngine,
+    url: &str,
+    request: &FilterPredictRequest,
+) -> Result<FilterProbabilities, PredictHttpOutcome> {
+    let body = serialize_catalog_request(request)?;
+    let builder = engine
+        .prepare_routed_post(url, Duration::from_secs(30))
+        .map_err(PredictHttpOutcome::Other)?;
+    send_predict_request(
+        builder
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body),
+    )
+    .await
 }
 
 async fn post_predict_with_status<T: Serialize + ?Sized>(
@@ -1551,21 +1638,41 @@ async fn post_predict_with_status<T: Serialize + ?Sized>(
     let builder = engine
         .prepare_routed_post(url, Duration::from_secs(30))
         .map_err(PredictHttpOutcome::Other)?;
+    send_predict_request(builder.json(req_body)).await
+}
 
-    let resp = builder
-        .json(req_body)
+async fn send_predict_request(
+    builder: reqwest::RequestBuilder,
+) -> Result<FilterProbabilities, PredictHttpOutcome> {
+    let mut resp = builder
         .send()
         .await
         .map_err(|e| PredictHttpOutcome::Other(CoreError::Network(e.to_string())))?;
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Err(PredictHttpOutcome::NotFound);
     }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(PredictHttpOutcome::Other(CoreError::Network(format!(
-            "过滤服务端点返回 HTTP {status}"
-        ))));
+    if !status.is_success() {
+        let err = CoreError::Network(format!("过滤服务端点返回 HTTP {status}"));
+        if status == reqwest::StatusCode::BAD_REQUEST {
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = resp.chunk().await {
+                if body.len() + chunk.len() > 4096 {
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            if serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+                .as_deref()
+                == Some(CATALOG_FILTER_IMAGE_FETCH_FAILED)
+            {
+                return Err(PredictHttpOutcome::ImageFetch(err));
+            }
+        }
+        return Err(PredictHttpOutcome::Other(err));
     }
     resp.json::<FilterProbabilities>()
         .await
@@ -1577,13 +1684,9 @@ async fn post_predict_request<T: Serialize + ?Sized>(
     url: &str,
     req_body: &T,
 ) -> Result<FilterProbabilities, CoreError> {
-    match post_predict_with_status(engine, url, req_body).await {
-        Ok(probs) => Ok(probs),
-        Err(PredictHttpOutcome::NotFound) => Err(CoreError::NotFound(format!(
-            "过滤预测接口不存在 (404): {url}"
-        ))),
-        Err(PredictHttpOutcome::Other(err)) => Err(err),
-    }
+    post_predict_with_status(engine, url, req_body)
+        .await
+        .map_err(|err| err.into_core_error(url))
 }
 
 async fn post_unimodal_predict(

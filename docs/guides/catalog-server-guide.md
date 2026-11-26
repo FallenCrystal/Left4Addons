@@ -89,6 +89,7 @@ bias = 0.0
 `[filter]` 配置项控制可选的内容敏感度概率推理接口（`GET /api/v1/filter/info` 与 `POST /api/v1/filter/predict`）：
 
 - **双后端模式 (`backend`)**：`managed_python` 由 `l4a-server` 自动将内嵌 HTTP 运行脚本挂载到您部署的 `Left4Filters` 目录（`deploy_dir`，可选指定 `python_bin` 虚拟环境解释器），支持热更新参数与进程退出守护；`upstream_http` 则连接外部独立的推理服务地址 (`upstream_url`)。
+- **托管运行路径**：在主机上的 `catalog.toml` 中设置 `deploy_dir` 和 `python_bin`，然后重启 Catalog 服务以加载路径。Web 控制台只读显示这两项。
 - **严格的职责与安全边界**：Catalog 过滤接口**仅返回连续校准概率 (`FilterProbabilities`)**，**绝不调用任何外部大语言模型 (LLM)**；模型参数（`threads`、`enable_text`、`enable_image`、`max_images`、`gallery_aggregation`、`gore_weight`、`nsfw_weight`、`temperature`、`bias`）仅允许由服务端 `catalog.toml` 或管理员控制台修改，公开请求无法覆盖参数；远程图片拉取严格限制于受信任的 Steam CDN HTTPS 域名白名单以防御 SSRF。
 
 ---

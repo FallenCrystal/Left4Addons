@@ -114,15 +114,19 @@ impl LocalDb {
                 None
             };
 
-            let bound_fingerprint = if req.bind_fingerprint {
-                let Some(hash) = installed_hash else {
-                    return Err(CoreError::InvalidInput(
-                        "该模组暂无已安装的本地 VPK 指纹，无法启用指纹绑定排除".into(),
-                    ));
-                };
-                Some(hash)
-            } else {
-                None
+            let (bind_fingerprint, bound_fingerprint) = match req.bind_fingerprint {
+                Some(true) => {
+                    let Some(hash) = installed_hash else {
+                        return Err(CoreError::InvalidInput(
+                            "该模组暂无已安装的本地 VPK 指纹，无法启用指纹绑定排除".into(),
+                        ));
+                    };
+                    (true, Some(hash))
+                }
+                Some(false) => (false, None),
+                None => Self::get_filter_exclusion_tx(tx, &req.addon_id)?
+                    .map(|existing| (existing.bind_fingerprint, existing.bound_fingerprint))
+                    .unwrap_or_default(),
             };
 
             let note = req
@@ -149,7 +153,7 @@ impl LocalDb {
                 params![
                     req.addon_id.as_str(),
                     serialize_enum(&req.display_level),
-                    if req.bind_fingerprint { 1 } else { 0 },
+                    i32::from(bind_fingerprint),
                     bound_fingerprint,
                     note,
                     now,
@@ -285,20 +289,13 @@ impl LocalDb {
         active_policy_sig: &str,
         verdict: &FilterItemVerdict,
     ) -> Result<bool, CoreError> {
-        if !verdict.complete {
+        if !verdict.complete || verdict_policy_sig != active_policy_sig {
             return Ok(false);
         }
         let verdict_json = serde_json::to_string(verdict)
             .map_err(|e| CoreError::Config(format!("序列化过滤判定结果失败: {e}")))?;
         let now = Utc::now().to_rfc3339();
         self.write(|tx| {
-            tx.execute(
-                "DELETE FROM filter_verdicts WHERE policy_sig != ?1",
-                params![active_policy_sig],
-            )?;
-            if verdict_policy_sig != active_policy_sig {
-                return Ok(false);
-            }
             tx.execute(
                 r#"
                 INSERT INTO filter_verdicts (
@@ -336,6 +333,17 @@ impl LocalDb {
         let conn = self.lock_conn()?;
         let removed = conn.execute("DELETE FROM filter_verdicts", [])?;
         Ok(removed as u64)
+    }
+
+    pub fn clear_llm_filter_verdicts(&self) -> Result<(), CoreError> {
+        let conn = self.lock_conn()?;
+        conn.execute(
+            "DELETE FROM filter_verdicts
+             WHERE CASE WHEN json_valid(verdict_json) THEN json_extract(verdict_json, '$.decisionSource') END
+                   IN ('llm_flagged_true', 'llm_flagged_false')",
+            [],
+        )?;
+        Ok(())
     }
 }
 
