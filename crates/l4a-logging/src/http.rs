@@ -22,13 +22,31 @@ enum SuccessLevel {
 ///
 /// `purpose` is a short, stable label such as `"workshop.details"`.
 pub async fn send(builder: RequestBuilder, purpose: &str) -> reqwest::Result<Response> {
-    send_inner(builder, purpose, SuccessLevel::Info).await
+    send_inner(builder, purpose, SuccessLevel::Info, false).await
 }
 
 /// Like [`send`], but successful responses are logged at `DEBUG` to keep logs readable for
 /// frequent requests (cover images, polling). Failures are still logged at `WARN`.
 pub async fn send_quiet(builder: RequestBuilder, purpose: &str) -> reqwest::Result<Response> {
-    send_inner(builder, purpose, SuccessLevel::Debug).await
+    send_inner(builder, purpose, SuccessLevel::Debug, false).await
+}
+
+/// Audits a request in a redirect chain, omitting the query on server-provided URLs.
+pub async fn send_redirect_hop(
+    builder: RequestBuilder,
+    purpose: &str,
+    hop: usize,
+) -> reqwest::Result<Response> {
+    send_inner(builder, purpose, SuccessLevel::Info, hop > 0).await
+}
+
+/// Like [`send_redirect_hop`] with successful responses logged at `DEBUG`.
+pub async fn send_redirect_hop_quiet(
+    builder: RequestBuilder,
+    purpose: &str,
+    hop: usize,
+) -> reqwest::Result<Response> {
+    send_inner(builder, purpose, SuccessLevel::Debug, hop > 0).await
 }
 
 /// Method-style access to [`send`] / [`send_quiet`]: replace `.send()` with
@@ -52,14 +70,14 @@ impl AuditedSend for RequestBuilder {
         self,
         purpose: &'static str,
     ) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send {
-        send_inner(self, purpose, SuccessLevel::Info)
+        send(self, purpose)
     }
 
     fn send_audited_quiet(
         self,
         purpose: &'static str,
     ) -> impl std::future::Future<Output = reqwest::Result<Response>> + Send {
-        send_inner(self, purpose, SuccessLevel::Debug)
+        send_quiet(self, purpose)
     }
 }
 
@@ -67,9 +85,10 @@ async fn send_inner(
     builder: RequestBuilder,
     purpose: &str,
     level: SuccessLevel,
+    omit_query: bool,
 ) -> reqwest::Result<Response> {
     let (client, request) = builder.build_split();
-    let request = match request {
+    let request = match request.map_err(reqwest::Error::without_url) {
         Ok(request) => request,
         Err(err) => {
             tracing::warn!(
@@ -82,9 +101,13 @@ async fn send_inner(
         }
     };
     let method = request.method().clone();
-    let url = redact_url(request.url());
+    let url = audit_url(request.url(), omit_query);
     let started = Instant::now();
-    match client.execute(request).await {
+    match client
+        .execute(request)
+        .await
+        .map_err(reqwest::Error::without_url)
+    {
         Ok(response) => {
             let elapsed_ms = started.elapsed().as_millis() as u64;
             let status = response.status();
@@ -138,5 +161,28 @@ async fn send_inner(
             );
             Err(err)
         }
+    }
+}
+
+fn audit_url(url: &reqwest::Url, omit_query: bool) -> String {
+    if omit_query {
+        let mut url = url.clone();
+        url.set_query(None);
+        redact_url(&url)
+    } else {
+        redact_url(url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_omits_all_query_parameters_on_redirect_hops() {
+        let url =
+            reqwest::Url::parse("https://download.example.com/file?opaque=test-value").unwrap();
+        assert_eq!(audit_url(&url, true), "https://download.example.com/file");
+        assert_eq!(audit_url(&url, false), url.as_str());
     }
 }

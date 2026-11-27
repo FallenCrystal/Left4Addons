@@ -1,6 +1,6 @@
 use crate::error::WorkshopError;
 use futures_util::StreamExt;
-use l4a_logging::http::AuditedSend;
+use l4a_logging::http;
 use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::WorkshopId;
 use reqwest::header::{CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
@@ -226,7 +226,9 @@ impl ResilientDownloader {
                     streaming_opts,
                     |builder, _, _| builder.header(RANGE, &range_header),
                     |_| Ok::<(), WorkshopError>(()),
-                    |builder| builder.send_audited("workshop.download.resume"),
+                    |builder, hop| {
+                        http::send_redirect_hop(builder, "workshop.download.resume", hop)
+                    },
                 )
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?;
@@ -253,7 +255,9 @@ impl ResilientDownloader {
                             streaming_opts,
                             |builder, _, _| builder,
                             |_| Ok::<(), WorkshopError>(()),
-                            |builder| builder.send_audited("workshop.download.restart"),
+                            |builder, hop| {
+                                http::send_redirect_hop(builder, "workshop.download.restart", hop)
+                            },
                         )
                         .await
                         .map_err(|e| WorkshopError::Network(e.to_string()))?;
@@ -271,7 +275,7 @@ impl ResilientDownloader {
                     streaming_opts,
                     |builder, _, _| builder,
                     |_| Ok::<(), WorkshopError>(()),
-                    |builder| builder.send_audited("workshop.download"),
+                    |builder, hop| http::send_redirect_hop(builder, "workshop.download", hop),
                 )
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?;

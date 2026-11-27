@@ -1522,9 +1522,7 @@ async fn fetch_validated_remote_image(
     let (mime, bytes) = match remote {
         ValidatedRemoteImage::LoopbackTest(url) => fetch_loopback_image(engine, url).await?,
         ValidatedRemoteImage::SteamCdn(url) | ValidatedRemoteImage::Mirrored(url) => {
-            engine
-                .fetch_workshop_cover_with_hop_validator(url, validate_filter_image_redirect_hop)
-                .await?
+            engine.fetch_filter_preview(url).await?
         }
     };
     finish_filter_image(mime, bytes).await

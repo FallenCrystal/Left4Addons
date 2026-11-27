@@ -2,8 +2,9 @@ use super::L4aEngine;
 use crate::db::repo::normalize_valid_remote_cover_url;
 use crate::error::CoreError;
 use crate::file_changes::same_file;
-use l4a_logging::http::AuditedSend;
-use l4a_mirror::{RedirectHop, RedirectRequestOptions, RedirectSendError};
+use crate::filter::evaluator::validate_filter_image_redirect_hop;
+use l4a_logging::http;
+use l4a_mirror::{RedirectRequestOptions, RedirectSendError};
 use l4a_workshop::WorkshopError;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -57,18 +58,21 @@ impl L4aEngine {
     }
 
     pub async fn fetch_workshop_cover(&self, url: &str) -> Result<(String, Vec<u8>), CoreError> {
-        self.fetch_workshop_cover_with_hop_validator(url, |_| Ok(()))
-            .await
+        self.fetch_remote_cover(url, false).await
     }
 
-    pub(crate) async fn fetch_workshop_cover_with_hop_validator<F>(
+    pub(crate) async fn fetch_filter_preview(
         &self,
         url: &str,
-        hop_validator: F,
-    ) -> Result<(String, Vec<u8>), CoreError>
-    where
-        F: FnMut(&RedirectHop<'_>) -> Result<(), CoreError>,
-    {
+    ) -> Result<(String, Vec<u8>), CoreError> {
+        self.fetch_remote_cover(url, true).await
+    }
+
+    async fn fetch_remote_cover(
+        &self,
+        url: &str,
+        for_filter: bool,
+    ) -> Result<(String, Vec<u8>), CoreError> {
         const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
         const COVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
         const CACHED_COVER_FORMATS: &[(&str, &str)] = &[
@@ -85,13 +89,28 @@ impl L4aEngine {
             .validate_url_with_https_only(&url, https_only)
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
 
-        let url_hash = hex::encode(&Sha256::digest(url.as_bytes())[..16]);
+        let cache_stem = if for_filter {
+            // Only filter-validated fetches populate this cache. Scope entries to the immutable
+            // mirror rules and HTTPS policy used for the whole redirect chain.
+            let mut hash = Sha256::new();
+            hash.update(self.mirror.rule_fingerprint());
+            hash.update([u8::from(https_only)]);
+            hash.update(url.as_bytes());
+            format!("ws_filter_cover_v1_{}", hex::encode(&hash.finalize()[..16]))
+        } else {
+            format!(
+                "ws_cover_{}",
+                hex::encode(&Sha256::digest(url.as_bytes())[..16])
+            )
+        };
+        let path_for_ext = |ext: &str| {
+            self.paths
+                .image_cache_dir
+                .join(format!("{cache_stem}.{ext}"))
+        };
         let mut stale_cached: Option<(&'static str, Vec<u8>)> = None;
         for &(ext, cached_mime) in CACHED_COVER_FORMATS {
-            let cache_path = self
-                .paths
-                .image_cache_dir
-                .join(format!("ws_cover_{url_hash}.{ext}"));
+            let cache_path = path_for_ext(ext);
             if let Ok(meta) = fs::symlink_metadata(&cache_path) {
                 if meta.is_file() && meta.len() > 0 && meta.len() <= MAX_COVER_BYTES as u64 {
                     if let Ok(bytes) = fs::read(&cache_path) {
@@ -121,8 +140,13 @@ impl L4aEngine {
                     ..Default::default()
                 },
                 |req, _, _| req,
-                hop_validator,
-                |req| req.send_audited_quiet("workshop.cover"),
+                |hop| {
+                    if for_filter {
+                        validate_filter_image_redirect_hop(hop)?;
+                    }
+                    Ok(())
+                },
+                |req, hop| http::send_redirect_hop_quiet(req, "workshop.cover", hop),
             )
             .await
         {
@@ -137,14 +161,14 @@ impl L4aEngine {
                             return Ok((stale_mime.to_string(), stale_bytes));
                         }
                     }
-                    return Err(WorkshopError::Network(status_err.to_string()).into());
+                    return Err(WorkshopError::Network(status_err.without_url().to_string()).into());
                 }
             },
             Err(RedirectSendError::Rejected(err)) => return Err(err),
             Err(RedirectSendError::Mirror(mirror_err)) => {
                 return Err(WorkshopError::Network(mirror_err.to_string()).into());
             }
-            Err(RedirectSendError::Request(net_err)) => {
+            Err(net_err @ (RedirectSendError::Request(_) | RedirectSendError::Timeout)) => {
                 if let Some((stale_mime, stale_bytes)) = stale_cached {
                     return Ok((stale_mime.to_string(), stale_bytes));
                 }
@@ -205,10 +229,7 @@ impl L4aEngine {
             _ => None,
         };
         if let Some(ext) = cache_ext {
-            let dest = self
-                .paths
-                .image_cache_dir
-                .join(format!("ws_cover_{url_hash}.{ext}"));
+            let dest = path_for_ext(ext);
             if let Ok(mut tmp) = tempfile::Builder::new()
                 .prefix(".ws_cover_")
                 .tempfile_in(&self.paths.image_cache_dir)
@@ -216,11 +237,7 @@ impl L4aEngine {
                 if tmp.write_all(&bytes).is_ok() && tmp.persist(&dest).is_ok() {
                     for &(other_ext, _) in CACHED_COVER_FORMATS {
                         if other_ext != ext {
-                            let stale_other = self
-                                .paths
-                                .image_cache_dir
-                                .join(format!("ws_cover_{url_hash}.{other_ext}"));
-                            let _ = fs::remove_file(stale_other);
+                            let _ = fs::remove_file(path_for_ext(other_ext));
                         }
                     }
                 }

@@ -2,7 +2,7 @@ use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use l4a_logging::http::AuditedSend;
+use l4a_logging::http;
 use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::{
     MetadataSource, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopFileType, WorkshopId,
@@ -99,7 +99,7 @@ impl WorkshopProvider for SteamWebApiProvider {
                         }
                     },
                     |_| Ok::<(), WorkshopError>(()),
-                    |req| req.send_audited("steam_web_api.item_details"),
+                    |req, hop| http::send_redirect_hop(req, "steam_web_api.item_details", hop),
                 )
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?
@@ -273,7 +273,7 @@ impl WorkshopProvider for SteamWebApiProvider {
                     }
                 },
                 |_| Ok::<(), WorkshopError>(()),
-                |req| req.send_audited("steam_web_api.collection_details"),
+                |req, hop| http::send_redirect_hop(req, "steam_web_api.collection_details", hop),
             )
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?

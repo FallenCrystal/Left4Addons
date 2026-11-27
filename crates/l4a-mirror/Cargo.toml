@@ -10,10 +10,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 url.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["http2"] }
 tracing.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
+h2 = "0.4"
+http = "1"
 tempfile.workspace = true
 tokio.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

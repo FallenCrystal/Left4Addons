@@ -241,7 +241,12 @@ impl L4aEngine {
         let https_only = self.config.read().unwrap().https_only;
         let (req, _) = self
             .mirror
-            .get_no_redirect_with_policy(url, Some(timeout), https_only)
+            .request_with_insecure_mirror_redirects(
+                reqwest::Method::GET,
+                url,
+                Some(timeout),
+                https_only,
+            )
             .map_err(|e| CoreError::Network(e.to_string()))?;
         Ok(req)
     }
@@ -257,7 +262,12 @@ impl L4aEngine {
         let https_only = self.config.read().unwrap().https_only;
         let (req, _) = self
             .mirror
-            .post_no_redirect_with_policy(url, Some(timeout), https_only)
+            .request_with_insecure_mirror_redirects(
+                reqwest::Method::POST,
+                url,
+                Some(timeout),
+                https_only,
+            )
             .map_err(|e| CoreError::Network(e.to_string()))?;
         Ok(req)
     }
@@ -716,15 +726,27 @@ mod tests {
                                 Ok(n) => pending.extend_from_slice(&buf[..n]),
                             }
                         }
+                        let is_expected_post =
+                            header_text.starts_with("POST ") && &pending[..content_length] == b"{}";
                         pending.drain(..content_length);
 
                         served_conn.lock().unwrap().push((path.clone(), conn_id));
-                        if path.starts_with("/redirect") {
-                            let head = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/blocked\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                        let redirect = match path.as_str() {
+                            "/redirect/get" => Some("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/blocked\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+                            "/redirect/post" => Some("HTTP/1.1 307 Temporary Redirect\r\nLocation: /routed-final/post\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"),
+                            _ => None,
+                        };
+                        if let Some(head) = redirect {
                             if socket.write_all(head.as_bytes()).await.is_err() {
                                 break;
                             }
                         } else {
+                            if path == "/routed-final/post" {
+                                assert!(
+                                    is_expected_post,
+                                    "307 should preserve the method and body"
+                                );
+                            }
                             let head = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                                 jpeg_bytes.len()
@@ -798,14 +820,14 @@ mod tests {
             );
         }
 
-        // 2. Routed GET and POST with insecure-tls mirror rule do not follow redirects and reuse one connection.
+        // 2. The insecure mirror follows same-origin redirects on its pooled connection.
         let resp_get = engine
             .prepare_routed_get(
                 "http://filter.insecure.test/redirect/get",
                 Duration::from_secs(5),
             )
             .unwrap()
-            .send_audited_quiet("test.routed.no_redirect.get")
+            .send_audited_quiet("test.routed.cross_origin.get")
             .await
             .unwrap();
         assert_eq!(resp_get.status(), reqwest::StatusCode::FOUND);
@@ -819,19 +841,20 @@ mod tests {
             )
             .unwrap()
             .body("{}")
-            .send_audited_quiet("test.routed.no_redirect.post")
+            .send_audited_quiet("test.routed.same_origin.post")
             .await
             .unwrap();
-        assert_eq!(resp_post.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(resp_post.status(), reqwest::StatusCode::OK);
         let _ = resp_post.bytes().await.unwrap();
 
         let recorded = served_conns.lock().unwrap();
-        assert_eq!(recorded.len(), 5);
+        assert_eq!(recorded.len(), 6);
+        assert_eq!(recorded[5].0, "/routed-final/post");
         let routed_conns: HashSet<usize> = recorded[3..].iter().map(|(_, id)| *id).collect();
         assert_eq!(
             routed_conns.len(),
             1,
-            "insecure-tls no-redirect GET and POST should reuse one dedicated pooled connection"
+            "routed GET, POST and its same-origin redirect should reuse a single connection"
         );
         assert_ne!(
             recorded[0].1, recorded[3].1,
@@ -937,12 +960,15 @@ mod tests {
             .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
             .unwrap();
         let jpeg_bytes = Arc::new(jpeg_bytes);
+        let images_served = Arc::new(AtomicUsize::new(0));
+        let images_served_bg = Arc::clone(&images_served);
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = mirror_listener.accept().await else {
                     break;
                 };
                 let jpeg_bytes = Arc::clone(&jpeg_bytes);
+                let images_served = Arc::clone(&images_served_bg);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let Ok(n) = socket.read(&mut buf).await else {
@@ -963,6 +989,7 @@ mod tests {
                         let resp = "HTTP/1.1 302 Found\r\nLocation: /ugc/same-final/cover.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         let _ = socket.write_all(resp.as_bytes()).await;
                     } else {
+                        images_served.fetch_add(1, Ordering::SeqCst);
                         let head = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             jpeg_bytes.len()
@@ -1019,14 +1046,17 @@ mod tests {
             "private service must never be contacted via filter image redirect"
         );
 
-        // 2. Same-origin redirect on the explicitly configured mirror succeeds.
-        let same_ok = crate::filter::evaluator::load_single_image(
-            &engine,
-            "http://mirror.cdn.test/ugc/same/cover.jpg",
-        )
-        .await
-        .expect("same-origin redirect on configured mirror should succeed");
-        assert_eq!(same_ok.mime, "image/jpeg");
+        // 2. Filtering verifies the same-origin redirect and caches the validated image.
+        let cover_url = "http://mirror.cdn.test/ugc/same/cover.jpg";
+        engine.fetch_workshop_cover(cover_url).await.unwrap();
+        assert_eq!(images_served.load(Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            let filtered = crate::filter::evaluator::load_single_image(&engine, cover_url)
+                .await
+                .expect("same-origin redirect on configured mirror should succeed");
+            assert_eq!(filtered.mime, "image/jpeg");
+            assert_eq!(images_served.load(Ordering::SeqCst), 2);
+        }
 
         // 3. Direct Steam CDN hop escaping cloud.steampowered.com `/ugc/` path or downgrading to HTTP is rejected.
         let bad_path = url::Url::parse("https://cloud.steampowered.com/other/secret.jpg").unwrap();

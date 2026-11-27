@@ -1,7 +1,9 @@
+use futures_util::FutureExt;
 use regex::Regex;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::Path;
@@ -39,6 +41,8 @@ pub enum RedirectSendError<E> {
     Request(#[from] reqwest::Error),
     #[error(transparent)]
     Rejected(E),
+    #[error("HTTP 请求超时")]
+    Timeout,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +124,7 @@ struct ClientPoolKey {
     https_only: bool,
     insecure_tls: bool,
     redirect_mode: RedirectMode,
+    http1_only: bool,
     no_proxy: bool,
     timeout: Option<Duration>,
     connect_timeout: Option<Duration>,
@@ -223,6 +228,7 @@ fn insert_bounded(
 #[derive(Debug, Clone, Default)]
 pub struct MirrorRouter {
     rules: Vec<CompiledRule>,
+    rule_fingerprint: [u8; 32],
     https_only: Arc<AtomicBool>,
     no_proxy_for_testing: Arc<AtomicBool>,
     clients: Arc<RwLock<ClientPool>>,
@@ -246,8 +252,31 @@ impl MirrorRouter {
                 }
             }
         }
+        let rule_fingerprint = if compiled.is_empty() {
+            [0; 32]
+        } else {
+            let mut hasher = Sha256::new();
+            for rule in &compiled {
+                let raw = &rule.raw;
+                let headers = raw
+                    .headers
+                    .as_ref()
+                    .map(|headers| headers.iter().collect::<BTreeMap<_, _>>());
+                let encoded = serde_json::to_vec(&(
+                    rule.regex.as_str(),
+                    &raw.target,
+                    raw.keep_host,
+                    raw.insecure_tls,
+                    headers,
+                ))
+                .expect("mirror rules are serializable");
+                hasher.update(encoded);
+            }
+            hasher.finalize().into()
+        };
         Self {
             rules: compiled,
+            rule_fingerprint,
             ..Self::default()
         }
     }
@@ -264,6 +293,11 @@ impl MirrorRouter {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// Stable identifier for the effective, ordered rules of this router.
+    pub fn rule_fingerprint(&self) -> &[u8; 32] {
+        &self.rule_fingerprint
     }
 
     pub fn set_https_only(&self, enabled: bool) {
@@ -376,10 +410,18 @@ impl MirrorRouter {
             }
             other => other,
         };
+        // Preserve the configured HTTP/1.1 Host override when TLS could negotiate HTTP/2.
+        let http1_only = resolved.url.starts_with("https://")
+            && (resolved.original_host.is_some()
+                || resolved
+                    .headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("host")));
         ClientPoolKey {
             https_only,
             insecure_tls,
             redirect_mode,
+            http1_only,
             no_proxy: self.no_proxy_for_testing.load(Ordering::Relaxed),
             timeout,
             connect_timeout,
@@ -519,6 +561,23 @@ impl MirrorRouter {
         self.request_no_redirect_with_policy(Method::POST, url, timeout, https_only)
     }
 
+    /// Preserve same-origin redirects for insecure mirrors used by existing routed endpoints.
+    pub fn request_with_insecure_mirror_redirects(
+        &self,
+        method: Method,
+        url: &str,
+        timeout: Option<Duration>,
+        https_only: bool,
+    ) -> Result<(RequestBuilder, ResolvedRequest), MirrorError> {
+        let resolved = self.validate_url_with_policy(url, https_only)?;
+        let redirect_mode = if resolved.insecure_tls && !https_only {
+            RedirectMode::SameOriginOnly
+        } else {
+            RedirectMode::None
+        };
+        self.build_resolved_request(method, resolved, timeout, https_only, redirect_mode)
+    }
+
     fn build_request_with_policy(
         &self,
         method: Method,
@@ -527,8 +586,21 @@ impl MirrorRouter {
         https_only: bool,
         redirect_mode: RedirectMode,
     ) -> Result<(RequestBuilder, ResolvedRequest), MirrorError> {
-        let (client, resolved) =
-            self.resolve_and_client(url, https_only, redirect_mode, None, None, None)?;
+        let resolved = self.validate_url_with_policy(url, https_only)?;
+        self.build_resolved_request(method, resolved, timeout, https_only, redirect_mode)
+    }
+
+    fn build_resolved_request(
+        &self,
+        method: Method,
+        resolved: ResolvedRequest,
+        timeout: Option<Duration>,
+        https_only: bool,
+        redirect_mode: RedirectMode,
+    ) -> Result<(RequestBuilder, ResolvedRequest), MirrorError> {
+        let key =
+            self.pool_key_for_resolved(&resolved, https_only, redirect_mode, None, None, None);
+        let client = self.get_or_build_client(key)?;
         let mut req = apply_resolved_headers(client.request(method, &resolved.url), &resolved);
         if let Some(t) = timeout {
             req = req.timeout(t);
@@ -554,11 +626,11 @@ impl MirrorRouter {
     where
         FBuild: FnMut(RequestBuilder, usize, &Method) -> RequestBuilder,
         FValidate: FnMut(&RedirectHop<'_>) -> Result<(), E>,
-        FSend: FnMut(RequestBuilder) -> Fut,
+        FSend: FnMut(RequestBuilder, usize) -> Fut,
         Fut: Future<Output = reqwest::Result<Response>>,
     {
         let max_redirects = options.max_redirects.unwrap_or(DEFAULT_MAX_REDIRECTS);
-        let started_at = options.timeout.map(|_| Instant::now());
+        let started_at = Instant::now();
         let mut current_method = method;
         let initial_https_only = options
             .https_only_override
@@ -581,25 +653,20 @@ impl MirrorRouter {
                 options.read_timeout,
             );
             let client = self.get_or_build_client(key)?;
-            let mut req = apply_resolved_headers(
+            let req = apply_resolved_headers(
                 client.request(current_method.clone(), &current_resolved.url),
                 &current_resolved,
             );
+            let mut req = configure(req, hop, &current_method);
             if let Some(total_timeout) = options.timeout {
-                let hop_timeout = if hop == 0 {
-                    total_timeout
-                } else {
-                    let elapsed = started_at.map_or(Duration::ZERO, |t| t.elapsed());
-                    total_timeout
-                        .checked_sub(elapsed)
-                        .filter(|d| !d.is_zero())
-                        .unwrap_or(Duration::from_millis(1))
-                };
+                let hop_timeout = total_timeout
+                    .checked_sub(started_at.elapsed())
+                    .filter(|remaining| !remaining.is_zero())
+                    .ok_or(RedirectSendError::Timeout)?;
                 req = req.timeout(hop_timeout);
             }
-            req = configure(req, hop, &current_method);
 
-            let mut response = send(req).await?;
+            let mut response = send(req, hop).await?;
             let status = response.status();
             let Some(location_value) = is_redirect_status(status)
                 .then(|| response.headers().get(reqwest::header::LOCATION))
@@ -621,17 +688,10 @@ impl MirrorRouter {
                 .map_err(|_| {
                     MirrorError::InvalidRedirect("Location 头包含非 ASCII 字符".to_string())
                 })?
-                .trim()
-                .to_string();
-
-            // 排空小体量 30x 响应体，使底层 HTTP/1.1 Keep-Alive 连接可顺利归池复用。
-            drain_small_body(&mut response, MAX_REDIRECT_BODY_DRAIN_BYTES).await;
-            drop(response);
-
-            let current_url = url::Url::parse(&current_resolved.url)
-                .map_err(|e| MirrorError::InvalidRedirect(e.to_string()))?;
+                .trim();
+            let current_url = response.url();
             let next_url = current_url
-                .join(&location)
+                .join(location)
                 .map_err(|e| MirrorError::InvalidRedirect(e.to_string()))?;
             if !matches!(next_url.scheme(), "http" | "https") {
                 return Err(RedirectSendError::Mirror(MirrorError::InvalidRedirect(
@@ -642,7 +702,7 @@ impl MirrorRouter {
             let next_https_only = options
                 .https_only_override
                 .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
-            let is_same_origin = urls_same_origin(&current_url, &next_url);
+            let is_same_origin = urls_same_origin(current_url, &next_url);
             let next_resolved = if is_same_origin {
                 let candidate = ResolvedRequest {
                     url: next_url.to_string(),
@@ -667,6 +727,7 @@ impl MirrorRouter {
             };
             validate_hop(&hop_info).map_err(RedirectSendError::Rejected)?;
 
+            drain_ready_redirect_body(&mut response);
             current_method = next_redirect_method(status, current_method);
             current_resolved = next_resolved;
         }
@@ -710,6 +771,9 @@ impl MirrorRouter {
             .danger_accept_invalid_certs(key.insecure_tls);
         if key.no_proxy {
             builder = builder.no_proxy();
+        }
+        if key.http1_only {
+            builder = builder.http1_only();
         }
         match key.redirect_mode {
             RedirectMode::Follow => {}
@@ -805,7 +869,7 @@ fn urls_same_origin(a: &url::Url, b: &url::Url) -> bool {
 
 fn same_origin_redirect_policy(max_redirects: usize) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= max_redirects {
+        if attempt.previous().len() > max_redirects {
             return attempt.error("too many redirects");
         }
         let Some(prev) = attempt.previous().last() else {
@@ -851,19 +915,20 @@ fn next_redirect_method(status: StatusCode, current: Method) -> Method {
     }
 }
 
-async fn drain_small_body(response: &mut Response, max_bytes: usize) {
+fn drain_ready_redirect_body(response: &mut Response) {
     if response
         .content_length()
-        .is_some_and(|len| len > max_bytes as u64)
+        .is_some_and(|len| len > MAX_REDIRECT_BODY_DRAIN_BYTES as u64)
     {
         return;
     }
     let mut drained = 0usize;
-    while drained < max_bytes {
-        match response.chunk().await {
-            Ok(Some(chunk)) => drained = drained.saturating_add(chunk.len()),
-            Ok(None) | Err(_) => break,
-        }
+    // An already buffered body can free an HTTP/1.1 connection. Never wait for it.
+    while drained < MAX_REDIRECT_BODY_DRAIN_BYTES {
+        let Some(Ok(Some(chunk))) = response.chunk().now_or_never() else {
+            break;
+        };
+        drained = drained.saturating_add(chunk.len());
     }
 }
 
@@ -1330,27 +1395,30 @@ mod tests {
         (format!("http://{addr}"), log)
     }
 
+    fn test_tls_config() -> rustls::ServerConfig {
+        use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let cert = CertificateDer::from(TEST_TLS_CERT_DER.to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_TLS_KEY_DER.to_vec()));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap()
+    }
+
     async fn start_self_signed_tls_server<F>(
         handler: F,
     ) -> (String, Arc<Mutex<Vec<RecordedRequest>>>)
     where
         F: Fn(&RecordedRequest) -> (String, String, String) + Send + Sync + 'static,
     {
-        use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         use tokio::net::TcpListener;
         use tokio_rustls::TlsAcceptor;
 
-        let cert = CertificateDer::from(TEST_TLS_CERT_DER.to_vec());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(TEST_TLS_KEY_DER.to_vec()));
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let tls_cfg = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .unwrap();
-        let acceptor = TlsAcceptor::from(Arc::new(tls_cfg));
-
+        let acceptor = TlsAcceptor::from(Arc::new(test_tls_config()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -1385,6 +1453,144 @@ mod tests {
             .map(|r| r.conn_id)
             .collect::<HashSet<_>>()
             .len()
+    }
+
+    #[tokio::test]
+    async fn reuses_http2_connection_and_preserves_host_overrides_over_http1() {
+        use tokio::net::TcpListener;
+        use tokio_rustls::TlsAcceptor;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let mut tls_config = test_tls_config();
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+        let h2_connections = Arc::new(Mutex::new(Vec::new()));
+        let h1_requests = Arc::new(Mutex::new(Vec::new()));
+        let h2_connections_bg = Arc::clone(&h2_connections);
+        let h1_requests_bg = Arc::clone(&h1_requests);
+        tokio::spawn(async move {
+            let mut conn_id = 0;
+            while let Ok((socket, _)) = listener.accept().await {
+                conn_id += 1;
+                let acceptor = acceptor.clone();
+                let h2_connections = Arc::clone(&h2_connections_bg);
+                let h1_requests = Arc::clone(&h1_requests_bg);
+                tokio::spawn(async move {
+                    let stream = acceptor.accept(socket).await.unwrap();
+                    if stream.get_ref().1.alpn_protocol() == Some(b"h2") {
+                        let mut connection = h2::server::handshake(stream).await.unwrap();
+                        while let Some(Ok((_, mut respond))) = connection.accept().await {
+                            h2_connections.lock().unwrap().push(conn_id);
+                            respond
+                                .send_response(http::Response::new(()), true)
+                                .unwrap();
+                        }
+                    } else {
+                        serve_http_stream(
+                            stream,
+                            conn_id,
+                            h1_requests,
+                            Arc::new(|_: &RecordedRequest| {
+                                ("200 OK".into(), String::new(), String::new())
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+
+        let mut h2_rule = base_rule(&target);
+        h2_rule.rules = Some("h2.mirror.test".into());
+        h2_rule.insecure_tls = true;
+        let mut keep_host_rule = h2_rule.clone();
+        keep_host_rule.rules = Some("keep-host.mirror.test".into());
+        keep_host_rule.keep_host = true;
+        let router = MirrorRouter::from_rules(vec![h2_rule, keep_host_rule]);
+        router.set_no_proxy_for_testing(true);
+
+        for timeout in [Duration::from_secs(4), Duration::from_secs(5)] {
+            let (request, _) = router
+                .get("https://h2.mirror.test/item", Some(timeout))
+                .unwrap();
+            let response = request.send().await.unwrap();
+            assert_eq!(response.version(), reqwest::Version::HTTP_2);
+            assert_eq!(response.status(), StatusCode::OK);
+            response.bytes().await.unwrap();
+        }
+        assert_eq!(*h2_connections.lock().unwrap(), [1, 1]);
+
+        let (request, _) = router
+            .get(
+                "https://keep-host.mirror.test/item",
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        let response = request.send().await.unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_11);
+        let requests = h1_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["host"], "keep-host.mirror.test");
+    }
+
+    #[tokio::test]
+    async fn follows_location_without_waiting_for_optional_response_body() {
+        use reqwest::ResponseBuilderExt;
+
+        let router = MirrorRouter::empty();
+        let redirected = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.send_with_redirects(
+                Method::GET,
+                "https://mirror.example.com/start",
+                RedirectRequestOptions::default(),
+                |request, _, _| request,
+                |_| Ok::<(), ()>(()),
+                |request, hop| async move {
+                    let url = request.build()?.url().clone();
+                    let response = http::Response::builder().url(url);
+                    let response = if hop == 0 {
+                        let body = reqwest::Body::wrap_stream(futures_util::stream::pending::<
+                            std::io::Result<&'static [u8]>,
+                        >());
+                        response
+                            .status(StatusCode::FOUND)
+                            .header(reqwest::header::LOCATION, "/item")
+                            .body(body)
+                    } else {
+                        response.body(reqwest::Body::from("ok"))
+                    };
+                    Ok(response.unwrap().into())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            redirected.final_resolved.url,
+            "https://mirror.example.com/item"
+        );
+        assert_eq!(redirected.response.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn exhausted_timeout_stops_before_sending() {
+        let result = MirrorRouter::empty()
+            .send_with_redirects(
+                Method::GET,
+                "https://mirror.example.com/item",
+                RedirectRequestOptions {
+                    timeout: Some(Duration::ZERO),
+                    ..Default::default()
+                },
+                |request, _, _| request,
+                |_| Ok::<(), ()>(()),
+                |_, _| async { panic!("the deadline is exhausted") },
+            )
+            .await;
+        assert!(matches!(result, Err(RedirectSendError::Timeout)));
     }
 
     #[tokio::test]
@@ -1579,7 +1785,7 @@ mod tests {
                 },
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await;
         assert!(
@@ -1599,7 +1805,7 @@ mod tests {
                     },
                     |r, _, _| r,
                     |_| Ok::<(), ()>(()),
-                    |r| r.send(),
+                    |r, _| r.send(),
                 )
                 .await
                 .expect("insecure mirror route should succeed when https_only=false");
@@ -1619,7 +1825,7 @@ mod tests {
                 },
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await;
         assert!(
@@ -1655,7 +1861,7 @@ mod tests {
                 },
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await;
         assert!(
@@ -1703,7 +1909,7 @@ mod tests {
                 RedirectRequestOptions::default(),
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await
             .unwrap();
@@ -1718,7 +1924,7 @@ mod tests {
                 RedirectRequestOptions::default(),
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await
             .unwrap();
@@ -1733,7 +1939,7 @@ mod tests {
                 RedirectRequestOptions::default(),
                 |r, _, _| r,
                 |_| Ok::<(), ()>(()),
-                |r| r.send(),
+                |r, _| r.send(),
             )
             .await
             .unwrap();

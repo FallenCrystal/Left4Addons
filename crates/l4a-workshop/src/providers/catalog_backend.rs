@@ -2,7 +2,7 @@ use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::Utc;
-use l4a_logging::http::AuditedSend;
+use l4a_logging::http;
 use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::{
     BatchItemsRequest, BatchItemsResponse, MetadataSource, SearchQuery, SearchResponse,
@@ -89,7 +89,7 @@ impl WorkshopProvider for CatalogBackendProvider {
                     }
                 },
                 |_| Ok::<(), WorkshopError>(()),
-                |req| req.send_audited("catalog.items.batch"),
+                |req, hop| http::send_redirect_hop(req, "catalog.items.batch", hop),
             )
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?
@@ -156,7 +156,7 @@ impl WorkshopProvider for CatalogBackendProvider {
                 },
                 |req, _, _| req,
                 |_| Ok::<(), WorkshopError>(()),
-                |req| req.send_audited("catalog.collection"),
+                |req, hop| http::send_redirect_hop(req, "catalog.collection", hop),
             )
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?
@@ -248,7 +248,7 @@ impl WorkshopProvider for CatalogBackendProvider {
                 },
                 |req, hop, _| if hop == 0 { req.query(&params) } else { req },
                 |_| Ok::<(), WorkshopError>(()),
-                |req| req.send_audited("catalog.search"),
+                |req, hop| http::send_redirect_hop(req, "catalog.search", hop),
             )
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?
