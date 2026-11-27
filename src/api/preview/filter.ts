@@ -30,6 +30,8 @@ import {
 } from '../../utils/contentFilter';
 import type { PreviewEmit } from './workshop';
 
+const PREVIEW_FILTER_DIR = '/home/preview/.local/share/Left4Addons/left4filters';
+
 const PREVIEW_COMMITS: FilterCommitInfo[] = [
   {
     sha: 'a94f18e2d3104b88c91e776201fa4b928c7d1204',
@@ -183,8 +185,9 @@ export class PreviewFilterRuntime {
         venvAvailable: true,
       },
       deployed: true,
-      repoDir: '/home/preview/.local/share/Left4Addons/left4filters/repo',
-      venvDir: '/home/preview/.local/share/Left4Addons/left4filters/venv',
+      webGpuEnabled: false,
+      repoDir: `${PREVIEW_FILTER_DIR}/repo`,
+      venvDir: `${PREVIEW_FILTER_DIR}/venv`,
       serviceState: 'running',
       serviceEndpoint: 'http://127.0.0.1:18791',
       runningPid: 48210,
@@ -256,6 +259,8 @@ export class PreviewFilterRuntime {
     }
 
     this.status.deployed = true;
+    this.status.webGpuEnabled = request.installWebGpu ?? this.status.webGpuEnabled;
+    this.status.venvDir = `${PREVIEW_FILTER_DIR}/${this.status.webGpuEnabled ? 'venv-webgpu' : 'venv'}`;
     this.status.currentCommit = structuredClone(targetCommit);
     this.status.remoteLatestCommit = structuredClone(PREVIEW_COMMITS[0]);
     this.status.updateAvailable = targetCommit.sha !== PREVIEW_COMMITS[0].sha;

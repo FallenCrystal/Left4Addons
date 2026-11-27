@@ -17,6 +17,7 @@ pub struct AppPaths {
     pub filters_dir: PathBuf,
     pub filter_repo_dir: PathBuf,
     pub filter_venv_dir: PathBuf,
+    pub filter_webgpu_venv_dir: PathBuf,
     pub filter_runner_path: PathBuf,
 }
 
@@ -36,6 +37,7 @@ impl AppPaths {
             download_cache_dir: cache_dir.join("downloading"),
             filter_repo_dir: filters_dir.join("Left4Filters"),
             filter_venv_dir: filters_dir.join("venv"),
+            filter_webgpu_venv_dir: filters_dir.join("venv-webgpu"),
             filter_runner_path: filters_dir.join("l4a_filter_runner.py"),
             config_dir,
             cache_dir,

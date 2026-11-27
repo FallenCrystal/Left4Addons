@@ -28,14 +28,26 @@ const REQUIRED_DEPLOY_FILES: &[&str] = &[
     "text_vocab.json",
     "requirements.txt",
 ];
+const WEBGPU_REQUIREMENTS: &str = "requirements-webgpu.txt";
+const WEBGPU_PROVIDER: &str = "WebGpuExecutionProvider";
+const VISION_PROVIDER_ENV: &str = "LEFT4FILTERS_VISION_PROVIDER";
+const CPU_PYTHON_MIN_MINOR: u8 = 9;
+const WEBGPU_PYTHON_MIN_MINOR: u8 = 11;
+const PYTHON_VERSION_CHECK: &str =
+    "import sys\nif sys.version_info < (3, int(sys.argv[1])):\n    sys.exit(2)\n";
 
-fn validate_deploy_assets(deploy_dir: &Path) -> Result<(), CoreError> {
+fn validate_deploy_assets(deploy_dir: &Path, web_gpu_enabled: bool) -> Result<(), CoreError> {
     for name in REQUIRED_DEPLOY_FILES {
         if !deploy_dir.join(name).is_file() {
             return Err(CoreError::InvalidInput(format!(
                 "模型仓库缺少必要的部署文件: deploy/{name}"
             )));
         }
+    }
+    if web_gpu_enabled && !deploy_dir.join(WEBGPU_REQUIREMENTS).is_file() {
+        return Err(CoreError::Unsupported(format!(
+            "所选 Left4Filters 版本缺少 deploy/{WEBGPU_REQUIREMENTS}。请更新模型版本或关闭 WebGPU 选项。"
+        )));
     }
 
     let config_path = deploy_dir.join("model_config.json");
@@ -95,6 +107,18 @@ fn configure_tokio_cmd(cmd: &mut tokio::process::Command) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = cmd;
+}
+
+fn configure_runner_vision_provider(
+    cmd: &mut tokio::process::Command,
+    web_gpu_enabled: bool,
+    inherited: Option<&str>,
+) {
+    if web_gpu_enabled {
+        cmd.env(VISION_PROVIDER_ENV, "webgpu");
+    } else if inherited.is_some_and(|provider| provider.trim().eq_ignore_ascii_case("webgpu")) {
+        cmd.env_remove(VISION_PROVIDER_ENV);
+    }
 }
 
 fn clean_os_path(path: &Path) -> String {
@@ -217,8 +241,12 @@ fn is_executable_file(path: &Path) -> bool {
 pub(crate) fn probe_python_candidates(
     candidates: &[(&str, &[&str])],
     path_override: Option<&OsStr>,
+    min_python_minor: u8,
 ) -> Option<(String, String, bool)> {
-    let probe_script = "import sys\nif sys.version_info < (3, 9):\n    sys.exit(2)\nprint(sys.executable)\nprint(sys.version.split()[0])\ntry:\n    import venv, ensurepip\n    print('1')\nexcept Exception:\n    print('0')\n";
+    let probe_script = format!(
+        "{PYTHON_VERSION_CHECK}print(sys.executable)\nprint(sys.version.split()[0])\ntry:\n    import venv, ensurepip\n    print('1')\nexcept Exception:\n    print('0')\n"
+    );
+    let min_python_minor = min_python_minor.to_string();
     let effective_path = path_override
         .map(OsStr::to_os_string)
         .or_else(|| std::env::var_os("PATH"));
@@ -242,7 +270,7 @@ pub(crate) fn probe_python_candidates(
             cmd.env("PATH", pv);
         }
         cmd.args(prefix_args)
-            .args(["-c", probe_script])
+            .args(["-c", &probe_script, &min_python_minor])
             .env("PYTHONIOENCODING", "utf-8")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -288,7 +316,91 @@ pub(crate) fn probe_python_candidates(
     fallback_no_venv.map(|(exe, ver)| (exe, ver, false))
 }
 
+fn probe_deployment_python(
+    web_gpu_enabled: bool,
+    path_override: Option<&OsStr>,
+) -> Option<(String, String, bool)> {
+    #[cfg(windows)]
+    let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[]), ("py", &["-3"])];
+    #[cfg(not(windows))]
+    let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[])];
+
+    let min_python_minor = if web_gpu_enabled {
+        WEBGPU_PYTHON_MIN_MINOR
+    } else {
+        CPU_PYTHON_MIN_MINOR
+    };
+    let selected = probe_python_candidates(candidates, path_override, min_python_minor);
+    if !web_gpu_enabled || selected.as_ref().is_some_and(|(_, _, has_venv)| *has_venv) {
+        return selected;
+    }
+
+    let Some(path) = path_override
+        .map(OsStr::to_os_string)
+        .or_else(|| std::env::var_os("PATH"))
+    else {
+        return selected;
+    };
+    let fallback_paths = webgpu_python_fallbacks(&path);
+    let fallback_candidates: Vec<(&str, &[&str])> = fallback_paths
+        .iter()
+        .map(|path| (path.as_str(), &[][..]))
+        .collect();
+    match probe_python_candidates(&fallback_candidates, Some(&path), min_python_minor) {
+        Some(candidate) if candidate.2 || selected.is_none() => Some(candidate),
+        _ => selected,
+    }
+}
+
+fn webgpu_python_fallbacks(path: &OsStr) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for dir in std::env::split_paths(path) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut interpreters: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                #[cfg(windows)]
+                let name = {
+                    if !path.extension()?.eq_ignore_ascii_case("exe") {
+                        return None;
+                    }
+                    path.file_stem()?.to_str()?.to_ascii_lowercase()
+                };
+                #[cfg(windows)]
+                let name = name.as_str();
+                #[cfg(not(windows))]
+                let name = path.file_name()?.to_str()?;
+                let minor = match name {
+                    "python3" | "python" => 0,
+                    _ => {
+                        let minor = name.strip_prefix("python3.")?.parse::<u8>().ok()?;
+                        if minor < WEBGPU_PYTHON_MIN_MINOR {
+                            return None;
+                        }
+                        minor
+                    }
+                };
+                is_executable_file(&path).then_some((std::cmp::Reverse(minor), path))
+            })
+            .collect();
+        interpreters.sort_unstable();
+        candidates.extend(
+            interpreters
+                .into_iter()
+                .map(|(_, path)| clean_os_path(&make_absolute_preserving_symlinks(&path))),
+        );
+    }
+    candidates
+}
+
 pub fn probe_environment() -> FilterEnvReport {
+    probe_environment_for_backend(false)
+}
+
+fn probe_environment_for_backend(web_gpu_enabled: bool) -> FilterEnvReport {
     let mut report = FilterEnvReport::default();
 
     let mut git_cmd = std::process::Command::new("git");
@@ -313,12 +425,7 @@ pub fn probe_environment() -> FilterEnvReport {
         }
     }
 
-    #[cfg(windows)]
-    let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[]), ("py", &["-3"])];
-    #[cfg(not(windows))]
-    let candidates: &[(&str, &[&str])] = &[("python3", &[]), ("python", &[])];
-
-    if let Some((exe_path, ver, has_venv)) = probe_python_candidates(candidates, None) {
+    if let Some((exe_path, ver, has_venv)) = probe_deployment_python(web_gpu_enabled, None) {
         report.python_available = true;
         report.python_path = Some(exe_path);
         report.python_version = Some(ver);
@@ -466,6 +573,7 @@ pub fn validate_target_commit(raw: &str) -> Result<String, CoreError> {
 #[derive(Debug, Deserialize)]
 struct ReadyBanner {
     port: u16,
+    vision_provider: Option<String>,
 }
 
 struct RunningRunner {
@@ -477,6 +585,14 @@ struct RunningRunner {
     runner_token: String,
     stderr_tail: Arc<Mutex<String>>,
     synced_params: Arc<Mutex<Option<FilterModelParams>>>,
+}
+
+struct PreparedDeployment {
+    env: FilterEnvReport,
+    current_commit: Option<FilterCommitInfo>,
+    remote_latest_commit: Option<FilterCommitInfo>,
+    recent_commits: Vec<FilterCommitInfo>,
+    runner: Option<RunningRunner>,
 }
 
 #[derive(Default)]
@@ -552,14 +668,49 @@ impl LocalFilterManager {
     }
 
     pub fn is_deployed(&self) -> bool {
+        self.is_backend_deployed(self.web_gpu_enabled())
+    }
+
+    fn is_backend_deployed(&self, web_gpu_enabled: bool) -> bool {
         let repo_dir = &self.paths.filter_repo_dir;
         if !repo_dir.join(".git").exists() {
             return false;
         }
         let deploy_dir = repo_dir.join("deploy");
-        validate_deploy_assets(&deploy_dir).is_ok()
-            && is_executable_file(&venv_python_path(&self.paths.filter_venv_dir))
+        validate_deploy_assets(&deploy_dir, web_gpu_enabled).is_ok()
+            && is_executable_file(&venv_python_path(self.venv_dir(web_gpu_enabled)))
             && self.paths.filter_runner_path.is_file()
+    }
+
+    fn venv_dir(&self, web_gpu_enabled: bool) -> &Path {
+        if web_gpu_enabled {
+            &self.paths.filter_webgpu_venv_dir
+        } else {
+            &self.paths.filter_venv_dir
+        }
+    }
+
+    fn web_gpu_marker(&self) -> PathBuf {
+        self.paths.filters_dir.join("webgpu-enabled")
+    }
+
+    fn web_gpu_enabled(&self) -> bool {
+        self.web_gpu_marker().is_file()
+    }
+
+    fn set_web_gpu_enabled(&self, enabled: bool) -> Result<(), CoreError> {
+        let marker = self.web_gpu_marker();
+        if enabled {
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(marker)?;
+        } else if let Err(err) = fs::remove_file(marker) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err.into());
+            }
+        }
+        Ok(())
     }
 
     pub fn active_commit_sha(&self) -> Option<String> {
@@ -584,14 +735,14 @@ impl LocalFilterManager {
             }
             Err(_) => true,
         };
+        let web_gpu_enabled = self.web_gpu_enabled();
+        let probe = move || probe_environment_for_backend(web_gpu_enabled);
 
         if op_busy {
             let cached_env = self.state.lock().unwrap().last_env.clone();
             let env = match cached_env {
                 Some(e) => e,
-                None => tokio::task::spawn_blocking(probe_environment)
-                    .await
-                    .unwrap_or_default(),
+                None => tokio::task::spawn_blocking(probe).await.unwrap_or_default(),
             };
             let mut st = self.state.lock().unwrap();
             if st.last_env.is_none() {
@@ -600,9 +751,7 @@ impl LocalFilterManager {
             return self.snapshot_from_state(env, &st);
         }
 
-        let env = tokio::task::spawn_blocking(probe_environment)
-            .await
-            .unwrap_or_default();
+        let env = tokio::task::spawn_blocking(probe).await.unwrap_or_default();
 
         let local_git = if self.paths.filter_repo_dir.join(".git").exists() {
             inspect_local_repo_async(&self.shutdown_token, &self.paths.filter_repo_dir)
@@ -649,9 +798,11 @@ impl LocalFilterManager {
         let validated_url = validate_repo_url(repo_url, https_only)?;
         let repo_dir = &self.paths.filter_repo_dir;
 
-        let env = tokio::task::spawn_blocking(probe_environment)
-            .await
-            .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
+        let web_gpu_enabled = self.web_gpu_enabled();
+        let env =
+            tokio::task::spawn_blocking(move || probe_environment_for_backend(web_gpu_enabled))
+                .await
+                .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
         if !env.git_available {
             return Err(CoreError::Unsupported(
                 "未检测到 Git，请先在系统中安装 Git 后再检查模型更新".into(),
@@ -719,6 +870,9 @@ impl LocalFilterManager {
         https_only: bool,
     ) -> Result<LocalFilterDeployOutcome, CoreError> {
         let mut runner_guard = self.op_lock.lock().await;
+        let web_gpu_enabled = request
+            .install_web_gpu
+            .unwrap_or_else(|| self.web_gpu_enabled());
 
         let raw_url = request
             .repo_url
@@ -745,6 +899,9 @@ impl LocalFilterManager {
 
         *self.last_auto_restart_at.lock().unwrap() = None;
 
+        self.reap_exited_runner(&mut runner_guard);
+        let restart_previous_runner =
+            web_gpu_enabled && request.start_after_deploy && runner_guard.is_some();
         // Stop any running Python process before touching git checkout or venv files
         {
             let _exec = self.predict_execution.write().await;
@@ -759,14 +916,42 @@ impl LocalFilterManager {
         let deploy_res = self
             .run_deploy_steps(
                 &validated_url,
-                request.track_latest,
                 target_commit.as_deref(),
+                web_gpu_enabled,
+                request.start_after_deploy,
             )
             .await;
 
-        let (env, cur_commit, rem_commit, recent_commits) = match deploy_res {
-            Ok(tuple) => tuple,
-            Err(err) => {
+        let PreparedDeployment {
+            env,
+            current_commit,
+            remote_latest_commit,
+            recent_commits,
+            runner,
+        } = match deploy_res {
+            Ok(deployment) => deployment,
+            Err(mut err) => {
+                if restart_previous_runner
+                    && !matches!(err, CoreError::RecoveryRequired(_))
+                    && !self.shutdown_token.is_cancelled()
+                {
+                    let params = self.desired_params.read().unwrap().clone();
+                    match self.start_runner_locked(&mut runner_guard, &params).await {
+                        Ok(()) => {
+                            self.emit_stage(
+                                LocalFilterServiceState::Running,
+                                None,
+                                Some(err.to_string()),
+                            );
+                            return Err(err);
+                        }
+                        Err(restart_err) => {
+                            err = CoreError::RecoveryRequired(format!(
+                                "部署失败（{err}），重启原推理服务失败（{restart_err}）"
+                            ));
+                        }
+                    }
+                }
                 self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
                 return Err(err);
             }
@@ -775,17 +960,20 @@ impl LocalFilterManager {
         {
             let mut st = self.state.lock().unwrap();
             st.last_env = Some(env.clone());
-            st.update_available = match (&cur_commit, &rem_commit) {
+            st.update_available = match (&current_commit, &remote_latest_commit) {
                 (Some(c), Some(r)) => c.sha != r.sha,
                 _ => false,
             };
-            st.current_commit = cur_commit;
-            st.remote_latest_commit = rem_commit;
+            st.current_commit = current_commit;
+            st.remote_latest_commit = remote_latest_commit;
             st.recent_commits = recent_commits;
             st.last_error = None;
         }
 
-        let start_error = if request.start_after_deploy {
+        let start_error = if let Some(runner) = runner {
+            self.set_running_runner(&mut runner_guard, runner);
+            None
+        } else if request.start_after_deploy {
             let latest_params = self.desired_params.read().unwrap().clone();
             self.start_runner_locked(&mut runner_guard, &latest_params)
                 .await
@@ -820,20 +1008,20 @@ impl LocalFilterManager {
     async fn run_deploy_steps(
         &self,
         validated_url: &str,
-        track_latest: bool,
         target_commit: Option<&str>,
-    ) -> Result<
-        (
-            FilterEnvReport,
-            Option<FilterCommitInfo>,
-            Option<FilterCommitInfo>,
-            Vec<FilterCommitInfo>,
-        ),
-        CoreError,
-    > {
-        let env = tokio::task::spawn_blocking(probe_environment)
-            .await
-            .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
+        web_gpu_enabled: bool,
+        start_after_deploy: bool,
+    ) -> Result<PreparedDeployment, CoreError> {
+        let env =
+            tokio::task::spawn_blocking(move || probe_environment_for_backend(web_gpu_enabled))
+                .await
+                .map_err(|e| CoreError::Io(std::io::Error::other(e)))?;
+
+        let required_python = if web_gpu_enabled {
+            "Python 3.11+ (WebGPU)"
+        } else {
+            "Python 3.9+"
+        };
 
         if !env.git_available || !env.python_available || !env.venv_available {
             let mut missing = Vec::new();
@@ -841,7 +1029,7 @@ impl LocalFilterManager {
                 missing.push("Git");
             }
             if !env.python_available {
-                missing.push("Python 3.9+");
+                missing.push(required_python);
             } else if !env.venv_available {
                 missing.push("Python venv / ensurepip 模块 (如 Debian/Ubuntu 请安装 python3-venv)");
             }
@@ -851,10 +1039,9 @@ impl LocalFilterManager {
             )));
         }
 
-        let sys_python = env
-            .python_path
-            .clone()
-            .ok_or_else(|| CoreError::Unsupported("未找到可用的 Python 3.9+ 可执行文件".into()))?;
+        let sys_python = env.python_path.clone().ok_or_else(|| {
+            CoreError::Unsupported(format!("未找到可用的 {required_python} 可执行文件"))
+        })?;
 
         self.emit_stage(
             LocalFilterServiceState::Deploying,
@@ -909,11 +1096,16 @@ impl LocalFilterManager {
             None
         };
 
-        if track_latest {
+        let sha = if let Some(target) = target_commit {
+            resolve_target_commit_sha_async(&self.shutdown_token, repo_dir, target).await?
+        } else {
             let remote_ref = resolve_remote_default_ref_async(&self.shutdown_token, repo_dir)
                 .await
                 .ok_or_else(|| CoreError::InvalidInput("无法解析模型仓库默认远端分支".into()))?;
-            let sha = rev_parse_async(&self.shutdown_token, repo_dir, &remote_ref).await?;
+            rev_parse_async(&self.shutdown_token, repo_dir, &remote_ref).await?
+        };
+
+        let post_checkout = async {
             run_git_async(
                 &self.shutdown_token,
                 repo_dir,
@@ -921,37 +1113,42 @@ impl LocalFilterManager {
                 GIT_FAST_TIMEOUT,
             )
             .await?;
-        } else {
-            let target = target_commit.ok_or_else(|| {
-                CoreError::InvalidInput("关闭跟随最新版本时必须指定目标 Commit".into())
-            })?;
-            let resolved_sha =
-                resolve_target_commit_sha_async(&self.shutdown_token, repo_dir, target).await?;
-            run_git_async(
-                &self.shutdown_token,
-                repo_dir,
-                &["checkout", "--force", "--detach", &resolved_sha],
-                GIT_FAST_TIMEOUT,
-            )
-            .await?;
-        }
-
-        let post_checkout = async {
             let deploy_dir = repo_dir.join("deploy");
-            validate_deploy_assets(&deploy_dir)?;
+            validate_deploy_assets(&deploy_dir, web_gpu_enabled)?;
 
-            let (cur_commit, rem_commit, recent_commits) =
+            let req_path = deploy_dir.join(if web_gpu_enabled {
+                WEBGPU_REQUIREMENTS
+            } else {
+                "requirements.txt"
+            });
+            let req_content = fs::read_to_string(&req_path)?;
+            let has_packages = req_content
+                .lines()
+                .map(str::trim)
+                .any(|line| !line.is_empty() && !line.starts_with('#'));
+            if web_gpu_enabled && !has_packages {
+                return Err(CoreError::InvalidInput(format!(
+                    "WebGPU 依赖清单为空: deploy/{WEBGPU_REQUIREMENTS}"
+                )));
+            }
+
+            let (current_commit, remote_latest_commit, recent_commits) =
                 inspect_local_repo_async(&self.shutdown_token, repo_dir).await?;
 
             self.emit_stage(
                 LocalFilterServiceState::Deploying,
-                Some("正在配置 Python 虚拟环境与推理依赖...".into()),
+                Some(if web_gpu_enabled {
+                    "正在配置 Python 虚拟环境与 WebGPU 推理依赖...".into()
+                } else {
+                    "正在配置 Python 虚拟环境与推理依赖...".into()
+                }),
                 None,
             );
 
-            let venv_py = venv_python_path(&self.paths.filter_venv_dir);
+            let venv_dir = self.venv_dir(web_gpu_enabled);
+            let venv_py = venv_python_path(venv_dir);
             let has_valid_venv = if is_executable_file(&venv_py) {
-                match venv_has_pip_async(&self.shutdown_token, &venv_py).await {
+                match venv_is_usable_async(&self.shutdown_token, &venv_py, web_gpu_enabled).await {
                     Ok(valid) => valid,
                     Err(CoreError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => {
                         return Err(CoreError::Io(err));
@@ -968,12 +1165,10 @@ impl LocalFilterManager {
                 false
             };
             if !has_valid_venv {
-                if self.paths.filter_venv_dir.exists() {
-                    fs::remove_dir_all(&self.paths.filter_venv_dir)?;
+                if venv_dir.exists() {
+                    fs::remove_dir_all(venv_dir)?;
                 }
-                let venv_str = clean_os_path(&make_absolute_preserving_symlinks(
-                    &self.paths.filter_venv_dir,
-                ));
+                let venv_str = clean_os_path(&make_absolute_preserving_symlinks(venv_dir));
                 let out = match run_cancellable_command(
                     &self.shutdown_token,
                     OsStr::new(&sys_python),
@@ -986,12 +1181,12 @@ impl LocalFilterManager {
                 {
                     Ok(out) => out,
                     Err(err) => {
-                        let _ = fs::remove_dir_all(&self.paths.filter_venv_dir);
+                        let _ = fs::remove_dir_all(venv_dir);
                         return Err(err);
                     }
                 };
                 if !out.status.success() {
-                    let _ = fs::remove_dir_all(&self.paths.filter_venv_dir);
+                    let _ = fs::remove_dir_all(venv_dir);
                     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
                     return Err(CoreError::Unsupported(format!(
                         "创建 Python 虚拟环境失败: {stderr}"
@@ -999,20 +1194,13 @@ impl LocalFilterManager {
                 }
             }
 
-            let venv_py = venv_python_path(&self.paths.filter_venv_dir);
+            let venv_py = venv_python_path(venv_dir);
             if !is_executable_file(&venv_py) {
                 return Err(CoreError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "Python 虚拟环境创建后未找到解释器",
                 )));
             }
-
-            let req_path = repo_dir.join("deploy").join("requirements.txt");
-            let req_content = fs::read_to_string(&req_path)?;
-            let has_packages = req_content
-                .lines()
-                .map(str::trim)
-                .any(|line| !line.is_empty() && !line.starts_with('#'));
 
             if has_packages {
                 let req_str = clean_os_path(&req_path);
@@ -1037,30 +1225,51 @@ impl LocalFilterManager {
                 )
                 .await?;
                 if !pip_out.status.success()
-                    && !venv_deps_importable_async(&self.shutdown_token, &venv_py).await?
+                    && (web_gpu_enabled
+                        || !venv_deps_importable_async(&self.shutdown_token, &venv_py).await?)
                 {
                     let stderr = String::from_utf8_lossy(&pip_out.stderr).trim().to_string();
+                    let dependencies = if web_gpu_enabled { "WebGPU" } else { "模型" };
                     return Err(CoreError::Network(format!(
-                        "安装模型 Python 依赖失败: {stderr}"
+                        "安装{dependencies} Python 依赖失败: {stderr}"
                     )));
                 }
             }
 
             fs::write(&self.paths.filter_runner_path, FILTER_RUNNER_PY)?;
+            // Keep the existing backend selected until the requested WebGPU runner is ready.
+            let runner = if web_gpu_enabled && start_after_deploy {
+                let params = self.desired_params.read().unwrap().clone();
+                Some(self.spawn_runner(&params, web_gpu_enabled).await?)
+            } else {
+                None
+            };
+            self.set_web_gpu_enabled(web_gpu_enabled)?;
 
-            Ok((env, cur_commit, rem_commit, recent_commits))
+            Ok(PreparedDeployment {
+                env,
+                current_commit,
+                remote_latest_commit,
+                recent_commits,
+                runner,
+            })
         }
         .await;
 
-        if post_checkout.is_err() {
+        if let Err(mut err) = post_checkout {
             if let Some(ref old_sha) = prev_head {
-                let _ = run_git_async(
+                if let Err(rollback_err) = run_git_async(
                     &self.shutdown_token,
                     repo_dir,
                     &["checkout", "--force", "--detach", old_sha],
                     GIT_FAST_TIMEOUT,
                 )
-                .await;
+                .await
+                {
+                    err = CoreError::RecoveryRequired(format!(
+                        "部署失败（{err}），恢复原模型版本失败（{rollback_err}）"
+                    ));
+                }
             }
             if let Ok((cur_commit, rem_commit, recent_commits)) =
                 inspect_local_repo_async(&self.shutdown_token, repo_dir).await
@@ -1074,6 +1283,7 @@ impl LocalFilterManager {
                 st.remote_latest_commit = rem_commit;
                 st.recent_commits = recent_commits;
             }
+            return Err(err);
         }
 
         post_checkout
@@ -1622,14 +1832,32 @@ impl LocalFilterManager {
         runner_guard: &mut Option<RunningRunner>,
         params: &FilterModelParams,
     ) -> Result<(), CoreError> {
+        match self.spawn_runner(params, self.web_gpu_enabled()).await {
+            Ok(runner) => {
+                self.set_running_runner(runner_guard, runner);
+                Ok(())
+            }
+            Err(err) => {
+                self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
+                *self.last_auto_restart_at.lock().unwrap() = Some(Instant::now());
+                Err(err)
+            }
+        }
+    }
+
+    async fn spawn_runner(
+        &self,
+        params: &FilterModelParams,
+        web_gpu_enabled: bool,
+    ) -> Result<RunningRunner, CoreError> {
         let deploy_dir = self.paths.filter_repo_dir.join("deploy");
-        let venv_py = venv_python_path(&self.paths.filter_venv_dir);
+        let venv_py = venv_python_path(self.venv_dir(web_gpu_enabled));
         if !is_executable_file(&venv_py) {
             return Err(CoreError::InvalidInput(
                 "本地过滤模型尚未完成部署，请先执行一键部署".into(),
             ));
         }
-        validate_deploy_assets(&deploy_dir)?;
+        validate_deploy_assets(&deploy_dir, web_gpu_enabled)?;
 
         fs::create_dir_all(&self.paths.filters_dir)?;
         let need_write_runner = fs::read_to_string(&self.paths.filter_runner_path)
@@ -1645,22 +1873,16 @@ impl LocalFilterManager {
             None,
         );
 
-        let res = self
-            .start_runner_body_locked(runner_guard, &venv_py, params)
-            .await;
-        if let Err(ref err) = res {
-            self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
-            *self.last_auto_restart_at.lock().unwrap() = Some(Instant::now());
-        }
-        res
+        self.spawn_runner_process(&venv_py, params, web_gpu_enabled)
+            .await
     }
 
-    async fn start_runner_body_locked(
+    async fn spawn_runner_process(
         &self,
-        runner_guard: &mut Option<RunningRunner>,
         venv_py: &Path,
         params: &FilterModelParams,
-    ) -> Result<(), CoreError> {
+        web_gpu_enabled: bool,
+    ) -> Result<RunningRunner, CoreError> {
         let rng = SystemRandom::new();
         let mut token_bytes = [0u8; 32];
         rng.fill(&mut token_bytes)
@@ -1691,6 +1913,8 @@ impl LocalFilterManager {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+        let inherited_provider = std::env::var(VISION_PROVIDER_ENV).ok();
+        configure_runner_vision_provider(&mut cmd, web_gpu_enabled, inherited_provider.as_deref());
         configure_tokio_cmd(&mut cmd);
 
         let mut child = cmd.spawn()?;
@@ -1850,6 +2074,14 @@ impl LocalFilterManager {
                 "本地过滤守护进程返回了无效监听端口 0".into(),
             ));
         }
+        if web_gpu_enabled && banner.vision_provider.as_deref() != Some(WEBGPU_PROVIDER) {
+            drop(stdin);
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(CoreError::Unsupported(
+                "本地过滤守护进程未能启用 WebGPU 视觉推理".into(),
+            ));
+        }
 
         let endpoint = format!("http://127.0.0.1:{}", banner.port);
 
@@ -1871,17 +2103,7 @@ impl LocalFilterManager {
         };
         let synced_params = Arc::new(Mutex::new(initial_synced));
 
-        {
-            let mut st = self.state.lock().unwrap();
-            st.service_state = LocalFilterServiceState::Running;
-            st.service_endpoint = Some(endpoint.clone());
-            st.running_pid = pid;
-            st.active_runner_synced = Some(synced_params.clone());
-            st.stage_message = None;
-            st.last_error = None;
-        }
-
-        *runner_guard = Some(RunningRunner {
+        Ok(RunningRunner {
             child,
             stdin: Some(stdin),
             pid,
@@ -1890,8 +2112,18 @@ impl LocalFilterManager {
             runner_token,
             stderr_tail,
             synced_params,
-        });
-        Ok(())
+        })
+    }
+
+    fn set_running_runner(&self, runner_guard: &mut Option<RunningRunner>, runner: RunningRunner) {
+        let mut st = self.state.lock().unwrap();
+        st.service_state = LocalFilterServiceState::Running;
+        st.service_endpoint = Some(runner.endpoint.clone());
+        st.running_pid = runner.pid;
+        st.active_runner_synced = Some(runner.synced_params.clone());
+        st.stage_message = None;
+        st.last_error = None;
+        *runner_guard = Some(runner);
     }
 
     fn reap_exited_runner(&self, runner_guard: &mut Option<RunningRunner>) {
@@ -1974,11 +2206,13 @@ impl LocalFilterManager {
         env: FilterEnvReport,
         st: &CachedStatusState,
     ) -> LocalFilterDeploymentStatus {
+        let web_gpu_enabled = self.web_gpu_enabled();
         LocalFilterDeploymentStatus {
             env,
-            deployed: self.is_deployed(),
+            deployed: self.is_backend_deployed(web_gpu_enabled),
+            web_gpu_enabled,
             repo_dir: clean_os_path(&self.paths.filter_repo_dir),
-            venv_dir: clean_os_path(&self.paths.filter_venv_dir),
+            venv_dir: clean_os_path(self.venv_dir(web_gpu_enabled)),
             service_state: st.service_state,
             service_endpoint: st.service_endpoint.clone(),
             running_pid: st.running_pid,
@@ -2081,7 +2315,29 @@ async fn run_cancellable_command(
     }
 }
 
-async fn venv_has_pip_async(cancel: &CancellationToken, venv_py: &Path) -> Result<bool, CoreError> {
+async fn venv_is_usable_async(
+    cancel: &CancellationToken,
+    venv_py: &Path,
+    web_gpu_enabled: bool,
+) -> Result<bool, CoreError> {
+    if web_gpu_enabled {
+        let version = run_cancellable_command(
+            cancel,
+            venv_py.as_os_str(),
+            None,
+            &[
+                "-c",
+                PYTHON_VERSION_CHECK,
+                &WEBGPU_PYTHON_MIN_MINOR.to_string(),
+            ],
+            &[],
+            Duration::from_secs(20),
+        )
+        .await?;
+        if !version.status.success() {
+            return Ok(false);
+        }
+    }
     let out = run_cancellable_command(
         cancel,
         venv_py.as_os_str(),
@@ -2475,6 +2731,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cpu_runner_clears_inherited_webgpu_and_keeps_other_providers() {
+        let mut cmd = tokio::process::Command::new("python");
+        configure_runner_vision_provider(&mut cmd, false, Some(" WeBgPu "));
+        let (key, value) = cmd.as_std().get_envs().next().unwrap();
+        assert_eq!(key, VISION_PROVIDER_ENV);
+        assert_eq!(value, None);
+
+        let mut cmd = tokio::process::Command::new("python");
+        configure_runner_vision_provider(&mut cmd, false, Some("cuda"));
+        assert_eq!(cmd.as_std().get_envs().count(), 0);
+
+        configure_runner_vision_provider(&mut cmd, true, Some("cuda"));
+        let (key, value) = cmd.as_std().get_envs().next().unwrap();
+        assert_eq!(key, VISION_PROVIDER_ENV);
+        assert_eq!(value, Some(OsStr::new("webgpu")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn webgpu_probe_selects_a_compatible_versioned_python() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, minor, has_venv) in [
+            ("python3", 10, 1),
+            ("python3.13", 13, 0),
+            ("python3.12", 12, 1),
+        ] {
+            let path = dir.path().join(name);
+            fs::write(
+                &path,
+                format!("#!/bin/sh\n[ \"$3\" -le {minor} ] || exit 2\nprintf '%s\\n' \"$0\" '3.{minor}.0' '{has_venv}'\n"),
+            )
+            .unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let path = Some(dir.path().as_os_str());
+        let (cpu_path, cpu_version, _) = probe_deployment_python(false, path).unwrap();
+        assert_eq!(Path::new(&cpu_path), dir.path().join("python3"));
+        assert_eq!(cpu_version, "3.10.0");
+
+        let (webgpu_path, webgpu_version, has_venv) = probe_deployment_python(true, path).unwrap();
+        assert_eq!(Path::new(&webgpu_path), dir.path().join("python3.12"));
+        assert_eq!(webgpu_version, "3.12.0");
+        assert!(has_venv);
+    }
+
+    #[test]
     fn validate_repo_url_rejects_unc_remote_file_hosts_and_http_in_https_only() {
         for bad in [
             r"\\attacker.example.com\share\repo",
@@ -2629,8 +2934,12 @@ mod tests {
             .file_type()
             .is_symlink());
 
-        let probed = probe_python_candidates(&[("python3", &[])], Some(bin_dir.as_os_str()))
-            .expect("probe_python_candidates should find symlinked python3");
+        let probed = probe_python_candidates(
+            &[("python3", &[])],
+            Some(bin_dir.as_os_str()),
+            CPU_PYTHON_MIN_MINOR,
+        )
+        .expect("probe_python_candidates should find symlinked python3");
         assert_eq!(
             Path::new(&probed.0),
             make_absolute_preserving_symlinks(&symlink_py3)

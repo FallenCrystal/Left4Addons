@@ -347,6 +347,7 @@ export interface FilterCommitInfo {
 export interface LocalFilterDeploymentStatus {
   env: FilterEnvReport;
   deployed: boolean;
+  webGpuEnabled: boolean;
   repoDir: string;
   venvDir: string;
   serviceState: LocalFilterServiceState;
@@ -366,6 +367,7 @@ export interface DeployLocalFilterRequest {
   trackLatest: boolean;
   targetCommit?: string;
   startAfterDeploy: boolean;
+  installWebGpu?: boolean;
 }
 
 export interface FilterExclusionRecord {

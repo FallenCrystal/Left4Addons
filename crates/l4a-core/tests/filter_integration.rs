@@ -106,15 +106,11 @@ fn write_mock_left4filters_deploy(repo_dir: &Path, version: &str, fixed_prob: f3
     std::fs::write(deploy_dir.join("requirements.txt"), "# mock offline test\n").unwrap();
 }
 
-fn install_offline_runner_shims(engine: &L4aEngine) {
+fn install_offline_runner_shims(venv_dir: &Path) {
     let venv_py = if cfg!(windows) {
-        engine
-            .paths()
-            .filter_venv_dir
-            .join("Scripts")
-            .join("python.exe")
+        venv_dir.join("Scripts").join("python.exe")
     } else {
-        engine.paths().filter_venv_dir.join("bin").join("python")
+        venv_dir.join("bin").join("python")
     };
     let site_out = Command::new(&venv_py)
         .args(["-c", "import site; print(site.getsitepackages()[0])"])
@@ -122,6 +118,11 @@ fn install_offline_runner_shims(engine: &L4aEngine) {
         .unwrap();
     assert!(site_out.status.success());
     let site_dir = Path::new(String::from_utf8_lossy(&site_out.stdout).trim()).to_path_buf();
+    write_offline_runner_shims(&site_dir);
+}
+
+fn write_offline_runner_shims(site_dir: &Path) {
+    std::fs::write(site_dir.join("onnxruntime.py"), "").unwrap();
     std::fs::write(
         site_dir.join("numpy.py"),
         r#"float32 = float
@@ -287,6 +288,7 @@ async fn local_git_repo_deployment_pinning_and_update_tracking() {
             track_latest: false,
             target_commit: Some(commit1.clone()),
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
@@ -328,6 +330,7 @@ async fn local_git_repo_deployment_pinning_and_update_tracking() {
             track_latest: true,
             target_commit: None,
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
@@ -344,6 +347,153 @@ async fn local_git_repo_deployment_pinning_and_update_tracking() {
         .iter()
         .any(|ev| matches!(ev, CoreEvent::LocalFilterStatusChanged { .. })));
 
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn webgpu_deployment_is_optional_and_persists_the_installed_backend() {
+    let dir = tempdir().unwrap();
+    let upstream_repo = dir.path().join("upstream");
+    std::fs::create_dir(&upstream_repo).unwrap();
+    run_git(&upstream_repo, &["init", "-b", "main"]);
+    write_mock_left4filters_deploy(&upstream_repo, "1.0.0", 0.1);
+    run_git(&upstream_repo, &["add", "deploy"]);
+    run_git(&upstream_repo, &["commit", "-m", "CPU model"]);
+
+    let config = AppConfig {
+        filter: ClientFilterConfig {
+            repo_url: upstream_repo.to_str().unwrap().into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine = make_engine(
+        dir.path(),
+        config.clone(),
+        Arc::new(MockSteamBridge::new(false)),
+    );
+    let request: DeployLocalFilterRequest =
+        serde_json::from_value(json!({"startAfterDeploy": false})).unwrap();
+    let cpu = engine.deploy_local_filter(request.clone()).await.unwrap();
+    assert!(cpu.deployed);
+    assert!(!cpu.web_gpu_enabled);
+
+    let webgpu_request = DeployLocalFilterRequest {
+        install_web_gpu: Some(true),
+        ..request.clone()
+    };
+    let missing = engine
+        .deploy_local_filter(webgpu_request.clone())
+        .await
+        .unwrap_err();
+    assert!(missing.to_string().contains("requirements-webgpu.txt"));
+    assert!(!engine.paths().filter_webgpu_venv_dir.exists());
+
+    let deploy_dir = upstream_repo.join("deploy");
+    let webgpu_requirements = deploy_dir.join("requirements-webgpu.txt");
+    std::fs::write(&webgpu_requirements, "--no-index\n-r requirements.txt\n").unwrap();
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        r#"import os
+from pathlib import Path
+
+class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        gpu = os.getenv("LEFT4FILTERS_VISION_PROVIDER", "").strip().lower() == "webgpu"
+        if gpu and (Path(deploy_dir).parent.parent / "mock-no-webgpu").exists():
+            raise RuntimeError("mock WebGPU adapter unavailable")
+        self.vision_provider = "WebGpuExecutionProvider" if gpu else "CPUExecutionProvider"
+"#,
+    )
+    .unwrap();
+    run_git(&upstream_repo, &["add", "deploy"]);
+    run_git(&upstream_repo, &["commit", "-m", "Add WebGPU support"]);
+
+    write_offline_runner_shims(&engine.paths().filters_dir);
+    engine.start_local_filter_service().await.unwrap();
+
+    #[cfg(unix)]
+    let stale_venv = {
+        use std::os::unix::fs::PermissionsExt;
+
+        let venv = &engine.paths().filter_webgpu_venv_dir;
+        let python = venv.join("bin/python");
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(
+            &python,
+            "#!/bin/sh\n[ \"$1\" = '-m' ] && [ \"$2\" = 'pip' ] && exit 0\nexit 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(python, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stale_venv = venv.join("old-python-3.10");
+        std::fs::write(&stale_venv, "").unwrap();
+        stale_venv
+    };
+
+    let adapter_blocker = engine.paths().filters_dir.join("mock-no-webgpu");
+    std::fs::write(&adapter_blocker, "").unwrap();
+    let start_webgpu = DeployLocalFilterRequest {
+        start_after_deploy: true,
+        ..webgpu_request
+    };
+    engine
+        .deploy_local_filter(start_webgpu.clone())
+        .await
+        .unwrap_err();
+
+    #[cfg(unix)]
+    assert!(!stale_venv.exists());
+    let recovered = engine.get_local_filter_status().await.unwrap();
+    assert!(recovered.deployed);
+    assert!(!recovered.web_gpu_enabled);
+    assert_eq!(recovered.current_commit, cpu.current_commit);
+    assert_eq!(recovered.service_state, LocalFilterServiceState::Running);
+    assert!(recovered.last_error.is_some());
+    assert!(!engine.paths().filters_dir.join("webgpu-enabled").exists());
+
+    std::fs::remove_file(&adapter_blocker).unwrap();
+    let webgpu = engine.deploy_local_filter(start_webgpu).await.unwrap();
+    assert!(webgpu.deployed && webgpu.web_gpu_enabled);
+    assert_eq!(webgpu.service_state, LocalFilterServiceState::Running);
+    assert_ne!(webgpu.venv_dir, cpu.venv_dir);
+    assert!(engine.paths().filter_venv_dir.is_dir());
+    install_offline_runner_shims(&engine.paths().filter_webgpu_venv_dir);
+    engine.shutdown().await;
+    drop(engine);
+
+    let engine = make_engine(dir.path(), config, Arc::new(MockSteamBridge::new(false)));
+    let started = engine.start_local_filter_service().await.unwrap();
+    assert!(started.web_gpu_enabled);
+    assert_eq!(started.service_state, LocalFilterServiceState::Running);
+
+    std::fs::write(&webgpu_requirements, "--no-index\nonnxruntime-ep-webgpu\n").unwrap();
+    run_git(&upstream_repo, &["add", "deploy"]);
+    run_git(
+        &upstream_repo,
+        &["commit", "-m", "Require an unavailable WebGPU package"],
+    );
+    let failure = engine
+        .deploy_local_filter(request.clone())
+        .await
+        .unwrap_err();
+    assert!(failure.to_string().contains("WebGPU Python"));
+    let status = engine.get_local_filter_status().await.unwrap();
+    assert!(status.deployed && status.web_gpu_enabled);
+    assert_eq!(status.current_commit, webgpu.current_commit);
+
+    std::fs::write(adapter_blocker, "").unwrap();
+    let cpu_again = engine
+        .deploy_local_filter(DeployLocalFilterRequest {
+            install_web_gpu: Some(false),
+            start_after_deploy: true,
+            ..request
+        })
+        .await
+        .unwrap();
+    assert!(cpu_again.deployed);
+    assert!(!cpu_again.web_gpu_enabled);
+    assert_eq!(cpu_again.service_state, LocalFilterServiceState::Running);
+    assert_eq!(cpu_again.venv_dir, cpu.venv_dir);
     engine.shutdown().await;
 }
 
@@ -1016,11 +1166,12 @@ async fn local_python_runner_daemon_lifecycle_and_live_reconfigure() {
             track_latest: true,
             target_commit: None,
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
 
-    install_offline_runner_shims(&engine);
+    install_offline_runner_shims(&engine.paths().filter_venv_dir);
 
     let started = engine.start_local_filter_service().await.unwrap();
     assert_eq!(started.service_state, LocalFilterServiceState::Running);
@@ -1717,6 +1868,7 @@ async fn local_filter_crash_auto_recovery_and_unc_or_empty_commit_guards() {
             track_latest: false,
             target_commit: Some("   ".into()),
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await;
     assert!(bad_deploy.is_err());
@@ -1733,11 +1885,12 @@ async fn local_filter_crash_auto_recovery_and_unc_or_empty_commit_guards() {
             track_latest: true,
             target_commit: None,
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
 
-    install_offline_runner_shims(&engine);
+    install_offline_runner_shims(&engine.paths().filter_venv_dir);
 
     let started = engine.start_local_filter_service().await.unwrap();
     let pid1 = started.running_pid.expect("runner PID present");
@@ -2198,10 +2351,11 @@ class Left4Filter:
             track_latest: true,
             target_commit: None,
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
-    install_offline_runner_shims(&engine);
+    install_offline_runner_shims(&engine.paths().filter_venv_dir);
 
     // Also verify LocalFilterManager sends `images_base64` (never `imagesBase64`) by wrapping
     // a strict HTTP proxy in front or verifying with `filter_runner.py`: first start runner and
@@ -2913,10 +3067,11 @@ class Left4Filter:
             track_latest: true,
             target_commit: None,
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
-    install_offline_runner_shims(&engine);
+    install_offline_runner_shims(&engine.paths().filter_venv_dir);
 
     let started = engine.start_local_filter_service().await.unwrap();
     let pid1 = started.running_pid.expect("initial runner PID");
@@ -3308,6 +3463,7 @@ async fn deploy_resolves_remote_only_branch_names_for_detached_checkout() {
             track_latest: false,
             target_commit: Some("feature/test-branch".into()),
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();
@@ -3344,6 +3500,7 @@ async fn deploy_resolves_remote_only_branch_names_for_detached_checkout() {
             track_latest: false,
             target_commit: Some("exp/fetch-head-branch".into()),
             start_after_deploy: false,
+            install_web_gpu: None,
         })
         .await
         .unwrap();

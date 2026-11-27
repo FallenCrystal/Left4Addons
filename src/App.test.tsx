@@ -84,6 +84,24 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(await screen.findByText('Manual Addons Directory (addons)')).toBeTruthy();
   });
 
+  it('opts into WebGPU on update and switches back on redeploy', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Content Filter' }));
+
+    const webGpuSwitch = screen.getByRole('switch', { name: 'Install WebGPU backend (experimental)' });
+    expect(webGpuSwitch.getAttribute('aria-checked')).toBe('false');
+    fireEvent.click(webGpuSwitch);
+    fireEvent.click(await screen.findByRole('button', { name: 'Update Now' }));
+    expect(await screen.findByText('WebGPU deployed')).toBeTruthy();
+    expect((await previewEngine.getLocalFilterStatus()).webGpuEnabled).toBe(true);
+
+    fireEvent.click(webGpuSwitch);
+    fireEvent.click(screen.getByRole('button', { name: 'Redeploy' }));
+    await waitFor(() => expect(screen.queryByText('WebGPU deployed')).toBeNull());
+    expect((await previewEngine.getLocalFilterStatus()).webGpuEnabled).toBe(false);
+  });
+
   it('collapses campaign bundles in Library and drills down into member AddonInfo URLs', async () => {
     render(<App />);
     // Chernobyl Assets Pack is collapsed under the Chernobyl: Chapter One campaign bundle card by default

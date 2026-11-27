@@ -269,6 +269,7 @@ export function FilterSettingsSection({
 
   const [applyPresetThresholds, setApplyPresetThresholds] = useState(true);
   const [tokenInput, setTokenInput] = useState('');
+  const [installWebGpu, setInstallWebGpu] = useState<boolean>();
   const [revealedExclusionIds, setRevealedExclusionIds] = useState<Set<string>>(new Set());
 
   const [sandboxTitle, setSandboxTitle] = useState('');
@@ -332,12 +333,14 @@ export function FilterSettingsSection({
       currentFilter = saved.filter;
     }
     const trackLatest = forceLatest ? true : currentFilter.trackLatest;
-    await onDeployLocalFilter({
+    const status = await onDeployLocalFilter({
       repoUrl: currentFilter.repoUrl.trim() || undefined,
       trackLatest,
       targetCommit: trackLatest ? undefined : currentFilter.pinnedCommit?.trim() || undefined,
       startAfterDeploy: currentFilter.autoStartLocalService,
+      installWebGpu,
     });
+    if (status) setInstallWebGpu(undefined);
   };
 
   const handleCheckLocalUpdates = async () => {
@@ -589,6 +592,11 @@ export function FilterSettingsSection({
                     {t('filter.settings.notDeployed')}
                   </span>
                 )}
+                {localStatus.deployed && localStatus.webGpuEnabled && (
+                  <span className="md-pill" data-tone="surface">
+                    {t('filter.settings.webGpuDeployed')}
+                  </span>
+                )}
                 {localStatus.updateAvailable && (
                   <span className="md-pill" data-tone="tertiary">
                     {t('filter.settings.updateAvailableBadge')}
@@ -651,6 +659,19 @@ export function FilterSettingsSection({
           value={filter.repoUrl}
           onChange={(e) => onUpdateFilter((curr) => ({ ...curr, repoUrl: e.target.value }))}
         />
+
+        <div className="l4a-setting-row">
+          <div className="l4a-kv-item">
+            <span className="md-title-small">{t('filter.settings.installWebGpu')}</span>
+            <span className="md-body-small">{t('filter.settings.webGpuHint')}</span>
+          </div>
+          <Switch
+            checked={installWebGpu ?? localStatus?.webGpuEnabled ?? false}
+            label={t('filter.settings.installWebGpu')}
+            disabled={busy || filterStatusBusy || serviceTransitioning}
+            onChange={setInstallWebGpu}
+          />
+        </div>
 
         <div className="l4a-setting-row">
           <span className="md-title-small">{t('filter.settings.autoStartService')}</span>

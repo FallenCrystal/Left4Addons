@@ -168,8 +168,7 @@ impl L4aEngine {
             }
         };
 
-        // Persist updated deployment tracking settings back to config and clear prior model verdicts,
-        // even when `start_after_deploy` fails after the new commit has already been checked out.
+        // Persist deployment settings and clear prior verdicts for retained installations.
         let workspace = self.lock_workspace()?;
         let mut updated_cfg = self.config();
         let mut changed = false;

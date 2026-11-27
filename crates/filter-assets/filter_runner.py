@@ -262,10 +262,12 @@ class RunnerEngine:
     def info(self) -> dict[str, Any]:
         with self._lock:
             cfg = getattr(self.clf, "config", {}) or {}
+            provider = getattr(self.clf, "vision_provider", None)
             return {
                 "status": "ok",
                 "model": cfg.get("model_name", "Left4FiltersModel"),
                 "version": cfg.get("version", "1.0.0"),
+                "vision_provider": provider if isinstance(provider, str) else None,
                 "params": dict(self.params),
             }
 

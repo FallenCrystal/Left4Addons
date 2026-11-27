@@ -940,6 +940,8 @@ pub enum LocalFilterServiceState {
 pub struct LocalFilterDeploymentStatus {
     pub env: FilterEnvReport,
     pub deployed: bool,
+    #[serde(default)]
+    pub web_gpu_enabled: bool,
     pub repo_dir: String,
     pub venv_dir: String,
     pub service_state: LocalFilterServiceState,
@@ -973,6 +975,9 @@ pub struct DeployLocalFilterRequest {
     pub target_commit: Option<String>,
     #[serde(default = "default_true")]
     pub start_after_deploy: bool,
+    /// Omission keeps the currently deployed backend (CPU on a fresh install).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_web_gpu: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

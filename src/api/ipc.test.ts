@@ -267,6 +267,7 @@ describe('v2 IPC client wrapper', () => {
       trackLatest: false,
       targetCommit: 'a94f18e',
       startAfterDeploy: true,
+      installWebGpu: true,
     };
     await deployLocalFilter(deployRequest);
     expect(invokeMock).toHaveBeenCalledWith('deploy_local_filter', {
