@@ -642,6 +642,7 @@ async fn downloader_preserves_partial_when_resume_returns_no_content() {
 async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials() {
     use axum::http::header;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let old_target = format!("http://{}/addon.vpk", listener.local_addr().unwrap());
@@ -659,10 +660,13 @@ async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials()
 
     let range_requests = Arc::new(AtomicUsize::new(0));
     let requests = Arc::clone(&range_requests);
+    let replacement_status = Arc::new(Mutex::new(StatusCode::SERVICE_UNAVAILABLE));
+    let status = Arc::clone(&replacement_status);
     let new_server = start_router(Router::new().route(
         "/addon.vpk",
         get(move |headers: HeaderMap| {
             let requests = Arc::clone(&requests);
+            let status = *status.lock().unwrap();
             async move {
                 if let Some(range) = headers.get(header::RANGE) {
                     assert_eq!(range, "bytes=2-");
@@ -674,7 +678,13 @@ async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials()
                     )
                         .into_response();
                 }
-                (StatusCode::OK, "WXYZ").into_response()
+                match status {
+                    StatusCode::OK => (status, "WXYZ").into_response(),
+                    StatusCode::PARTIAL_CONTENT => {
+                        (status, [(header::CONTENT_RANGE, "bytes 2-3/4")], "YZ").into_response()
+                    }
+                    _ => status.into_response(),
+                }
             }
         }),
     ))
@@ -722,32 +732,188 @@ async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials()
     let meta_path = dir.path().join("784.part.meta.json");
     let partial = std::fs::read(&part_path).unwrap();
     assert_eq!(partial, b"ab");
-    let mut legacy: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    let saved_meta = std::fs::read(&meta_path).unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&saved_meta).unwrap();
     legacy
         .as_object_mut()
         .unwrap()
         .remove("resourceFingerprint");
 
     switched.store(true, Ordering::SeqCst);
-    let result = downloader
+    let error = downloader
         .download(&req, CancellationToken::new(), None)
         .await
-        .unwrap();
-    assert_eq!(result.resumed_from, 0);
-    assert_eq!(std::fs::read(&req.dest_path).unwrap(), b"WXYZ");
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        WorkshopError::HttpStatus { status: 503, .. }
+    ));
+    assert_eq!(std::fs::read(&part_path).unwrap(), partial);
+    assert_eq!(std::fs::read(&meta_path).unwrap(), saved_meta);
     assert_eq!(range_requests.load(Ordering::SeqCst), 1);
 
-    std::fs::remove_file(&req.dest_path).unwrap();
-    std::fs::write(part_path, partial).unwrap();
-    std::fs::write(meta_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    *replacement_status.lock().unwrap() = StatusCode::OK;
     let result = downloader
         .download(&req, CancellationToken::new(), None)
         .await
         .unwrap();
     assert_eq!(result.resumed_from, 0);
     assert_eq!(std::fs::read(&req.dest_path).unwrap(), b"WXYZ");
-    assert_eq!(range_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(range_requests.load(Ordering::SeqCst), 2);
+
+    std::fs::remove_file(&req.dest_path).unwrap();
+    std::fs::write(&part_path, &partial).unwrap();
+    let legacy_meta = serde_json::to_vec(&legacy).unwrap();
+    std::fs::write(&meta_path, &legacy_meta).unwrap();
+    *replacement_status.lock().unwrap() = StatusCode::PARTIAL_CONTENT;
+    let error = downloader
+        .download(&req, CancellationToken::new(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, WorkshopError::IntegrityMismatch(_)));
+    assert_eq!(std::fs::read(&part_path).unwrap(), partial);
+    assert_eq!(std::fs::read(&meta_path).unwrap(), legacy_meta);
+
+    *replacement_status.lock().unwrap() = StatusCode::OK;
+    let result = downloader
+        .download(&req, CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.resumed_from, 0);
+    assert_eq!(std::fs::read(&req.dest_path).unwrap(), b"WXYZ");
+    assert_eq!(range_requests.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn downloader_resumes_rotated_signatures_with_a_matching_strong_etag() {
+    use axum::{
+        body::Body,
+        http::{header, Uri},
+    };
+    use futures_util::{stream, StreamExt};
+    use tokio::sync::Notify;
+
+    const OLD_QUERY: &str = "version=1&signature=old&expires=100";
+    const NEW_QUERY: &str = "version=1&signature=new&expires=200";
+    const STRONG_ETAG: &str = "\"file-v1\"";
+    const WEAK_ETAG: &str = "W/\"file-v1\"";
+
+    for (query, old_etag, etag, expected_offset) in [
+        (NEW_QUERY, STRONG_ETAG, STRONG_ETAG, 3),
+        (
+            "version=2&signature=new&expires=200",
+            STRONG_ETAG,
+            STRONG_ETAG,
+            0,
+        ),
+        (NEW_QUERY, WEAK_ETAG, WEAK_ETAG, 0),
+        (NEW_QUERY, STRONG_ETAG, "\"file-v2\"", 0),
+    ] {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let redirect_requests = Arc::clone(&requests);
+        let prefix_downloaded = Arc::new(Notify::new());
+        let progress = Arc::clone(&prefix_downloaded);
+        let app = Router::new()
+            .route(
+                "/download",
+                get(move || {
+                    let query = if redirect_requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                        OLD_QUERY
+                    } else {
+                        query
+                    };
+                    async move {
+                        (
+                            StatusCode::FOUND,
+                            [(header::LOCATION, format!("/addon.vpk?{query}"))],
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/addon.vpk",
+                get(move |headers: HeaderMap, uri: Uri| {
+                    let prefix_downloaded = Arc::clone(&prefix_downloaded);
+                    async move {
+                        if uri.query() == Some(OLD_QUERY) {
+                            let body = Body::from_stream(
+                                stream::iter([Ok::<_, std::io::Error>("abc")]).chain(stream::once(
+                                    async move {
+                                        prefix_downloaded.notified().await;
+                                        Err(std::io::Error::other("interrupted transfer"))
+                                    },
+                                )),
+                            );
+                            return (
+                                StatusCode::OK,
+                                [(header::CONTENT_LENGTH, "6"), (header::ETAG, old_etag)],
+                                body,
+                            )
+                                .into_response();
+                        }
+                        if let Some(range) = headers.get(header::RANGE) {
+                            assert_eq!(range, "bytes=3-");
+                            return (
+                                StatusCode::PARTIAL_CONTENT,
+                                [(header::CONTENT_RANGE, "bytes 3-5/6"), (header::ETAG, etag)],
+                                "def",
+                            )
+                                .into_response();
+                        }
+                        (StatusCode::OK, [(header::ETAG, etag)], "UVWXYZ").into_response()
+                    }
+                }),
+            );
+
+        let base_url = start_router(app).await;
+        let dir = tempdir().unwrap();
+        let mirror = Arc::new(MirrorRouter::empty());
+        mirror.set_no_proxy_for_testing(true);
+        let downloader = ResilientDownloader::new(dir.path(), mirror)
+            .with_progress_intervals(Duration::ZERO, Duration::from_secs(1));
+        let request = DownloadRequest {
+            workshop_id: WorkshopId(785),
+            url: format!("{base_url}/download"),
+            dest_path: dir.path().join("addon.vpk"),
+            max_retries: 0,
+        };
+
+        let interrupted = timeout(
+            Duration::from_secs(5),
+            downloader.download(
+                &request,
+                CancellationToken::new(),
+                Some(Arc::new(move |download| {
+                    if download.downloaded == 3 {
+                        progress.notify_one();
+                    }
+                })),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(interrupted, Err(WorkshopError::Network(_))));
+        assert_eq!(
+            std::fs::read(dir.path().join("785.vpk.part")).unwrap(),
+            b"abc"
+        );
+
+        let result = downloader
+            .download(&request, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.resumed_from, expected_offset,
+            "{query} {old_etag} {etag}"
+        );
+        let (expected_file, expected_requests) = if expected_offset > 0 {
+            (b"abcdef", 2)
+        } else {
+            (b"UVWXYZ", 3)
+        };
+        assert_eq!(std::fs::read(&request.dest_path).unwrap(), expected_file);
+        assert_eq!(requests.load(Ordering::SeqCst), expected_requests);
+    }
 }
 
 #[tokio::test]

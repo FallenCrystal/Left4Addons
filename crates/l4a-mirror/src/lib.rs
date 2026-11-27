@@ -16,6 +16,12 @@ const DEFAULT_MAX_REDIRECTS: usize = 10;
 const MAX_STREAMING_CLIENTS: usize = 16;
 const MAX_CUSTOM_TIMEOUT_CLIENTS: usize = 32;
 const MAX_REDIRECT_BODY_DRAIN_BYTES: usize = 4096;
+const PAYLOAD_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "content-encoding",
+    "transfer-encoding",
+];
 
 #[derive(Debug, Error)]
 pub enum MirrorError {
@@ -651,6 +657,7 @@ impl MirrorRouter {
         let initial_resolved = self.validate_url_with_policy(url, initial_https_only)?;
         let mut current_resolved = initial_resolved.clone();
         let mut mirror_sources = Vec::new();
+        let mut drop_payload_headers = false;
         if initial_resolved.matched_rule {
             if let Some(source) = url::Url::parse(url)
                 .ok()
@@ -722,7 +729,7 @@ impl MirrorRouter {
                 .https_only_override
                 .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
             let is_same_origin = urls_same_origin(current_url, &next_url);
-            let next_resolved = if is_same_origin {
+            let mut next_resolved = if is_same_origin {
                 let mut resolved_url = next_url.clone();
                 if resolved_url.username().is_empty() && resolved_url.password().is_none() {
                     // Reqwest converts URL credentials to Authorization and removes them from
@@ -756,6 +763,16 @@ impl MirrorRouter {
                 };
                 Self::resolve_with_rules(next_url.as_str(), next_https_only, rules)
             };
+            let (next_method, drops_payload) = next_redirect_method(status, current_method);
+            // Later hops can match another rule after the request body has been discarded.
+            drop_payload_headers |= drops_payload;
+            if drop_payload_headers {
+                next_resolved.headers.retain(|name, _| {
+                    !PAYLOAD_HEADERS
+                        .iter()
+                        .any(|header| name.eq_ignore_ascii_case(header))
+                });
+            }
             ensure_https_if_required(&next_resolved.url, next_https_only)?;
 
             let hop_info = RedirectHop {
@@ -768,7 +785,7 @@ impl MirrorRouter {
             validate_hop(&hop_info).map_err(RedirectSendError::Rejected)?;
 
             drain_ready_redirect_body(&mut response);
-            current_method = next_redirect_method(status, current_method);
+            current_method = next_method;
             if !is_same_origin && next_resolved.rewrites_authority(&next_url) {
                 mirror_sources.push(next_url);
             }
@@ -941,24 +958,14 @@ fn is_redirect_status(status: StatusCode) -> bool {
     )
 }
 
-fn next_redirect_method(status: StatusCode, current: Method) -> Method {
+fn next_redirect_method(status: StatusCode, current: Method) -> (Method, bool) {
     match status {
-        StatusCode::SEE_OTHER => {
-            if current == Method::HEAD {
-                Method::HEAD
-            } else {
-                Method::GET
-            }
+        StatusCode::SEE_OTHER if current == Method::HEAD => (Method::HEAD, true),
+        StatusCode::SEE_OTHER => (Method::GET, true),
+        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND if current == Method::POST => {
+            (Method::GET, true)
         }
-        StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
-            if current == Method::POST {
-                Method::GET
-            } else {
-                current
-            }
-        }
-        StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => current,
-        _ => current,
+        _ => (current, false),
     }
 }
 
@@ -1656,6 +1663,66 @@ mod tests {
 
         assert_eq!(redirected.response.text().await.unwrap(), "cover");
         assert_eq!(requests.lock().unwrap()[1].path, "/%E5%B0%81%E9%9D%A2.jpg");
+    }
+
+    #[tokio::test]
+    async fn redirect_strips_mirror_payload_headers_when_post_becomes_get() {
+        let (base_url, requests) = start_keep_alive_server(|req| match req.path.as_str() {
+            "/start" => (
+                "307 Temporary Redirect".into(),
+                "Location: /post\r\n".into(),
+                String::new(),
+            ),
+            "/post" => (
+                "303 See Other".into(),
+                "Location: /final\r\n".into(),
+                String::new(),
+            ),
+            _ => ("200 OK".into(), String::new(), "done".into()),
+        })
+        .await;
+        let mut rule = base_rule(base_url.strip_prefix("http://").unwrap());
+        rule.rules = Some("catalog.example.test".into());
+        rule.headers = Some(HashMap::from([
+            ("Content-Length".into(), "2".into()),
+            ("Content-Type".into(), "application/json".into()),
+            ("Content-Encoding".into(), "identity".into()),
+            ("X-Mirror".into(), "present".into()),
+        ]));
+        let router = MirrorRouter::from_rules(vec![rule]);
+        router.set_no_proxy_for_testing(true);
+
+        let response = router
+            .send_with_redirects(
+                Method::POST,
+                "http://catalog.example.test/start",
+                RedirectRequestOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+                |request, _, method| {
+                    if *method == Method::POST {
+                        request.body("{}")
+                    } else {
+                        request
+                    }
+                },
+                |_| Ok::<(), ()>(()),
+                |request, _| request.send(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.response.text().await.unwrap(), "done");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].headers["content-length"], "2");
+        assert_eq!(requests[2].method, "GET");
+        assert_eq!(requests[2].headers["x-mirror"], "present");
+        for header in PAYLOAD_HEADERS {
+            assert!(!requests[2].headers.contains_key(*header));
+        }
     }
 
     #[tokio::test]

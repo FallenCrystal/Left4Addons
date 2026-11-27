@@ -168,7 +168,9 @@ impl L4aEngine {
             Err(
                 net_err @ (RedirectSendError::Request(_)
                 | RedirectSendError::Timeout
-                | RedirectSendError::Mirror(MirrorError::TooManyRedirects)),
+                | RedirectSendError::Mirror(
+                    MirrorError::TooManyRedirects | MirrorError::InvalidRedirect(_),
+                )),
             ) => {
                 if let Some((stale_mime, stale_bytes)) = stale_cached {
                     return Ok((stale_mime.to_string(), stale_bytes));

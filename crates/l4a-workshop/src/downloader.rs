@@ -50,10 +50,28 @@ struct ResumeMetadata {
     workshop_id: WorkshopId,
     resolved_url: String,
     resource_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signed_resource_fingerprint: Option<String>,
     dest_file_name: String,
     total_size: Option<u64>,
     etag: Option<String>,
     last_modified: Option<String>,
+}
+
+impl ResumeMetadata {
+    fn matches_resource(
+        &self,
+        fingerprint: &str,
+        signed_fingerprint: Option<&str>,
+        headers: &reqwest::header::HeaderMap,
+    ) -> bool {
+        self.resource_fingerprint.as_deref() == Some(fingerprint)
+            || (signed_fingerprint.is_some()
+                && self.signed_resource_fingerprint.as_deref() == signed_fingerprint
+                && self.etag.as_deref().is_some_and(|etag| {
+                    is_strong_etag(etag) && header_str(headers, ETAG).as_deref() == Some(etag)
+                }))
+    }
 }
 
 pub struct ResilientDownloader {
@@ -196,23 +214,22 @@ impl ResilientDownloader {
             .validate_url(&req.url)
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
-        let mut resume_from = 0u64;
-        let mut stored_meta: Option<ResumeMetadata> = None;
-        if partial_path.exists() && meta_path.exists() {
-            if let Ok(raw) = fs::read_to_string(&meta_path) {
-                if let Ok(meta) = serde_json::from_str::<ResumeMetadata>(&raw) {
-                    if meta.workshop_id == req.workshop_id
-                        && meta.resolved_url == resolved.url
-                        && meta.dest_file_name == dest_name
-                        && meta.resource_fingerprint.is_some()
-                    {
-                        resume_from = fs::metadata(&partial_path).map(|m| m.len()).unwrap_or(0);
-                        stored_meta = Some(meta);
-                    } else {
-                        self.cleanup_partial(req.workshop_id);
-                    }
-                }
-            }
+        let mut stored_meta = fs::read(&meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<ResumeMetadata>(&raw).ok())
+            .filter(|meta| {
+                meta.workshop_id == req.workshop_id
+                    && meta.resolved_url == resolved.url
+                    && meta.dest_file_name == dest_name
+                    && meta.resource_fingerprint.is_some()
+            });
+        let mut resume_from = if stored_meta.is_some() {
+            fs::metadata(&partial_path).map_or(0, |meta| meta.len())
+        } else {
+            0
+        };
+        if resume_from == 0 {
+            stored_meta = None;
         }
 
         let mut redirected = if resume_from > 0 {
@@ -222,17 +239,20 @@ impl ResilientDownloader {
             self.send_request(&req.url, None, "workshop.download")
                 .await?
         };
-        let mut fingerprint = resource_fingerprint(&redirected.final_resolved);
-        if resume_from > 0 {
-            let status = redirected.response.status();
-            let previous_fingerprint = stored_meta
-                .as_ref()
-                .and_then(|meta| meta.resource_fingerprint.as_deref());
+        let (mut fingerprint, mut signed_fingerprint) =
+            resource_fingerprints(&redirected.final_resolved);
+        if let Some(previous) = &stored_meta {
+            let response = &redirected.response;
+            let status = response.status();
             let restart = status == StatusCode::RANGE_NOT_SATISFIABLE
                 || (status == StatusCode::PARTIAL_CONTENT
-                    && previous_fingerprint != Some(fingerprint.as_str()));
+                    && !previous.matches_resource(
+                        &fingerprint,
+                        signed_fingerprint.as_deref(),
+                        response.headers(),
+                    ));
             if restart || status == StatusCode::OK {
-                self.cleanup_partial(req.workshop_id);
+                // Keep both files until a replacement response has been accepted.
                 resume_from = 0;
                 stored_meta = None;
             }
@@ -241,7 +261,8 @@ impl ResilientDownloader {
                 redirected = self
                     .send_request(&req.url, None, "workshop.download.restart")
                     .await?;
-                fingerprint = resource_fingerprint(&redirected.final_resolved);
+                (fingerprint, signed_fingerprint) =
+                    resource_fingerprints(&redirected.final_resolved);
             }
         }
         let response = redirected.response;
@@ -270,7 +291,9 @@ impl ResilientDownloader {
                 WorkshopError::IntegrityMismatch(format!("无效 Content-Range: {range_header}"))
             })?;
             if start != resume_from {
-                self.cleanup_partial(req.workshop_id);
+                if stored_meta.is_some() {
+                    self.cleanup_partial(req.workshop_id);
+                }
                 return Err(WorkshopError::IntegrityMismatch(format!(
                     "续传偏移不一致: 期望 {resume_from}, 实际 {start}"
                 )));
@@ -301,7 +324,7 @@ impl ResilientDownloader {
                     }
                 }
             }
-            total
+            total.or_else(|| stored_meta.as_ref().and_then(|meta| meta.total_size))
         } else {
             response.content_length()
         };
@@ -310,6 +333,7 @@ impl ResilientDownloader {
             workshop_id: req.workshop_id,
             resolved_url: redirected.initial_resolved.url,
             resource_fingerprint: Some(fingerprint),
+            signed_resource_fingerprint: signed_fingerprint,
             dest_file_name: dest_name,
             total_size,
             etag,
@@ -488,16 +512,66 @@ impl ResilientDownloader {
     }
 }
 
-fn resource_fingerprint(resolved: &ResolvedRequest) -> String {
+fn resource_fingerprints(resolved: &ResolvedRequest) -> (String, Option<String>) {
     let url = resolved
         .url
         .split_once('#')
         .map_or(resolved.url.as_str(), |(url, _)| url);
     let headers: BTreeMap<_, _> = resolved.headers.iter().collect();
     // The effective route may contain a signed URL or credentials in its headers.
-    let resource = serde_json::to_vec(&(url, &resolved.original_host, headers))
-        .expect("download resource is serializable");
-    format!("{:x}", Sha256::digest(resource))
+    let hash_url = |url: &str| {
+        let resource = serde_json::to_vec(&(url, &resolved.original_host, &headers))
+            .expect("download resource is serializable");
+        format!("{:x}", Sha256::digest(resource))
+    };
+    (
+        hash_url(url),
+        url_without_signature_values(url).as_deref().map(hash_url),
+    )
+}
+
+fn url_without_signature_values(url: &str) -> Option<String> {
+    const SIGNING_PARAMETERS: &[(&str, &[&str])] = &[
+        ("X-Amz-Signature", &["X-Amz-Date", "X-Amz-Expires"]),
+        ("X-Goog-Signature", &["X-Goog-Date", "X-Goog-Expires"]),
+        ("Signature", &["Expires"]),
+        ("signature", &["expires"]),
+        ("sig", &["expires"]),
+    ];
+    let (base, query) = url.split_once('?')?;
+    if query.contains(';') {
+        return None;
+    }
+    let (signature, volatile_fields) =
+        SIGNING_PARAMETERS.iter().copied().find(|(signature, _)| {
+            let mut signatures = query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .filter_map(|(key, value)| (key == *signature).then_some(value));
+            signatures.next().is_some_and(|value| !value.is_empty()) && signatures.next().is_none()
+        })?;
+    // Preserve the spelling and order of the other fields, including any object version.
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key == signature || volatile_fields.contains(&key) => {
+                &pair[..key.len() + 1]
+            }
+            _ => pair,
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    Some(format!("{base}?{query}"))
+}
+
+fn is_strong_etag(etag: &str) -> bool {
+    etag.strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .is_some_and(|value| {
+            value
+                .bytes()
+                .all(|byte| byte == b'!' || (b'#'..=b'~').contains(&byte))
+        })
 }
 
 fn calc_percent(downloaded: u64, total_size: Option<u64>) -> u8 {
@@ -522,14 +596,15 @@ fn header_str(
 fn parse_content_range(header: &str) -> Option<(u64, Option<u64>)> {
     let rest = header.trim().strip_prefix("bytes ")?;
     let (range_part, total_part) = rest.split_once('/')?;
-    let (start_str, _end_str) = range_part.split_once('-')?;
+    let (start_str, end_str) = range_part.split_once('-')?;
     let start = start_str.trim().parse::<u64>().ok()?;
+    let end = end_str.trim().parse::<u64>().ok()?;
     let total = if total_part.trim() == "*" {
         None
     } else {
-        total_part.trim().parse::<u64>().ok()
+        Some(total_part.trim().parse::<u64>().ok()?)
     };
-    Some((start, total))
+    (start <= end && total.is_none_or(|total| end < total)).then_some((start, total))
 }
 
 fn is_retryable(err: &WorkshopError) -> bool {
