@@ -7,7 +7,9 @@ use crate::error::CoreError;
 use crate::filter::deploy::{
     merge_raw_max, split_images_by_raw_budget, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES,
 };
-use crate::filter::image_prep::{self, PreparedImage};
+use crate::filter::image_prep::{
+    self, PreparedImage, FILTER_MAX_IMAGE_BYTES as MAX_INLINE_IMAGE_BYTES,
+};
 use crate::filter::llm::{is_loopback_url, judge_with_openai_llm_using_token, LoadedImage};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
@@ -29,7 +31,6 @@ use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_IMAGES: usize = 8;
 const EVAL_CONCURRENCY: usize = 4;
 const CATALOG_SCORING_INFO_TTL: Duration = Duration::from_secs(30);

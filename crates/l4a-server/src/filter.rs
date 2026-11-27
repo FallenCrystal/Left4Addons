@@ -1,7 +1,10 @@
 use crate::config::{CatalogConfigStore, FilterSection};
 use crate::credentials::write_private_file;
 use crate::db::ServerRepo;
-use crate::image_prep;
+use crate::image_prep::{
+    self, FILTER_MAX_IMAGE_BYTES as MAX_IMAGE_BYTES,
+    FILTER_MAX_IMAGE_DIMENSION as MAX_IMAGE_DIMENSION, FILTER_MAX_IMAGE_PIXELS as MAX_IMAGE_PIXELS,
+};
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use l4a_logging::http::AuditedSend;
@@ -37,10 +40,7 @@ const MAX_TITLE_BYTES: usize = 4_096;
 const MAX_DESCRIPTION_BYTES: usize = 65_536;
 const MAX_TAGS_COUNT: usize = 64;
 const MAX_TAG_BYTES: usize = 256;
-const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BASE64_ENCODED_LEN: usize = (MAX_IMAGE_BYTES * 4 / 3) + 256;
-const MAX_IMAGE_DIMENSION: u32 = 4_096;
-const MAX_IMAGE_PIXELS: u64 = 16_777_216;
 const MAX_REQUEST_IMAGE_URLS: usize = 16;
 const MAX_REDIRECT_HOPS: usize = 3;
 const IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -2001,7 +2001,7 @@ fn check_image_dimensions(w: u32, h: u32, fmt_name: &str) -> Result<(), FilterSe
     Ok(())
 }
 
-/// Zero-dependency pure-Rust image magic-byte and header-dimension validator against decompression bombs.
+/// Validates the encoded length and header dimensions without initializing a decoder.
 pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
     let (w, h, fmt_name) = sniff_image_dimensions(bytes)?;
     check_image_dimensions(w, h, fmt_name)
@@ -2012,12 +2012,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
 /// 4096x4096 are legitimate and must not make the whole evaluation fail.
 async fn prepare_fetched_image(bytes: Vec<u8>) -> Result<Vec<u8>, FilterServiceError> {
     let (w, h, fmt_name) = sniff_image_dimensions(&bytes)?;
-    let pixels = u64::from(w) * u64::from(h);
-    if image_prep::fit_within_filter_limits(w, h).is_none()
-        || w > image_prep::MAX_SHRINK_SOURCE_DIMENSION
-        || h > image_prep::MAX_SHRINK_SOURCE_DIMENSION
-        || pixels > image_prep::MAX_SHRINK_SOURCE_PIXELS
-    {
+    if image_prep::fit_within_filter_limits(w, h).is_none() {
         check_image_dimensions(w, h, fmt_name)?;
         return Ok(bytes);
     }
@@ -2043,7 +2038,7 @@ async fn prepare_fetched_image(bytes: Vec<u8>) -> Result<Vec<u8>, FilterServiceE
     }
 }
 
-/// Reads the pixel size from a PNG, GIF, JPEG or WebP header without decoding the image.
+/// Checks the encoded size before probing dimensions.
 fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, &'static str), FilterServiceError> {
     if bytes.is_empty() {
         return Err(FilterServiceError::BadRequest(
@@ -2056,154 +2051,16 @@ fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, &'static str), Filt
         ));
     }
 
-    // 1. PNG: 8-byte signature `\x89PNG\r\n\x1a\n` followed by `IHDR` chunk (width & height big-endian u32).
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        if bytes.len() < 24 || &bytes[12..16] != b"IHDR" {
-            return Err(FilterServiceError::BadRequest(
-                "损坏的 PNG 图片头 (缺少 IHDR)".to_string(),
-            ));
-        }
-        let ihdr_len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        if ihdr_len != 13 {
-            return Err(FilterServiceError::BadRequest(
-                "损坏的 PNG IHDR 块长度".to_string(),
-            ));
-        }
-        let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        return Ok((w, h, "PNG"));
-    }
-
-    // 2. GIF: `GIF87a` or `GIF89a` followed by logical screen width & height (little-endian u16).
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        if bytes.len() < 10 {
-            return Err(FilterServiceError::BadRequest(
-                "损坏的 GIF 图片头".to_string(),
-            ));
-        }
-        let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
-        let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-        return Ok((w, h, "GIF"));
-    }
-
-    // 3. JPEG: `\xFF\xD8` followed by segments until SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15.
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        let mut pos = 2usize;
-        while pos < bytes.len() {
-            if bytes[pos] != 0xFF {
-                return Err(FilterServiceError::BadRequest(
-                    "损坏的 JPEG 段标记结构".to_string(),
-                ));
-            }
-            while pos < bytes.len() && bytes[pos] == 0xFF {
-                pos += 1;
-            }
-            if pos >= bytes.len() {
-                break;
-            }
-            let marker = bytes[pos];
-            pos += 1;
-
-            match marker {
-                0x00 => {
-                    return Err(FilterServiceError::BadRequest(
-                        "损坏的 JPEG 头部填充字节".to_string(),
-                    ));
-                }
-                // Standalone markers without length payload
-                0x01 | 0xD0..=0xD8 => continue,
-                // EOI or SOS reached before any SOF frame header
-                0xD9 | 0xDA => break,
-                _ => {}
-            }
-
-            if pos + 2 > bytes.len() {
-                return Err(FilterServiceError::BadRequest(
-                    "截断的 JPEG 段长度头".to_string(),
-                ));
-            }
-            let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-            if seg_len < 2 || pos + seg_len > bytes.len() {
-                return Err(FilterServiceError::BadRequest(
-                    "JPEG 段长度越界或损坏".to_string(),
-                ));
-            }
-
-            if matches!(
-                marker,
-                0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
-            ) {
-                if seg_len < 8 {
-                    return Err(FilterServiceError::BadRequest(
-                        "损坏的 JPEG SOF 帧头".to_string(),
-                    ));
-                }
-                let h = u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]) as u32;
-                let w = u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]) as u32;
-                return Ok((w, h, "JPEG"));
-            }
-
-            pos += seg_len;
-        }
-        return Err(FilterServiceError::BadRequest(
-            "JPEG 图片缺少有效的 SOF 尺寸头".to_string(),
-        ));
-    }
-
-    // 4. WebP: `RIFF....WEBP` followed by `VP8 `, `VP8L`, or `VP8X` chunk.
-    if bytes.len() >= 20 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        let chunk_type = &bytes[12..16];
-        let chunk_size = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
-        match chunk_type {
-            b"VP8 " => {
-                if chunk_size < 10 || bytes.len() < 30 {
-                    return Err(FilterServiceError::BadRequest(
-                        "截断的 WebP VP8 帧头".to_string(),
-                    ));
-                }
-                if (bytes[20] & 0x01) != 0 || bytes[23..26] != [0x9D, 0x01, 0x2A] {
-                    return Err(FilterServiceError::BadRequest(
-                        "损坏的 WebP VP8 关键帧签名".to_string(),
-                    ));
-                }
-                let w = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
-                let h = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
-                return Ok((w, h, "WebP"));
-            }
-            b"VP8L" => {
-                if chunk_size < 5 || bytes.len() < 25 || bytes[20] != 0x2F {
-                    return Err(FilterServiceError::BadRequest(
-                        "损坏的 WebP VP8L 无损帧头".to_string(),
-                    ));
-                }
-                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-                let w = (bits & 0x3FFF) + 1;
-                let h = ((bits >> 14) & 0x3FFF) + 1;
-                return Ok((w, h, "WebP"));
-            }
-            b"VP8X" => {
-                if chunk_size < 10 || bytes.len() < 30 {
-                    return Err(FilterServiceError::BadRequest(
-                        "截断的 WebP VP8X 扩展头".to_string(),
-                    ));
-                }
-                let w =
-                    (bytes[24] as u32 | ((bytes[25] as u32) << 8) | ((bytes[26] as u32) << 16)) + 1;
-                let h =
-                    (bytes[27] as u32 | ((bytes[28] as u32) << 8) | ((bytes[29] as u32) << 16)) + 1;
-                return Ok((w, h, "WebP"));
-            }
-            _ => {
-                return Err(FilterServiceError::BadRequest(
-                    "不支持或损坏的 WebP 块类型".to_string(),
-                ));
-            }
-        }
-    }
-
-    Err(FilterServiceError::BadRequest(
-        "不支持的图片格式（仅支持 PNG、JPEG、GIF、WebP）".to_string(),
-    ))
+    let (w, h, format) = image_prep::sniff_image_dimensions(bytes)
+        .map_err(|err| FilterServiceError::BadRequest(err.to_string()))?;
+    let fmt_name = match format {
+        image::ImageFormat::Png => "PNG",
+        image::ImageFormat::Gif => "GIF",
+        image::ImageFormat::Jpeg => "JPEG",
+        image::ImageFormat::WebP => "WebP",
+        _ => unreachable!("the preview header probe supports only PNG, GIF, JPEG, and WebP"),
+    };
+    Ok((w, h, fmt_name))
 }
 
 fn decode_base64_image(raw: &str) -> Result<Vec<u8>, FilterServiceError> {
