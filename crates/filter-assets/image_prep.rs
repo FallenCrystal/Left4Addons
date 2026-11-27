@@ -134,25 +134,10 @@ pub fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, ImageFormat), &
     }
 
     // 3. JPEG: `\xFF\xD8` followed by segments until SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15.
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        let mut pos = 2usize;
-        while pos < bytes.len() {
-            if bytes[pos] != 0xFF {
-                return Err("损坏的 JPEG 段标记结构");
-            }
-            while pos < bytes.len() && bytes[pos] == 0xFF {
-                pos += 1;
-            }
-            if pos >= bytes.len() {
-                break;
-            }
-            let marker = bytes[pos];
-            pos += 1;
-
+    if let Some(mut headers) = bytes.strip_prefix(&[0xFF, 0xD8]) {
+        while !headers.is_empty() {
+            let marker = take_jpeg_marker(&mut headers)?;
             match marker {
-                0x00 => {
-                    return Err("损坏的 JPEG 头部填充字节");
-                }
                 // Standalone markers without length payload
                 0x01 | 0xD0..=0xD8 => continue,
                 // EOI or SOS reached before any SOF frame header
@@ -160,27 +145,18 @@ pub fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, ImageFormat), &
                 _ => {}
             }
 
-            if pos + 2 > bytes.len() {
-                return Err("截断的 JPEG 段长度头");
-            }
-            let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-            if seg_len < 2 || pos + seg_len > bytes.len() {
-                return Err("JPEG 段长度越界或损坏");
-            }
-
+            let segment = take_jpeg_segment(&mut headers)?;
             if matches!(
                 marker,
                 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
             ) {
-                if seg_len < 8 {
+                if segment.len() < 6 {
                     return Err("损坏的 JPEG SOF 帧头");
                 }
-                let h = u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]) as u32;
-                let w = u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]) as u32;
+                let h = u16::from_be_bytes([segment[1], segment[2]]) as u32;
+                let w = u16::from_be_bytes([segment[3], segment[4]]) as u32;
                 return Ok((w, h, ImageFormat::Jpeg));
             }
-
-            pos += seg_len;
         }
         return Err("JPEG 图片缺少有效的 SOF 尺寸头");
     }
@@ -189,53 +165,202 @@ pub fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, ImageFormat), &
     if bytes.len() >= 20 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         let chunk_type = &bytes[12..16];
         let chunk_size = u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]) as usize;
-        match chunk_type {
-            b"VP8 " => {
-                if chunk_size < 10 || bytes.len() < 30 {
-                    return Err("截断的 WebP VP8 帧头");
-                }
-                if (bytes[20] & 0x01) != 0 || bytes[23..26] != [0x9D, 0x01, 0x2A] {
-                    return Err("损坏的 WebP VP8 关键帧签名");
-                }
-                let w = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
-                let h = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
-                return Ok((w, h, ImageFormat::WebP));
+        let header = &bytes[20..][..chunk_size.min(bytes.len() - 20)];
+        let (w, h) = if chunk_type == b"VP8X" {
+            if header.len() < 10 {
+                return Err("截断的 WebP VP8X 扩展头");
             }
-            b"VP8L" => {
-                if chunk_size < 5 || bytes.len() < 25 || bytes[20] != 0x2F {
-                    return Err("损坏的 WebP VP8L 无损帧头");
-                }
-                let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
-                let w = (bits & 0x3FFF) + 1;
-                let h = ((bits >> 14) & 0x3FFF) + 1;
-                return Ok((w, h, ImageFormat::WebP));
-            }
-            b"VP8X" => {
-                if chunk_size < 10 || bytes.len() < 30 {
-                    return Err("截断的 WebP VP8X 扩展头");
-                }
-                let w =
-                    (bytes[24] as u32 | ((bytes[25] as u32) << 8) | ((bytes[26] as u32) << 16)) + 1;
-                let h =
-                    (bytes[27] as u32 | ((bytes[28] as u32) << 8) | ((bytes[29] as u32) << 16)) + 1;
-                return Ok((w, h, ImageFormat::WebP));
-            }
-            _ => {
-                return Err("不支持或损坏的 WebP 块类型");
-            }
-        }
+            (webp_u24(&header[4..7]) + 1, webp_u24(&header[7..10]) + 1)
+        } else {
+            webp_frame_dimensions(chunk_type, header)?
+        };
+        return Ok((w, h, ImageFormat::WebP));
     }
 
     Err("不支持的图片格式（仅支持 PNG、JPEG、GIF、WebP）")
 }
 
-fn decoder_scratch_bytes(format: ImageFormat, width: u32, height: u32, input_len: u64) -> u64 {
+fn take_jpeg_marker(headers: &mut &[u8]) -> Result<u8, &'static str> {
+    let after_prefix = headers
+        .strip_prefix(&[0xFF])
+        .ok_or("损坏的 JPEG 段标记结构")?;
+    let marker_pos = after_prefix
+        .iter()
+        .position(|&b| b != 0xFF)
+        .ok_or("JPEG 图片缺少有效的 SOF 尺寸头")?;
+    let marker = after_prefix[marker_pos];
+    if marker == 0 {
+        return Err("损坏的 JPEG 头部填充字节");
+    }
+    *headers = &after_prefix[marker_pos + 1..];
+    Ok(marker)
+}
+
+fn take_jpeg_segment<'a>(headers: &mut &'a [u8]) -> Result<&'a [u8], &'static str> {
+    let len = headers.get(..2).ok_or("截断的 JPEG 段长度头")?;
+    let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+    let (segment, rest) = headers
+        .split_at_checked(len)
+        .filter(|_| len >= 2)
+        .ok_or("JPEG 段长度越界或损坏")?;
+    *headers = rest;
+    Ok(&segment[2..])
+}
+
+/// Zune can decode sequential JPEGs a row of MCUs at a time when the first scan
+/// contains every component. Keep the full coefficient budget for other headers.
+fn jpeg_uses_row_buffers(bytes: &[u8]) -> bool {
+    let Some(mut headers) = bytes.strip_prefix(&[0xFF, 0xD8]) else {
+        return false;
+    };
+    let mut components = 0;
+    while let Ok(marker) = take_jpeg_marker(&mut headers) {
+        let Ok(segment) = take_jpeg_segment(&mut headers) else {
+            return false;
+        };
+        match marker {
+            0xC0 | 0xC1 if components == 0 => {
+                let [8, _, _, _, _, count @ 1..=4, ..] = segment else {
+                    return false;
+                };
+                if segment.len() != 6 + 3 * usize::from(*count) {
+                    return false;
+                }
+                components = *count;
+            }
+            0xDA if components > 0 => {
+                return segment.first() == Some(&components)
+                    && segment.len() == 4 + 2 * usize::from(components)
+                    && segment.ends_with(&[0, 63, 0]);
+            }
+            // Table, restart interval, application and comment segments.
+            0xC4 | 0xDB | 0xDD | 0xE0..=0xEF | 0xFE => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn webp_u24(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
+}
+
+fn webp_frame_dimensions(chunk_type: &[u8], data: &[u8]) -> Result<(u32, u32), &'static str> {
+    match chunk_type {
+        b"VP8 " => {
+            if data.len() < 10 {
+                return Err("截断的 WebP VP8 帧头");
+            }
+            if (data[0] & 0x01) != 0 || data[3..6] != [0x9D, 0x01, 0x2A] {
+                return Err("损坏的 WebP VP8 关键帧签名");
+            }
+            let w = u32::from(u16::from_le_bytes([data[6], data[7]]) & 0x3FFF);
+            let h = u32::from(u16::from_le_bytes([data[8], data[9]]) & 0x3FFF);
+            Ok((w, h))
+        }
+        b"VP8L" => {
+            if data.len() < 5 || data[0] != 0x2F {
+                return Err("损坏的 WebP VP8L 无损帧头");
+            }
+            let bits = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            Ok(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+        }
+        _ => Err("不支持或损坏的 WebP 块类型"),
+    }
+}
+
+fn take_webp_chunk<'a>(chunks: &mut &'a [u8]) -> Result<(&'a [u8], &'a [u8]), &'static str> {
+    let (header, rest) = chunks.split_at_checked(8).ok_or("截断的 WebP 块头")?;
+    let len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+    let (data, rest) = rest.split_at_checked(len).ok_or("损坏的 WebP 块长度")?;
+    *chunks = rest.get(len % 2..).ok_or("缺少 WebP 块填充字节")?;
+    Ok((&header[..4], data))
+}
+
+fn check_webp_frame_size(
+    chunk_type: &[u8],
+    data: &[u8],
+    expected: (u32, u32),
+) -> Result<(), &'static str> {
+    if webp_frame_dimensions(chunk_type, data)? != expected {
+        return Err("WebP 位流与容器声明的帧尺寸不一致");
+    }
+    Ok(())
+}
+
+fn check_webp_animation_frame(frame: &[u8], canvas: (u32, u32)) -> Result<(), &'static str> {
+    let (header, mut chunks) = frame.split_at_checked(16).ok_or("截断的 WebP 动画帧头")?;
+    let x = webp_u24(&header[0..3]) * 2;
+    let y = webp_u24(&header[3..6]) * 2;
+    let width = webp_u24(&header[6..9]) + 1;
+    let height = webp_u24(&header[9..12]) + 1;
+    if x + width > canvas.0 || y + height > canvas.1 {
+        return Err("WebP 动画帧超出画布范围");
+    }
+
+    let (mut chunk_type, mut data) = take_webp_chunk(&mut chunks)?;
+    if chunk_type == b"ALPH" {
+        (chunk_type, data) = take_webp_chunk(&mut chunks)?;
+        if chunk_type != b"VP8 " {
+            return Err("WebP 动画的 ALPH 块后缺少 VP8 帧");
+        }
+    }
+    check_webp_frame_size(chunk_type, data, (width, height))
+}
+
+/// The WebP decoder reports the canvas size for VP8X and allocates VP8 buffers
+/// using the coded frame size. Check that frame before starting the decoder.
+fn checked_webp_source(bytes: &[u8], canvas: (u32, u32)) -> Result<&[u8], &'static str> {
+    if bytes.get(12..16) != Some(b"VP8X") {
+        return Ok(bytes);
+    }
+
+    let mut riff_chunk = bytes;
+    let (_, riff) = take_webp_chunk(&mut riff_chunk)?;
+    // Keep the decoder inside the RIFF envelope used to find the frame.
+    let source = &bytes[..8 + riff.len()];
+    let mut chunks = riff.strip_prefix(b"WEBP").ok_or("损坏的 WebP 容器头")?;
+    let (_, header) = take_webp_chunk(&mut chunks)?;
+    if header.len() != 10 {
+        return Err("损坏的 WebP VP8X 块长度");
+    }
+    let animated = header[0] & 0x02 != 0;
+    let mut has_image = false;
+    while !chunks.is_empty() {
+        let (chunk_type, data) = take_webp_chunk(&mut chunks)?;
+        match chunk_type {
+            b"ANMF" if animated => {
+                // A still decode of an animation reads only the first frame.
+                check_webp_animation_frame(data, canvas)?;
+                return Ok(source);
+            }
+            b"ANMF" => return Err("静态 WebP 包含动画帧"),
+            b"VP8 " | b"VP8L" if !animated => {
+                check_webp_frame_size(chunk_type, data, canvas)?;
+                has_image = true;
+            }
+            _ => {}
+        }
+    }
+    if !has_image {
+        return Err("WebP 缺少图片帧");
+    }
+    Ok(source)
+}
+
+fn decoder_scratch_bytes(format: ImageFormat, width: u32, height: u32, bytes: &[u8]) -> u64 {
     let (width, height) = (u64::from(width), u64::from(height));
     match format {
-        // Zune can keep up to four full i16 coefficient planes for progressive or
-        // multi-scan sequential JPEGs. Each dimension can be padded by up to 31 pixels
-        // (4 x 8-pixel blocks per MCU). The image adapter also copies the compressed input.
-        ImageFormat::Jpeg => 8 * (width + 31) * (height + 31) + input_len,
+        ImageFormat::Jpeg => {
+            // Up to four i16 coefficient planes, padded to MCU boundaries of at
+            // most 32 pixels. The image adapter also copies the compressed input.
+            let coefficient_rows = if jpeg_uses_row_buffers(bytes) {
+                32
+            } else {
+                height + 31
+            };
+            8 * (width + 31) * coefficient_rows + bytes.len() as u64
+        }
         ImageFormat::Png => PNG_DECODER_ALLOC,
         // An animated WebP can hold an RGBA frame and an RGBA canvas alongside the output.
         // Allow for both buffers and padding in the decoder's lossy planes.
@@ -258,7 +383,7 @@ fn shrink_for_filter(
 
     let input_len = bytes.len() as u64;
     let available = MAX_SHRINK_WORKING_SET.saturating_sub(input_len);
-    let scratch = decoder_scratch_bytes(format, width, height, input_len);
+    let scratch = decoder_scratch_bytes(format, width, height, bytes);
     let decode_budget = available
         .checked_sub(DECODER_HEADROOM + scratch)
         .ok_or_else(source_too_large)?;
@@ -267,7 +392,12 @@ fn shrink_for_filter(
     limits.max_image_height = Some(height);
     limits.max_alloc = Some(decode_budget);
 
-    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    let source = if format == ImageFormat::WebP {
+        checked_webp_source(bytes, source_size).map_err(|err| ShrinkError::Decode(err.into()))?
+    } else {
+        bytes
+    };
+    let mut reader = ImageReader::with_format(Cursor::new(source), format);
     let mut init_limits = limits.clone();
     if format == ImageFormat::Png {
         init_limits.max_alloc = Some(PNG_DECODER_ALLOC);
@@ -484,6 +614,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn jpeg_budget_fits_reported_size_with_all_components_in_one_scan() {
+        let jpeg = encode(
+            &RgbImage::from_pixel(16, 8, Rgb([32, 96, 160])).into(),
+            ImageFormat::Jpeg,
+        );
+        let (width, height) = (8_496, 8_512);
+        let scratch = decoder_scratch_bytes(ImageFormat::Jpeg, width, height, &jpeg);
+        let decoded_rgb_bytes = 3 * u64::from(width) * u64::from(height);
+        assert!(
+            jpeg.len() as u64 + scratch + DECODER_HEADROOM + decoded_rgb_bytes
+                <= MAX_SHRINK_WORKING_SET
+        );
+
+        // A sequential frame with three components and only one in the first scan.
+        let partial_scan = b"\xff\xd8\xff\xc0\x00\x11\x08\x00\x08\x00\x10\x03\
+                             \x01\x11\x00\x02\x11\x00\x03\x11\x00\
+                             \xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00";
+        let scratch = decoder_scratch_bytes(ImageFormat::Jpeg, width, height, partial_scan);
+        assert!(scratch + DECODER_HEADROOM + decoded_rgb_bytes > MAX_SHRINK_WORKING_SET);
+    }
+
     #[tokio::test]
     async fn shrink_rejects_jpeg_coefficient_buffers_beyond_the_budget() {
         // These dimensions fit the source pixel cap. The SOF is enough to reject
@@ -500,6 +652,36 @@ mod tests {
                 height: 11_500
             }
         ));
+    }
+
+    #[test]
+    fn extended_webp_checks_the_coded_frame_size() {
+        // A 16x8 lossy WebP with XMP metadata, encoded by libwebp.
+        let webp = b"RIFFX\0\0\0WEBPVP8X\x0a\0\0\0\x04\0\0\0\x0f\0\0\x07\0\0\
+                     VP8 ,\0\0\0\xd0\x01\0\x9d\x01*\x10\0\x08\0\x01@&%\xa0\x02t\
+                     \xba\x01\xf8\0\x03\xb0\0\xfe\xf0\xfa+\xff3D\xc71\xfbW\xff\xe5*\
+                     \xf0X\xdc\xdf\0\0XMP \x06\0\0\0<xmp/>";
+        assert_eq!(sniff_image_dimensions(webp), Ok((16, 8, ImageFormat::WebP)));
+        assert_eq!(checked_webp_source(webp, (16, 8)).unwrap(), webp);
+        assert_eq!(
+            checked_webp_source(webp, (15, 8)),
+            Err("WebP 位流与容器声明的帧尺寸不一致")
+        );
+    }
+
+    #[test]
+    fn animated_webp_accepts_a_smaller_frame_with_alpha_inside_the_canvas() {
+        // The ANMF payload for a 16x8 frame encoded with ALPH and VP8 chunks.
+        let frame = b"\0\0\0\0\0\0\x0f\0\0\x07\0\0d\0\0\x02\
+                      ALPH\x0a\0\0\0\x01\x07P\xcb\x88\x08DD\xff\x03\
+                      VP8 .\0\0\0\x30\x01\0\x9d\x01*\x10\0\x08\0\x01@&%\xa0\0\x03p\0\
+                      \xfe\xf0\xfa+\xff\xfef\x8f\xfd&\xff\xb0\xde@\x7f\xff\xe5+\xff\
+                      \x8d\xdf\xee\xcbx\0\0\0";
+        assert_eq!(check_webp_animation_frame(frame, (32, 16)), Ok(()));
+        assert_eq!(
+            check_webp_animation_frame(frame, (15, 8)),
+            Err("WebP 动画帧超出画布范围")
+        );
     }
 
     #[test]
