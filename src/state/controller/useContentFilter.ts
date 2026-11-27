@@ -1,5 +1,5 @@
 import type { Dispatch, RefObject, SetStateAction } from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   AddonId,
   AppConfig,
@@ -26,10 +26,22 @@ import {
 } from '../../utils/contentFilter';
 import type { DesktopClient, NotifyFn, TranslateFn } from './types';
 
-const EVAL_BATCH_CHUNK_SIZE = 16;
-const MAX_CONCURRENT_EVAL_BATCHES = 1;
+const MAX_CONCURRENT_EVAL_REQUESTS = 4;
 const EVAL_DEBOUNCE_MS = 50;
 const MAX_EVALUATION_LOG_ENTRIES = 100;
+
+export type FilterEvalPriority = 'normal' | 'front' | 'urgent';
+
+export interface PrioritizeFilterTargetsOptions {
+  urgent?: boolean;
+  owner?: string;
+}
+
+interface PriorityScopeEntry {
+  urgent: boolean;
+  keys: string[];
+  order: number;
+}
 
 type FilterEvaluationIssue =
   | { targetKey: string; status: 'failed'; error?: string }
@@ -54,6 +66,118 @@ function removeTargetKeys(
   const keys = new Set(state.keys);
   for (const key of staleKeys) keys.delete(key);
   return keys.size === state.keys.size ? state : { policySig, keys };
+}
+
+function sameNumberArray(a?: readonly number[], b?: readonly number[]): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function isSameVerdict(a: FilterItemVerdict, b: FilterItemVerdict): boolean {
+  const pa = a.probabilities;
+  const pb = b.probabilities;
+  return (
+    a.targetKey === b.targetKey &&
+    a.revisionHint === b.revisionHint &&
+    a.flagged === b.flagged &&
+    a.decisionSource === b.decisionSource &&
+    a.evaluatedScore === b.evaluatedScore &&
+    a.textSensitive === b.textSensitive &&
+    a.titleSensitive === b.titleSensitive &&
+    a.descriptionSensitive === b.descriptionSensitive &&
+    a.imageSensitive === b.imageSensitive &&
+    (a.complete !== false) === (b.complete !== false) &&
+    a.evaluatedAt === b.evaluatedAt &&
+    sameNumberArray(a.evaluatedImageIndices, b.evaluatedImageIndices) &&
+    sameNumberArray(a.sensitiveImageIndices, b.sensitiveImageIndices) &&
+    pa.prob === pb.prob &&
+    pa.goreProb === pb.goreProb &&
+    pa.nsfwProb === pb.nsfwProb &&
+    pa.corpseProb === pb.corpseProb &&
+    pa.corpsePileProb === pb.corpsePileProb &&
+    pa.corpseReviewFloor === pb.corpseReviewFloor &&
+    pa.fusionProb === pb.fusionProb &&
+    pa.textProb === pb.textProb &&
+    pa.textGoreProb === pb.textGoreProb &&
+    pa.textNsfwProb === pb.textNsfwProb &&
+    pa.titleProb === pb.titleProb &&
+    pa.descriptionProb === pb.descriptionProb &&
+    pa.imageProb === pb.imageProb &&
+    pa.imageGoreProb === pb.imageGoreProb &&
+    pa.imageNsfwProb === pb.imageNsfwProb &&
+    pa.scoringRevision === pb.scoringRevision &&
+    sameNumberArray(pa.perImageProbs, pb.perImageProbs) &&
+    sameNumberArray(pa.corpseImageIndices, pb.corpseImageIndices)
+  );
+}
+
+function prependTargetsToMap(
+  current: Map<string, FilterEvaluationTarget>,
+  promoted: readonly FilterEvaluationTarget[],
+): Map<string, FilterEvaluationTarget> {
+  if (promoted.length === 0) return current;
+  const next = new Map<string, FilterEvaluationTarget>();
+  for (const target of promoted) {
+    next.set(target.targetKey, target);
+  }
+  for (const [key, target] of current) {
+    if (!next.has(key)) {
+      next.set(key, target);
+    }
+  }
+  return next;
+}
+
+function computeActivePriorityOrder(scopes: ReadonlyMap<string, PriorityScopeEntry>): {
+  urgentKeys: string[];
+  urgentSet: Set<string>;
+  frontKeys: string[];
+  frontSet: Set<string>;
+} {
+  const orderedScopes = Array.from(scopes.values()).sort((a, b) => b.order - a.order);
+  const urgentKeys: string[] = [];
+  const urgentSet = new Set<string>();
+  const frontKeys: string[] = [];
+  const frontSet = new Set<string>();
+
+  for (const scope of orderedScopes) {
+    if (!scope.urgent) continue;
+    for (const key of scope.keys) {
+      if (!urgentSet.has(key)) {
+        urgentSet.add(key);
+        urgentKeys.push(key);
+      }
+    }
+  }
+  for (const scope of orderedScopes) {
+    if (scope.urgent) continue;
+    for (const key of scope.keys) {
+      if (!urgentSet.has(key) && !frontSet.has(key)) {
+        frontSet.add(key);
+        frontKeys.push(key);
+      }
+    }
+  }
+  return { urgentKeys, urgentSet, frontKeys, frontSet };
+}
+
+function promoteKeyOrderInMap(
+  current: Map<string, FilterEvaluationTarget>,
+  orderedKeys: readonly string[],
+): Map<string, FilterEvaluationTarget> {
+  if (current.size <= 1 || orderedKeys.length === 0) return current;
+  const promoted: FilterEvaluationTarget[] = [];
+  for (const key of orderedKeys) {
+    const target = current.get(key);
+    if (target) {
+      promoted.push(target);
+    }
+  }
+  return prependTargetsToMap(current, promoted);
 }
 
 export interface UseContentFilterParams {
@@ -270,6 +394,7 @@ export function useContentFilter({
     return map;
   }, [snapshot?.filterExclusions]);
 
+  const latestSnapshotRef = useRef<DashboardSnapshot | null>(snapshot);
   const basePolicySigRef = useRef(basePolicySignature);
   const policySigRef = useRef(policySignature);
   const filterConfigRef = useRef(filterConfig);
@@ -279,8 +404,12 @@ export function useContentFilter({
   const prevEnabledRef = useRef(filterConfig.enabled);
   const evalEpochRef = useRef(0);
   const activeBatchCountRef = useRef(0);
+  const priorityTargetsRef = useRef<Map<string, FilterEvaluationTarget>>(new Map());
   const pendingTargetsRef = useRef<Map<string, FilterEvaluationTarget>>(new Map());
+  const priorityScopesRef = useRef<Map<string, PriorityScopeEntry>>(new Map());
+  const priorityScopeSeqRef = useRef(0);
   const inFlightSigsRef = useRef<Set<string>>(new Set());
+  const inFlightTargetRevsRef = useRef<Map<string, number>>(new Map());
   const failedSigsRef = useRef<Set<string>>(new Set());
   const evaluatedRevisionsRef = useRef<Record<string, string>>({});
   const filterVerdictsRef = useRef<Record<string, FilterItemVerdict>>({});
@@ -318,18 +447,16 @@ export function useContentFilter({
     appendEvaluationLog(issues);
   }, [appendEvaluationLog]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    latestSnapshotRef.current = snapshot;
     basePolicySigRef.current = basePolicySignature;
     filterConfigRef.current = filterConfig;
-  }, [basePolicySignature, filterConfig]);
-
-  useEffect(() => {
     if (snapshot?.config) {
       latestConfigRef.current = snapshot.config;
     }
-  }, [snapshot?.config]);
+  }, [snapshot, basePolicySignature, filterConfig]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const prevMap = currentRevByKeyRef.current;
     const map = new Map<string, string>();
     for (const addon of snapshot?.addons ?? []) {
@@ -358,8 +485,10 @@ export function useContentFilter({
       cacheGenerationRef.current = cacheGeneration;
       evalEpochRef.current += 1;
       activeBatchCountRef.current = 0;
+      priorityTargetsRef.current.clear();
       pendingTargetsRef.current.clear();
       inFlightSigsRef.current.clear();
+      inFlightTargetRevsRef.current.clear();
       failedSigsRef.current.clear();
       evaluatedRevisionsRef.current = {};
       filterVerdictsRef.current = {};
@@ -384,11 +513,16 @@ export function useContentFilter({
   }, [filterConfig.enabled]);
 
   useEffect(() => {
+    const inFlightSigs = inFlightSigsRef.current;
+    const inFlightTargetRevs = inFlightTargetRevsRef.current;
     return () => {
       evalEpochRef.current += 1;
       activeBatchCountRef.current = 0;
+      inFlightSigs.clear();
+      inFlightTargetRevs.clear();
       if (flushTimerRef.current !== null) {
         window.clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = null;
       }
     };
   }, []);
@@ -396,6 +530,7 @@ export function useContentFilter({
   const adoptRuntimePolicySignature = useCallback((nextSig: string) => {
     if (!nextSig || nextSig === policySigRef.current) return;
     policySigRef.current = nextSig;
+    priorityTargetsRef.current.clear();
     pendingTargetsRef.current.clear();
     failedSigsRef.current.clear();
     evaluatedRevisionsRef.current = {};
@@ -418,7 +553,7 @@ export function useContentFilter({
   }, []);
 
   const targetStillEligible = useCallback((targetKey: string, revision?: string) => {
-    const latest = snapshotRef?.current;
+    const latest = snapshotRef?.current ?? latestSnapshotRef.current;
     if (!isAutomaticFilterTargetEnabled(targetKey, latest?.config.filter ?? filterConfigRef.current)) {
       return false;
     }
@@ -456,6 +591,12 @@ export function useContentFilter({
           existingComplete === complete &&
           Date.parse(existing.evaluatedAt) > Date.parse(verdict.evaluatedAt)
         ) continue;
+        if (
+          isSameVerdict(existing, verdict) &&
+          (!complete ||
+            verdict.revisionHint == null ||
+            evaluatedRevisionsRef.current[verdict.targetKey] === verdict.revisionHint)
+        ) continue;
       }
       filterVerdictsRef.current[verdict.targetKey] = verdict;
       accepted.push(verdict);
@@ -465,6 +606,8 @@ export function useContentFilter({
         delete evaluatedRevisionsRef.current[verdict.targetKey];
       }
     }
+
+    if (accepted.length === 0) return;
 
     setVerdictStore((prev) => {
       if (policySigRef.current !== sig || cacheGenerationRef.current !== generation) return prev;
@@ -489,6 +632,13 @@ export function useContentFilter({
     return evaluatedRevisionsRef.current[targetKey] === revision &&
       verdict && verdict.complete !== false &&
       filterVerdictExpiresAt(verdict, filterConfigRef.current.mode) > Date.now();
+  }, []);
+
+  const isTargetInFlight = useCallback((sigNow: string, targetKey: string, rev: string) => {
+    return (
+      inFlightSigsRef.current.has(`${sigNow}::${targetKey}::${rev}`) ||
+      (inFlightTargetRevsRef.current.get(`${targetKey}::${rev}`) ?? 0) > 0
+    );
   }, []);
 
   useEffect(() => {
@@ -543,56 +693,70 @@ export function useContentFilter({
       flushTimerRef.current = null;
     }
 
-    const pump = () => {
-      while (
-        activeBatchCountRef.current < MAX_CONCURRENT_EVAL_BATCHES &&
-        pendingTargetsRef.current.size > 0
-      ) {
-        const chunk: FilterEvaluationTarget[] = [];
-        const sigNow = policySigRef.current;
-
-        for (const [key, target] of pendingTargetsRef.current) {
-          pendingTargetsRef.current.delete(key);
+    const takeNextTarget = (sigNow: string): FilterEvaluationTarget | null => {
+      for (const queue of [priorityTargetsRef.current, pendingTargetsRef.current]) {
+        for (const [key, target] of queue) {
+          queue.delete(key);
           const rev = target.revisionHint ?? '';
           const itemSig = `${sigNow}::${target.targetKey}::${rev}`;
           if (!targetStillEligible(key, target.revisionHint) || isCurrentEvaluation(key, rev)) {
             continue;
           }
-          if (inFlightSigsRef.current.has(itemSig) || failedSigsRef.current.has(itemSig)) {
+          if (isTargetInFlight(sigNow, target.targetKey, rev) || failedSigsRef.current.has(itemSig)) {
             continue;
           }
-          chunk.push(target);
-          if (chunk.length >= EVAL_BATCH_CHUNK_SIZE) {
-            break;
-          }
+          return target;
         }
+      }
+      return null;
+    };
 
-        if (chunk.length === 0) {
-          continue;
-        }
-
+    const pump = () => {
+      while (
+        activeBatchCountRef.current < MAX_CONCURRENT_EVAL_REQUESTS &&
+        (priorityTargetsRef.current.size > 0 || pendingTargetsRef.current.size > 0)
+      ) {
         const dispatchSig = policySigRef.current;
+        const target = takeNextTarget(dispatchSig);
+        if (!target) {
+          break;
+        }
+
+        const chunk = [target];
         const epoch = evalEpochRef.current;
-        const chunkSigs = chunk.map(
-          (t) => `${dispatchSig}::${t.targetKey}::${t.revisionHint ?? ''}`,
+        const reqRev = target.revisionHint ?? '';
+        const targetSig = `${dispatchSig}::${target.targetKey}::${reqRev}`;
+        const targetRevKey = `${target.targetKey}::${reqRev}`;
+        inFlightSigsRef.current.add(targetSig);
+        inFlightTargetRevsRef.current.set(
+          targetRevKey,
+          (inFlightTargetRevsRef.current.get(targetRevKey) ?? 0) + 1,
         );
-        const requestedRevByKey = new Map<string, string>();
-        for (const t of chunk) {
-          requestedRevByKey.set(t.targetKey, t.revisionHint ?? '');
-        }
-        for (const s of chunkSigs) {
-          inFlightSigsRef.current.add(s);
-        }
         activeBatchCountRef.current += 1;
+        let requeueUnderCurrentPolicy = false;
 
         void client
           .evaluateFilterItems(chunk, true)
           .then((response) => {
-            if (evalEpochRef.current !== epoch || dispatchSig !== policySigRef.current ||
-                (response.cacheGeneration ?? 0) !== cacheGenerationRef.current) {
+            if (
+              evalEpochRef.current !== epoch ||
+              (response.cacheGeneration ?? 0) !== cacheGenerationRef.current
+            ) {
               return;
             }
-            if (response.policySignature && response.policySignature !== policySigRef.current) {
+            if (dispatchSig !== policySigRef.current) {
+              if (
+                filterConfigRef.current.mode !== 'catalog' ||
+                !response.policySignature ||
+                response.policySignature !== policySigRef.current
+              ) {
+                requeueUnderCurrentPolicy = true;
+                return;
+              }
+            } else if (
+              response.policySignature &&
+              response.policySignature !== policySigRef.current
+            ) {
               if (filterConfigRef.current.mode !== 'catalog') return;
               adoptRuntimePolicySignature(response.policySignature);
             }
@@ -603,8 +767,9 @@ export function useContentFilter({
             const issues: FilterEvaluationIssue[] = [];
 
             for (const item of response.items) {
-              const reqRev = requestedRevByKey.get(item.targetKey);
-              if (reqRev === undefined || !targetStillEligible(item.targetKey, reqRev)) continue;
+              if (item.targetKey !== target.targetKey || !targetStillEligible(item.targetKey, reqRev)) {
+                continue;
+              }
               const itemSig = `${sig}::${item.targetKey}::${reqRev}`;
               const dispatchItemSig = `${dispatchSig}::${item.targetKey}::${reqRev}`;
 
@@ -617,6 +782,11 @@ export function useContentFilter({
                 failedSigsRef.current.delete(itemSig);
                 failedSigsRef.current.delete(dispatchItemSig);
                 clearedKeys.push(item.targetKey);
+                continue;
+              }
+
+              // Never let a late failure/incomplete result overwrite an already-completed card.
+              if (isCurrentEvaluation(item.targetKey, reqRev)) {
                 continue;
               }
 
@@ -636,28 +806,64 @@ export function useContentFilter({
           })
           .catch((err) => {
             if (evalEpochRef.current !== epoch) return;
+            if (dispatchSig !== policySigRef.current) {
+              requeueUnderCurrentPolicy = true;
+              return;
+            }
             const sig = policySigRef.current;
             const error = err instanceof Error ? err.message : String(err);
-            const issues: FilterEvaluationIssue[] = [];
-            for (const t of chunk) {
-              if (!targetStillEligible(t.targetKey, t.revisionHint)) continue;
-              failedSigsRef.current.add(`${sig}::${t.targetKey}::${t.revisionHint ?? ''}`);
-              issues.push({ targetKey: t.targetKey, status: 'failed', error });
+            if (!targetStillEligible(target.targetKey, target.revisionHint) || isCurrentEvaluation(target.targetKey, reqRev)) {
+              return;
             }
-            updateFailedTargets(sig, issues);
+            failedSigsRef.current.add(`${sig}::${target.targetKey}::${reqRev}`);
+            updateFailedTargets(sig, [{ targetKey: target.targetKey, status: 'failed', error }]);
           })
           .finally(() => {
             if (evalEpochRef.current === epoch) {
-              for (const s of chunkSigs) {
-                inFlightSigsRef.current.delete(s);
+              inFlightSigsRef.current.delete(targetSig);
+              const nextCount = (inFlightTargetRevsRef.current.get(targetRevKey) ?? 1) - 1;
+              if (nextCount <= 0) {
+                inFlightTargetRevsRef.current.delete(targetRevKey);
+              } else {
+                inFlightTargetRevsRef.current.set(targetRevKey, nextCount);
               }
               activeBatchCountRef.current = Math.max(0, activeBatchCountRef.current - 1);
+              if (
+                requeueUnderCurrentPolicy &&
+                targetStillEligible(target.targetKey, target.revisionHint) &&
+                !isCurrentEvaluation(target.targetKey, reqRev) &&
+                !isTargetInFlight(policySigRef.current, target.targetKey, reqRev) &&
+                !failedSigsRef.current.has(`${policySigRef.current}::${target.targetKey}::${reqRev}`)
+              ) {
+                const { urgentKeys, urgentSet, frontKeys, frontSet } = computeActivePriorityOrder(
+                  priorityScopesRef.current,
+                );
+                if (urgentSet.has(target.targetKey)) {
+                  priorityTargetsRef.current.set(target.targetKey, target);
+                  priorityTargetsRef.current = promoteKeyOrderInMap(
+                    priorityTargetsRef.current,
+                    urgentKeys,
+                  );
+                } else if (frontSet.has(target.targetKey)) {
+                  pendingTargetsRef.current.set(target.targetKey, target);
+                  pendingTargetsRef.current = promoteKeyOrderInMap(
+                    pendingTargetsRef.current,
+                    frontKeys,
+                  );
+                } else {
+                  pendingTargetsRef.current.set(target.targetKey, target);
+                }
+              }
               pump();
             }
           });
       }
 
-      if (pendingTargetsRef.current.size === 0 && flushTimerRef.current !== null) {
+      if (
+        priorityTargetsRef.current.size === 0 &&
+        pendingTargetsRef.current.size === 0 &&
+        flushTimerRef.current !== null
+      ) {
         window.clearTimeout(flushTimerRef.current);
         flushTimerRef.current = null;
       }
@@ -665,14 +871,32 @@ export function useContentFilter({
 
     pump();
   }, [
-    adoptRuntimePolicySignature, client, isCurrentEvaluation, mergeVerdicts, targetStillEligible,
-    updateFailedTargets,
+    adoptRuntimePolicySignature, client, isCurrentEvaluation, isTargetInFlight, mergeVerdicts,
+    targetStillEligible, updateFailedTargets,
   ]);
 
+  const scheduleQueueFlushIfIdle = useCallback(() => {
+    if (
+      flushTimerRef.current === null &&
+      activeBatchCountRef.current < MAX_CONCURRENT_EVAL_REQUESTS &&
+      (priorityTargetsRef.current.size > 0 || pendingTargetsRef.current.size > 0)
+    ) {
+      flushTimerRef.current = window.setTimeout(flushEvaluationQueue, EVAL_DEBOUNCE_MS);
+    }
+  }, [flushEvaluationQueue]);
+
   const enqueueTargets = useCallback(
-    (targets: FilterEvaluationTarget[]) => {
+    (targets: FilterEvaluationTarget[], options?: { priority?: FilterEvalPriority }) => {
       if (targets.length === 0) return;
+      const priority = options?.priority ?? 'normal';
+      const { urgentKeys, urgentSet, frontKeys, frontSet } = computeActivePriorityOrder(
+        priorityScopesRef.current,
+      );
       const sig = policySigRef.current;
+      const explicitUrgent: FilterEvaluationTarget[] = [];
+      const explicitFront: FilterEvaluationTarget[] = [];
+      let addedUrgentScope = false;
+      let addedFrontScope = false;
       let added = false;
 
       for (const target of targets) {
@@ -681,22 +905,167 @@ export function useContentFilter({
         if (isCurrentEvaluation(target.targetKey, rev)) {
           continue;
         }
-        if (inFlightSigsRef.current.has(itemSig) || failedSigsRef.current.has(itemSig)) {
+        if (isTargetInFlight(sig, target.targetKey, rev) || failedSigsRef.current.has(itemSig)) {
           continue;
         }
-        pendingTargetsRef.current.set(target.targetKey, target);
         added = true;
+        if (priority === 'urgent') {
+          pendingTargetsRef.current.delete(target.targetKey);
+          explicitUrgent.push(target);
+        } else if (urgentSet.has(target.targetKey)) {
+          pendingTargetsRef.current.delete(target.targetKey);
+          priorityTargetsRef.current.set(target.targetKey, target);
+          addedUrgentScope = true;
+        } else if (priorityTargetsRef.current.has(target.targetKey)) {
+          priorityTargetsRef.current.set(target.targetKey, target);
+        } else if (priority === 'front') {
+          explicitFront.push(target);
+        } else if (frontSet.has(target.targetKey)) {
+          pendingTargetsRef.current.set(target.targetKey, target);
+          addedFrontScope = true;
+        } else {
+          pendingTargetsRef.current.set(target.targetKey, target);
+        }
       }
 
-      if (
-        added &&
-        flushTimerRef.current === null &&
-        activeBatchCountRef.current < MAX_CONCURRENT_EVAL_BATCHES
-      ) {
-        flushTimerRef.current = window.setTimeout(flushEvaluationQueue, EVAL_DEBOUNCE_MS);
+      if (explicitUrgent.length > 0) {
+        priorityTargetsRef.current = prependTargetsToMap(priorityTargetsRef.current, explicitUrgent);
+      } else if (addedUrgentScope) {
+        priorityTargetsRef.current = promoteKeyOrderInMap(priorityTargetsRef.current, urgentKeys);
+      }
+
+      if (explicitFront.length > 0) {
+        pendingTargetsRef.current = prependTargetsToMap(pendingTargetsRef.current, explicitFront);
+      } else if (addedFrontScope) {
+        pendingTargetsRef.current = promoteKeyOrderInMap(pendingTargetsRef.current, frontKeys);
+      }
+
+      if (added) {
+        scheduleQueueFlushIfIdle();
       }
     },
-    [flushEvaluationQueue, isCurrentEvaluation],
+    [isCurrentEvaluation, isTargetInFlight, scheduleQueueFlushIfIdle],
+  );
+
+  const prioritizeFilterTargets = useCallback(
+    (targetKeys: string[], options?: PrioritizeFilterTargetsOptions) => {
+      const urgent = options?.urgent ?? false;
+      const owner = options?.owner ?? (urgent ? '__default_urgent__' : '__default_front__');
+      const dedupedKeys: string[] = [];
+      const seenInput = new Set<string>();
+      for (const key of targetKeys) {
+        if (!seenInput.has(key)) {
+          seenInput.add(key);
+          dedupedKeys.push(key);
+        }
+      }
+
+      const prevEntry = priorityScopesRef.current.get(owner);
+      const removedFromUrgent = new Set<string>();
+      if (prevEntry?.urgent) {
+        for (const oldKey of prevEntry.keys) {
+          if (!urgent || !seenInput.has(oldKey)) {
+            removedFromUrgent.add(oldKey);
+          }
+        }
+      }
+
+      if (dedupedKeys.length === 0) {
+        priorityScopesRef.current.delete(owner);
+      } else {
+        priorityScopeSeqRef.current += 1;
+        priorityScopesRef.current.set(owner, {
+          urgent,
+          keys: dedupedKeys,
+          order: priorityScopeSeqRef.current,
+        });
+      }
+
+      const { urgentKeys, urgentSet, frontKeys } = computeActivePriorityOrder(
+        priorityScopesRef.current,
+      );
+
+      // Demote still-queued targets belonging only to a closed/updated urgent scope.
+      if (removedFromUrgent.size > 0) {
+        for (const key of removedFromUrgent) {
+          if (!urgentSet.has(key)) {
+            const demoted = priorityTargetsRef.current.get(key);
+            if (demoted) {
+              priorityTargetsRef.current.delete(key);
+              pendingTargetsRef.current.set(key, demoted);
+            }
+          }
+        }
+      }
+
+      // Resolve any urgent target not yet queued (e.g. when child sheet effects run before parent enqueue).
+      if (urgent && dedupedKeys.length > 0) {
+        const sig = policySigRef.current;
+        const liveSnapshot = snapshotRef?.current ?? latestSnapshotRef.current;
+        const liveAddons = liveSnapshot?.addons;
+        const liveFilterCfg = liveSnapshot?.config.filter ?? filterConfigRef.current;
+
+        for (const key of dedupedKeys) {
+          if (priorityTargetsRef.current.has(key) || pendingTargetsRef.current.has(key)) {
+            continue;
+          }
+          if (key.startsWith('addon:') && liveAddons) {
+            const addonId = key.slice('addon:'.length);
+            const matched = liveAddons.find((addon) => addon.id === addonId);
+            const excluded = liveSnapshot?.filterExclusions.some(
+              (entry) => entry.fingerprintValid && entry.addonId === addonId,
+            );
+            if (matched && !excluded && isAutomaticFilterTargetEnabled(key, liveFilterCfg)) {
+              const candidate = buildAddonFilterTarget(matched);
+              const rev = candidate.revisionHint ?? '';
+              const itemSig = `${sig}::${candidate.targetKey}::${rev}`;
+              if (
+                !isCurrentEvaluation(candidate.targetKey, rev) &&
+                !isTargetInFlight(sig, candidate.targetKey, rev) &&
+                !failedSigsRef.current.has(itemSig)
+              ) {
+                priorityTargetsRef.current.set(key, candidate);
+              }
+            }
+          } else {
+            const registered = workshopRegistryRef.current.get(key);
+            if (registered) {
+              const rev = registered.revisionHint ?? '';
+              const itemSig = `${sig}::${registered.targetKey}::${rev}`;
+              if (
+                targetStillEligible(registered.targetKey, registered.revisionHint) &&
+                !isCurrentEvaluation(registered.targetKey, rev) &&
+                !isTargetInFlight(sig, registered.targetKey, rev) &&
+                !failedSigsRef.current.has(itemSig)
+              ) {
+                priorityTargetsRef.current.set(key, registered);
+              }
+            }
+          }
+        }
+      }
+
+      // Move any queued urgent targets from pendingTargetsRef into priorityTargetsRef, then enforce urgent order.
+      for (const key of urgentKeys) {
+        const pendingTarget = pendingTargetsRef.current.get(key);
+        if (pendingTarget) {
+          pendingTargetsRef.current.delete(key);
+          if (!priorityTargetsRef.current.has(key)) {
+            priorityTargetsRef.current.set(key, pendingTarget);
+          }
+        }
+      }
+      priorityTargetsRef.current = promoteKeyOrderInMap(priorityTargetsRef.current, urgentKeys);
+
+      // Reorder front targets to the front of pendingTargetsRef (never demoting urgent items).
+      pendingTargetsRef.current = promoteKeyOrderInMap(pendingTargetsRef.current, frontKeys);
+
+      scheduleQueueFlushIfIdle();
+    },
+    [
+      isCurrentEvaluation, isTargetInFlight, scheduleQueueFlushIfIdle, snapshotRef,
+      targetStillEligible,
+    ],
   );
 
   // Automatic Library evaluation (skipping addons with a valid fingerprint exclusion)
@@ -741,7 +1110,10 @@ export function useContentFilter({
   ]);
 
   const registerWorkshopItems = useCallback(
-    (items: WorkshopItemRecord[], options?: { onlyIfMissing?: boolean }) => {
+    (
+      items: WorkshopItemRecord[],
+      options?: { onlyIfMissing?: boolean; priority?: FilterEvalPriority },
+    ) => {
       if (items.length === 0) return;
       const onlyIfMissing = options?.onlyIfMissing ?? false;
       const sig = policySigRef.current;
@@ -771,7 +1143,7 @@ export function useContentFilter({
         }
       }
       if (targets.length > 0 && filterConfig.enabled && filterConfig.applyToWorkshop) {
-        enqueueTargets(targets);
+        enqueueTargets(targets, { priority: options?.priority });
       }
     },
     [enqueueTargets, filterConfig.applyToWorkshop, filterConfig.enabled],
@@ -780,10 +1152,35 @@ export function useContentFilter({
   const handleFilterVerdictsUpdated = useCallback(
     (verdicts: FilterItemVerdict[], eventPolicySignature?: string, generation = 0) => {
       if (eventPolicySignature === policySigRef.current && generation === cacheGenerationRef.current) {
+        const mode = filterConfigRef.current.mode;
+        const now = Date.now();
+        const completedKeys: string[] = [];
+        for (const verdict of verdicts) {
+          if (
+            verdict.targetKey.startsWith('sandbox:') ||
+            verdict.complete === false ||
+            !targetStillEligible(verdict.targetKey, verdict.revisionHint) ||
+            filterVerdictExpiresAt(verdict, mode) <= now
+          ) {
+            continue;
+          }
+          const rev = verdict.revisionHint ?? '';
+          failedSigsRef.current.delete(`${eventPolicySignature}::${verdict.targetKey}::${rev}`);
+          for (const queue of [priorityTargetsRef.current, pendingTargetsRef.current]) {
+            const queued = queue.get(verdict.targetKey);
+            if (queued && (queued.revisionHint ?? '') === rev) {
+              queue.delete(verdict.targetKey);
+            }
+          }
+          completedKeys.push(verdict.targetKey);
+        }
+        if (completedKeys.length > 0) {
+          updateFailedTargets(eventPolicySignature, [], completedKeys);
+        }
         mergeVerdicts(verdicts);
       }
     },
-    [mergeVerdicts],
+    [mergeVerdicts, targetStillEligible, updateFailedTargets],
   );
 
   const handleLocalFilterStatusChanged = useCallback(
@@ -816,8 +1213,10 @@ export function useContentFilter({
     }
     evalEpochRef.current += 1;
     activeBatchCountRef.current = 0;
+    priorityTargetsRef.current.clear();
     pendingTargetsRef.current.clear();
     inFlightSigsRef.current.clear();
+    inFlightTargetRevsRef.current.clear();
     failedSigsRef.current.clear();
     evaluatedRevisionsRef.current = {};
     filterVerdictsRef.current = {};
@@ -1061,6 +1460,7 @@ export function useContentFilter({
     failedTargetKeys,
     revealCard,
     retryFailedEvaluations,
+    prioritizeFilterTargets,
     registerWorkshopItems,
     handleFilterVerdictsUpdated,
     handleLocalFilterStatusChanged,

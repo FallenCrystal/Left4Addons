@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -29,6 +29,7 @@ import type {
 } from '../../api/ipc';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
 import {
+  addonFilterKey,
   getFilteredAddonFallbackCover,
   collectAddonImageSources,
   formatRedactedAddonLabel,
@@ -125,9 +126,23 @@ export function AddonDetailSheet({
   const filterCtx = useContentFilterContext();
   const {
     exclusionsByAddonId,
+    prioritizeFilterTargets,
     upsertFilterExclusion,
     deleteFilterExclusion,
   } = filterCtx;
+
+  useEffect(() => {
+    prioritizeFilterTargets(currentAddonId ? [addonFilterKey(currentAddonId)] : [], {
+      urgent: true,
+      owner: 'addon-detail',
+    });
+  }, [currentAddonId, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'addon-detail' });
+    };
+  }, [prioritizeFilterTargets]);
 
   const { primaryInfoEntries, zeroFlagEntries } = useMemo(() => {
     if (!addon) {

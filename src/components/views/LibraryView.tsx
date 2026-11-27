@@ -9,7 +9,11 @@ import type {
 } from '../../api/ipc';
 import type { LiveDownloadState } from '../../state/useAppController';
 import { useContentFilterContext } from '../../state/ContentFilterContext';
-import { resolveLibraryAddonCardFilter } from '../../utils/contentFilter';
+import {
+  addonFilterKey,
+  resolveAddonVerdict,
+  resolveLibraryAddonCardFilter,
+} from '../../utils/contentFilter';
 import { Button, EmptyState } from '../m3/primitives';
 import { BundleDetailSheet } from './library/BundleDetailSheet';
 import {
@@ -164,7 +168,7 @@ export function LibraryView({
   );
 
   const filterCtx = useContentFilterContext();
-  const { filterConfig } = filterCtx;
+  const { filterConfig, prioritizeFilterTargets } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
 
   const extFilterKey = externalFilter
@@ -229,6 +233,48 @@ export function LibraryView({
       filterCtx,
     ],
   );
+
+  const prioritizedVisibleKeysSig = useMemo(() => {
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    const limit = 24;
+    const pushIfPending = (addon: AddonSummary) => {
+      if (keys.length >= limit) return;
+      if (filterCtx.exclusionsByAddonId.get(addon.id)?.fingerprintValid) return;
+      const verdict = resolveAddonVerdict(addon, filterCtx);
+      if (verdict === null || (verdict !== undefined && verdict.complete !== false)) return;
+      const key = addonFilterKey(addon.id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
+    };
+    for (const item of displayItems) {
+      if (keys.length >= limit) break;
+      if (item.kind === 'addon') {
+        pushIfPending(item.addon);
+      } else {
+        for (const member of item.visibleMembers) {
+          if (keys.length >= limit) break;
+          pushIfPending(member);
+        }
+      }
+    }
+    return keys.join('\0');
+  }, [displayItems, filterCtx]);
+
+  useEffect(() => {
+    prioritizeFilterTargets(
+      prioritizedVisibleKeysSig ? prioritizedVisibleKeysSig.split('\0') : [],
+      { owner: 'library-visible' },
+    );
+  }, [prioritizedVisibleKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { owner: 'library-visible' });
+    };
+  }, [prioritizeFilterTargets]);
 
   const existingIds = useMemo(() => new Set(addons.map((a) => a.id)), [addons]);
   const validSelectedIds = useMemo(() => {

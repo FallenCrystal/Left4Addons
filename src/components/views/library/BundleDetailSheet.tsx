@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useEffect, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -84,7 +84,7 @@ export function BundleDetailSheet({
   const { t } = useTranslation();
   const bundleTabsId = useId();
   const filterCtx = useContentFilterContext();
-  const { verdicts, revealCard } = filterCtx;
+  const { verdicts, revealCard, prioritizeFilterTargets } = filterCtx;
 
   const allMembers = bundle
     ? bundle.memberAddonIds
@@ -106,6 +106,39 @@ export function BundleDetailSheet({
   const hiddenMemberCount = memberStates.filter((entry) => entry.state.hiddenCard).length;
   const visibleMemberEntries = memberStates.filter((entry) => !entry.state.hiddenCard);
   const members = visibleMemberEntries.map((entry) => entry.member);
+
+  const orderedBundleMemberKeysSig = (() => {
+    if (!bundle) return '';
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of visibleMemberEntries) {
+      if (!seen.has(entry.key)) {
+        seen.add(entry.key);
+        ordered.push(entry.key);
+      }
+    }
+    for (const id of bundle.memberAddonIds) {
+      const key = addonFilterKey(id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        ordered.push(key);
+      }
+    }
+    return ordered.join('\0');
+  })();
+
+  useEffect(() => {
+    prioritizeFilterTargets(
+      orderedBundleMemberKeysSig ? orderedBundleMemberKeysSig.split('\0') : [],
+      { urgent: true, owner: 'bundle-detail' },
+    );
+  }, [orderedBundleMemberKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'bundle-detail' });
+    };
+  }, [prioritizeFilterTargets]);
 
   const summary = bundle ? summarizeBundle(members) : null;
   const coverPres = bundle

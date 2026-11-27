@@ -31,6 +31,7 @@ import {
 import { useContentFilterContext } from '../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../state/useAppController';
 import {
+  addonFilterKey,
   collectWorkshopImageUrls,
   formatDiagnosticVerdictBadge,
   formatRedactedAddonLabel,
@@ -217,6 +218,7 @@ export function WorkshopView({
     revealedCardIds,
     failedTargetKeys,
     revealCard,
+    prioritizeFilterTargets,
     registerWorkshopItems,
   } = filterCtx;
   const [showingFilteredCards, setShowingFilteredCards] = useState(false);
@@ -238,17 +240,64 @@ export function WorkshopView({
     [activeItem, response?.items],
   );
 
-  useEffect(() => {
-    const batch: WorkshopItemRecord[] = [];
-    batch.push(...displayedItems);
-    if (activeItem && !batch.includes(activeItem)) {
-      batch.push(activeItem);
+  const prioritizedVisibleWorkshopKeysSig = useMemo(() => {
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    const limit = 24;
+    for (const item of displayedItems) {
+      if (keys.length >= limit) break;
+      const verdict = resolveWorkshopVerdict(item, filterCtx);
+      if (verdict === null || (verdict !== undefined && verdict.complete !== false)) continue;
+      const key = workshopFilterKey(item.workshopId);
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
     }
-    if (batch.length > 0) {
-      registerWorkshopItems(batch);
+    return keys.join('\0');
+  }, [displayedItems, filterCtx]);
+
+  const activeDetailPriorityKeysSig = useMemo(() => {
+    if (!activeItem) return '';
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    const pushKey = (key: string) => {
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
+    };
+    pushKey(workshopFilterKey(activeItem.workshopId));
+    for (const dep of activeItem.dependencies) {
+      const depTitle = dep.title?.trim();
+      if (!depTitle) continue;
+      const depLocal = localByWorkshopId.get(dep.workshopId);
+      if (
+        filterConfig.applyToLibrary &&
+        depLocal &&
+        matchesEvaluatedAddonTitle(depLocal, depTitle)
+      ) {
+        pushKey(addonFilterKey(depLocal.id));
+      } else {
+        pushKey(workshopFilterKey(dep.workshopId));
+      }
+    }
+    return keys.join('\0');
+  }, [activeItem, filterConfig.applyToLibrary, localByWorkshopId]);
+
+  useEffect(() => {
+    if (activeItem) {
+      registerWorkshopItems([activeItem], { priority: 'urgent' });
+    }
+    const visibleBatch = activeItem
+      ? displayedItems.filter((item) => item !== activeItem)
+      : displayedItems;
+    if (visibleBatch.length > 0) {
+      registerWorkshopItems(visibleBatch, { priority: 'front' });
     }
     if (activeItem && activeItem.dependencies.length > 0) {
-      const covered = new Set(batch.map((item) => item.workshopId));
+      const covered = new Set<string>(displayedItems.map((item) => item.workshopId));
+      covered.add(activeItem.workshopId);
       const depStubs: WorkshopItemRecord[] = [];
       for (const dep of activeItem.dependencies) {
         const depTitle = dep.title?.trim();
@@ -275,7 +324,7 @@ export function WorkshopView({
         });
       }
       if (depStubs.length > 0) {
-        registerWorkshopItems(depStubs, { onlyIfMissing: true });
+        registerWorkshopItems(depStubs, { onlyIfMissing: true, priority: 'front' });
       }
     }
   }, [
@@ -285,6 +334,27 @@ export function WorkshopView({
     localByWorkshopId,
     registerWorkshopItems,
   ]);
+
+  useEffect(() => {
+    prioritizeFilterTargets(
+      prioritizedVisibleWorkshopKeysSig ? prioritizedVisibleWorkshopKeysSig.split('\0') : [],
+      { owner: 'workshop-visible' },
+    );
+  }, [prioritizedVisibleWorkshopKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    prioritizeFilterTargets(
+      activeDetailPriorityKeysSig ? activeDetailPriorityKeysSig.split('\0') : [],
+      { urgent: true, owner: 'workshop-detail' },
+    );
+  }, [activeDetailPriorityKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'workshop-detail' });
+      prioritizeFilterTargets([], { owner: 'workshop-visible' });
+    };
+  }, [prioritizeFilterTargets]);
 
   const { visibleItems, filteredOutCount } = useMemo(() => {
     let hiddenCount = 0;

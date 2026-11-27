@@ -1217,9 +1217,9 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(canonicalSig).toMatch(/^pol_[0-9a-f]{32}$/);
     snapshot.filterPolicySignature = canonicalSig;
 
-    // Add extra addons so total uncached items > 16 (verifies bounded 1-batch-at-a-time concurrency)
+    // Add extra addons so total uncached items > 4 (verifies bounded per-card concurrent evaluation)
     const templateAddon = snapshot.addons[3];
-    for (let idx = 0; idx < 15; idx += 1) {
+    for (let idx = 0; idx < 5; idx += 1) {
       const wid = `990000${idx}`;
       snapshot.addons.push({
         ...structuredClone(templateAddon),
@@ -1275,7 +1275,8 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     let maxObservedConcurrency = 0;
     let evalRound = 0;
     const evaluatedTargetBatches: string[][] = [];
-    let releaseFirstBatch: (() => void) | null = null;
+    let releaseSlowCard: (() => void) | null = null;
+    const expectedFirstPassCount = snapshot.addons.length - 1;
 
     invokeMock.mockImplementation(
       async (cmd: string, args?: { targets?: FilterEvaluationTarget[]; config?: AppConfig }) => {
@@ -1304,11 +1305,10 @@ describe('Left4Addons v2 Material 3 frontend', () => {
           evaluatedTargetBatches.push(targets.map((t) => t.targetKey));
           inFlightEvalCount += 1;
           maxObservedConcurrency = Math.max(maxObservedConcurrency, inFlightEvalCount);
-          const currentCallIndex = evaluatedTargetBatches.length;
 
-          if (currentCallIndex === 1) {
+          if (evalRound === 0 && targets.some((t) => t.targetKey === 'addon:ws:2814104912')) {
             await new Promise<void>((resolve) => {
-              releaseFirstBatch = resolve;
+              releaseSlowCard = resolve;
             });
           }
 
@@ -1376,26 +1376,32 @@ describe('Left4Addons v2 Material 3 frontend', () => {
 
     render(<App />);
 
-    // Wait for first batch (16 items) to start; verify chunk 2 has NOT started while chunk 1 is in-flight!
+    // Fast cards finish and update immediately while the slow card (Chernobyl: Chapter One) stays pending!
     await waitFor(() => {
-      expect(evaluatedTargetBatches.length).toBe(1);
+      expect(releaseSlowCard).not.toBeNull();
+      expect(evaluatedTargetBatches.length).toBe(expectedFirstPassCount);
     });
-    expect(evaluatedTargetBatches[0].length).toBe(16);
-    expect(inFlightEvalCount).toBe(1);
+    expect(evaluatedTargetBatches.every((batch) => batch.length === 1)).toBe(true);
+    expect(maxObservedConcurrency).toBeLessThanOrEqual(4);
     const pendingCard = screen.getByText('Chernobyl: Chapter One').closest('article')!;
     expect(
       within(pendingCard).getByRole('progressbar', { name: 'Evaluating content safety…' }),
     ).toBeTruthy();
     expect(within(pendingCard).queryByText('Evaluating content safety…')).toBeNull();
+    // Already-finished safe cards are unblurred before the slow card finishes!
+    const fastSettledCard = screen.getByText('Tactical M4A1 SOPMOD').closest('article')!;
+    expect(fastSettledCard.getAttribute('data-blur-card')).toBe('false');
 
-    // Release chunk 1 -> chunk 2 pumps sequentially after chunk 1 settles
+    // Release slow card -> settles into failure state
     await act(async () => {
-      releaseFirstBatch?.();
+      releaseSlowCard?.();
     });
     await waitFor(() => {
-      expect(evaluatedTargetBatches.length).toBe(2);
+      const chernobylCard = screen.getByText('Chernobyl: Chapter One').closest('article')!;
+      expect(
+        within(chernobylCard).getByRole('button', { name: 'Content check failed · Show text' }),
+      ).toBeTruthy();
     });
-    expect(maxObservedConcurrency).toBe(1);
 
     const allFirstPassTargets = evaluatedTargetBatches.flat();
     // Stale cached addon:ws:2814104912 WAS re-evaluated; valid cached addon:ws:2814105100 was NOT!
@@ -1427,7 +1433,7 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     expect(
       within(sensitiveDisplayCard).getByRole('button', { name: 'Sensitive · Click to show text' }),
     ).toBeTruthy();
-    expect(evaluatedTargetBatches).toHaveLength(2);
+    expect(evaluatedTargetBatches).toHaveLength(expectedFirstPassCount);
 
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     fireEvent.click(screen.getByText('Filter Logs'));
@@ -1437,10 +1443,12 @@ describe('Left4Addons v2 Material 3 frontend', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Recheck failed items' }));
 
     await waitFor(() => {
-      expect(evaluatedTargetBatches.length).toBe(3);
+      expect(evaluatedTargetBatches.length).toBe(expectedFirstPassCount + 2);
       expect(screen.queryByRole('button', { name: 'Recheck failed items' })).toBeNull();
     });
-    expect([...evaluatedTargetBatches[2]].sort()).toEqual([
+    expect(
+      evaluatedTargetBatches.slice(expectedFirstPassCount).flat().sort(),
+    ).toEqual([
       'addon:ws:2814104912',
       'addon:ws:3011942811',
     ]);

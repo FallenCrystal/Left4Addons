@@ -22,7 +22,7 @@ use l4a_protocol::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -429,6 +429,12 @@ struct EvaluationPolicy {
     automatic: bool,
 }
 
+fn is_automatic_target_enabled(cfg: &ClientFilterConfig, target: &FilterEvaluationTarget) -> bool {
+    cfg.enabled
+        && (!target.target_key.starts_with("addon:") || cfg.apply_to_library)
+        && (!target.target_key.starts_with("ws:") || cfg.apply_to_workshop)
+}
+
 impl EvaluationPolicy {
     fn check_target(
         &self,
@@ -442,11 +448,7 @@ impl EvaluationPolicy {
         {
             return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
         }
-        if self.automatic
-            && (!live.filter.enabled
-                || (target.target_key.starts_with("addon:") && !live.filter.apply_to_library)
-                || (target.target_key.starts_with("ws:") && !live.filter.apply_to_workshop))
-        {
+        if self.automatic && !is_automatic_target_enabled(&live.filter, target) {
             return Err(CoreError::InvalidInput("该范围的自动内容过滤已停用".into()));
         }
         Ok(())
@@ -492,23 +494,6 @@ pub async fn evaluate_targets(
         let current_policy = engine.current_filter_policy_signature(&live);
 
         if *gate == generation && current_policy == policy.signature {
-            let verdicts: Vec<_> = items
-                .iter()
-                .filter_map(|item| match &item.outcome {
-                    FilterTargetOutcome::Completed {
-                        verdict,
-                        complete: true,
-                    } => Some(verdict.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !verdicts.is_empty() {
-                engine.emit_event(CoreEvent::FilterVerdictsUpdated {
-                    verdicts,
-                    policy_signature: Some(policy.signature.clone()),
-                    cache_generation: generation,
-                });
-            }
             return Ok(FilterEvaluationBatchResponse {
                 policy_signature: policy.signature,
                 cache_generation: generation,
@@ -563,6 +548,7 @@ async fn evaluate_on_policy(
 
     let mut target_keys: Vec<String> = Vec::with_capacity(targets.len());
     let mut ordered_outcomes: Vec<Option<FilterTargetOutcome>> = vec![None; targets.len()];
+    let mut cached_hits: Vec<CachedHit<'_>> = Vec::new();
     let mut miss_groups: Vec<DeduplicatedMiss> = Vec::new();
     let mut miss_index_by_key: HashMap<(String, String), usize> = HashMap::new();
 
@@ -601,6 +587,12 @@ async fn evaluate_on_policy(
                 max_age,
             )? {
                 cached.complete = true;
+                cached_hits.push(CachedHit {
+                    target: &targets[idx],
+                    has_local_addon,
+                    expected_addon_sig,
+                    verdict: cached.clone(),
+                });
                 ordered_outcomes[idx] = Some(FilterTargetOutcome::Completed {
                     verdict: cached,
                     complete: true,
@@ -627,6 +619,9 @@ async fn evaluate_on_policy(
             });
         }
     }
+
+    // Emit cache hits immediately so already-known cards render without waiting for uncached misses.
+    emit_cached_verdicts_if_still_valid(engine, policy, cached_hits);
 
     if !miss_groups.is_empty() {
         let prestart_err = if cfg.mode == ClientFilterSourceMode::Local
@@ -689,22 +684,25 @@ async fn run_deduplicated_misses(
     miss_groups: Vec<DeduplicatedMiss>,
     policy: &EvaluationPolicy,
 ) -> Vec<(Vec<usize>, FilterTargetOutcome)> {
-    stream::iter(miss_groups)
+    let mut pending = stream::iter(miss_groups)
         .map(|group| async move {
-            let permit_res = engine.filter_eval_semaphore.acquire().await;
-            let Ok(_permit) = permit_res else {
-                return (
-                    group.indices,
-                    FilterTargetOutcome::Failed {
-                        error: "过滤评估并发信号量已关闭".into(),
-                    },
-                );
+            let result = {
+                let permit_res = engine.filter_eval_semaphore.acquire().await;
+                let Ok(_permit) = permit_res else {
+                    return (
+                        group.indices,
+                        FilterTargetOutcome::Failed {
+                            error: "过滤评估并发信号量已关闭".into(),
+                        },
+                    );
+                };
+                evaluate_single_target(engine, app_cfg, &group.target, policy).await
             };
 
-            match evaluate_single_target(engine, app_cfg, &group.target, policy).await {
+            match result {
                 Ok(verdict) => {
-                    if verdict.complete && group.persist_cache {
-                        persist_verdict_if_still_valid(engine, policy, &group, &verdict);
+                    if verdict.complete {
+                        persist_and_emit_verdict_if_still_valid(engine, policy, &group, &verdict);
                     }
 
                     (
@@ -730,46 +728,122 @@ async fn run_deduplicated_misses(
                 }
             }
         })
-        .buffered(EVAL_CONCURRENCY)
-        .collect()
-        .await
+        .buffer_unordered(EVAL_CONCURRENCY);
+
+    let mut results = Vec::new();
+    while let Some(item) = pending.next().await {
+        results.push(item);
+    }
+    results
 }
 
-fn persist_verdict_if_still_valid(
+struct CachedHit<'a> {
+    target: &'a FilterEvaluationTarget,
+    has_local_addon: bool,
+    expected_addon_sig: Option<String>,
+    verdict: FilterItemVerdict,
+}
+
+fn local_addon_still_matches(
+    engine: &L4aEngine,
+    target: &FilterEvaluationTarget,
+    has_local_addon: bool,
+    expected_addon_sig: Option<&str>,
+) -> bool {
+    if !has_local_addon {
+        return true;
+    }
+    target_addon_id(target)
+        .and_then(|id| engine.db().get_addon(&id).ok().flatten())
+        .zip(expected_addon_sig)
+        .is_some_and(|(addon, sig)| compute_addon_state_sig(&addon) == sig)
+}
+
+fn emit_cached_verdicts_if_still_valid(
+    engine: &L4aEngine,
+    policy: &EvaluationPolicy,
+    cached_hits: Vec<CachedHit<'_>>,
+) {
+    if cached_hits.is_empty() {
+        return;
+    }
+    let gate = engine.filter_cache_generation.lock().unwrap();
+    let live = engine.config();
+    if *gate != policy.cache_generation
+        || engine.current_filter_policy_signature(&live) != policy.signature
+    {
+        return;
+    }
+    let mut seen_keys = HashSet::with_capacity(cached_hits.len());
+    let verdicts: Vec<FilterItemVerdict> = cached_hits
+        .into_iter()
+        .filter(|hit| {
+            (!policy.automatic || is_automatic_target_enabled(&live.filter, hit.target))
+                && local_addon_still_matches(
+                    engine,
+                    hit.target,
+                    hit.has_local_addon,
+                    hit.expected_addon_sig.as_deref(),
+                )
+                && seen_keys.insert(hit.target.target_key.clone())
+        })
+        .map(|hit| hit.verdict)
+        .collect();
+    if !verdicts.is_empty() {
+        engine.emit_event(CoreEvent::FilterVerdictsUpdated {
+            verdicts,
+            policy_signature: Some(policy.signature.clone()),
+            cache_generation: policy.cache_generation,
+        });
+    }
+}
+
+fn persist_and_emit_verdict_if_still_valid(
     engine: &L4aEngine,
     policy: &EvaluationPolicy,
     group: &DeduplicatedMiss,
     verdict: &FilterItemVerdict,
 ) {
     let gate = engine.filter_cache_generation.lock().unwrap();
-    let live_active_sig = engine.current_filter_policy_signature(&engine.config());
+    let live = engine.config();
+    let live_active_sig = engine.current_filter_policy_signature(&live);
     if *gate != policy.cache_generation || live_active_sig != policy.signature {
         return;
     }
-    if group.has_local_addon {
-        let addon_still_matches = target_addon_id(&group.target)
-            .and_then(|id| engine.db().get_addon(&id).ok().flatten())
-            .zip(group.expected_addon_sig.as_ref())
-            .is_some_and(|(addon, sig)| &compute_addon_state_sig(&addon) == sig);
-        if !addon_still_matches {
-            return;
+    if policy.automatic && !is_automatic_target_enabled(&live.filter, &group.target) {
+        return;
+    }
+    if !local_addon_still_matches(
+        engine,
+        &group.target,
+        group.has_local_addon,
+        group.expected_addon_sig.as_deref(),
+    ) {
+        return;
+    }
+
+    if group.persist_cache {
+        if let Err(db_err) = engine.db().put_cached_filter_verdict(
+            &group.target.target_key,
+            &group.content_sig,
+            group.expected_addon_sig.as_deref(),
+            &policy.signature,
+            &live_active_sig,
+            verdict,
+        ) {
+            tracing::warn!(
+                target_key = %group.target.target_key,
+                error = %db_err,
+                "写入过滤判定缓存失败"
+            );
         }
     }
 
-    if let Err(db_err) = engine.db().put_cached_filter_verdict(
-        &group.target.target_key,
-        &group.content_sig,
-        group.expected_addon_sig.as_deref(),
-        &policy.signature,
-        &live_active_sig,
-        verdict,
-    ) {
-        tracing::warn!(
-            target_key = %group.target.target_key,
-            error = %db_err,
-            "写入过滤判定缓存失败"
-        );
-    }
+    engine.emit_event(CoreEvent::FilterVerdictsUpdated {
+        verdicts: vec![verdict.clone()],
+        policy_signature: Some(policy.signature.clone()),
+        cache_generation: policy.cache_generation,
+    });
 }
 
 fn effective_max_images(cfg: &ClientFilterConfig) -> usize {

@@ -1570,18 +1570,35 @@ async fn batch_partial_failure_dedup_fail_open_cache_guard_and_snapshot_verdicts
     // Dedup ensured only 3 backend /predict calls (3001 once, 3002 once, 3003 once), NOT 4!
     assert_eq!(predict_calls.load(Ordering::SeqCst), 3);
 
-    // Verify FilterVerdictsUpdated event carries canonical policy_signature matching snapshot
+    // Verify FilterVerdictsUpdated events stream per completed card with canonical policy_signature matching snapshot
     let snap = engine.snapshot().unwrap();
     assert_eq!(snap.filter_policy_signature, batch_res.policy_signature);
     let drained = events.drain();
-    assert!(drained.iter().any(|ev| matches!(
-        ev,
-        CoreEvent::FilterVerdictsUpdated {
-            verdicts,
-            policy_signature: Some(sig),
-            cache_generation,
-        } if verdicts.len() == 3 && sig == &snap.filter_policy_signature && *cache_generation == snap.filter_cache_generation
-    )));
+    let streamed_keys: Vec<String> = drained
+        .iter()
+        .filter_map(|ev| match ev {
+            CoreEvent::FilterVerdictsUpdated {
+                verdicts,
+                policy_signature: Some(sig),
+                cache_generation,
+            } if sig == &snap.filter_policy_signature
+                && *cache_generation == snap.filter_cache_generation =>
+            {
+                Some(
+                    verdicts
+                        .iter()
+                        .map(|v| v.target_key.clone())
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(streamed_keys.len(), 2);
+    assert!(streamed_keys.contains(&"addon:workshop:3001".to_string()));
+    assert!(streamed_keys.contains(&"addon:workshop:3003".to_string()));
+    assert!(!streamed_keys.contains(&"addon:workshop:3002".to_string()));
 
     // Verify snapshot.cached_filter_verdicts is populated immediately at startup / snapshot()!
     assert_eq!(snap.cached_filter_verdicts.len(), 2);
@@ -3931,6 +3948,401 @@ async fn custom_endpoint_image_disabled_does_not_fabricate_zero_image_scores_for
         "LLM flagging with images must preserve image_sensitive=true on image-disabled CustomEndpoint"
     );
     assert_eq!(verdict.sensitive_image_indices, vec![0]);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn streaming_evaluation_emits_fast_and_cached_cards_without_waiting_for_slow_cards() {
+    let slow_started = Arc::new(tokio::sync::Notify::new());
+    let slow_release = Arc::new(tokio::sync::Notify::new());
+    let slow_started_srv = slow_started.clone();
+    let slow_release_srv = slow_release.clone();
+
+    let app = Router::new().route(
+        "/api/v1/filter/predict",
+        post(move |Json(req): Json<FilterPredictRequest>| {
+            let started = slow_started_srv.clone();
+            let release = slow_release_srv.clone();
+            async move {
+                let title = req.title.unwrap_or_default();
+                if title.contains("[SLOW_BLOCKER]") {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                let is_flagged = title.contains("[FLAG]");
+                Json(FilterProbabilities {
+                    prob: if is_flagged { 0.91 } else { 0.04 },
+                    gore_prob: 0.01,
+                    nsfw_prob: if is_flagged { 0.91 } else { 0.04 },
+                    text_prob: Some(if is_flagged { 0.91 } else { 0.04 }),
+                    title_prob: Some(if is_flagged { 0.91 } else { 0.04 }),
+                    ..Default::default()
+                })
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("loading");
+    std::fs::create_dir_all(&loading).unwrap();
+
+    struct ChannelEventSink {
+        tx: tokio::sync::mpsc::UnboundedSender<CoreEvent>,
+    }
+
+    impl EventSink for ChannelEventSink {
+        fn emit(&self, event: CoreEvent) {
+            let _ = self.tx.send(event);
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Arc::new(ChannelEventSink { tx });
+    let engine = Arc::new(make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/api/v1/filter/predict")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+        sink,
+    ));
+
+    let make_target = |key: &str, title: &str| FilterEvaluationTarget {
+        target_key: key.into(),
+        addon_id: None,
+        workshop_id: None,
+        title: title.into(),
+        description: None,
+        tags: vec![],
+        image_sources: vec![],
+        revision_hint: Some("rev-1".into()),
+        bypass_cache: false,
+    };
+
+    // Prime one cached verdict so the mixed batch contains both a cache hit and uncached items.
+    let cached_target = make_target("ws:cached-0", "Cached Fast Card");
+    let _ = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![cached_target.clone()])
+            .await
+            .unwrap(),
+    );
+    while rx.try_recv().is_ok() {}
+
+    // Put the slow blocker at index 0 followed by 5 fast uncached cards (> EVAL_CONCURRENCY=4)
+    // and 1 cached card to prove both immediate emission and zero head-of-line blocking.
+    let batch_targets = vec![
+        make_target("ws:slow-0", "[SLOW_BLOCKER] Slow Card"),
+        make_target("ws:fast-1", "Fast Safe 1"),
+        make_target("ws:fast-2", "[FLAG] Fast Flagged 2"),
+        make_target("ws:fast-3", "Fast Safe 3"),
+        make_target("ws:fast-4", "Fast Safe 4"),
+        make_target("ws:fast-5", "Fast Safe 5"),
+        cached_target,
+    ];
+
+    let engine_for_batch = engine.clone();
+    let batch_handle = tokio::spawn(async move {
+        engine_for_batch
+            .evaluate_filter_items(batch_targets)
+            .await
+            .unwrap()
+    });
+
+    // Wait until the slow blocker has entered the server handler.
+    tokio::time::timeout(std::time::Duration::from_secs(5), slow_started.notified())
+        .await
+        .expect("slow card should start evaluating");
+
+    // Collect all 6 non-blocked cards BEFORE releasing the slow card!
+    let mut arrived_before_slow: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while arrived_before_slow.len() < 6 {
+        let ev = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("fast & cached cards must emit before slow card completes")
+            .expect("event channel should stay open");
+        if let CoreEvent::FilterVerdictsUpdated { verdicts, .. } = ev {
+            for verdict in verdicts {
+                arrived_before_slow.push(verdict.target_key);
+            }
+        }
+    }
+
+    assert!(
+        !batch_handle.is_finished(),
+        "batch future must still be running while slow card is blocked"
+    );
+    assert!(
+        !arrived_before_slow.contains(&"ws:slow-0".to_string()),
+        "slow card has not been released yet"
+    );
+    for expected in [
+        "ws:cached-0",
+        "ws:fast-1",
+        "ws:fast-2",
+        "ws:fast-3",
+        "ws:fast-4",
+        "ws:fast-5",
+    ] {
+        assert!(
+            arrived_before_slow.contains(&expected.to_string()),
+            "expected {expected} to stream before slow card finishes; got {arrived_before_slow:?}"
+        );
+    }
+
+    // Release slow card and verify batch response preserves exact original input order.
+    slow_release.notify_one();
+    let response = batch_handle.await.unwrap();
+    let returned_keys: Vec<&str> = response
+        .items
+        .iter()
+        .map(|item| item.target_key.as_str())
+        .collect();
+    assert_eq!(
+        returned_keys,
+        vec![
+            "ws:slow-0",
+            "ws:fast-1",
+            "ws:fast-2",
+            "ws:fast-3",
+            "ws:fast-4",
+            "ws:fast-5",
+            "ws:cached-0",
+        ]
+    );
+
+    let slow_event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(ev) = rx.recv().await {
+            if let CoreEvent::FilterVerdictsUpdated { verdicts, .. } = ev {
+                if verdicts.iter().any(|v| v.target_key == "ws:slow-0") {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .expect("slow card should emit once released");
+    assert!(slow_event);
+
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn streaming_evaluation_suppresses_writes_and_events_after_mid_batch_invalidation() {
+    use tokio::sync::Notify;
+
+    let gate_started = Arc::new(Notify::new());
+    let gate_release = Arc::new(Notify::new());
+    let started_for_route = gate_started.clone();
+    let release_for_route = gate_release.clone();
+
+    let app = Router::new().route(
+        "/api/v1/filter/predict",
+        post(move |Json(req): Json<RawFilterPredictRequest>| {
+            let started = started_for_route.clone();
+            let release = release_for_route.clone();
+            async move {
+                let title = req.title.unwrap_or_default();
+                if title.contains("[HOLD]") {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Json(FilterProbabilities {
+                    prob: 0.04,
+                    gore_prob: 0.01,
+                    nsfw_prob: 0.01,
+                    text_prob: Some(0.04),
+                    title_prob: Some(0.04),
+                    ..Default::default()
+                })
+            }
+        }),
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading = dir.path().join("addons");
+    std::fs::create_dir_all(&loading).unwrap();
+    let vpk_path = loading.join("919191.vpk");
+    create_test_vpk(
+        &vpk_path,
+        "[HOLD] Local Mutable Addon V1",
+        "Mapper",
+        false,
+        None,
+        b"v1-bytes",
+    );
+
+    struct ChannelEventSink {
+        tx: tokio::sync::mpsc::UnboundedSender<CoreEvent>,
+    }
+    impl EventSink for ChannelEventSink {
+        fn emit(&self, event: CoreEvent) {
+            let _ = self.tx.send(event);
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink = Arc::new(ChannelEventSink { tx });
+    let engine = Arc::new(make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading.to_string_lossy().into_owned(),
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                apply_to_library: true,
+                apply_to_workshop: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/api/v1/filter/predict")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+        sink,
+    ));
+
+    let drain_verdict_keys = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<CoreEvent>| {
+        let mut keys = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let CoreEvent::FilterVerdictsUpdated { verdicts, .. } = ev {
+                keys.extend(verdicts.into_iter().map(|v| v.target_key));
+            }
+        }
+        keys
+    };
+
+    // Case 1: Mid-batch clear_filter_cache() suppresses remaining SQLite writes & FilterVerdictsUpdated events.
+    let engine_clear = engine.clone();
+    let clear_handle = tokio::spawn(async move {
+        engine_clear
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:clear-victim".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "[HOLD] Clear Victim".into(),
+                description: None,
+                tags: vec![],
+                image_sources: vec![],
+                revision_hint: Some("rev-clear".into()),
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
+        .await
+        .expect("case 1 request should reach server");
+    let _ = engine.clear_filter_cache().unwrap();
+    let _ = drain_verdict_keys(&mut rx);
+    gate_release.notify_one();
+    let _ = clear_handle.await.unwrap();
+
+    assert!(
+        drain_verdict_keys(&mut rx).is_empty(),
+        "mid-batch clear_filter_cache must suppress streamed FilterVerdictsUpdated"
+    );
+    assert_eq!(
+        engine.clear_filter_cache().unwrap().count,
+        0,
+        "mid-batch clear_filter_cache must suppress SQLite verdict persistence"
+    );
+
+    // Case 2: Mid-batch automatic scope disable (apply_to_library = false) suppresses writes & events.
+    let snap_v1 = engine.scan().unwrap();
+    let addon_v1 = snap_v1.addons[0].clone();
+    let target_v1 = l4a_core::filter::build_addon_filter_target(&addon_v1);
+    let _ = drain_verdict_keys(&mut rx);
+
+    let engine_disable = engine.clone();
+    let target_for_disable = target_v1.clone();
+    let disable_handle = tokio::spawn(async move {
+        engine_disable
+            .evaluate_automatic_filter_items(vec![target_for_disable])
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
+        .await
+        .expect("case 2 request should reach server");
+    let mut disabled_cfg = engine.config();
+    disabled_cfg.filter.apply_to_library = false;
+    engine.save_config_async(disabled_cfg).await.unwrap();
+    let _ = drain_verdict_keys(&mut rx);
+    gate_release.notify_one();
+    let _ = disable_handle.await.unwrap();
+
+    assert!(
+        drain_verdict_keys(&mut rx).is_empty(),
+        "mid-batch apply_to_library=false must suppress streamed FilterVerdictsUpdated"
+    );
+    assert!(
+        engine.snapshot().unwrap().cached_filter_verdicts.is_empty(),
+        "mid-batch apply_to_library=false must suppress SQLite verdict persistence"
+    );
+
+    // Re-enable apply_to_library for Case 3.
+    let mut reenabled_cfg = engine.config();
+    reenabled_cfg.filter.apply_to_library = true;
+    engine.save_config_async(reenabled_cfg).await.unwrap();
+    let _ = drain_verdict_keys(&mut rx);
+
+    // Case 3: Mid-batch local addon disk modification + scan() suppresses stale verdict write & event.
+    let engine_disk = engine.clone();
+    let target_for_disk = target_v1;
+    let disk_handle = tokio::spawn(async move {
+        engine_disk
+            .evaluate_automatic_filter_items(vec![target_for_disk])
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate_started.notified())
+        .await
+        .expect("case 3 request should reach server");
+    create_test_vpk(
+        &vpk_path,
+        "Local Mutable Addon V2 Changed On Disk",
+        "Mapper",
+        false,
+        None,
+        b"v2-modified-bytes",
+    );
+    let _ = engine.scan().unwrap();
+    let _ = drain_verdict_keys(&mut rx);
+    gate_release.notify_one();
+    let _ = disk_handle.await.unwrap();
+
+    assert!(
+        drain_verdict_keys(&mut rx).is_empty(),
+        "mid-batch local addon disk modification must suppress stale streamed FilterVerdictsUpdated"
+    );
+    assert!(
+        engine.snapshot().unwrap().cached_filter_verdicts.is_empty(),
+        "mid-batch local addon disk modification must suppress stale SQLite verdict persistence"
+    );
 
     server_handle.abort();
 }

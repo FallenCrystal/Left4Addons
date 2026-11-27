@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -94,7 +95,7 @@ export function OrganizeInspectorSheet({
 }: OrganizeInspectorSheetProps) {
   const { t } = useTranslation();
   const filterCtx = useContentFilterContext();
-  const { verdicts, revealCard } = filterCtx;
+  const { verdicts, revealCard, prioritizeFilterTargets } = filterCtx;
 
   const visibleCollectionWids = inspectedCollection
     ? inspectedCollection.memberWorkshopIds.filter((wid) => {
@@ -140,6 +141,86 @@ export function OrganizeInspectorSheet({
         return Boolean(found && resolveLibraryAddonCardFilter(found, filterCtx).hiddenCard);
       }).length
     : 0;
+
+  const inspectedMemberKeysSig = (() => {
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    const pushAddonId = (id: string) => {
+      const key = addonFilterKey(id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        keys.push(key);
+      }
+    };
+
+    if (inspectedBundle) {
+      for (const id of inspectedBundle.memberAddonIds) {
+        const addon = addonsById.get(id);
+        if (addon && !resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) {
+          pushAddonId(addon.id);
+        }
+      }
+      for (const id of inspectedBundle.memberAddonIds) {
+        pushAddonId(id);
+      }
+    }
+
+    if (inspectedCollection) {
+      for (const wid of visibleCollectionWids) {
+        const local = addonsByWorkshopId.get(wid);
+        if (local) pushAddonId(local.id);
+      }
+      for (const wid of inspectedCollection.memberWorkshopIds) {
+        const local = addonsByWorkshopId.get(wid);
+        if (local) pushAddonId(local.id);
+      }
+    }
+
+    if (inspectedGroup) {
+      for (const id of visibleGroupAddonIds) {
+        pushAddonId(id);
+      }
+      for (const id of inspectedGroup.addonIds) {
+        pushAddonId(id);
+      }
+    }
+
+    if (profileDiff) {
+      const profileAddons = [
+        ...profileDiff.toEnable,
+        ...profileDiff.toDisable,
+        ...profileDiff.unchangedEnabled,
+      ];
+      for (const addon of profileAddons) {
+        if (!resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) {
+          pushAddonId(addon.id);
+        }
+      }
+      for (const addon of profileAddons) {
+        pushAddonId(addon.id);
+      }
+      for (const id of profileDiff.missingIds) {
+        if (addonsById.has(id)) {
+          pushAddonId(id);
+        }
+      }
+    }
+
+    return keys.join('\0');
+  })();
+
+  useEffect(() => {
+    prioritizeFilterTargets(inspectedMemberKeysSig ? inspectedMemberKeysSig.split('\0') : [], {
+      urgent: true,
+      owner: 'organize-inspector',
+    });
+  }, [inspectedMemberKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'organize-inspector' });
+    };
+  }, [prioritizeFilterTargets]);
 
   return (
     <>

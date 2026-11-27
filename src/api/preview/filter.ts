@@ -349,30 +349,81 @@ export class PreviewFilterRuntime {
               : createDefaultModelParams().maxImages,
           };
 
-    const items: FilterEvaluationItemResult[] = [];
-    const emittedVerdicts: FilterItemVerdict[] = [];
+    const items: Array<FilterEvaluationItemResult | undefined> = Array.from(
+      { length: targets.length },
+      () => undefined,
+    );
+    const cachedHitVerdicts: FilterItemVerdict[] = [];
+    const seenCachedKeys = new Set<string>();
+    const missGroups: Array<{
+      indices: number[];
+      target: FilterEvaluationTarget;
+      cacheKey: string;
+      persistCache: boolean;
+    }> = [];
+    const missGroupByKey = new Map<string, number>();
 
-    for (const target of targets) {
+    for (let idx = 0; idx < targets.length; idx += 1) {
+      const target = targets[idx];
       if (automatic && !isAutomaticFilterTargetEnabled(target.targetKey, config)) {
-        items.push({ targetKey: target.targetKey, status: 'failed', error: 'Content filtering is disabled for this scope' });
+        items[idx] = {
+          targetKey: target.targetKey,
+          status: 'failed',
+          error: 'Content filtering is disabled for this scope',
+        };
         continue;
       }
       const cacheKey = `${policySig}::${target.targetKey}`;
       if (!target.bypassCache) {
         const hit = this.cache.get(cacheKey);
-        if (hit && hit.complete !== false && (hit.revisionHint ?? '') === (target.revisionHint ?? '') &&
-            filterVerdictExpiresAt(hit, config.mode) > Date.now()) {
+        if (
+          hit &&
+          hit.complete !== false &&
+          (hit.revisionHint ?? '') === (target.revisionHint ?? '') &&
+          filterVerdictExpiresAt(hit, config.mode) > Date.now()
+        ) {
           const cloned = structuredClone(hit);
-          items.push({
+          items[idx] = {
             targetKey: target.targetKey,
             status: 'completed',
             verdict: cloned,
             complete: true,
-          });
-          emittedVerdicts.push(cloned);
+          };
+          if (!seenCachedKeys.has(target.targetKey)) {
+            seenCachedKeys.add(target.targetKey);
+            cachedHitVerdicts.push(structuredClone(cloned));
+          }
           continue;
         }
       }
+
+      const dedupKey = `${target.targetKey}::${target.revisionHint ?? ''}`;
+      const existingGroup = missGroupByKey.get(dedupKey);
+      if (existingGroup !== undefined) {
+        missGroups[existingGroup].indices.push(idx);
+        missGroups[existingGroup].persistCache ||= !target.bypassCache;
+      } else {
+        missGroupByKey.set(dedupKey, missGroups.length);
+        missGroups.push({
+          indices: [idx],
+          target,
+          cacheKey,
+          persistCache: !target.bypassCache,
+        });
+      }
+    }
+
+    if (cachedHitVerdicts.length > 0) {
+      emit({
+        type: 'filter_verdicts_updated',
+        verdicts: cachedHitVerdicts,
+        policySignature: policySig,
+        cacheGeneration: this.cacheGeneration,
+      });
+    }
+
+    for (const group of missGroups) {
+      const { target, cacheKey } = group;
 
       const titleScores = params.enableText
         ? scoreSnippet(`${target.title} ${target.tags.join(' ')}`)
@@ -542,32 +593,31 @@ export class PreviewFilterRuntime {
         evaluatedAt: new Date().toISOString(),
       };
 
-      if (!target.bypassCache && complete) {
+      if (group.persistCache && complete) {
         this.cache.set(cacheKey, structuredClone(verdict));
       }
-      items.push({
-        targetKey: target.targetKey,
-        status: 'completed',
-        verdict,
-        complete,
-      });
-      if (complete || flagged) {
-        emittedVerdicts.push(verdict);
+      for (const idx of group.indices) {
+        items[idx] = {
+          targetKey: target.targetKey,
+          status: 'completed',
+          verdict: structuredClone(verdict),
+          complete,
+        };
+      }
+      if (complete) {
+        emit({
+          type: 'filter_verdicts_updated',
+          verdicts: [structuredClone(verdict)],
+          policySignature: policySig,
+          cacheGeneration: this.cacheGeneration,
+        });
       }
     }
 
-    if (emittedVerdicts.length > 0) {
-      emit({
-        type: 'filter_verdicts_updated',
-        verdicts: structuredClone(emittedVerdicts),
-        policySignature: policySig,
-        cacheGeneration: this.cacheGeneration,
-      });
-    }
     return {
       policySignature: policySig,
       cacheGeneration: this.cacheGeneration,
-      items,
+      items: items.filter((item): item is FilterEvaluationItemResult => item !== undefined),
     };
   }
 }

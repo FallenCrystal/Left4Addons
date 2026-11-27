@@ -7,6 +7,10 @@ import type {
   UpsertFilterExclusionRequest,
   WorkshopItemRecord,
 } from '../api/ipc';
+import type {
+  FilterEvalPriority,
+  PrioritizeFilterTargetsOptions,
+} from './controller/useContentFilter';
 import { createDefaultFilterConfig } from '../utils/contentFilter';
 
 export interface ContentFilterContextValue {
@@ -17,9 +21,13 @@ export interface ContentFilterContextValue {
   revealedCardIds: ReadonlySet<string>;
   failedTargetKeys: ReadonlySet<string>;
   revealCard: (cardKey: string) => void;
+  prioritizeFilterTargets: (
+    targetKeys: string[],
+    options?: PrioritizeFilterTargetsOptions,
+  ) => void;
   registerWorkshopItems: (
     items: WorkshopItemRecord[],
-    options?: { onlyIfMissing?: boolean },
+    options?: { onlyIfMissing?: boolean; priority?: FilterEvalPriority },
   ) => void;
   upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
   deleteFilterExclusion: (addonId: AddonId) => Promise<boolean>;
@@ -34,6 +42,7 @@ const DEFAULT_CONTEXT: ContentFilterContextValue = {
   revealedCardIds: new Set(),
   failedTargetKeys: new Set(),
   revealCard: () => {},
+  prioritizeFilterTargets: () => {},
   registerWorkshopItems: () => {},
   upsertFilterExclusion: async () => false,
   deleteFilterExclusion: async () => false,

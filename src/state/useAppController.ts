@@ -407,6 +407,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     failedTargetKeys: contentFilter.failedTargetKeys,
     revealCard: contentFilter.revealCard,
     retryFailedEvaluations: contentFilter.retryFailedEvaluations,
+    prioritizeFilterTargets: contentFilter.prioritizeFilterTargets,
     registerWorkshopItems: contentFilter.registerWorkshopItems,
     refreshLocalFilterStatus: contentFilter.refreshLocalFilterStatus,
     checkLocalFilterUpdates: contentFilter.checkLocalFilterUpdates,
