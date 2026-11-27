@@ -1473,20 +1473,43 @@ fn validate_remote_filter_image_url(
     }
 
     // Allow non-Steam URLs only if explicitly rewritten by a configured MirrorRouter rule
-    let resolved = engine.mirror_router().resolve(&normalized);
-    let rewritten_by_mirror = resolved.url != normalized
-        || resolved.original_host.is_some()
-        || !resolved.headers.is_empty();
-    if rewritten_by_mirror {
+    let https_only = engine.config().https_only;
+    let resolved = engine
+        .mirror_router()
+        .resolve_with_https_only(&normalized, https_only);
+    if resolved.matched_rule {
         engine
             .mirror_router()
-            .validate_url(&normalized)
+            .validate_url_with_https_only(&normalized, https_only)
             .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
         return Ok(ValidatedRemoteImage::Mirrored(normalized));
     }
 
     Err(CoreError::InvalidInput(
         "远程预览图地址不在受信任的 Steam 创意工坊 CDN 白名单内".into(),
+    ))
+}
+
+pub(crate) fn validate_filter_image_redirect_hop(
+    hop: &l4a_mirror::RedirectHop<'_>,
+) -> Result<(), CoreError> {
+    if !hop.url.username().is_empty() || hop.url.password().is_some() {
+        return Err(CoreError::InvalidInput(
+            "预览图重定向地址不得包含内联凭据".into(),
+        ));
+    }
+    // Explicitly configured mirror origin (same-origin hop on that mirror, or cross-origin
+    // hop matching another explicit mirror rule): MirrorRouter has already enforced https_only.
+    if hop.matched_mirror_rule {
+        return Ok(());
+    }
+    // Unmirrored hops (same-origin or cross-origin) must stay strictly inside the trusted
+    // public Steam CDN allowlist and use HTTPS (blocking private/loopback SSRF and HTTP downgrades).
+    if is_allowed_steam_cdn_image_url(hop.url) && hop.resolved.url.starts_with("https://") {
+        return Ok(());
+    }
+    Err(CoreError::InvalidInput(
+        "预览图重定向地址不在受信任的 Steam 创意工坊 CDN 白名单内".into(),
     ))
 }
 
@@ -1503,7 +1526,9 @@ async fn fetch_validated_remote_image(
             })
         }
         ValidatedRemoteImage::SteamCdn(url) | ValidatedRemoteImage::Mirrored(url) => {
-            let (mime, bytes) = engine.fetch_workshop_cover(url).await?;
+            let (mime, bytes) = engine
+                .fetch_workshop_cover_with_hop_validator(url, validate_filter_image_redirect_hop)
+                .await?;
             Ok(LoadedImage {
                 mime,
                 b64: STANDARD.encode(&bytes),
@@ -1512,7 +1537,10 @@ async fn fetch_validated_remote_image(
     }
 }
 
-async fn load_single_image(engine: &L4aEngine, src: &str) -> Result<LoadedImage, CoreError> {
+pub(crate) async fn load_single_image(
+    engine: &L4aEngine,
+    src: &str,
+) -> Result<LoadedImage, CoreError> {
     if is_valid_local_cover_key(src) {
         let bytes = engine.read_cached_image(src)?;
         let mime = detect_image_mime(&bytes, Some(src))?;

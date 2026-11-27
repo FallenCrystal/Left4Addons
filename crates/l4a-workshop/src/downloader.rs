@@ -1,10 +1,10 @@
 use crate::error::WorkshopError;
 use futures_util::StreamExt;
 use l4a_logging::http::AuditedSend;
-use l4a_mirror::MirrorRouter;
+use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::WorkshopId;
 use reqwest::header::{CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
-use reqwest::StatusCode;
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -188,9 +188,14 @@ impl ResilientDownloader {
             .unwrap_or("addon.vpk")
             .to_string();
 
-        let (client, resolved) = self
+        let streaming_opts = RedirectRequestOptions {
+            connect_timeout: Some(self.connect_timeout),
+            read_timeout: Some(self.read_timeout),
+            ..Default::default()
+        };
+        let mut resolved = self
             .mirror
-            .build_streaming_client_for(&req.url, self.connect_timeout, self.read_timeout)
+            .validate_url(&req.url)
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
         let mut resume_from = 0u64;
@@ -212,12 +217,21 @@ impl ResilientDownloader {
         }
 
         let response = if resume_from > 0 {
-            let (builder, _) = self.mirror.prepare_get(&client, &req.url);
-            let resp = builder
-                .header(RANGE, format!("bytes={resume_from}-"))
-                .send_audited("workshop.download.resume")
+            let range_header = format!("bytes={resume_from}-");
+            let redirected = self
+                .mirror
+                .send_with_redirects(
+                    Method::GET,
+                    &req.url,
+                    streaming_opts,
+                    |builder, _, _| builder.header(RANGE, &range_header),
+                    |_| Ok::<(), WorkshopError>(()),
+                    |builder| builder.send_audited("workshop.download.resume"),
+                )
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            resolved = redirected.initial_resolved;
+            let resp = redirected.response;
             match resp.status() {
                 StatusCode::PARTIAL_CONTENT => resp,
                 StatusCode::OK => {
@@ -230,20 +244,39 @@ impl ResilientDownloader {
                     self.cleanup_partial(req.workshop_id);
                     resume_from = 0;
                     stored_meta = None;
-                    let (fresh_builder, _) = self.mirror.prepare_get(&client, &req.url);
-                    fresh_builder
-                        .send_audited("workshop.download.restart")
+                    drop(resp);
+                    let fresh = self
+                        .mirror
+                        .send_with_redirects(
+                            Method::GET,
+                            &req.url,
+                            streaming_opts,
+                            |builder, _, _| builder,
+                            |_| Ok::<(), WorkshopError>(()),
+                            |builder| builder.send_audited("workshop.download.restart"),
+                        )
                         .await
-                        .map_err(|e| WorkshopError::Network(e.to_string()))?
+                        .map_err(|e| WorkshopError::Network(e.to_string()))?;
+                    resolved = fresh.initial_resolved;
+                    fresh.response
                 }
                 _ => resp,
             }
         } else {
-            let (builder, _) = self.mirror.prepare_get(&client, &req.url);
-            builder
-                .send_audited("workshop.download")
+            let redirected = self
+                .mirror
+                .send_with_redirects(
+                    Method::GET,
+                    &req.url,
+                    streaming_opts,
+                    |builder, _, _| builder,
+                    |_| Ok::<(), WorkshopError>(()),
+                    |builder| builder.send_audited("workshop.download"),
+                )
                 .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?
+                .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            resolved = redirected.initial_resolved;
+            redirected.response
         };
 
         let status = response.status();

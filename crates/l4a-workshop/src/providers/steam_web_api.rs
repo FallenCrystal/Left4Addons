@@ -3,11 +3,12 @@ use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use l4a_logging::http::AuditedSend;
-use l4a_mirror::MirrorRouter;
+use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::{
     MetadataSource, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopFileType, WorkshopId,
     WorkshopItemRecord, WorkshopItemStatus,
 };
+use reqwest::Method;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -70,10 +71,6 @@ impl WorkshopProvider for SteamWebApiProvider {
             "{}/ISteamRemoteStorage/GetPublishedFileDetails/v1/",
             self.base_url
         );
-        let (client, _) = self
-            .mirror
-            .build_client_for(&url, Some(self.timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
         let now = Utc::now();
         let mut outcomes = Vec::with_capacity(ids.len());
@@ -85,12 +82,28 @@ impl WorkshopProvider for SteamWebApiProvider {
                 params.push((format!("publishedfileids[{idx}]"), id.to_string()));
             }
 
-            let (req, _) = self.mirror.prepare_post(&client, &url);
-            let resp = req
-                .form(&params)
-                .send_audited("steam_web_api.item_details")
+            let resp = self
+                .mirror
+                .send_with_redirects(
+                    Method::POST,
+                    &url,
+                    RedirectRequestOptions {
+                        timeout: Some(self.timeout),
+                        ..Default::default()
+                    },
+                    |req, _, method| {
+                        if *method == Method::POST {
+                            req.form(&params)
+                        } else {
+                            req
+                        }
+                    },
+                    |_| Ok::<(), WorkshopError>(()),
+                    |req| req.send_audited("steam_web_api.item_details"),
+                )
                 .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?;
+                .map_err(|e| WorkshopError::Network(e.to_string()))?
+                .response;
 
             let status = resp.status();
             if !status.is_success() {
@@ -238,22 +251,33 @@ impl WorkshopProvider for SteamWebApiProvider {
             "{}/ISteamRemoteStorage/GetCollectionDetails/v1/",
             self.base_url
         );
-        let (client, _) = self
-            .mirror
-            .build_client_for(&url, Some(self.timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
         let params = vec![
             ("collectioncount".to_string(), "1".to_string()),
             ("publishedfileids[0]".to_string(), collection_id.to_string()),
         ];
 
-        let (req, _) = self.mirror.prepare_post(&client, &url);
-        let resp = req
-            .form(&params)
-            .send_audited("steam_web_api.collection_details")
+        let resp = self
+            .mirror
+            .send_with_redirects(
+                Method::POST,
+                &url,
+                RedirectRequestOptions {
+                    timeout: Some(self.timeout),
+                    ..Default::default()
+                },
+                |req, _, method| {
+                    if *method == Method::POST {
+                        req.form(&params)
+                    } else {
+                        req
+                    }
+                },
+                |_| Ok::<(), WorkshopError>(()),
+                |req| req.send_audited("steam_web_api.collection_details"),
+            )
             .await
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            .map_err(|e| WorkshopError::Network(e.to_string()))?
+            .response;
 
         let status = resp.status();
         if !status.is_success() {

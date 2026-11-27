@@ -3,6 +3,7 @@ use crate::db::repo::normalize_valid_remote_cover_url;
 use crate::error::CoreError;
 use crate::file_changes::same_file;
 use l4a_logging::http::AuditedSend;
+use l4a_mirror::{RedirectHop, RedirectRequestOptions, RedirectSendError};
 use l4a_workshop::WorkshopError;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -56,6 +57,18 @@ impl L4aEngine {
     }
 
     pub async fn fetch_workshop_cover(&self, url: &str) -> Result<(String, Vec<u8>), CoreError> {
+        self.fetch_workshop_cover_with_hop_validator(url, |_| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn fetch_workshop_cover_with_hop_validator<F>(
+        &self,
+        url: &str,
+        hop_validator: F,
+    ) -> Result<(String, Vec<u8>), CoreError>
+    where
+        F: FnMut(&RedirectHop<'_>) -> Result<(), CoreError>,
+    {
         const MAX_COVER_BYTES: usize = 16 * 1024 * 1024;
         const COVER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
         const CACHED_COVER_FORMATS: &[(&str, &str)] = &[
@@ -67,8 +80,9 @@ impl L4aEngine {
 
         let url = normalize_valid_remote_cover_url(url)
             .ok_or_else(|| CoreError::InvalidInput("无效的封面图片地址".into()))?;
+        let https_only = self.config.read().unwrap().https_only;
         self.mirror
-            .validate_url(&url)
+            .validate_url_with_https_only(&url, https_only)
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
 
         let url_hash = hex::encode(&Sha256::digest(url.as_bytes())[..16]);
@@ -96,13 +110,23 @@ impl L4aEngine {
             }
         }
 
-        let (client, _) = self
+        let mut response = match self
             .mirror
-            .build_client_for(&url, Some(Duration::from_secs(15)))
-            .map_err(|err| WorkshopError::Network(err.to_string()))?;
-        let (request, _) = self.mirror.prepare_get(&client, &url);
-        let mut response = match request.send_audited_quiet("workshop.cover").await {
-            Ok(resp) => match resp.error_for_status() {
+            .send_with_redirects(
+                reqwest::Method::GET,
+                &url,
+                RedirectRequestOptions {
+                    timeout: Some(Duration::from_secs(15)),
+                    https_only_override: Some(https_only),
+                    ..Default::default()
+                },
+                |req, _, _| req,
+                hop_validator,
+                |req| req.send_audited_quiet("workshop.cover"),
+            )
+            .await
+        {
+            Ok(redirected) => match redirected.response.error_for_status() {
                 Ok(ok_resp) => ok_resp,
                 Err(status_err) => {
                     if status_err
@@ -116,7 +140,11 @@ impl L4aEngine {
                     return Err(WorkshopError::Network(status_err.to_string()).into());
                 }
             },
-            Err(net_err) => {
+            Err(RedirectSendError::Rejected(err)) => return Err(err),
+            Err(RedirectSendError::Mirror(mirror_err)) => {
+                return Err(WorkshopError::Network(mirror_err.to_string()).into());
+            }
+            Err(RedirectSendError::Request(net_err)) => {
                 if let Some((stale_mime, stale_bytes)) = stale_cached {
                     return Ok((stale_mime.to_string(), stale_bytes));
                 }

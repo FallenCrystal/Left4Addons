@@ -2529,10 +2529,14 @@ version = "2.0.0-alpha.1"
 dependencies = [
  "regex",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
 ]

@@ -47,23 +47,12 @@ impl EventSink for NullEventSink {
 
 type RescanCallback = Arc<dyn Fn() + Send + Sync>;
 
-fn build_reusable_http_clients() -> (reqwest::Client, reqwest::Client, reqwest::Client) {
-    let loopback = reqwest::Client::builder()
+fn build_loopback_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let https_only = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let standard = reqwest::Client::builder()
-        .https_only(false)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    (loopback, https_only, standard)
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// 客户端核心门面：协调本地 SQLite 状态、VPK 扫描与 Dummy v2 对账、生命周期同步、
@@ -94,8 +83,6 @@ pub struct L4aEngine {
     pub(crate) catalog_scoring_probe: tokio::sync::Mutex<()>,
     allow_loopback_image_urls_for_testing: AtomicBool,
     loopback_http_client: reqwest::Client,
-    https_only_http_client: reqwest::Client,
-    standard_http_client: reqwest::Client,
 }
 
 impl L4aEngine {
@@ -145,8 +132,7 @@ impl L4aEngine {
         local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = TokenVault::default_for_paths(&paths);
         let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
-        let (loopback_http_client, https_only_http_client, standard_http_client) =
-            build_reusable_http_clients();
+        let loopback_http_client = build_loopback_http_client();
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -173,8 +159,6 @@ impl L4aEngine {
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
-            https_only_http_client,
-            standard_http_client,
         })
     }
 
@@ -195,8 +179,7 @@ impl L4aEngine {
         local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = TokenVault::default_for_paths(&paths);
         let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
-        let (loopback_http_client, https_only_http_client, standard_http_client) =
-            build_reusable_http_clients();
+        let loopback_http_client = build_loopback_http_client();
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
             download_gate: DownloadGate::new(config.download_concurrency),
@@ -222,8 +205,6 @@ impl L4aEngine {
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
-            https_only_http_client,
-            standard_http_client,
         })
     }
 
@@ -257,26 +238,12 @@ impl L4aEngine {
         if crate::filter::llm::is_loopback_url(url) {
             return Ok(self.loopback_http_client.get(url).timeout(timeout));
         }
-        let resolved = self
-            .mirror
-            .validate_url(url)
-            .map_err(|e| CoreError::Network(e.to_string()))?;
         let https_only = self.config.read().unwrap().https_only;
-        if resolved.insecure_tls && !https_only {
-            let (client, _) = self
-                .mirror
-                .build_client_for(url, Some(timeout))
-                .map_err(|e| CoreError::Network(e.to_string()))?;
-            let (req, _) = self.mirror.prepare_get(&client, url);
-            return Ok(req.timeout(timeout));
-        }
-        let client = if https_only {
-            &self.https_only_http_client
-        } else {
-            &self.standard_http_client
-        };
-        let (req, _) = self.mirror.prepare_get(client, url);
-        Ok(req.timeout(timeout))
+        let (req, _) = self
+            .mirror
+            .get_no_redirect_with_policy(url, Some(timeout), https_only)
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        Ok(req)
     }
 
     pub(crate) fn prepare_routed_post(
@@ -287,26 +254,12 @@ impl L4aEngine {
         if crate::filter::llm::is_loopback_url(url) {
             return Ok(self.loopback_http_client.post(url).timeout(timeout));
         }
-        let resolved = self
-            .mirror
-            .validate_url(url)
-            .map_err(|e| CoreError::Network(e.to_string()))?;
         let https_only = self.config.read().unwrap().https_only;
-        if resolved.insecure_tls && !https_only {
-            let (client, _) = self
-                .mirror
-                .build_client_for(url, Some(timeout))
-                .map_err(|e| CoreError::Network(e.to_string()))?;
-            let (req, _) = self.mirror.prepare_post(&client, url);
-            return Ok(req.timeout(timeout));
-        }
-        let client = if https_only {
-            &self.https_only_http_client
-        } else {
-            &self.standard_http_client
-        };
-        let (req, _) = self.mirror.prepare_post(client, url);
-        Ok(req.timeout(timeout))
+        let (req, _) = self
+            .mirror
+            .post_no_redirect_with_policy(url, Some(timeout), https_only)
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        Ok(req)
     }
 
     pub(crate) fn cached_catalog_scoring_revision(
@@ -697,5 +650,399 @@ mod tests {
             engine.resolve_managed_path(outside_file.to_str().unwrap()),
             Err(CoreError::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn covers_and_routed_requests_reuse_tcp_keep_alive_connections() {
+        use l4a_logging::http::AuditedSend;
+        use l4a_steam::MockSteamBridge;
+        use l4a_workshop::{SourceRoutingPolicy, WorkshopResolver};
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let next_conn_id = Arc::new(AtomicUsize::new(1));
+        let served_conns = Arc::new(Mutex::new(Vec::<(String, usize)>::new()));
+        let served_conns_bg = Arc::clone(&served_conns);
+
+        tokio::spawn(async move {
+            // Minimal valid JPEG header bytes (`image::guess_format` checks magic bytes).
+            let jpeg_bytes: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let conn_id = next_conn_id.fetch_add(1, Ordering::SeqCst);
+                let served_conn = Arc::clone(&served_conns_bg);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut pending = Vec::new();
+                    loop {
+                        let header_end = loop {
+                            if let Some(pos) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break Some(pos + 4);
+                            }
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => break None,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        };
+                        let Some(end) = header_end else {
+                            break;
+                        };
+                        let header_text = String::from_utf8_lossy(&pending[..end]).into_owned();
+                        let path = header_text
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let content_length = header_text
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        pending.drain(..end);
+                        while pending.len() < content_length {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        pending.drain(..content_length);
+
+                        served_conn.lock().unwrap().push((path.clone(), conn_id));
+                        if path.starts_with("/redirect") {
+                            let head = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/blocked\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+                            if socket.write_all(head.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                                jpeg_bytes.len()
+                            );
+                            if socket.write_all(head.as_bytes()).await.is_err()
+                                || socket.write_all(jpeg_bytes).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let loading = dir.path().join("addons");
+        fs::create_dir_all(&loading).unwrap();
+        let mirror = Arc::new(MirrorRouter::from_rules(vec![
+            serde_json::from_value(serde_json::json!({
+                "rules": "images.steamusercontent.com",
+                "target": addr.to_string(),
+            }))
+            .unwrap(),
+            serde_json::from_value(serde_json::json!({
+                "rules": "filter.insecure.test",
+                "target": addr.to_string(),
+                "insecure-tls": true,
+            }))
+            .unwrap(),
+        ]));
+        mirror.set_no_proxy_for_testing(true);
+        let engine = L4aEngine::with_dependencies(
+            AppPaths::from_runtime_dir(dir.path().join("runtime")),
+            Arc::new(LocalDb::open_in_memory().unwrap()),
+            AppConfig {
+                loading_dir: loading.to_string_lossy().into_owned(),
+                https_only: false,
+                ..Default::default()
+            },
+            mirror,
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                Vec::new(),
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(NullEventSink),
+        )
+        .unwrap();
+
+        // 1. Multiple cover fetches share a single keep-alive TCP connection.
+        for idx in 1..=3 {
+            let (mime, bytes) = engine
+                .fetch_workshop_cover(&format!(
+                    "http://images.steamusercontent.com/ugc/{idx}/cover.jpg"
+                ))
+                .await
+                .unwrap();
+            assert_eq!(mime, "image/jpeg");
+            assert!(!bytes.is_empty());
+            tokio::task::yield_now().await;
+        }
+        {
+            let recorded = served_conns.lock().unwrap();
+            assert_eq!(recorded.len(), 3);
+            let cover_conns: HashSet<usize> = recorded.iter().map(|(_, id)| *id).collect();
+            assert_eq!(
+                cover_conns.len(),
+                1,
+                "fetch_workshop_cover should reuse one serving TCP connection across distinct cover URLs"
+            );
+        }
+
+        // 2. Routed GET and POST with insecure-tls mirror rule do not follow redirects and reuse one connection.
+        let resp_get = engine
+            .prepare_routed_get(
+                "http://filter.insecure.test/redirect/get",
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .send_audited_quiet("test.routed.no_redirect.get")
+            .await
+            .unwrap();
+        assert_eq!(resp_get.status(), reqwest::StatusCode::FOUND);
+        let _ = resp_get.bytes().await.unwrap();
+        tokio::task::yield_now().await;
+
+        let resp_post = engine
+            .prepare_routed_post(
+                "http://filter.insecure.test/redirect/post",
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .body("{}")
+            .send_audited_quiet("test.routed.no_redirect.post")
+            .await
+            .unwrap();
+        assert_eq!(resp_post.status(), reqwest::StatusCode::FOUND);
+        let _ = resp_post.bytes().await.unwrap();
+
+        let recorded = served_conns.lock().unwrap();
+        assert_eq!(recorded.len(), 5);
+        let routed_conns: HashSet<usize> = recorded[3..].iter().map(|(_, id)| *id).collect();
+        assert_eq!(
+            routed_conns.len(),
+            1,
+            "insecure-tls no-redirect GET and POST should reuse one dedicated pooled connection"
+        );
+        assert_ne!(
+            recorded[0].1, recorded[3].1,
+            "verified cover pool and insecure-tls routed pool must remain separate connections"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_mirror_router_does_not_override_engine_https_only_policy() {
+        use l4a_steam::MockSteamBridge;
+        use l4a_workshop::{SourceRoutingPolicy, WorkshopResolver};
+
+        let dir = tempdir().unwrap();
+        let loading = dir.path().join("addons");
+        fs::create_dir_all(&loading).unwrap();
+
+        let shared_mirror = Arc::new(MirrorRouter::empty());
+        let strict_engine = L4aEngine::with_dependencies(
+            AppPaths::from_runtime_dir(dir.path().join("runtime-strict")),
+            Arc::new(LocalDb::open_in_memory().unwrap()),
+            AppConfig {
+                loading_dir: loading.to_string_lossy().into_owned(),
+                https_only: true,
+                ..Default::default()
+            },
+            Arc::clone(&shared_mirror),
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                Vec::new(),
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(NullEventSink),
+        )
+        .unwrap();
+
+        // Second engine sharing the same MirrorRouter flips shared_mirror to https_only = false.
+        let permissive_engine = L4aEngine::with_dependencies(
+            AppPaths::from_runtime_dir(dir.path().join("runtime-permissive")),
+            Arc::new(LocalDb::open_in_memory().unwrap()),
+            AppConfig {
+                loading_dir: loading.to_string_lossy().into_owned(),
+                https_only: false,
+                ..Default::default()
+            },
+            Arc::clone(&shared_mirror),
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                Vec::new(),
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(NullEventSink),
+        )
+        .unwrap();
+
+        // Strict engine MUST still reject plain HTTP even though shared_mirror was mutated.
+        assert!(strict_engine
+            .prepare_routed_get("http://filter.example.com/info", Duration::from_secs(5))
+            .is_err());
+        assert!(strict_engine
+            .prepare_routed_post("http://filter.example.com/predict", Duration::from_secs(5))
+            .is_err());
+        assert!(strict_engine
+            .fetch_workshop_cover("http://other.example.com/cover.jpg")
+            .await
+            .is_err());
+
+        // Permissive engine continues to accept HTTP according to its own config.
+        assert!(permissive_engine
+            .prepare_routed_get("http://filter.example.com/info", Duration::from_secs(5))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn filter_preview_image_blocks_cross_origin_ssrf_redirects_and_path_escapes() {
+        use l4a_steam::MockSteamBridge;
+        use l4a_workshop::{SourceRoutingPolicy, WorkshopResolver};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Private internal service that must NEVER be contacted via redirect.
+        let private_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private_addr = private_listener.local_addr().unwrap();
+        let private_hits = Arc::new(AtomicUsize::new(0));
+        let private_hits_bg = Arc::clone(&private_hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = private_listener.accept().await else {
+                    break;
+                };
+                private_hits_bg.fetch_add(1, Ordering::SeqCst);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecret")
+                    .await;
+            }
+        });
+
+        // Mirrored Steam CDN fixture: `/ugc/ssrf` redirects to private_addr; `/ugc/same` redirects same-origin.
+        let mirror_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mirror_addr = mirror_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let jpeg_bytes: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+            loop {
+                let Ok((mut socket, _)) = mirror_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let text = String::from_utf8_lossy(&buf[..n]);
+                    let path = text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if path == "/ugc/ssrf/cover.jpg" {
+                        let resp = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{private_addr}/internal.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else if path == "/ugc/same/cover.jpg" {
+                        let resp = "HTTP/1.1 302 Found\r\nLocation: /ugc/same-final/cover.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            jpeg_bytes.len()
+                        );
+                        let _ = socket.write_all(head.as_bytes()).await;
+                        let _ = socket.write_all(jpeg_bytes).await;
+                    }
+                });
+            }
+        });
+
+        let dir = tempdir().unwrap();
+        let loading = dir.path().join("addons");
+        fs::create_dir_all(&loading).unwrap();
+        let mirror = Arc::new(MirrorRouter::from_rules(vec![serde_json::from_value(
+            serde_json::json!({
+                "rules": "mirror.cdn.test",
+                "target": mirror_addr.to_string(),
+            }),
+        )
+        .unwrap()]));
+        mirror.set_no_proxy_for_testing(true);
+        let engine = L4aEngine::with_dependencies(
+            AppPaths::from_runtime_dir(dir.path().join("runtime")),
+            Arc::new(LocalDb::open_in_memory().unwrap()),
+            AppConfig {
+                loading_dir: loading.to_string_lossy().into_owned(),
+                https_only: false,
+                ..Default::default()
+            },
+            mirror,
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                Vec::new(),
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(NullEventSink),
+        )
+        .unwrap();
+
+        // 1. Cross-origin redirect to an unmirrored private address MUST be rejected before connecting.
+        let ssrf_err = crate::filter::evaluator::load_single_image(
+            &engine,
+            "http://mirror.cdn.test/ugc/ssrf/cover.jpg",
+        )
+        .await;
+        assert!(
+            matches!(ssrf_err, Err(CoreError::InvalidInput(_))),
+            "cross-origin SSRF redirect must be rejected, got {ssrf_err:?}"
+        );
+        assert_eq!(
+            private_hits.load(Ordering::SeqCst),
+            0,
+            "private service must never be contacted via filter image redirect"
+        );
+
+        // 2. Same-origin redirect on the explicitly configured mirror succeeds.
+        let same_ok = crate::filter::evaluator::load_single_image(
+            &engine,
+            "http://mirror.cdn.test/ugc/same/cover.jpg",
+        )
+        .await
+        .expect("same-origin redirect on configured mirror should succeed");
+        assert_eq!(same_ok.mime, "image/jpeg");
+
+        // 3. Direct Steam CDN hop escaping cloud.steampowered.com `/ugc/` path or downgrading to HTTP is rejected.
+        let bad_path = url::Url::parse("https://cloud.steampowered.com/other/secret.jpg").unwrap();
+        let bad_resolved = l4a_mirror::ResolvedRequest {
+            url: bad_path.to_string(),
+            original_host: None,
+            headers: HashMap::new(),
+            insecure_tls: false,
+            matched_rule: false,
+        };
+        assert!(
+            crate::filter::evaluator::validate_filter_image_redirect_hop(
+                &l4a_mirror::RedirectHop {
+                    hop: 1,
+                    url: &bad_path,
+                    same_origin: true,
+                    matched_mirror_rule: false,
+                    resolved: &bad_resolved,
+                }
+            )
+            .is_err()
+        );
     }
 }
