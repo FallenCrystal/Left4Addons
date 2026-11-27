@@ -17,6 +17,7 @@ use l4a_workshop::{
     WorkshopProvider, WorkshopResolver,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -37,6 +38,11 @@ async fn start_router(app: Router) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+fn direct_resource_fingerprint(url: &str) -> String {
+    let resource = serde_json::to_vec(&json!([url, null, {}])).unwrap();
+    format!("{:x}", Sha256::digest(resource))
 }
 
 #[tokio::test]
@@ -351,6 +357,7 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
         serde_json::to_vec(&json!({
             "workshopId": "777",
             "resolvedUrl": format!("{base_url}/addon.vpk"),
+            "resourceFingerprint": direct_resource_fingerprint(&format!("{base_url}/addon.vpk")),
             "destFileName": "777.vpk",
             "totalSize": payload.len(),
             "etag": "etag-v1",
@@ -386,6 +393,7 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
         serde_json::to_vec(&json!({
             "workshopId": "778",
             "resolvedUrl": format!("{base_url}/addon.vpk"),
+            "resourceFingerprint": direct_resource_fingerprint(&format!("{base_url}/addon.vpk")),
             "destFileName": "778.vpk",
             "totalSize": payload.len(),
             "etag": "etag-old",
@@ -454,6 +462,7 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
         serde_json::to_vec(&json!({
             "workshopId": "781",
             "resolvedUrl": format!("{base_url}/addon.vpk"),
+            "resourceFingerprint": direct_resource_fingerprint(&format!("{base_url}/addon.vpk")),
             "destFileName": "781.vpk",
             "totalSize": payload.len(),
             "etag": "etag-v1",
@@ -487,6 +496,7 @@ async fn downloader_supports_resume_etag_reset_retry_and_cancellation() {
         serde_json::to_vec(&json!({
             "workshopId": "782",
             "resolvedUrl": format!("{base_url}/addon.vpk"),
+            "resourceFingerprint": direct_resource_fingerprint(&format!("{base_url}/addon.vpk")),
             "destFileName": "782.vpk",
             "totalSize": payload.len(),
             "etag": "etag-stale",
@@ -561,6 +571,118 @@ async fn wait_for_progress(
 }
 
 #[tokio::test]
+async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials() {
+    use axum::http::header;
+    use std::sync::atomic::AtomicBool;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old_target = format!("http://{}/addon.vpk", listener.local_addr().unwrap());
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let interrupted = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(socket.read(&mut [0; 1024]).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nab")
+            .await
+            .unwrap();
+        wait_for_progress(&mut progress_rx, "partial download", |p| p.downloaded == 2).await;
+        socket.shutdown().await.unwrap();
+    });
+
+    let range_requests = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::clone(&range_requests);
+    let new_server = start_router(Router::new().route(
+        "/addon.vpk",
+        get(move |headers: HeaderMap| {
+            let requests = Arc::clone(&requests);
+            async move {
+                if let Some(range) = headers.get(header::RANGE) {
+                    assert_eq!(range, "bytes=2-");
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    return (
+                        StatusCode::PARTIAL_CONTENT,
+                        [(header::CONTENT_RANGE, "bytes 2-3/4")],
+                        "YZ",
+                    )
+                        .into_response();
+                }
+                (StatusCode::OK, "WXYZ").into_response()
+            }
+        }),
+    ))
+    .await;
+    let new_target = format!("{new_server}/addon.vpk");
+    let switched = Arc::new(AtomicBool::new(false));
+    let use_new_target = Arc::clone(&switched);
+    let entry = start_router(Router::new().route(
+        "/redirect",
+        get(move || {
+            let target = if use_new_target.load(Ordering::SeqCst) {
+                new_target.clone()
+            } else {
+                old_target.clone()
+            };
+            async move { (StatusCode::FOUND, [(header::LOCATION, target)]) }
+        }),
+    ))
+    .await;
+
+    let dir = tempdir().unwrap();
+    let mirror = Arc::new(MirrorRouter::empty());
+    mirror.set_no_proxy_for_testing(true);
+    let downloader = ResilientDownloader::new(dir.path(), mirror)
+        .with_progress_intervals(Duration::ZERO, Duration::from_secs(1));
+    let req = DownloadRequest {
+        workshop_id: WorkshopId(784),
+        url: format!("{entry}/redirect"),
+        dest_path: dir.path().join("addon.vpk"),
+        max_retries: 0,
+    };
+    let result = downloader
+        .download(
+            &req,
+            CancellationToken::new(),
+            Some(Arc::new(move |p| {
+                let _ = progress_tx.send(p);
+            })),
+        )
+        .await;
+    assert!(matches!(result, Err(WorkshopError::Network(_))));
+    interrupted.await.unwrap();
+
+    let part_path = dir.path().join("784.vpk.part");
+    let meta_path = dir.path().join("784.part.meta.json");
+    let partial = std::fs::read(&part_path).unwrap();
+    assert_eq!(partial, b"ab");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceFingerprint");
+
+    switched.store(true, Ordering::SeqCst);
+    let result = downloader
+        .download(&req, CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.resumed_from, 0);
+    assert_eq!(std::fs::read(&req.dest_path).unwrap(), b"WXYZ");
+    assert_eq!(range_requests.load(Ordering::SeqCst), 1);
+
+    std::fs::remove_file(&req.dest_path).unwrap();
+    std::fs::write(part_path, partial).unwrap();
+    std::fs::write(meta_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let result = downloader
+        .download(&req, CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.resumed_from, 0);
+    assert_eq!(std::fs::read(&req.dest_path).unwrap(), b"WXYZ");
+    assert_eq!(range_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_bytes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -628,6 +750,7 @@ async fn downloader_refreshes_speed_on_tick_drops_on_stall_and_excludes_resumed_
         serde_json::to_vec(&json!({
             "workshopId": "901",
             "resolvedUrl": format!("http://{addr}/stream.vpk"),
+            "resourceFingerprint": direct_resource_fingerprint(&format!("http://{addr}/stream.vpk")),
             "destFileName": "901.vpk",
             "totalSize": total,
             "etag": "\"speed-v1\"",
@@ -1091,6 +1214,7 @@ async fn downloader_416_restart_and_steam_web_api_batches_respect_live_https_onl
         serde_json::to_vec(&json!({
             "workshopId": "555",
             "resolvedUrl": req_url,
+            "resourceFingerprint": direct_resource_fingerprint(&req_url),
             "destFileName": "555.vpk",
             "totalSize": 100,
             "etag": null,

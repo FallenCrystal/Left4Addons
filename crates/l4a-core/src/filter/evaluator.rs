@@ -1474,7 +1474,7 @@ fn validate_remote_filter_image_url(
         return Ok(ValidatedRemoteImage::LoopbackTest(normalized));
     }
 
-    // Allow non-Steam URLs only if explicitly rewritten by a configured MirrorRouter rule
+    // An effective mirror rule changes the authority or supplies request headers.
     let https_only = engine.config().https_only;
     let resolved = engine
         .mirror_router()
@@ -1500,8 +1500,7 @@ pub(crate) fn validate_filter_image_redirect_hop(
             "预览图重定向地址不得包含内联凭据".into(),
         ));
     }
-    // Explicitly configured mirror origin (same-origin hop on that mirror, or cross-origin
-    // hop matching another explicit mirror rule): MirrorRouter has already enforced https_only.
+    // Same-origin hops inherit the effective mirror rule from their route.
     if hop.matched_mirror_rule {
         return Ok(());
     }
@@ -2362,6 +2361,54 @@ mod tests {
                 "expected {rejected} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn preview_validation_requires_an_effective_mirror_rule() {
+        use l4a_mirror::{MirrorRouter, RedirectHop};
+        use l4a_steam::MockSteamBridge;
+        use l4a_workshop::{SourceRoutingPolicy, WorkshopResolver};
+        use std::sync::Arc;
+
+        let mirror = Arc::new(MirrorRouter::from_rules(vec![serde_json::from_value(
+            serde_json::json!({
+                "rules": "assets.example.test",
+                "target": "assets.example.test",
+            }),
+        )
+        .unwrap()]));
+        let dir = tempfile::tempdir().unwrap();
+        let engine = L4aEngine::with_dependencies(
+            crate::AppPaths::from_runtime_dir(dir.path()),
+            Arc::new(crate::db::LocalDb::open_in_memory().unwrap()),
+            AppConfig::default(),
+            Arc::clone(&mirror),
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                vec![],
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(crate::NullEventSink),
+        )
+        .unwrap();
+
+        let url = url::Url::parse("https://assets.example.test/cover.jpg").unwrap();
+        assert!(matches!(
+            validate_remote_filter_image_url(&engine, url.as_str()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        let resolved = mirror.resolve(url.as_str());
+        let hop = RedirectHop {
+            hop: 1,
+            url: &url,
+            same_origin: false,
+            matched_mirror_rule: resolved.matched_rule,
+            resolved: &resolved,
+        };
+        assert!(matches!(
+            validate_filter_image_redirect_hop(&hop),
+            Err(CoreError::InvalidInput(_))
+        ));
     }
 
     #[test]

@@ -78,12 +78,19 @@ pub struct ResolvedRequest {
     pub original_host: Option<String>,
     pub headers: HashMap<String, String>,
     pub insecure_tls: bool,
+    /// A configured rule rewrote the authority or supplied request headers.
     pub matched_rule: bool,
 }
 
 impl ResolvedRequest {
     fn has_mirror_overrides(&self, effective_insecure_tls: bool) -> bool {
         effective_insecure_tls || self.original_host.is_some() || !self.headers.is_empty()
+    }
+
+    fn rewrites_authority(&self, source: &url::Url) -> bool {
+        self.matched_rule
+            && url::Url::parse(&self.url)
+                .is_ok_and(|target| url_authority(&target) != url_authority(source))
     }
 }
 
@@ -353,12 +360,17 @@ impl MirrorRouter {
                 let _ = routed_url.set_scheme("https");
             }
             if set_target_host(&mut routed_url, &target) {
+                let original_host = compiled.raw.keep_host.then_some(host);
+                let headers = compiled.raw.headers.clone().unwrap_or_default();
+                let matched_rule = url_authority(&routed_url) != url_authority(&parsed_url)
+                    || original_host.is_some()
+                    || !headers.is_empty();
                 return ResolvedRequest {
                     url: routed_url.into(),
-                    original_host: compiled.raw.keep_host.then_some(host),
-                    headers: compiled.raw.headers.clone().unwrap_or_default(),
+                    original_host,
+                    headers,
                     insecure_tls: compiled.raw.insecure_tls,
-                    matched_rule: true,
+                    matched_rule,
                 };
             }
         }
@@ -638,11 +650,15 @@ impl MirrorRouter {
             .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
         let initial_resolved = self.validate_url_with_policy(url, initial_https_only)?;
         let mut current_resolved = initial_resolved.clone();
-        let mut mirror_source = if initial_resolved.matched_rule {
-            url::Url::parse(url).ok()
-        } else {
-            None
-        };
+        let mut mirror_sources = Vec::new();
+        if initial_resolved.matched_rule {
+            if let Some(source) = url::Url::parse(url)
+                .ok()
+                .filter(|source| initial_resolved.rewrites_authority(source))
+            {
+                mirror_sources.push(source);
+            }
+        }
 
         for hop in 0..=max_redirects {
             let https_only = options
@@ -712,16 +728,15 @@ impl MirrorRouter {
                     ..current_resolved
                 }
             } else {
-                // Match the same host and explicit port as the mirror rules. A direct route
-                // stays direct if the source changes scheme, for example to upgrade to HTTPS.
-                let current = (current_url.host_str(), current_url.port());
-                let target = (next_url.host_str(), next_url.port());
-                let use_direct_route = match &mirror_source {
-                    Some(source) => {
-                        current != target && (source.host_str(), source.port()) == target
-                    }
-                    None => current == target,
-                };
+                // Keep direct requests direct across scheme changes, and honor returns to
+                // any authority that was rewritten earlier in this chain.
+                let current = url_authority(current_url);
+                let target = url_authority(&next_url);
+                let was_direct = !current_resolved.matched_rule && !current_resolved.insecure_tls;
+                let use_direct_route = (was_direct && current == target)
+                    || mirror_sources
+                        .iter()
+                        .any(|source| url_authority(source) == target);
                 let rules = if use_direct_route {
                     &[]
                 } else {
@@ -742,8 +757,8 @@ impl MirrorRouter {
 
             drain_ready_redirect_body(&mut response);
             current_method = next_redirect_method(status, current_method);
-            if !is_same_origin {
-                mirror_source = next_resolved.matched_rule.then_some(next_url);
+            if !is_same_origin && next_resolved.rewrites_authority(&next_url) {
+                mirror_sources.push(next_url);
             }
             current_resolved = next_resolved;
         }
@@ -873,6 +888,10 @@ fn ensure_https_if_required(url: &str, https_only: bool) -> Result<(), MirrorErr
         return Err(MirrorError::HttpsRequired);
     }
     Ok(())
+}
+
+fn url_authority(url: &url::Url) -> (Option<&str>, Option<u16>) {
+    (url.host_str(), url.port())
 }
 
 fn urls_same_origin(a: &url::Url, b: &url::Url) -> bool {
@@ -2095,6 +2114,58 @@ mod tests {
         let source = source_requests.lock().unwrap();
         assert_eq!(source.len(), 1);
         assert_eq!(source[0].headers.get("x-mirror-route"), None);
+    }
+
+    #[tokio::test]
+    async fn mirror_can_return_to_an_earlier_source_in_the_chain() {
+        use reqwest::ResponseBuilderExt;
+
+        let router = MirrorRouter::from_rules(vec![
+            MirrorRule {
+                rules: Some("first.example.test".into()),
+                ..base_rule("first.mirror.test")
+            },
+            MirrorRule {
+                rules: Some("second.example.test".into()),
+                ..base_rule("second.mirror.test")
+            },
+        ]);
+        let steps = [
+            (
+                "https://first.mirror.test/start",
+                Some("https://second.example.test/edge"),
+            ),
+            (
+                "https://second.mirror.test/edge",
+                Some("https://first.example.test/file"),
+            ),
+            ("https://first.example.test/file", None),
+        ];
+        let redirected = router
+            .send_with_redirects(
+                Method::GET,
+                "https://first.example.test/start",
+                RedirectRequestOptions::default(),
+                |req, _, _| req,
+                |_| Ok::<(), ()>(()),
+                |req, hop| async move {
+                    let url = req.build()?.url().clone();
+                    let (expected, location) = steps[hop];
+                    assert_eq!(url.as_str(), expected);
+                    let mut response = http::Response::builder().url(url);
+                    if let Some(location) = location {
+                        response = response
+                            .status(StatusCode::FOUND)
+                            .header(reqwest::header::LOCATION, location);
+                    }
+                    Ok(response.body(reqwest::Body::from("")).unwrap().into())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(redirected.final_resolved.url, steps[2].0);
+        assert!(!redirected.final_resolved.matched_rule);
     }
 
     #[tokio::test]

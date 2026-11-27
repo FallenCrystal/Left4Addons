@@ -2667,9 +2667,11 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
     ];
     let version_two = Arc::new(AtomicBool::new(false));
     let fail_upstream = Arc::new(AtomicBool::new(false));
+    let redirect_loop = Arc::new(AtomicBool::new(false));
     let hits = Arc::new(AtomicUsize::new(0));
     let v2_route = version_two.clone();
     let fail_route = fail_upstream.clone();
+    let redirect_route = redirect_loop.clone();
     let hits_route = hits.clone();
     let jpg_body = minimal_jpeg.clone();
     let png_body = minimal_png.clone();
@@ -2678,11 +2680,19 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
         get(move || {
             let v2 = v2_route.load(Ordering::SeqCst);
             let fail = fail_route.load(Ordering::SeqCst);
+            let redirect = redirect_route.load(Ordering::SeqCst);
             let hits_route = hits_route.clone();
             let jpg = jpg_body.clone();
             let png = png_body.clone();
             async move {
                 hits_route.fetch_add(1, Ordering::SeqCst);
+                if redirect {
+                    return (
+                        axum::http::StatusCode::FOUND,
+                        [("location", "/rotating.img")],
+                        Vec::new(),
+                    );
+                }
                 if fail {
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -2747,4 +2757,10 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
     assert_eq!(mime3, "image/png");
     assert_eq!(bytes3, minimal_png);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+    redirect_loop.store(true, Ordering::SeqCst);
+    let (mime, bytes) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime, "image/png");
+    assert_eq!(bytes, minimal_png);
+    assert!(hits.load(Ordering::SeqCst) > 4);
 }

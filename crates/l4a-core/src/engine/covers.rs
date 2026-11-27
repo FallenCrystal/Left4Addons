@@ -4,7 +4,7 @@ use crate::error::CoreError;
 use crate::file_changes::same_file;
 use crate::filter::evaluator::validate_filter_image_redirect_hop;
 use l4a_logging::http;
-use l4a_mirror::{RedirectRequestOptions, RedirectSendError};
+use l4a_mirror::{MirrorError, RedirectRequestOptions, RedirectSendError};
 use l4a_workshop::WorkshopError;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -96,7 +96,7 @@ impl L4aEngine {
             hash.update(self.mirror.rule_fingerprint());
             hash.update([u8::from(https_only)]);
             hash.update(url.as_bytes());
-            format!("ws_filter_cover_v1_{}", hex::encode(&hash.finalize()[..16]))
+            format!("ws_filter_cover_v2_{}", hex::encode(&hash.finalize()[..16]))
         } else {
             format!(
                 "ws_cover_{}",
@@ -165,14 +165,18 @@ impl L4aEngine {
                 }
             },
             Err(RedirectSendError::Rejected(err)) => return Err(err),
-            Err(RedirectSendError::Mirror(mirror_err)) => {
-                return Err(WorkshopError::Network(mirror_err.to_string()).into());
-            }
-            Err(net_err @ (RedirectSendError::Request(_) | RedirectSendError::Timeout)) => {
+            Err(
+                net_err @ (RedirectSendError::Request(_)
+                | RedirectSendError::Timeout
+                | RedirectSendError::Mirror(MirrorError::TooManyRedirects)),
+            ) => {
                 if let Some((stale_mime, stale_bytes)) = stale_cached {
                     return Ok((stale_mime.to_string(), stale_bytes));
                 }
                 return Err(WorkshopError::Network(net_err.to_string()).into());
+            }
+            Err(RedirectSendError::Mirror(mirror_err)) => {
+                return Err(WorkshopError::Network(mirror_err.to_string()).into());
             }
         };
 

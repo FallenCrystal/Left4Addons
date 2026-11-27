@@ -1,11 +1,13 @@
 use crate::error::WorkshopError;
 use futures_util::StreamExt;
 use l4a_logging::http;
-use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
+use l4a_mirror::{MirrorRouter, RedirectRequestOptions, RedirectedResponse, ResolvedRequest};
 use l4a_protocol::WorkshopId;
 use reqwest::header::{CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -47,6 +49,7 @@ pub struct DownloadResult {
 struct ResumeMetadata {
     workshop_id: WorkshopId,
     resolved_url: String,
+    resource_fingerprint: Option<String>,
     dest_file_name: String,
     total_size: Option<u64>,
     etag: Option<String>,
@@ -188,12 +191,7 @@ impl ResilientDownloader {
             .unwrap_or("addon.vpk")
             .to_string();
 
-        let streaming_opts = RedirectRequestOptions {
-            connect_timeout: Some(self.connect_timeout),
-            read_timeout: Some(self.read_timeout),
-            ..Default::default()
-        };
-        let mut resolved = self
+        let resolved = self
             .mirror
             .validate_url(&req.url)
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
@@ -206,6 +204,7 @@ impl ResilientDownloader {
                     if meta.workshop_id == req.workshop_id
                         && meta.resolved_url == resolved.url
                         && meta.dest_file_name == dest_name
+                        && meta.resource_fingerprint.is_some()
                     {
                         resume_from = fs::metadata(&partial_path).map(|m| m.len()).unwrap_or(0);
                         stored_meta = Some(meta);
@@ -216,72 +215,36 @@ impl ResilientDownloader {
             }
         }
 
-        let response = if resume_from > 0 {
-            let range_header = format!("bytes={resume_from}-");
-            let redirected = self
-                .mirror
-                .send_with_redirects(
-                    Method::GET,
-                    &req.url,
-                    streaming_opts,
-                    |builder, _, _| builder.header(RANGE, &range_header),
-                    |_| Ok::<(), WorkshopError>(()),
-                    |builder, hop| {
-                        http::send_redirect_hop(builder, "workshop.download.resume", hop)
-                    },
-                )
-                .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?;
-            resolved = redirected.initial_resolved;
-            let resp = redirected.response;
-            match resp.status() {
-                StatusCode::PARTIAL_CONTENT => resp,
-                StatusCode::OK => {
-                    self.cleanup_partial(req.workshop_id);
-                    resume_from = 0;
-                    stored_meta = None;
-                    resp
-                }
-                StatusCode::RANGE_NOT_SATISFIABLE => {
-                    self.cleanup_partial(req.workshop_id);
-                    resume_from = 0;
-                    stored_meta = None;
-                    drop(resp);
-                    let fresh = self
-                        .mirror
-                        .send_with_redirects(
-                            Method::GET,
-                            &req.url,
-                            streaming_opts,
-                            |builder, _, _| builder,
-                            |_| Ok::<(), WorkshopError>(()),
-                            |builder, hop| {
-                                http::send_redirect_hop(builder, "workshop.download.restart", hop)
-                            },
-                        )
-                        .await
-                        .map_err(|e| WorkshopError::Network(e.to_string()))?;
-                    resolved = fresh.initial_resolved;
-                    fresh.response
-                }
-                _ => resp,
-            }
+        let mut redirected = if resume_from > 0 {
+            self.send_request(&req.url, Some(resume_from), "workshop.download.resume")
+                .await?
         } else {
-            let redirected = self
-                .mirror
-                .send_with_redirects(
-                    Method::GET,
-                    &req.url,
-                    streaming_opts,
-                    |builder, _, _| builder,
-                    |_| Ok::<(), WorkshopError>(()),
-                    |builder, hop| http::send_redirect_hop(builder, "workshop.download", hop),
-                )
-                .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?;
-            resolved = redirected.initial_resolved;
-            redirected.response
+            self.send_request(&req.url, None, "workshop.download")
+                .await?
         };
+        let mut fingerprint = resource_fingerprint(&redirected.final_resolved);
+        if resume_from > 0 {
+            let status = redirected.response.status();
+            let previous_fingerprint = stored_meta
+                .as_ref()
+                .and_then(|meta| meta.resource_fingerprint.as_deref());
+            let restart = status == StatusCode::RANGE_NOT_SATISFIABLE
+                || (status == StatusCode::PARTIAL_CONTENT
+                    && previous_fingerprint != Some(fingerprint.as_str()));
+            if restart || (status.is_success() && status != StatusCode::PARTIAL_CONTENT) {
+                self.cleanup_partial(req.workshop_id);
+                resume_from = 0;
+                stored_meta = None;
+            }
+            if restart {
+                drop(redirected);
+                redirected = self
+                    .send_request(&req.url, None, "workshop.download.restart")
+                    .await?;
+                fingerprint = resource_fingerprint(&redirected.final_resolved);
+            }
+        }
+        let response = redirected.response;
 
         let status = response.status();
         if !status.is_success() {
@@ -345,25 +308,22 @@ impl ResilientDownloader {
 
         let meta = ResumeMetadata {
             workshop_id: req.workshop_id,
-            resolved_url: resolved.url,
+            resolved_url: redirected.initial_resolved.url,
+            resource_fingerprint: Some(fingerprint),
             dest_file_name: dest_name,
             total_size,
             etag,
             last_modified,
         };
+        let mut file = if resume_from > 0 {
+            OpenOptions::new().append(true).open(&partial_path)?
+        } else {
+            fs::File::create(&partial_path)?
+        };
         fs::write(
             &meta_path,
             serde_json::to_vec_pretty(&meta).unwrap_or_default(),
         )?;
-
-        let mut file = if resume_from > 0 {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&partial_path)?
-        } else {
-            fs::File::create(&partial_path)?
-        };
 
         let mut downloaded = resume_from;
         let mut stream = response.bytes_stream();
@@ -487,6 +447,33 @@ impl ResilientDownloader {
         })
     }
 
+    async fn send_request(
+        &self,
+        url: &str,
+        offset: Option<u64>,
+        purpose: &'static str,
+    ) -> Result<RedirectedResponse, WorkshopError> {
+        let range = offset.map(|offset| format!("bytes={offset}-"));
+        self.mirror
+            .send_with_redirects(
+                Method::GET,
+                url,
+                RedirectRequestOptions {
+                    connect_timeout: Some(self.connect_timeout),
+                    read_timeout: Some(self.read_timeout),
+                    ..Default::default()
+                },
+                |builder, _, _| match &range {
+                    Some(range) => builder.header(RANGE, range),
+                    None => builder,
+                },
+                |_| Ok::<(), WorkshopError>(()),
+                |builder, hop| http::send_redirect_hop(builder, purpose, hop),
+            )
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))
+    }
+
     fn partial_path(&self, id: WorkshopId) -> PathBuf {
         self.cache_dir.join(format!("{id}.vpk.part"))
     }
@@ -499,6 +486,18 @@ impl ResilientDownloader {
         let _ = fs::remove_file(self.partial_path(id));
         let _ = fs::remove_file(self.meta_path(id));
     }
+}
+
+fn resource_fingerprint(resolved: &ResolvedRequest) -> String {
+    let url = resolved
+        .url
+        .split_once('#')
+        .map_or(resolved.url.as_str(), |(url, _)| url);
+    let headers: BTreeMap<_, _> = resolved.headers.iter().collect();
+    // The effective route may contain a signed URL or credentials in its headers.
+    let resource = serde_json::to_vec(&(url, &resolved.original_host, headers))
+        .expect("download resource is serializable");
+    format!("{:x}", Sha256::digest(resource))
 }
 
 fn calc_percent(downloaded: u64, total_size: Option<u64>) -> u8 {
