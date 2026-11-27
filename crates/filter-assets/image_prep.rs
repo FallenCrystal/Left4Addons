@@ -8,9 +8,15 @@
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, RgbImage};
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, Cursor, Write};
 use tokio::sync::Semaphore;
+
+#[path = "webp_worker.rs"]
+mod webp_worker;
+
+pub use webp_worker::init_filter_image_worker;
 
 /// Largest edge accepted by `filter_runner.py` (`MAX_IMAGE_DIMENSION`).
 pub const FILTER_MAX_IMAGE_DIMENSION: u32 = 4_096;
@@ -207,38 +213,51 @@ fn take_jpeg_segment<'a>(headers: &mut &'a [u8]) -> Result<&'a [u8], &'static st
     Ok(&segment[2..])
 }
 
-/// Zune can decode sequential JPEGs a row of MCUs at a time when the first scan
-/// contains every component. Keep the full coefficient budget for other headers.
-fn jpeg_uses_row_buffers(bytes: &[u8]) -> bool {
-    let Some(mut headers) = bytes.strip_prefix(&[0xFF, 0xD8]) else {
-        return false;
-    };
-    let mut components = 0;
+/// Estimate Zune's i16 coefficient buffers using the sampling factors in the SOF.
+/// Sequential JPEGs whose first scan contains every component need only row buffers.
+fn jpeg_coefficient_bytes(bytes: &[u8], width: u64, height: u64) -> Option<u64> {
+    let mut headers = bytes.strip_prefix(&[0xFF, 0xD8])?;
+    let mut frame = None;
     while let Ok(marker) = take_jpeg_marker(&mut headers) {
-        let Ok(segment) = take_jpeg_segment(&mut headers) else {
-            return false;
-        };
+        let segment = take_jpeg_segment(&mut headers).ok()?;
         match marker {
-            0xC0 | 0xC1 if components == 0 => {
-                let [8, _, _, _, _, count @ 1..=4, ..] = segment else {
-                    return false;
+            0xC0..=0xC2 if frame.is_none() => {
+                let [8, _, _, _, _, count @ 1..=4, samples @ ..] = segment else {
+                    return None;
                 };
-                if segment.len() != 6 + 3 * usize::from(*count) {
-                    return false;
+                if samples.len() != 3 * usize::from(*count) {
+                    return None;
                 }
-                components = *count;
+                let (mut max_h, mut max_v, mut blocks_per_mcu) = (1, 1, 0);
+                for &[_, sampling, _] in samples.as_chunks::<3>().0 {
+                    let (h, v) = (u64::from(sampling >> 4), u64::from(sampling & 0xF));
+                    if !(1..=4).contains(&h) || !(1..=4).contains(&v) {
+                        return None;
+                    }
+                    max_h = max_h.max(h);
+                    max_v = max_v.max(v);
+                    blocks_per_mcu += h * v;
+                }
+                let row_bytes = width.div_ceil(8 * max_h) * blocks_per_mcu * 64 * 2;
+                let frame_bytes = row_bytes * height.div_ceil(8 * max_v);
+                if marker == 0xC2 {
+                    return Some(frame_bytes);
+                }
+                frame = Some((*count, row_bytes, frame_bytes));
             }
-            0xDA if components > 0 => {
-                return segment.first() == Some(&components)
+            0xDA => {
+                let (components, row_bytes, frame_bytes) = frame?;
+                let single_scan = segment.first() == Some(&components)
                     && segment.len() == 4 + 2 * usize::from(components)
                     && segment.ends_with(&[0, 63, 0]);
+                return Some(if single_scan { row_bytes } else { frame_bytes });
             }
             // Table, restart interval, application and comment segments.
             0xC4 | 0xDB | 0xDD | 0xE0..=0xEF | 0xFE => {}
-            _ => return false,
+            _ => return None,
         }
     }
-    false
+    None
 }
 
 fn webp_u24(bytes: &[u8]) -> u32 {
@@ -310,17 +329,31 @@ fn check_webp_animation_frame(frame: &[u8], canvas: (u32, u32)) -> Result<(), &'
 
 /// The WebP decoder reports the canvas size for VP8X and allocates VP8 buffers
 /// using the coded frame size. Check that frame before starting the decoder.
-fn checked_webp_source(bytes: &[u8], canvas: (u32, u32)) -> Result<&[u8], &'static str> {
-    if bytes.get(12..16) != Some(b"VP8X") {
-        return Ok(bytes);
-    }
-
+fn checked_webp_source(bytes: &[u8], canvas: (u32, u32)) -> Result<Cow<'_, [u8]>, &'static str> {
     let mut riff_chunk = bytes;
     let (_, riff) = take_webp_chunk(&mut riff_chunk)?;
     // Keep the decoder inside the RIFF envelope used to find the frame.
     let source = &bytes[..8 + riff.len()];
     let mut chunks = riff.strip_prefix(b"WEBP").ok_or("损坏的 WebP 容器头")?;
-    let (_, header) = take_webp_chunk(&mut chunks)?;
+    let (first, header) = take_webp_chunk(&mut chunks)?;
+    if first == b"VP8L" && (canvas.0 == 16_384 || canvas.1 == 16_384) {
+        // image-webp 0.2.4 misreads a maximal VP8L side in the simple container.
+        // An extended canvas preserves the exact size and the original lossless bitstream.
+        let alpha = header.get(4).ok_or("截断的 WebP VP8L 帧头")? & 0x10;
+        let riff_size = u32::try_from(riff.len() + 18).map_err(|_| "WebP 容器过大")?;
+        let mut extended = Vec::with_capacity(source.len() + 18);
+        extended.extend_from_slice(b"RIFF");
+        extended.extend_from_slice(&riff_size.to_le_bytes());
+        extended.extend_from_slice(b"WEBPVP8X\x0a\0\0\0");
+        extended.extend_from_slice(&[alpha, 0, 0, 0]);
+        extended.extend_from_slice(&(canvas.0 - 1).to_le_bytes()[..3]);
+        extended.extend_from_slice(&(canvas.1 - 1).to_le_bytes()[..3]);
+        extended.extend_from_slice(&riff[4..]);
+        return Ok(Cow::Owned(extended));
+    }
+    if first != b"VP8X" {
+        return Ok(Cow::Borrowed(source));
+    }
     if header.len() != 10 {
         return Err("损坏的 WebP VP8X 块长度");
     }
@@ -332,7 +365,7 @@ fn checked_webp_source(bytes: &[u8], canvas: (u32, u32)) -> Result<&[u8], &'stat
             b"ANMF" if animated => {
                 // A still decode of an animation reads only the first frame.
                 check_webp_animation_frame(data, canvas)?;
-                return Ok(source);
+                return Ok(Cow::Borrowed(source));
             }
             b"ANMF" => return Err("静态 WebP 包含动画帧"),
             b"VP8 " | b"VP8L" if !animated => {
@@ -345,21 +378,17 @@ fn checked_webp_source(bytes: &[u8], canvas: (u32, u32)) -> Result<&[u8], &'stat
     if !has_image {
         return Err("WebP 缺少图片帧");
     }
-    Ok(source)
+    Ok(Cow::Borrowed(source))
 }
 
 fn decoder_scratch_bytes(format: ImageFormat, width: u32, height: u32, bytes: &[u8]) -> u64 {
     let (width, height) = (u64::from(width), u64::from(height));
     match format {
         ImageFormat::Jpeg => {
-            // Up to four i16 coefficient planes, padded to MCU boundaries of at
-            // most 32 pixels. The image adapter also copies the compressed input.
-            let coefficient_rows = if jpeg_uses_row_buffers(bytes) {
-                32
-            } else {
-                height + 31
-            };
-            8 * (width + 31) * coefficient_rows + bytes.len() as u64
+            // Keep the four-plane estimate when the header structure is unfamiliar.
+            let coefficients = jpeg_coefficient_bytes(bytes, width, height)
+                .unwrap_or(8 * (width + 31) * (height + 31));
+            coefficients + bytes.len() as u64
         }
         ImageFormat::Png => PNG_DECODER_ALLOC,
         // An animated WebP can hold an RGBA frame and an RGBA canvas alongside the output.
@@ -395,9 +424,9 @@ fn shrink_for_filter(
     let source = if format == ImageFormat::WebP {
         checked_webp_source(bytes, source_size).map_err(|err| ShrinkError::Decode(err.into()))?
     } else {
-        bytes
+        Cow::Borrowed(bytes)
     };
-    let mut reader = ImageReader::with_format(Cursor::new(source), format);
+    let mut reader = ImageReader::with_format(Cursor::new(source.as_ref()), format);
     let mut init_limits = limits.clone();
     if format == ImageFormat::Png {
         init_limits.max_alloc = Some(PNG_DECODER_ALLOC);
@@ -483,15 +512,28 @@ fn encode_filter_jpeg(
     }
 }
 
-/// Probe dimensions without a decoder. Oversized images are shrunk on the blocking pool
-/// one at a time, with their source size checked before decoder initialization.
+/// Probe dimensions without a decoder. Oversized images are resized one at a time,
+/// with their source size checked before decoder initialization.
 pub async fn prepare_for_filter(bytes: Vec<u8>) -> Result<PreparedImage, ShrinkError> {
     let Ok((width, height, format)) = sniff_image_dimensions(&bytes) else {
         return Ok(PreparedImage::Original(bytes));
     };
-    let Some(target_size) = fit_within_filter_limits(width, height) else {
+    let Some(target_size) = shrink_target(width, height)? else {
         return Ok(PreparedImage::Original(bytes));
     };
+    if format == ImageFormat::WebP {
+        return webp_worker::resize(bytes, (width, height), &SHRINK_PERMITS)
+            .await
+            .map(PreparedImage::Shrunk);
+    }
+
+    run_resize(&SHRINK_PERMITS, move || {
+        shrink_for_filter(&bytes, format, (width, height), target_size).map(PreparedImage::Shrunk)
+    })
+    .await
+}
+
+fn shrink_target(width: u32, height: u32) -> Result<Option<(u32, u32)>, ShrinkError> {
     if width > MAX_SHRINK_SOURCE_DIMENSION
         || height > MAX_SHRINK_SOURCE_DIMENSION
         || u64::from(width) * u64::from(height) > MAX_SHRINK_SOURCE_PIXELS
@@ -499,10 +541,7 @@ pub async fn prepare_for_filter(bytes: Vec<u8>) -> Result<PreparedImage, ShrinkE
         return Err(ShrinkError::SourceTooLarge { width, height });
     }
 
-    run_resize(&SHRINK_PERMITS, move || {
-        shrink_for_filter(&bytes, format, (width, height), target_size).map(PreparedImage::Shrunk)
-    })
-    .await
+    Ok(fit_within_filter_limits(width, height))
 }
 
 async fn run_resize(
@@ -633,7 +672,22 @@ mod tests {
                              \x01\x11\x00\x02\x11\x00\x03\x11\x00\
                              \xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00";
         let scratch = decoder_scratch_bytes(ImageFormat::Jpeg, width, height, partial_scan);
-        assert!(scratch + DECODER_HEADROOM + decoded_rgb_bytes > MAX_SHRINK_WORKING_SET);
+        assert_eq!(
+            scratch,
+            6 * u64::from(width * height) + partial_scan.len() as u64
+        );
+    }
+
+    #[test]
+    fn progressive_jpeg_budget_uses_chroma_subsampling() {
+        // 8496x8512 with a 2x2 luma plane and two 1x1 chroma planes.
+        let progressive = b"\xff\xd8\xff\xc2\x00\x11\x08\x21\x40\x21\x30\x03\
+                            \x01\x22\x00\x02\x11\x00\x03\x11\x00";
+        let (width, height, _) = sniff_image_dimensions(progressive).unwrap();
+        let decoded_rgb_bytes = 3 * u64::from(width * height);
+        let scratch = decoder_scratch_bytes(ImageFormat::Jpeg, width, height, progressive);
+        assert_eq!(scratch, decoded_rgb_bytes + progressive.len() as u64);
+        assert!(scratch + DECODER_HEADROOM + decoded_rgb_bytes <= MAX_SHRINK_WORKING_SET);
     }
 
     #[tokio::test]
@@ -662,7 +716,7 @@ mod tests {
                      \xba\x01\xf8\0\x03\xb0\0\xfe\xf0\xfa+\xff3D\xc71\xfbW\xff\xe5*\
                      \xf0X\xdc\xdf\0\0XMP \x06\0\0\0<xmp/>";
         assert_eq!(sniff_image_dimensions(webp), Ok((16, 8, ImageFormat::WebP)));
-        assert_eq!(checked_webp_source(webp, (16, 8)).unwrap(), webp);
+        assert_eq!(checked_webp_source(webp, (16, 8)).unwrap().as_ref(), webp);
         assert_eq!(
             checked_webp_source(webp, (15, 8)),
             Err("WebP 位流与容器声明的帧尺寸不一致")

@@ -9,4 +9,5 @@ pub(crate) const FILTER_RUNNER_PY: &str = include_str!("../../../filter-assets/f
 
 pub use deploy::LocalFilterManager;
 pub use evaluator::{build_addon_filter_target, compute_addon_state_sig, evaluate_targets};
+pub use image_prep::init_filter_image_worker;
 pub use secret::{validate_env_var_name, TokenVault};

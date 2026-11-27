@@ -75,8 +75,9 @@
 - **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
 - 公开预测和管理员试算共用并发配额，JSON 请求体上限为 48 MiB。读取超时返回 `408 Request Timeout`，配额已满时返回 `429 Too Many Requests`。管理员试算在读取请求体前验证身份。
 - **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。
-- **SSRF 与载荷限制**：`imageUrls` 允许受信任的 Steam CDN 域名白名单（`media.steampowered.com`、`*.steamusercontent.com`、`*.steamstatic.com`、`steamuserimages*.akamaihd.net`、`steamcdn*.akamaihd.net` 以及 `cloud*.steampowered.com/ugc/*`），支持 `https://` 并将历史 `http://` Steam CDN 链接自动升级为 `https://` 后抓取；最多跟随 3 次 HTTP 重定向且每跳均须通过 Steam CDN 白名单校验，单图上限 `16 MiB`、超时 `8s`；服务端抓取的预览图若超过 `4096×4096` 像素上限，会在边长不超过 `32768`、总像素不超过 `134217728`（2^27）且按格式估算的内存用量不超过 `768 MiB` 时等比缩放，再编码成不超过 `16 MiB` 的 JPEG 送入模型。必要时降低 JPEG 质量或继续缩小尺寸，超出解码预算的源图会被拒绝；`imagesBase64` 内联图片不做服务端缩放，须由客户端预先缩放到 `4096×4096` 以内（Left4Addons 桌面端会自动处理）。任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
-- 当服务端无法读取请求中的预览图 URL 时，响应附带 `code: "image_fetch_failed"`。客户端可以读取预览图后用 `imagesBase64` 重试。
+- **SSRF 与载荷限制**。`imageUrls` 允许受信任的 Steam CDN 域名白名单（`media.steampowered.com`、`*.steamusercontent.com`、`*.steamstatic.com`、`steamuserimages*.akamaihd.net`、`steamcdn*.akamaihd.net` 以及 `cloud*.steampowered.com/ugc/*`）。支持 `https://`，历史 `http://` Steam CDN 链接会升级为 `https://`。最多跟随 3 次 HTTP 重定向，每跳均须通过白名单校验。单图上限为 `16 MiB`，下载、等待和缩放共用每张图 `8s` 的时限。任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+- 服务端抓取的预览图超过 `4096×4096` 像素上限时，会在边长不超过 `32768`、总像素不超过 `134217728`（2^27）且按格式估算的内存用量不超过 `768 MiB` 时等比缩放，再编码成不超过 `16 MiB` 的 JPEG 送入模型。大尺寸 WebP 由操作系统限制内存为 `768 MiB` 的子进程处理。必要时降低 JPEG 质量或继续缩小尺寸，超出解码预算的源图会被拒绝。`imagesBase64` 须由客户端预先缩放到 `4096×4096` 以内，Left4Addons 桌面端会自动处理。
+- 当服务端无法读取或缩放请求中的预览图时，响应附带 `code: "image_fetch_failed"`。客户端可以读取预览图后用 `imagesBase64` 重试。
 
 ---
 

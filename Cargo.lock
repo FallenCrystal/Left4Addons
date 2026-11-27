@@ -2518,6 +2518,7 @@ dependencies = [
  "l4a-steam",
  "l4a-vpk",
  "l4a-workshop",
+ "libc",
  "notify",
  "regex",
  "reqwest 0.12.28",
@@ -2597,6 +2598,7 @@ dependencies = [
  "l4a-mirror",
  "l4a-protocol",
  "l4a-workshop",
+ "libc",
  "pinyin",
  "qrcode",
  "reqwest 0.12.28",
@@ -2617,6 +2619,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

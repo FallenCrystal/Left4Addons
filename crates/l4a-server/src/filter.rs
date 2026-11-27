@@ -1694,18 +1694,16 @@ impl CatalogFilterService {
                     ));
                 }
 
-                // Validated (and downscaled when needed) by `prepare_fetched_image` below.
-                return Ok(buf);
+                return prepare_fetched_image(buf).await;
             }
             Err(FilterServiceError::BadRequest(
                 "预览图重定向次数超限".to_string(),
             ))
         };
 
-        let buf = tokio::time::timeout(IMAGE_FETCH_TIMEOUT, fut)
+        tokio::time::timeout(IMAGE_FETCH_TIMEOUT, fut)
             .await
-            .map_err(|_| FilterServiceError::BadRequest("拉取预览图超时 (8s)".to_string()))??;
-        prepare_fetched_image(buf).await
+            .map_err(|_| FilterServiceError::BadRequest("读取或缩放预览图超时 (8s)".to_string()))?
     }
 
     fn clear_cache(&self) {

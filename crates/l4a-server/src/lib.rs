@@ -12,6 +12,8 @@ pub mod sync;
 pub mod upstream;
 pub mod web_assets;
 
+pub use image_prep::init_filter_image_worker;
+
 use auth::AdminAuthManager;
 use config::{CatalogConfig, CatalogConfigStore};
 use db::ServerRepo;
