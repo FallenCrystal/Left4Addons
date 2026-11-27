@@ -231,7 +231,7 @@ impl ResilientDownloader {
             let restart = status == StatusCode::RANGE_NOT_SATISFIABLE
                 || (status == StatusCode::PARTIAL_CONTENT
                     && previous_fingerprint != Some(fingerprint.as_str()));
-            if restart || (status.is_success() && status != StatusCode::PARTIAL_CONTENT) {
+            if restart || status == StatusCode::OK {
                 self.cleanup_partial(req.workshop_id);
                 resume_from = 0;
                 stored_meta = None;
@@ -247,7 +247,7 @@ impl ResilientDownloader {
         let response = redirected.response;
 
         let status = response.status();
-        if !status.is_success() {
+        if !matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) {
             let body = response.text().await.unwrap_or_default();
             return Err(WorkshopError::HttpStatus {
                 status: status.as_u16(),

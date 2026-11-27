@@ -623,7 +623,7 @@ impl MirrorRouter {
     /// 逐跳安全执行 HTTP 请求并处理重定向：
     /// - 底层统一复用 `Policy::none()` 的缓存 `reqwest::Client`；
     /// - 每一跳重新读取生效的 `https_only` 策略；
-    /// - 同源重定向保留当前镜像的 `Host` / 自定义请求头 / TLS 配置；
+    /// - 同源重定向保留 URL 凭据与当前镜像的 `Host` / 自定义请求头 / TLS 配置；
     /// - 跨源重定向丢弃上一跳镜像特权与自定义头，按新目标重新匹配规则并切换至受校验客户端；
     /// - 镜像显式重定向回源站时直连源站，并继续执行逐跳校验；
     /// - 每次重定向发起前回调 `validate_hop` 供调用方执行来源白名单等策略校验。
@@ -723,8 +723,20 @@ impl MirrorRouter {
                 .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
             let is_same_origin = urls_same_origin(current_url, &next_url);
             let next_resolved = if is_same_origin {
+                let mut resolved_url = next_url.clone();
+                if resolved_url.username().is_empty() && resolved_url.password().is_none() {
+                    // Reqwest converts URL credentials to Authorization and removes them from
+                    // the response URL used to resolve Location.
+                    let previous = url::Url::parse(&current_resolved.url).ok();
+                    if let Some(previous) =
+                        previous.filter(|url| urls_same_origin(url, current_url))
+                    {
+                        let _ = resolved_url.set_username(previous.username());
+                        let _ = resolved_url.set_password(previous.password());
+                    }
+                }
                 ResolvedRequest {
-                    url: next_url.to_string(),
+                    url: resolved_url.into(),
                     ..current_resolved
                 }
             } else {
@@ -2045,6 +2057,59 @@ mod tests {
             b_entries[0].headers.get("host").map(String::as_str),
             Some("mirrored.example.test")
         );
+    }
+
+    #[tokio::test]
+    async fn redirects_keep_url_credentials_on_the_same_origin() {
+        let (other_origin, other_requests) =
+            start_keep_alive_server(|_| ("200 OK".into(), String::new(), "done".into())).await;
+        let (origin, requests) = start_keep_alive_server(move |req| {
+            let location = if req.path == "/start" {
+                "/next".to_string()
+            } else {
+                format!("{other_origin}/final")
+            };
+            (
+                "307 Temporary Redirect".into(),
+                format!("Location: {location}\r\n"),
+                String::new(),
+            )
+        })
+        .await;
+        let mut url = url::Url::parse(&format!("{origin}/start")).unwrap();
+        url.set_username("fixture").unwrap();
+        url.set_password(Some("test :@")).unwrap();
+        let router = MirrorRouter::empty();
+        router.set_no_proxy_for_testing(true);
+
+        let result = router
+            .send_with_redirects(
+                Method::GET,
+                url.as_str(),
+                RedirectRequestOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+                |req, _, _| req,
+                |_| Ok::<(), ()>(()),
+                |req, _| req.send(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.response.text().await.unwrap(), "done");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let authorization = &requests[0].headers["authorization"];
+        assert!(authorization.starts_with("Basic "));
+        assert_eq!(requests[1].path, "/next");
+        assert_eq!(
+            requests[1].headers.get("authorization"),
+            Some(authorization)
+        );
+        let other_requests = other_requests.lock().unwrap();
+        assert_eq!(other_requests.len(), 1);
+        assert!(!other_requests[0].headers.contains_key("authorization"));
     }
 
     #[tokio::test]

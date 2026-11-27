@@ -571,6 +571,74 @@ async fn wait_for_progress(
 }
 
 #[tokio::test]
+async fn downloader_preserves_partial_when_resume_returns_no_content() {
+    use axum::http::header::{CONTENT_RANGE, RANGE};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let base_url = start_router(Router::new().route(
+        "/addon.vpk",
+        get(move |headers: HeaderMap| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                assert_eq!(headers.get(RANGE).unwrap(), "bytes=3-");
+                if attempt == 0 {
+                    StatusCode::NO_CONTENT.into_response()
+                } else {
+                    (
+                        StatusCode::PARTIAL_CONTENT,
+                        [(CONTENT_RANGE, "bytes 3-5/6")],
+                        "def",
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    ))
+    .await;
+
+    let dir = tempdir().unwrap();
+    let mirror = Arc::new(MirrorRouter::empty());
+    mirror.set_no_proxy_for_testing(true);
+    let downloader = ResilientDownloader::new(dir.path(), mirror);
+    let request = DownloadRequest {
+        workshop_id: WorkshopId(1),
+        url: format!("{base_url}/addon.vpk"),
+        dest_path: dir.path().join("addon.vpk"),
+        max_retries: 0,
+    };
+    let partial_path = dir.path().join("1.vpk.part");
+    let meta_path = dir.path().join("1.part.meta.json");
+    let meta = serde_json::to_vec(&json!({
+        "workshopId": "1",
+        "resolvedUrl": request.url,
+        "resourceFingerprint": direct_resource_fingerprint(&request.url),
+        "destFileName": "addon.vpk",
+        "totalSize": 6
+    }))
+    .unwrap();
+    std::fs::write(&partial_path, b"abc").unwrap();
+    std::fs::write(&meta_path, &meta).unwrap();
+
+    let result = downloader
+        .download(&request, CancellationToken::new(), None)
+        .await;
+    assert!(matches!(
+        result,
+        Err(WorkshopError::HttpStatus { status: 204, .. })
+    ));
+    assert_eq!(std::fs::read(&partial_path).unwrap(), b"abc");
+    assert_eq!(std::fs::read(&meta_path).unwrap(), meta);
+    assert!(!request.dest_path.exists());
+
+    let result = downloader
+        .download(&request, CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(result.resumed_from, 3);
+    assert_eq!(std::fs::read(&request.dest_path).unwrap(), b"abcdef");
+}
+
+#[tokio::test]
 async fn downloader_restarts_on_redirect_target_change_and_for_legacy_partials() {
     use axum::http::header;
     use std::sync::atomic::AtomicBool;
