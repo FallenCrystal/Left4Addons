@@ -1,5 +1,7 @@
 pub mod deploy;
 pub mod evaluator;
+#[path = "../../../filter-assets/image_prep.rs"]
+pub(crate) mod image_prep;
 pub mod llm;
 pub mod secret;
 

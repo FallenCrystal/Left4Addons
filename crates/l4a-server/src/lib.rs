@@ -4,6 +4,8 @@ mod credentials;
 pub mod db;
 pub mod filter;
 pub mod hybrid_search;
+#[path = "../../filter-assets/image_prep.rs"]
+mod image_prep;
 pub mod routes;
 pub mod search;
 pub mod sync;

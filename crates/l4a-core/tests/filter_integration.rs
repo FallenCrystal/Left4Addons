@@ -1132,6 +1132,85 @@ async fn custom_endpoint_raw_predict_fallback_and_unimodal_followup() {
 }
 
 #[tokio::test]
+async fn oversized_preview_images_are_downscaled_before_reaching_the_filter() {
+    // Wider than the runner's 4096 px cap, which Pillow would reject as a decompression bomb.
+    let big: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(5000, 400, Rgb([30, 60, 90]));
+    let mut png = Cursor::new(Vec::new());
+    big.write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let big_data_url = format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(png.into_inner())
+    );
+
+    let seen_sizes = Arc::new(Mutex::new(Vec::<(u32, u32)>::new()));
+    let seen_ref = seen_sizes.clone();
+    let app = Router::new().route(
+        "/predict",
+        post(move |Json(req): Json<RawFilterPredictRequest>| {
+            let seen_ref = seen_ref.clone();
+            async move {
+                for b64 in &req.images_base64 {
+                    let bytes = STANDARD.decode(b64).unwrap();
+                    let img = image::load_from_memory(&bytes).unwrap();
+                    seen_ref.lock().unwrap().push((img.width(), img.height()));
+                }
+                Json(json!({ "prob": 0.02, "gore_prob": 0.01, "nsfw_prob": 0.02 }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let dir = tempdir().unwrap();
+    let loading_dir = dir.path().join("addons");
+    std::fs::create_dir_all(&loading_dir).unwrap();
+    let engine = make_engine(
+        dir.path(),
+        AppConfig {
+            loading_dir: loading_dir.to_str().unwrap().into(),
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+    );
+
+    let verdicts = unwrap_verdicts(
+        engine
+            .evaluate_filter_items(vec![FilterEvaluationTarget {
+                target_key: "ws:9002".into(),
+                addon_id: None,
+                workshop_id: None,
+                title: "Huge Screenshot Map".into(),
+                description: None,
+                tags: Vec::new(),
+                image_sources: vec![big_data_url],
+                revision_hint: None,
+                bypass_cache: false,
+            }])
+            .await
+            .unwrap(),
+    );
+
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].complete, "oversized image must not be dropped");
+    assert_eq!(verdicts[0].evaluated_image_indices, vec![0]);
+    let seen = seen_sizes.lock().unwrap().clone();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter().all(|&size| size == (4096, 327)),
+        "filter received images outside the runner limits: {seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn local_python_runner_daemon_lifecycle_and_live_reconfigure() {
     let dir = tempdir().unwrap();
     let upstream_repo = dir.path().join("upstream-runner-repo");

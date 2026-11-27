@@ -1,6 +1,7 @@
 use crate::config::{CatalogConfigStore, FilterSection};
 use crate::credentials::write_private_file;
 use crate::db::ServerRepo;
+use crate::image_prep;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use l4a_logging::http::AuditedSend;
@@ -1693,7 +1694,7 @@ impl CatalogFilterService {
                     ));
                 }
 
-                validate_image_bytes(&buf)?;
+                // Validated (and downscaled when needed) by `prepare_fetched_image` below.
                 return Ok(buf);
             }
             Err(FilterServiceError::BadRequest(
@@ -1701,9 +1702,10 @@ impl CatalogFilterService {
             ))
         };
 
-        tokio::time::timeout(IMAGE_FETCH_TIMEOUT, fut)
+        let buf = tokio::time::timeout(IMAGE_FETCH_TIMEOUT, fut)
             .await
-            .map_err(|_| FilterServiceError::BadRequest("拉取预览图超时 (8s)".to_string()))?
+            .map_err(|_| FilterServiceError::BadRequest("拉取预览图超时 (8s)".to_string()))??;
+        prepare_fetched_image(buf).await
     }
 
     fn clear_cache(&self) {
@@ -2001,6 +2003,48 @@ fn check_image_dimensions(w: u32, h: u32, fmt_name: &str) -> Result<(), FilterSe
 
 /// Zero-dependency pure-Rust image magic-byte and header-dimension validator against decompression bombs.
 pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
+    let (w, h, fmt_name) = sniff_image_dimensions(bytes)?;
+    check_image_dimensions(w, h, fmt_name)
+}
+
+/// Validates a preview image fetched from the trusted Steam CDN, downscaling it when it is
+/// only rejected for exceeding the runner's pixel limits. Workshop screenshots larger than
+/// 4096x4096 are legitimate and must not make the whole evaluation fail.
+async fn prepare_fetched_image(bytes: Vec<u8>) -> Result<Vec<u8>, FilterServiceError> {
+    let (w, h, fmt_name) = sniff_image_dimensions(&bytes)?;
+    let pixels = u64::from(w) * u64::from(h);
+    if image_prep::fit_within_filter_limits(w, h).is_none()
+        || w > image_prep::MAX_SHRINK_SOURCE_DIMENSION
+        || h > image_prep::MAX_SHRINK_SOURCE_DIMENSION
+        || pixels > image_prep::MAX_SHRINK_SOURCE_PIXELS
+    {
+        check_image_dimensions(w, h, fmt_name)?;
+        return Ok(bytes);
+    }
+    match image_prep::prepare_for_filter(bytes).await {
+        Ok(image_prep::PreparedImage::Shrunk(shrunk)) => {
+            tracing::info!(
+                source_width = shrunk.source_size.0,
+                source_height = shrunk.source_size.1,
+                width = shrunk.output_size.0,
+                height = shrunk.output_size.1,
+                "Downscaled oversized Workshop preview image before content filtering"
+            );
+            validate_image_bytes(&shrunk.bytes)?;
+            Ok(shrunk.bytes)
+        }
+        Ok(image_prep::PreparedImage::Original(original)) => {
+            validate_image_bytes(&original)?;
+            Ok(original)
+        }
+        Err(err) => Err(FilterServiceError::BadRequest(format!(
+            "{fmt_name} 预览图 ({w}x{h}) 缩放失败: {err}"
+        ))),
+    }
+}
+
+/// Reads the pixel size from a PNG, GIF, JPEG or WebP header without decoding the image.
+fn sniff_image_dimensions(bytes: &[u8]) -> Result<(u32, u32, &'static str), FilterServiceError> {
     if bytes.is_empty() {
         return Err(FilterServiceError::BadRequest(
             "图片内容不能为空".to_string(),
@@ -2027,7 +2071,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
         }
         let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
         let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        return check_image_dimensions(w, h, "PNG");
+        return Ok((w, h, "PNG"));
     }
 
     // 2. GIF: `GIF87a` or `GIF89a` followed by logical screen width & height (little-endian u16).
@@ -2039,7 +2083,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
         }
         let w = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
         let h = u16::from_le_bytes([bytes[8], bytes[9]]) as u32;
-        return check_image_dimensions(w, h, "GIF");
+        return Ok((w, h, "GIF"));
     }
 
     // 3. JPEG: `\xFF\xD8` followed by segments until SOF0..SOF3 / SOF5..SOF7 / SOF9..SOF11 / SOF13..SOF15.
@@ -2096,7 +2140,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
                 }
                 let h = u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]) as u32;
                 let w = u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]) as u32;
-                return check_image_dimensions(w, h, "JPEG");
+                return Ok((w, h, "JPEG"));
             }
 
             pos += seg_len;
@@ -2124,7 +2168,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
                 }
                 let w = (u16::from_le_bytes([bytes[26], bytes[27]]) & 0x3FFF) as u32;
                 let h = (u16::from_le_bytes([bytes[28], bytes[29]]) & 0x3FFF) as u32;
-                return check_image_dimensions(w, h, "WebP");
+                return Ok((w, h, "WebP"));
             }
             b"VP8L" => {
                 if chunk_size < 5 || bytes.len() < 25 || bytes[20] != 0x2F {
@@ -2135,7 +2179,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
                 let bits = u32::from_le_bytes([bytes[21], bytes[22], bytes[23], bytes[24]]);
                 let w = (bits & 0x3FFF) + 1;
                 let h = ((bits >> 14) & 0x3FFF) + 1;
-                return check_image_dimensions(w, h, "WebP");
+                return Ok((w, h, "WebP"));
             }
             b"VP8X" => {
                 if chunk_size < 10 || bytes.len() < 30 {
@@ -2147,7 +2191,7 @@ pub fn validate_image_bytes(bytes: &[u8]) -> Result<(), FilterServiceError> {
                     (bytes[24] as u32 | ((bytes[25] as u32) << 8) | ((bytes[26] as u32) << 16)) + 1;
                 let h =
                     (bytes[27] as u32 | ((bytes[28] as u32) << 8) | ((bytes[29] as u32) << 16)) + 1;
-                return check_image_dimensions(w, h, "WebP");
+                return Ok((w, h, "WebP"));
             }
             _ => {
                 return Err(FilterServiceError::BadRequest(
@@ -2943,6 +2987,32 @@ mod tests {
         assert!(validate_image_bytes(&vp8x_ok).is_ok());
 
         assert!(validate_image_bytes(b"not-an-image-header").is_err());
+    }
+
+    #[tokio::test]
+    async fn fetched_oversized_images_are_downscaled_but_bombs_are_still_rejected() {
+        let mut big = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(4500, 300, image::Rgb([5, 120, 200]))
+            .write_to(&mut big, image::ImageFormat::Png)
+            .unwrap();
+        let big = big.into_inner();
+        assert!(validate_image_bytes(&big).is_err());
+
+        let shrunk = prepare_fetched_image(big).await.unwrap();
+        validate_image_bytes(&shrunk).unwrap();
+        let decoded = image::load_from_memory(&shrunk).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (4096, 273));
+
+        let small = minimal_png(512, 512);
+        assert_eq!(prepare_fetched_image(small.clone()).await.unwrap(), small);
+
+        // Headers beyond the decode budget are rejected without decoding anything.
+        assert!(prepare_fetched_image(minimal_png(20_000, 20_000))
+            .await
+            .is_err());
+        assert!(prepare_fetched_image(b"not-an-image-header".to_vec())
+            .await
+            .is_err());
     }
 
     #[test]
