@@ -3,12 +3,18 @@ import * as ipc from '../../api/ipc';
 import type {
   AddonBatchReport,
   AddonDirType,
+  AddonId,
   AddonSummary,
   AppConfig,
   BundleRecord,
   CoreEvent,
   DashboardSnapshot,
+  DeployLocalFilterRequest,
+  FilterEvaluationBatchResponse,
+  FilterEvaluationTarget,
+  FilterTokenStatus,
   LoadoutProfile,
+  LocalFilterDeploymentStatus,
   ProfileApplyReport,
   ReconcileAction,
   ReconcileBatchItem,
@@ -20,6 +26,7 @@ import type {
   SteamCapabilities,
   SyncReport,
   TrackedCollectionRecord,
+  UpsertFilterExclusionRequest,
   UserGroup,
   WorkshopItemRecord,
 } from '../../api/ipc';
@@ -127,6 +134,20 @@ export interface DesktopClient {
   searchByMapCode: (query: string) => Promise<AddonSummary[]>;
   openExternalUrl: (url: string) => Promise<void>;
   openInFileManager: (path: string) => Promise<void>;
+  getLocalFilterStatus: () => Promise<LocalFilterDeploymentStatus>;
+  checkLocalFilterUpdates: () => Promise<LocalFilterDeploymentStatus>;
+  deployLocalFilter: (request: DeployLocalFilterRequest) => Promise<LocalFilterDeploymentStatus>;
+  startLocalFilterService: () => Promise<LocalFilterDeploymentStatus>;
+  stopLocalFilterService: () => Promise<LocalFilterDeploymentStatus>;
+  getFilterTokenStatus: () => Promise<FilterTokenStatus>;
+  setFilterLlmToken: (token: string | null) => Promise<FilterTokenStatus>;
+  evaluateFilterItems: (
+    targets: FilterEvaluationTarget[],
+    automatic?: boolean,
+  ) => Promise<FilterEvaluationBatchResponse>;
+  clearFilterCache: () => Promise<ipc.FilterCacheClearResult>;
+  upsertFilterExclusion: (request: UpsertFilterExclusionRequest) => Promise<DashboardSnapshot>;
+  deleteFilterExclusion: (addonId: AddonId) => Promise<DashboardSnapshot>;
   subscribeCoreEvents: (handler: (ev: CoreEvent) => void) => Promise<() => void>;
 }
 
@@ -167,6 +188,17 @@ export function getClient(tauri: boolean): DesktopClient {
       searchByMapCode: ipc.searchByMapCode,
       openExternalUrl: ipc.openExternalUrl,
       openInFileManager: ipc.openInFileManager,
+      getLocalFilterStatus: ipc.getLocalFilterStatus,
+      checkLocalFilterUpdates: ipc.checkLocalFilterUpdates,
+      deployLocalFilter: ipc.deployLocalFilter,
+      startLocalFilterService: ipc.startLocalFilterService,
+      stopLocalFilterService: ipc.stopLocalFilterService,
+      getFilterTokenStatus: ipc.getFilterTokenStatus,
+      setFilterLlmToken: ipc.setFilterLlmToken,
+      evaluateFilterItems: ipc.evaluateFilterItems,
+      clearFilterCache: ipc.clearFilterCache,
+      upsertFilterExclusion: ipc.upsertFilterExclusion,
+      deleteFilterExclusion: ipc.deleteFilterExclusion,
       subscribeCoreEvents: ipc.subscribeCoreEvents,
     };
   }
@@ -206,6 +238,17 @@ export function getClient(tauri: boolean): DesktopClient {
     searchByMapCode: (q) => previewEngine.searchByMapCode(q),
     openExternalUrl: (u) => previewEngine.openExternalUrl(u),
     openInFileManager: (p) => previewEngine.openInFileManager(p),
+    getLocalFilterStatus: () => previewEngine.getLocalFilterStatus(),
+    checkLocalFilterUpdates: () => previewEngine.checkLocalFilterUpdates(),
+    deployLocalFilter: (req) => previewEngine.deployLocalFilter(req),
+    startLocalFilterService: () => previewEngine.startLocalFilterService(),
+    stopLocalFilterService: () => previewEngine.stopLocalFilterService(),
+    getFilterTokenStatus: () => previewEngine.getFilterTokenStatus(),
+    setFilterLlmToken: (tok) => previewEngine.setFilterLlmToken(tok),
+    evaluateFilterItems: (targets, automatic) => previewEngine.evaluateFilterItems(targets, automatic),
+    clearFilterCache: () => previewEngine.clearFilterCache(),
+    upsertFilterExclusion: (req) => previewEngine.upsertFilterExclusion(req),
+    deleteFilterExclusion: (id) => previewEngine.deleteFilterExclusion(id),
     subscribeCoreEvents: async (h) => previewEngine.subscribe(h),
   };
 }

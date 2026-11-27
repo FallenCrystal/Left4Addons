@@ -1,12 +1,19 @@
 import type {
   AddonBatchReport,
   AddonDirType,
+  AddonId,
   AddonSummary,
   AppConfig,
   BundleRecord,
   CoreEvent,
   DashboardSnapshot,
+  DeployLocalFilterRequest,
+  FilterCacheClearResult,
+  FilterEvaluationBatchResponse,
+  FilterEvaluationTarget,
+  FilterTokenStatus,
   LoadoutProfile,
+  LocalFilterDeploymentStatus,
   ProfileApplyReport,
   ReconcileAction,
   ReconcileBatchItem,
@@ -18,10 +25,18 @@ import type {
   SteamCapabilities,
   SyncReport,
   TrackedCollectionRecord,
+  UpsertFilterExclusionRequest,
   UserGroup,
   WorkshopItemRecord,
 } from './ipc';
 import { IpcError } from './ipc';
+import { computeFilterPolicySignature } from '../utils/contentFilter';
+import {
+  deletePreviewFilterExclusion,
+  PreviewFilterRuntime,
+  reconcilePreviewExclusions,
+  upsertPreviewFilterExclusion,
+} from './preview/filter';
 import { createInitialSnapshot } from './preview/fixtures';
 import {
   applyPreviewProfile,
@@ -49,13 +64,22 @@ class PreviewEngine {
   private state: DashboardSnapshot = createInitialSnapshot();
   private listeners = new Set<(event: CoreEvent) => void>();
   private activeDownloads = new Map<string, PreviewDownloadToken>();
+  private filterRuntime = new PreviewFilterRuntime();
 
   reset(): void {
     this.state = createInitialSnapshot();
     this.activeDownloads.clear();
+    this.filterRuntime.reset();
   }
 
   private cloneSnapshot(): DashboardSnapshot {
+    reconcilePreviewExclusions(this.state);
+    this.state.filterPolicySignature = computeFilterPolicySignature(this.state.config.filter, {
+      catalogServerUrl: this.state.config.catalogServerUrl,
+      httpsOnly: this.state.config.httpsOnly,
+    });
+    this.state.cachedFilterVerdicts = this.filterRuntime.getCachedVerdictsForSnapshot(this.state);
+    this.state.filterCacheGeneration = this.filterRuntime.cacheGeneration;
     return structuredClone(this.state);
   }
 
@@ -289,6 +313,73 @@ class PreviewEngine {
 
   async openInFileManager(_path: string): Promise<void> {
     // Preview mode has no local file manager.
+  }
+
+  async getLocalFilterStatus(): Promise<LocalFilterDeploymentStatus> {
+    return this.filterRuntime.getStatus();
+  }
+
+  async checkLocalFilterUpdates(): Promise<LocalFilterDeploymentStatus> {
+    return this.filterRuntime.checkUpdates(this.emit);
+  }
+
+  async deployLocalFilter(
+    request: DeployLocalFilterRequest,
+  ): Promise<LocalFilterDeploymentStatus> {
+    const status = this.filterRuntime.deploy(request, this.emit);
+    const trimmedRepo = request.repoUrl?.trim();
+    if (trimmedRepo && this.state.config.filter.repoUrl !== trimmedRepo) {
+      this.state.config.filter.repoUrl = trimmedRepo;
+    }
+    if (this.state.config.filter.trackLatest !== request.trackLatest) {
+      this.state.config.filter.trackLatest = request.trackLatest;
+    }
+    const nextPinned = request.trackLatest ? null : (request.targetCommit?.trim() || null);
+    if ((this.state.config.filter.pinnedCommit ?? null) !== nextPinned) {
+      this.state.config.filter.pinnedCommit = nextPinned;
+    }
+    this.emit({ type: 'snapshot_updated', externalChange: false });
+    return status;
+  }
+
+  async startLocalFilterService(): Promise<LocalFilterDeploymentStatus> {
+    return this.filterRuntime.startService(this.emit);
+  }
+
+  async stopLocalFilterService(): Promise<LocalFilterDeploymentStatus> {
+    return this.filterRuntime.stopService(this.emit);
+  }
+
+  async getFilterTokenStatus(): Promise<FilterTokenStatus> {
+    return this.filterRuntime.getTokenStatus(this.state.config.filter);
+  }
+
+  async setFilterLlmToken(token: string | null): Promise<FilterTokenStatus> {
+    return this.filterRuntime.setLlmToken(token, this.state.config.filter);
+  }
+
+  async evaluateFilterItems(
+    targets: FilterEvaluationTarget[],
+    automatic = false,
+  ): Promise<FilterEvaluationBatchResponse> {
+    return this.filterRuntime.evaluateItems(targets, this.state.config.filter, this.emit, {
+      catalogServerUrl: this.state.config.catalogServerUrl,
+      httpsOnly: this.state.config.httpsOnly,
+    }, automatic);
+  }
+
+  async clearFilterCache(): Promise<FilterCacheClearResult> {
+    return this.filterRuntime.clearCache();
+  }
+
+  async upsertFilterExclusion(
+    request: UpsertFilterExclusionRequest,
+  ): Promise<DashboardSnapshot> {
+    return upsertPreviewFilterExclusion(this.state, this.emit, request);
+  }
+
+  async deleteFilterExclusion(addonId: AddonId): Promise<DashboardSnapshot> {
+    return deletePreviewFilterExclusion(this.state, this.emit, addonId);
   }
 }
 

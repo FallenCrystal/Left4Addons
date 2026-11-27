@@ -193,6 +193,17 @@ pub fn run() {
             commands::delete_profile,
             commands::apply_profile,
             commands::search_by_map_code,
+            commands::get_local_filter_status,
+            commands::check_local_filter_updates,
+            commands::deploy_local_filter,
+            commands::start_local_filter_service,
+            commands::stop_local_filter_service,
+            commands::get_filter_token_status,
+            commands::set_filter_llm_token,
+            commands::evaluate_filter_items,
+            commands::clear_filter_cache,
+            commands::upsert_filter_exclusion,
+            commands::delete_filter_exclusion,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

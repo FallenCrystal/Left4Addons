@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 mod credentials;
 pub mod db;
+pub mod filter;
 pub mod hybrid_search;
 pub mod routes;
 pub mod search;
@@ -12,6 +13,7 @@ pub mod web_assets;
 use auth::AdminAuthManager;
 use config::{CatalogConfig, CatalogConfigStore};
 use db::ServerRepo;
+use filter::CatalogFilterService;
 use hybrid_search::HybridSearchService;
 use std::path::Path;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ pub struct ServerState {
     pub upstream: Arc<dyn WorkshopUpstream>,
     pub sync: Arc<CatalogSyncCoordinator>,
     pub search: Arc<HybridSearchService>,
+    pub filter: Arc<CatalogFilterService>,
 }
 
 impl ServerState {
@@ -72,6 +75,7 @@ impl ServerState {
             repo.clone(),
             upstream.clone(),
         ));
+        let filter = CatalogFilterService::new(config_store.clone(), repo.clone());
         Self {
             config_store,
             repo,
@@ -79,6 +83,7 @@ impl ServerState {
             upstream,
             sync,
             search,
+            filter,
         }
     }
 

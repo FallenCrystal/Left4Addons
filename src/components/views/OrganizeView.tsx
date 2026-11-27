@@ -9,6 +9,12 @@ import type {
   TrackedCollectionRecord,
   UserGroup,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import type { LiveDownloadState } from '../../state/useAppController';
+import {
+  getAddonSearchRedaction,
+  resolveLibraryAddonCardFilter,
+} from '../../utils/contentFilter';
 import { matchesAddonSearch } from '../../utils/format';
 import { Button, IconButton, Tabs } from '../m3/primitives';
 import type { ExternalAddonFilter } from './LibraryView';
@@ -28,6 +34,7 @@ export interface OrganizeViewProps {
   collections: TrackedCollectionRecord[];
   userGroups: UserGroup[];
   profiles: LoadoutProfile[];
+  liveDownloads?: Record<string, LiveDownloadState>;
   busy: boolean;
   onRebuildBundles: () => void;
   onCreateBundle: () => void;
@@ -59,6 +66,7 @@ export function OrganizeView({
   collections,
   userGroups,
   profiles,
+  liveDownloads,
   busy,
   onRebuildBundles,
   onCreateBundle,
@@ -107,18 +115,39 @@ export function OrganizeView({
     [addons],
   );
 
+  const filterCtx = useContentFilterContext();
   const needle = query.trim().toLowerCase();
 
+  const accessibleBundles = useMemo(
+    () =>
+      bundles.filter((b) => {
+        const members = b.memberAddonIds
+          .map((id) => addonsById.get(id))
+          .filter((a): a is AddonSummary => Boolean(a));
+        if (members.length === 0) return true;
+        return members.some((m) => !resolveLibraryAddonCardFilter(m, filterCtx).hiddenCard);
+      }),
+    [bundles, addonsById, filterCtx],
+  );
+
   const filteredBundles = useMemo(() => {
-    if (!needle) return bundles;
-    return bundles.filter((b) => {
-      if (b.name.toLowerCase().includes(needle)) return true;
-      return b.memberAddonIds.some((id) => {
-        const addon = addonsById.get(id);
-        return addon ? matchesAddonSearch(addon, needle) : false;
-      });
+    if (!needle) return accessibleBundles;
+    return accessibleBundles.filter((b) => {
+      const visibleMembers = b.memberAddonIds
+        .map((id) => addonsById.get(id))
+        .filter(
+          (a): a is AddonSummary =>
+            Boolean(a) && !resolveLibraryAddonCardFilter(a!, filterCtx).hiddenCard,
+        );
+      const allRedacted =
+        visibleMembers.length > 0 &&
+        visibleMembers.every((m) => getAddonSearchRedaction(m, filterCtx).redactTitle);
+      if (!allRedacted && b.name.toLowerCase().includes(needle)) return true;
+      return visibleMembers.some((addon) =>
+        matchesAddonSearch(addon, needle, getAddonSearchRedaction(addon, filterCtx)),
+      );
     });
-  }, [bundles, needle, addonsById]);
+  }, [accessibleBundles, needle, addonsById, filterCtx]);
 
   const filteredCollections = useMemo(() => {
     if (!needle) return collections;
@@ -126,10 +155,12 @@ export function OrganizeView({
       if (c.title.toLowerCase().includes(needle) || c.collectionId.includes(needle)) return true;
       return c.memberWorkshopIds.some((wid) => {
         const addon = addonsByWorkshopId.get(wid);
-        return addon ? matchesAddonSearch(addon, needle) : false;
+        if (!addon) return wid.toLowerCase().includes(needle);
+        if (resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) return false;
+        return matchesAddonSearch(addon, needle, getAddonSearchRedaction(addon, filterCtx));
       });
     });
-  }, [collections, needle, addonsByWorkshopId]);
+  }, [collections, needle, addonsByWorkshopId, filterCtx]);
 
   const filteredGroups = useMemo(() => {
     if (!needle) return userGroups;
@@ -138,10 +169,11 @@ export function OrganizeView({
       if (g.tags.some((tag) => tag.toLowerCase().includes(needle))) return true;
       return g.addonIds.some((id) => {
         const addon = addonsById.get(id);
-        return addon ? matchesAddonSearch(addon, needle) : false;
+        if (!addon || resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) return false;
+        return matchesAddonSearch(addon, needle, getAddonSearchRedaction(addon, filterCtx));
       });
     });
-  }, [userGroups, needle, addonsById]);
+  }, [userGroups, needle, addonsById, filterCtx]);
 
   const filteredProfiles = useMemo(() => {
     if (!needle) return profiles;
@@ -151,13 +183,16 @@ export function OrganizeView({
       }
       return p.enabledAddonIds.some((id) => {
         const addon = addonsById.get(id);
-        return addon ? matchesAddonSearch(addon, needle) : false;
+        if (!addon || resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard) return false;
+        return matchesAddonSearch(addon, needle, getAddonSearchRedaction(addon, filterCtx));
       });
     });
-  }, [profiles, needle, addonsById]);
+  }, [profiles, needle, addonsById, filterCtx]);
 
   const inspectedBundle =
-    inspected?.kind === 'bundle' ? (bundles.find((b) => b.id === inspected.id) ?? null) : null;
+    inspected?.kind === 'bundle'
+      ? (accessibleBundles.find((b) => b.id === inspected.id) ?? null)
+      : null;
   const inspectedCollection =
     inspected?.kind === 'collection'
       ? (collections.find((c) => c.collectionId === inspected.id) ?? null)
@@ -228,7 +263,7 @@ export function OrganizeView({
         value={tab}
         onChange={setTab}
         tabs={[
-          { value: 'bundles', label: t('organize.bundles'), count: bundles.length },
+          { value: 'bundles', label: t('organize.bundles'), count: accessibleBundles.length },
           { value: 'collections', label: t('organize.collections'), count: collections.length },
           { value: 'groups', label: t('organize.groups'), count: userGroups.length },
           { value: 'profiles', label: t('organize.profiles'), count: profiles.length },
@@ -264,6 +299,7 @@ export function OrganizeView({
             filteredCollections={filteredCollections}
             addonsByWorkshopId={addonsByWorkshopId}
             namePreference={namePreference}
+            liveDownloads={liveDownloads}
             busy={busy}
             onInspectCollection={(id) => setInspected({ kind: 'collection', id })}
             onDownloadWorkshopItem={onDownloadWorkshopItem}
@@ -313,6 +349,7 @@ export function OrganizeView({
         addonsByWorkshopId={addonsByWorkshopId}
         loadingAddons={loadingAddons}
         namePreference={namePreference}
+        liveDownloads={liveDownloads}
         busy={busy}
         onClose={() => setInspected(null)}
         onToggleBundleLock={onToggleBundleLock}

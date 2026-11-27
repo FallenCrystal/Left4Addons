@@ -4980,3 +4980,2337 @@ async fn search_preserves_terms_beyond_sixteen_across_hybrid_and_local_fallback(
         vec![9952]
     );
 }
+
+#[tokio::test]
+async fn filter_disabled_returns_public_disabled_info_and_503_on_predict() {
+    let state = ServerState::in_memory("test-admin-password").unwrap();
+    let app = build_router(state);
+
+    let (status, bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&bytes).unwrap();
+    assert!(!info.enabled);
+    assert!(!info.ready);
+    assert_eq!(info.max_images, 2);
+
+    let (pred_status, pred_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Any Addon" })),
+    )
+    .await;
+    assert_eq!(pred_status, StatusCode::SERVICE_UNAVAILABLE);
+    let err_val: serde_json::Value = serde_json::from_slice(&pred_bytes).unwrap();
+    assert!(err_val["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let (ov_status, ov_bytes) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/overview",
+        vec![("x-admin-token", "test-admin-password")],
+        None,
+    )
+    .await;
+    assert_eq!(ov_status, StatusCode::OK);
+    let overview: CatalogOverviewResponse = serde_json::from_slice(&ov_bytes).unwrap();
+    assert!(!overview.filter.config.enabled);
+    assert!(!overview.filter.ready);
+}
+
+#[tokio::test]
+async fn filter_upstream_http_predict_calibration_cache_and_toml_persistence() {
+    use axum::routing::{get, post};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let predict_calls = Arc::new(AtomicUsize::new(0));
+    let captured_requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let calls_cl = predict_calls.clone();
+    let reqs_cl = captured_requests.clone();
+    let mock_upstream = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "model": "MockLeft4Filters",
+                    "version": "2.4.0"
+                }))
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let calls = calls_cl.clone();
+                let reqs = reqs_cl.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    reqs.lock().unwrap().push(payload);
+                    axum::Json(json!({
+                        "prob": 0.88,
+                        "goreProb": 0.82,
+                        "nsfwProb": 0.45,
+                        "textProb": 0.75,
+                        "textGoreProb": 0.70,
+                        "textNsfwProb": 0.35,
+                        "titleProb": 0.72,
+                        "descriptionProb": 0.40
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = listener.local_addr().unwrap();
+    let upstream_url = format!("http://{mock_addr}");
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_upstream).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("catalog.toml");
+    let mut initial_cfg = CatalogConfig::default();
+    initial_cfg.admin.password = "filter-secret-pass".to_string();
+    initial_cfg.server.db_path = dir.path().join("catalog.db");
+    initial_cfg.save_to(&config_path).unwrap();
+
+    let (state, _) = ServerState::open_config_file(&config_path).unwrap();
+    let app = build_router(state);
+    let admin_hdr = vec![("x-admin-token", "filter-secret-pass")];
+
+    // 1. Enable UpstreamHttp via PATCH /api/v1/admin/config/filter and verify persistence to catalog.toml.
+    let enable_dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::UpstreamHttp,
+        deploy_dir: None,
+        python_bin: None,
+        upstream_url: Some(upstream_url.clone()),
+        cache_ttl_secs: 3600,
+        params: l4a_protocol::FilterPresetId::Recommended.default_params(),
+    };
+    let (patch_status, patch_bytes) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&enable_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(patch_status, StatusCode::OK);
+    let status_resp: l4a_protocol::CatalogFilterStatus =
+        serde_json::from_slice(&patch_bytes).unwrap();
+    assert!(status_resp.ready);
+    assert_eq!(status_resp.model_name.as_deref(), Some("MockLeft4Filters"));
+    assert_eq!(status_resp.model_version.as_deref(), Some("2.4.0"));
+
+    let persisted_raw = std::fs::read_to_string(&config_path).unwrap();
+    let persisted_cfg: CatalogConfig = toml::from_str(&persisted_raw).unwrap();
+    assert!(persisted_cfg.filter.enabled);
+    assert_eq!(
+        persisted_cfg.filter.backend,
+        l4a_protocol::CatalogFilterBackendKind::UpstreamHttp
+    );
+    assert_eq!(
+        persisted_cfg.filter.upstream_url.as_deref(),
+        Some(upstream_url.as_str())
+    );
+
+    // 2. Public GET /api/v1/filter/info reflects ready status and model metadata.
+    let (info_code, info_bytes) =
+        json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(info_code, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&info_bytes).unwrap();
+    assert!(info.enabled);
+    assert!(info.ready);
+    assert_eq!(info.model_name.as_deref(), Some("MockLeft4Filters"));
+
+    // 3. Public POST /api/v1/filter/predict ignores client-injected parameter fields and caches identical inputs.
+    let req_body = json!({
+        "title": "Extreme Gore Pack",
+        "description": "Bloody textures",
+        "tags": ["Textures"],
+        "goreWeight": 0.0,
+        "params": { "goreWeight": 0.0, "nsfwWeight": 0.0 }
+    });
+    let (p1_code, p1_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body.clone()),
+    )
+    .await;
+    assert_eq!(p1_code, StatusCode::OK);
+    let p1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p1_bytes).unwrap();
+    assert!((p1.prob - 0.88).abs() < 1e-5);
+    assert!((p1.gore_prob - 0.82).abs() < 1e-5);
+    assert!((p1.nsfw_prob - 0.45).abs() < 1e-5);
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 1);
+
+    // Second identical request hits TTL cache without calling upstream again.
+    let (p2_code, p2_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body.clone()),
+    )
+    .await;
+    assert_eq!(p2_code, StatusCode::OK);
+    let p2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p2_bytes).unwrap();
+    assert_eq!(p1, p2);
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 1);
+
+    let (st_code, st_bytes) = json_request(
+        &app,
+        "GET",
+        "/api/v1/admin/filter/status",
+        admin_hdr.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(st_code, StatusCode::OK);
+    let st: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&st_bytes).unwrap();
+    assert_eq!(st.total_requests, 2);
+    assert_eq!(st.cache_hits, 1);
+
+    // 4. Switch server calibration to NsfwOnly (goreWeight = 0.0) via admin PATCH:
+    //    invalidates cache, zeroes out goreProb, and calibrates overall prob to nsfwProb (0.45).
+    let nsfw_only_dto = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterPresetId::NsfwOnly.default_params(),
+        ..enable_dto
+    };
+    let (cal_code, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&nsfw_only_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(cal_code, StatusCode::OK);
+
+    let reloaded_cfg: CatalogConfig =
+        toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    assert_eq!(reloaded_cfg.filter.gore_weight, 0.0);
+    assert_eq!(reloaded_cfg.filter.nsfw_weight, 1.0);
+
+    let (p3_code, p3_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(req_body),
+    )
+    .await;
+    assert_eq!(p3_code, StatusCode::OK);
+    let p3: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p3_bytes).unwrap();
+    assert_eq!(predict_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(p3.gore_prob, 0.0);
+    assert!((p3.nsfw_prob - 0.45).abs() < 1e-5);
+    assert!((p3.prob - 0.45).abs() < 1e-5);
+    assert_eq!(p3.text_gore_prob, Some(0.0));
+    assert_eq!(p3.text_prob, Some(0.35));
+
+    // 5. Admin restart and sandbox test endpoints + audit logs.
+    let (rst_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/restart",
+        admin_hdr.clone(),
+        None,
+    )
+    .await;
+    assert_eq!(rst_code, StatusCode::OK);
+
+    let (test_code, test_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/test",
+        admin_hdr.clone(),
+        Some(json!({ "title": "Admin Sandbox Check" })),
+    )
+    .await;
+    assert_eq!(test_code, StatusCode::OK);
+    let test_probs: l4a_protocol::FilterProbabilities =
+        serde_json::from_slice(&test_bytes).unwrap();
+    assert_eq!(test_probs.gore_prob, 0.0);
+
+    let (audit_code, audit_bytes) =
+        json_request(&app, "GET", "/api/v1/admin/audit?limit=20", admin_hdr, None).await;
+    assert_eq!(audit_code, StatusCode::OK);
+    let audits: Vec<l4a_protocol::AuditLogEntry> = serde_json::from_slice(&audit_bytes).unwrap();
+    let actions: Vec<&str> = audits.iter().map(|a| a.action.as_str()).collect();
+    assert!(actions.contains(&"filter_config_update"));
+    assert!(actions.contains(&"filter_restart"));
+
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn filter_workshop_id_lookup_populates_public_items_and_rejects_ssrf_and_restricted_items() {
+    use axum::routing::{get, post};
+    use base64::Engine;
+
+    let sample_png: &'static [u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x02\x00\x00\x00\x00\x00\x00\x00";
+    let captured_requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reqs_cl = captured_requests.clone();
+
+    let mock_srv = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({ "status": "ok", "model": "MockModel", "version": "1.0" }))
+            }),
+        )
+        .route(
+            "/fixture.png",
+            get(move || async move { ([(header::CONTENT_TYPE, "image/png")], sample_png) }),
+        )
+        .route(
+            "/evil-redirect",
+            get(|| async {
+                (
+                    StatusCode::FOUND,
+                    [(header::LOCATION, "https://evil.example.com/ssrf.png")],
+                    "",
+                )
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let reqs = reqs_cl.clone();
+                async move {
+                    reqs.lock().unwrap().push(payload);
+                    axum::Json(json!({
+                        "prob": 0.64,
+                        "goreProb": 0.12,
+                        "nsfwProb": 0.61,
+                        "textProb": 0.22,
+                        "imageProb": 0.58
+                    }))
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_srv).await;
+    });
+
+    let mut cfg = CatalogConfig::default();
+    cfg.admin.password = "test-admin-password".to_string();
+    cfg.filter.enabled = true;
+    cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+    cfg.filter.upstream_url = Some(format!("http://{addr}"));
+    cfg.filter.max_images = 2;
+
+    let store = Arc::new(CatalogConfigStore::new(None, cfg));
+    let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+    let state = ServerState::with_components(store, repo, Arc::new(MockWorkshopUpstream::new()));
+
+    // Insert public active item 55001, private item 55002, and unlisted item 55003.
+    let mut public_item = sample_item(55001, "Public Anime Survivor", 500, None);
+    public_item.description = Some("Custom survivor model description".to_string());
+    public_item.tags = vec!["Survivors".to_string(), "Models".to_string()];
+    public_item.preview_url = Some(format!("http://{addr}/fixture.png"));
+    public_item.previews = vec![];
+    state.repo.upsert_item(&public_item, false, true).unwrap();
+
+    let mut private_item = sample_item(55002, "Hidden Private Title", 500, None);
+    private_item.status = WorkshopItemStatus::PrivateOrUnavailable;
+    private_item.description = Some("Top secret private description".to_string());
+    state.repo.upsert_item(&private_item, false, true).unwrap();
+
+    let mut unlisted_item = sample_item(55003, "Unlisted Secret Item", 500, None);
+    unlisted_item.description = Some("Unlisted secret description".to_string());
+    state
+        .repo
+        .apply_upstream_outcomes_with_policy(
+            &[WorkshopObservation {
+                outcome: WorkshopFetchOutcome::Found {
+                    item: unlisted_item,
+                },
+                listed: false,
+                consumer_appid: Some(550),
+            }],
+            l4a_server::db::CatalogIndexPolicy::CacheOnly,
+        )
+        .unwrap();
+
+    let app = build_router(state.clone());
+
+    // 1. Default SSRF enforcement (production mode: loopback HTTP and arbitrary hosts rejected with 400).
+    for disallowed_url in [
+        "https://evil.example.com/a.png",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://images.steamusercontent.com:8080/ugc/123/custom_http_port.jpg",
+        "https://images.steamusercontent.com:8443/ugc/123/custom_port.jpg",
+        "https://cloud-3.steampowered.com/non-ugc/not_allowed.jpg",
+        &format!("http://{addr}/fixture.png"),
+    ] {
+        let (code, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({
+                "title": "SSRF Probe",
+                "imageUrls": [disallowed_url]
+            })),
+        )
+        .await;
+        assert_eq!(
+            code,
+            StatusCode::BAD_REQUEST,
+            "expected 400 Bad Request for disallowed imageUrl: {disallowed_url}"
+        );
+    }
+    assert!(captured_requests.lock().unwrap().is_empty());
+
+    // 2. Enable test loopback flag to test local image fetch & cross-host redirect SSRF protection.
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+
+    let (redir_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Redirect SSRF Probe",
+            "imageUrls": [format!("http://{addr}/evil-redirect")]
+        })),
+    )
+    .await;
+    assert_eq!(redir_code, StatusCode::BAD_REQUEST);
+
+    // 3. Public active `workshopId` populates title, description, tags, and preview image bytes.
+    let (ok_code, ok_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "55001" })),
+    )
+    .await;
+    assert_eq!(ok_code, StatusCode::OK);
+    let ok_probs: l4a_protocol::FilterProbabilities = serde_json::from_slice(&ok_bytes).unwrap();
+    assert!((ok_probs.prob - 0.64).abs() < 1e-5);
+
+    {
+        let reqs = captured_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0]["title"], "Public Anime Survivor");
+        assert_eq!(reqs[0]["description"], "Custom survivor model description");
+        assert_eq!(reqs[0]["tags"], json!(["Survivors", "Models"]));
+        assert!(reqs[0].get("imagesBase64").is_none());
+        let imgs = reqs[0]["images_base64"].as_array().unwrap();
+        assert_eq!(imgs.len(), 1);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode(sample_png);
+        assert_eq!(imgs[0].as_str(), Some(expected_b64.as_str()));
+    }
+
+    // 4. Private (55002), unlisted (55003), and missing (55999) items return identical 404 Not Found
+    //    and never leak restricted metadata into the filter backend.
+    for restricted_id in ["55002", "55003", "55999"] {
+        let (code, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "workshopId": restricted_id })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "workshopId={restricted_id}");
+    }
+    assert_eq!(captured_requests.lock().unwrap().len(), 1);
+
+    // Even if caller supplies `title` alongside a private `workshopId`, private description is never read.
+    let (partial_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "55002", "title": "Caller Title Only" })),
+    )
+    .await;
+    assert_eq!(partial_code, StatusCode::OK);
+    {
+        let reqs = captured_requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1]["title"], "Caller Title Only");
+        assert_eq!(reqs[1]["description"], "");
+    }
+
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn admin_filter_routes_authenticate_before_parsing_and_preserve_host_paths() {
+    let state = ServerState::in_memory("filter-admin-password").unwrap();
+    let trusted_dir = std::path::PathBuf::from("/opt/left4filters/deploy");
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.deploy_dir = Some(trusted_dir.clone());
+            cfg.filter.python_bin = Some("/opt/left4filters/venv/bin/python".into());
+        })
+        .unwrap();
+    let app = build_router(state.clone());
+
+    let (unauthenticated, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/admin/filter/test",
+        vec![],
+        Some(json!("not a prediction object")),
+    )
+    .await;
+    assert_eq!(unauthenticated, StatusCode::UNAUTHORIZED);
+
+    let headers = vec![("x-admin-token", "filter-admin-password")];
+    for request in [
+        json!({"deployDir": "/elsewhere/deploy"}),
+        json!({"pythonBin": "/elsewhere/python"}),
+    ] {
+        let (code, _) = json_request(
+            &app,
+            "PATCH",
+            "/api/v1/admin/config/filter",
+            headers.clone(),
+            Some(request),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    let (code, bytes) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        headers,
+        Some(json!({"cacheTtlSecs": 60})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let status: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status.config.deploy_dir.as_deref(), trusted_dir.to_str());
+    assert_eq!(
+        status.config.python_bin.as_deref(),
+        Some("/opt/left4filters/venv/bin/python")
+    );
+    assert_eq!(state.config_store.get().filter.cache_ttl_secs, 60);
+}
+
+#[tokio::test]
+async fn upstream_prediction_failure_invalidates_readiness_and_reprobes_model() {
+    use axum::{
+        routing::{get, post},
+        Json,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let phase = Arc::new(AtomicUsize::new(0));
+    let health_phase = phase.clone();
+    let predict_phase = phase.clone();
+    let upstream = axum::Router::new()
+        .route(
+            "/health",
+            get(move || {
+                let version = if health_phase.load(Ordering::SeqCst) == 2 {
+                    "2"
+                } else {
+                    "1"
+                };
+                async move { Json(json!({ "model": "fixture-model", "version": version })) }
+            }),
+        )
+        .route(
+            "/predict",
+            post(move || {
+                let unavailable = predict_phase.load(Ordering::SeqCst) == 1;
+                async move {
+                    if unavailable {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({ "error": "unavailable" })),
+                        )
+                    } else {
+                        (StatusCode::OK, Json(json!({ "prob": 0.3 })))
+                    }
+                }
+            }),
+        );
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(socket, upstream).await.unwrap() });
+
+    let state = ServerState::in_memory("filter-test-secret").unwrap();
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.enabled = true;
+            cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+            cfg.filter.upstream_url = Some(format!("http://{addr}"));
+        })
+        .unwrap();
+    let info = state.filter.public_info().await;
+    assert!(info.ready);
+    assert_eq!(info.model_version.as_deref(), Some("1"));
+
+    phase.store(1, Ordering::SeqCst);
+    assert!(matches!(
+        state
+            .filter
+            .predict(l4a_protocol::FilterPredictRequest {
+                title: Some("Catalog fixture".into()),
+                ..Default::default()
+            })
+            .await,
+        Err(l4a_server::filter::FilterServiceError::Unavailable(_))
+    ));
+    let unavailable = state.filter.public_info().await;
+    assert!(!unavailable.ready);
+    assert!(unavailable.scoring_revision.is_none());
+
+    phase.store(2, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let recovered = state.filter.public_info().await;
+    assert!(recovered.ready);
+    assert_eq!(recovered.model_version.as_deref(), Some("2"));
+    assert_ne!(recovered.scoring_revision, info.scoring_revision);
+    upstream_task.abort();
+}
+
+fn configure_host_filter_paths(state: &ServerState, dto: &l4a_protocol::CatalogFilterConfigDto) {
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.deploy_dir = dto.deploy_dir.as_ref().map(std::path::PathBuf::from);
+            cfg.filter.python_bin = dto.python_bin.clone();
+        })
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filter_managed_python_runner_spawns_live_reconfigures_and_terminates_cleanly() {
+    use axum::routing::get;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let dir = tempfile::tempdir().unwrap();
+    let deploy_dir = dir.path().join("deploy");
+    let py_shim_dir = dir.path().join("pyshims");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    std::fs::create_dir_all(py_shim_dir.join("PIL")).unwrap();
+
+    // Minimal numpy + PIL shims sufficient for `FILTER_RUNNER_PY` SDK fallback mode.
+    std::fs::write(py_shim_dir.join("numpy.py"), "float32 = float\n").unwrap();
+    std::fs::write(
+        py_shim_dir.join("PIL").join("Image.py"),
+        "MAX_IMAGE_PIXELS = None\n",
+    )
+    .unwrap();
+    std::fs::write(py_shim_dir.join("PIL").join("__init__.py"), "").unwrap();
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        r#"class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        self.config = {"model_name": "ManagedMockONNX", "version": "3.1.0"}
+        self.num_threads = num_threads
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        return {"prob": 0.80, "gore_prob": 0.75, "nsfw_prob": 0.30}
+"#,
+    )
+    .unwrap();
+
+    let py_wrapper = dir.path().join("python_wrapper.sh");
+    std::fs::write(
+        &py_wrapper,
+        format!(
+            "#!/usr/bin/env bash\nexport PYTHONPATH=\"{}:${{PYTHONPATH:-}}\"\nexec python3 \"$@\"\n",
+            py_shim_dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&py_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let state = ServerState::in_memory("managed-secret").unwrap();
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+    let app = build_router(state.clone());
+    let admin_hdr = vec![("x-admin-token", "managed-secret")];
+
+    // 1. Start ManagedPython runner via admin config PATCH.
+    let cfg_v1 = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(deploy_dir.display().to_string()),
+        python_bin: Some(py_wrapper.display().to_string()),
+        upstream_url: None,
+        cache_ttl_secs: 3600,
+        params: l4a_protocol::FilterPresetId::Recommended.default_params(),
+    };
+    configure_host_filter_paths(&state, &cfg_v1);
+    let (code1, bytes1) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_v1).unwrap()),
+    )
+    .await;
+    assert_eq!(code1, StatusCode::OK);
+    let st1: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes1).unwrap();
+    assert!(st1.ready, "last_error={:?}", st1.last_error);
+    let pid1 = st1
+        .running_pid
+        .expect("ManagedPython should report running_pid");
+    assert_eq!(st1.model_name.as_deref(), Some("ManagedMockONNX"));
+    assert_eq!(st1.model_version.as_deref(), Some("3.1.0"));
+
+    // 2. Run prediction (unadjusted Recommended preset).
+    let (p1_code, p1_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Managed Test" })),
+    )
+    .await;
+    assert_eq!(p1_code, StatusCode::OK);
+    let p1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p1_bytes).unwrap();
+    assert!((p1.gore_prob - 0.75).abs() < 1e-5);
+    assert!((p1.nsfw_prob - 0.30).abs() < 1e-5);
+
+    let fetch_started = Arc::new(Notify::new());
+    let finish_fetch = Arc::new(Notify::new());
+    let cdn = axum::Router::new().route(
+        "/preview",
+        get({
+            let fetch_started = fetch_started.clone();
+            let finish_fetch = finish_fetch.clone();
+            move || {
+                let started = fetch_started.clone();
+                let finish = finish_fetch.clone();
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR\0\0\0\x04\0\0\0\x04".to_vec()
+                }
+            }
+        }),
+    );
+    let cdn_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let preview_url = format!("http://{}/preview", cdn_socket.local_addr().unwrap());
+    let cdn_task = tokio::spawn(async move { axum::serve(cdn_socket, cdn).await.unwrap() });
+    let prediction_app = app.clone();
+    let inflight = tokio::spawn(async move {
+        json_request(
+            &prediction_app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "title": "Live update during fetch", "imageUrls": [preview_url] })),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), fetch_started.notified())
+        .await
+        .unwrap();
+
+    // Reconfigure while the first request is still fetching its preview.
+    let cfg_v2 = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterModelParams {
+            enable_image: false,
+            ..l4a_protocol::FilterPresetId::NsfwOnly.default_params()
+        },
+        ..cfg_v1.clone()
+    };
+    let (code2, bytes2) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_v2).unwrap()),
+    )
+    .await;
+    assert_eq!(code2, StatusCode::OK);
+    let st2: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes2).unwrap();
+    assert!(st2.ready);
+    assert_eq!(
+        st2.running_pid,
+        Some(pid1),
+        "live /configure should preserve running child PID"
+    );
+
+    let (p2_code, p2_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Managed Test" })),
+    )
+    .await;
+    assert_eq!(p2_code, StatusCode::OK);
+    let p2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p2_bytes).unwrap();
+    assert_eq!(p2.gore_prob, 0.0);
+    assert!((p2.nsfw_prob - 0.30).abs() < 1e-5);
+    assert!((p2.prob - 0.30).abs() < 1e-5);
+
+    finish_fetch.notify_one();
+    let (code, body) = inflight.await.unwrap();
+    assert_eq!(code, StatusCode::OK);
+    let updated: l4a_protocol::FilterProbabilities = serde_json::from_slice(&body).unwrap();
+    assert_ne!(updated.scoring_revision, p1.scoring_revision);
+    assert_eq!(updated, p2);
+    cdn_task.abort();
+
+    // 4. Disable filter and verify running_pid is cleared.
+    let cfg_off = l4a_protocol::CatalogFilterConfigDto {
+        enabled: false,
+        ..cfg_v2
+    };
+    let (code3, bytes3) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr,
+        Some(serde_json::to_value(&cfg_off).unwrap()),
+    )
+    .await;
+    assert_eq!(code3, StatusCode::OK);
+    let st3: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&bytes3).unwrap();
+    assert!(!st3.ready);
+    assert_eq!(st3.running_pid, None);
+}
+
+#[tokio::test]
+async fn filter_hardening_oversized_dimensions_input_bounds_sanitized_503_and_legacy_steam_cdn_upgrade(
+) {
+    use axum::body::Body;
+    use axum::routing::{get, post};
+    use base64::Engine;
+    use tower::ServiceExt;
+
+    // 1. Early disabled middleware rejects `/api/v1/filter/predict` BEFORE buffering body!
+    let disabled_state = ServerState::in_memory("secret-admin-pw").unwrap();
+    let disabled_app = build_router(disabled_state.clone());
+    let body_read_attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_cl = body_read_attempted.clone();
+    let unbuffered_stream = futures_util::stream::poll_fn(move |_| {
+        flag_cl.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+            b"{\"title\":\"huge\"}",
+        ))))
+    });
+    let early_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/filter/predict")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(unbuffered_stream))
+        .unwrap();
+    let early_resp = disabled_app.clone().oneshot(early_req).await.unwrap();
+    assert_eq!(early_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !body_read_attempted.load(std::sync::atomic::Ordering::SeqCst),
+        "disabled route middleware must reject before reading request body"
+    );
+    let early_json: serde_json::Value = serde_json::from_slice(
+        &http_body_util::BodyExt::collect(early_resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(early_json["error"], "内容过滤服务未启用");
+
+    // 2. Legacy L4D2 Steam CDN HTTP URLs upgrade cleanly to HTTPS while preserving SSRF rejections.
+    for (legacy_http, expected_https) in [
+        (
+            "http://cloud-3.steamusercontent.com/ugc/8829102/preview_legacy.jpg",
+            "https://cloud-3.steamusercontent.com/ugc/8829102/preview_legacy.jpg",
+        ),
+        (
+            "http://steamuserimages-a.akamaihd.net/ugc/991234/shot.png",
+            "https://steamuserimages-a.akamaihd.net/ugc/991234/shot.png",
+        ),
+        (
+            "http://media.steampowered.com/steamcommunity/public/images/items/550/a.jpg",
+            "https://media.steampowered.com/steamcommunity/public/images/items/550/a.jpg",
+        ),
+        (
+            "http://cloud-4.steampowered.com/ugc/112233/old_l4d2.jpg",
+            "https://cloud-4.steampowered.com/ugc/112233/old_l4d2.jpg",
+        ),
+    ] {
+        let upgraded = l4a_server::filter::validate_allowed_image_url(legacy_http, false).unwrap();
+        assert_eq!(upgraded.as_str(), expected_https);
+    }
+
+    // 3. Reject cloud metadata IP `169.254.169.254` in `PATCH /api/v1/admin/config/filter`.
+    let admin_hdr = vec![("x-admin-token", "secret-admin-pw")];
+    let bad_upstream_dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::UpstreamHttp,
+        deploy_dir: None,
+        python_bin: None,
+        upstream_url: Some("http://169.254.169.254/latest/meta-data".to_string()),
+        cache_ttl_secs: 60,
+        params: l4a_protocol::FilterModelParams::default(),
+    };
+    let (meta_code, _) = json_request(
+        &disabled_app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&bad_upstream_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(meta_code, StatusCode::BAD_REQUEST);
+
+    // 4. Sanitized public `503` vs detailed admin `503` when backend is broken/unreachable.
+    let secret_internal_path = "/srv/internal-secret-models/missing-l4filter-dir";
+    let broken_managed_dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(secret_internal_path.to_string()),
+        python_bin: None,
+        upstream_url: None,
+        cache_ttl_secs: 60,
+        params: l4a_protocol::FilterModelParams::default(),
+    };
+    configure_host_filter_paths(&disabled_state, &broken_managed_dto);
+    let (cfg_code, _) = json_request(
+        &disabled_app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&broken_managed_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(cfg_code, StatusCode::OK);
+
+    let (pub_503_code, pub_503_bytes) = json_request(
+        &disabled_app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Probe Public Error" })),
+    )
+    .await;
+    assert_eq!(pub_503_code, StatusCode::SERVICE_UNAVAILABLE);
+    let pub_err: serde_json::Value = serde_json::from_slice(&pub_503_bytes).unwrap();
+    assert_eq!(pub_err["error"], "内容过滤服务暂不可用");
+    assert!(!pub_err["error"]
+        .as_str()
+        .unwrap()
+        .contains(secret_internal_path));
+
+    let (adm_503_code, adm_503_bytes) = json_request(
+        &disabled_app,
+        "POST",
+        "/api/v1/admin/filter/test",
+        admin_hdr.clone(),
+        Some(json!({ "title": "Probe Admin Error" })),
+    )
+    .await;
+    assert_eq!(adm_503_code, StatusCode::SERVICE_UNAVAILABLE);
+    let adm_err: serde_json::Value = serde_json::from_slice(&adm_503_bytes).unwrap();
+    assert!(
+        adm_err["error"]
+            .as_str()
+            .unwrap()
+            .contains(secret_internal_path),
+        "admin test endpoint should retain diagnostic detail, got: {:?}",
+        adm_err
+    );
+
+    // 5. Start a healthy mock upstream to test oversized image dimension bomb rejection (400),
+    //    strict input bounds (400), and early `imagesBase64` slicing before decoding.
+    let predict_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_cl = predict_hits.clone();
+    let mock_upstream = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({ "status": "ok", "model": "Mock", "version": "1.0" }))
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let hits = hits_cl.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if payload["title"] == "Backend rejection" {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({ "error": secret_internal_path })),
+                        );
+                    }
+                    let count = payload["images_base64"]
+                        .as_array()
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "prob": 0.25,
+                            "goreProb": 0.10,
+                            "nsfwProb": 0.20,
+                            "textProb": 0.15,
+                            "imageProb": if count > 0 { Some(0.25) } else { None }
+                        })),
+                    )
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_upstream).await;
+    });
+
+    let params_max1 = l4a_protocol::FilterModelParams {
+        max_images: 1,
+        ..Default::default()
+    };
+    let healthy_dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::UpstreamHttp,
+        deploy_dir: None,
+        python_bin: None,
+        upstream_url: Some(format!("http://{addr}")),
+        cache_ttl_secs: 0,
+        params: params_max1,
+    };
+    let (up_code, _) = json_request(
+        &disabled_app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&healthy_dto).unwrap()),
+    )
+    .await;
+    assert_eq!(up_code, StatusCode::OK);
+
+    // Oversized 8192x8192 PNG bomb -> 400 Bad Request without hitting backend `/predict`.
+    let make_png = |w: u32, h: u32| -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        v
+    };
+    let bomb_b64 = base64::engine::general_purpose::STANDARD.encode(make_png(8192, 8192));
+    let (bomb_code, _) = json_request(
+        &disabled_app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Bomb Test", "imageBase64": bomb_b64 })),
+    )
+    .await;
+    assert_eq!(bomb_code, StatusCode::BAD_REQUEST);
+    assert_eq!(predict_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Oversized title (> 4096B), description (> 65536B), and tags (> 64) -> 400 Bad Request.
+    for invalid_payload in [
+        json!({ "title": "x".repeat(4097) }),
+        json!({ "description": "y".repeat(65_537) }),
+        json!({ "tags": (0..65).map(|i| format!("t{i}")).collect::<Vec<_>>() }),
+        json!({ "tags": ["z".repeat(257)] }),
+    ] {
+        let (code, _) = json_request(
+            &disabled_app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(invalid_payload),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(predict_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    // Early slicing of `imagesBase64` to `max_images = 1` BEFORE base64 decode:
+    // second item is invalid base64, yet ignored because slice happens upfront!
+    let valid_b64 = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(make_png(32, 32))
+    );
+    let (slice_code, _) = json_request(
+        &disabled_app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Early Slice Check",
+            "imagesBase64": [valid_b64, "%%%corrupt-unused-second-image%%%"]
+        })),
+    )
+    .await;
+    assert_eq!(slice_code, StatusCode::OK);
+    assert_eq!(predict_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    for (uri, headers, expected_detail) in [
+        ("/api/v1/filter/predict", vec![], false),
+        ("/api/v1/admin/filter/test", admin_hdr, true),
+    ] {
+        let (code, body) = json_request(
+            &disabled_app,
+            "POST",
+            uri,
+            headers,
+            Some(json!({ "title": "Backend rejection" })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains(secret_internal_path),
+            expected_detail
+        );
+    }
+
+    mock_task.abort();
+}
+
+#[tokio::test]
+async fn filter_upstream_unimodal_backfill_and_fail_open_db_image_cache_guard() {
+    use axum::routing::{get, post};
+    use base64::Engine;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let serve_image_ok = Arc::new(AtomicBool::new(false));
+    let img_flag = serve_image_ok.clone();
+    let sample_png: &'static [u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x02\x00\x00\x00\x00\x00\x00\x00";
+
+    // Vanilla `deploy/server.py` mock: returns ONLY `prob`, `gore_prob`, `nsfw_prob` (no unimodal fields).
+    let vanilla_srv = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({ "status": "ok" })) }),
+        )
+        .route(
+            "/flaky-preview.png",
+            get(move || {
+                let flag = img_flag.clone();
+                async move {
+                    if flag.load(Ordering::SeqCst) {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "image/png")],
+                            sample_png,
+                        )
+                    } else {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(header::CONTENT_TYPE, "text/plain")],
+                            &b"cdn error"[..],
+                        )
+                    }
+                }
+            }),
+        )
+        .route(
+            "/predict",
+            post(
+                |axum::Json(payload): axum::Json<serde_json::Value>| async move {
+                    let has_txt = !payload["title"].as_str().unwrap_or_default().is_empty()
+                        || !payload["description"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .is_empty();
+                    let has_img = payload["images_base64"]
+                        .as_array()
+                        .is_some_and(|arr| !arr.is_empty());
+                    match (has_txt, has_img) {
+                        (true, true) => axum::Json(json!({
+                            "prob": 0.90,
+                            "gore_prob": 0.15,
+                            "nsfw_prob": 0.88
+                        })),
+                        (true, false) => axum::Json(json!({
+                            "prob": 0.20,
+                            "gore_prob": 0.05,
+                            "nsfw_prob": 0.18
+                        })),
+                        (false, true) => axum::Json(json!({
+                            "prob": 0.86,
+                            "gore_prob": 0.12,
+                            "nsfw_prob": 0.85
+                        })),
+                        (false, false) => axum::Json(json!({
+                            "prob": 0.0,
+                            "gore_prob": 0.0,
+                            "nsfw_prob": 0.0
+                        })),
+                    }
+                },
+            ),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, vanilla_srv).await;
+    });
+
+    let mut cfg = CatalogConfig::default();
+    cfg.admin.password = "admin-pw".to_string();
+    cfg.filter.enabled = true;
+    cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+    cfg.filter.upstream_url = Some(format!("http://{addr}"));
+    cfg.filter.cache_ttl_secs = 3600;
+    let store = Arc::new(CatalogConfigStore::new(None, cfg));
+    let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+    let state = ServerState::with_components(store, repo, Arc::new(MockWorkshopUpstream::new()));
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+
+    let mut item = sample_item(77001, "Neutral Addon Title", 600, None);
+    item.description = Some("Simple survivor skin".to_string());
+    item.preview_url = Some(format!("http://{addr}/flaky-preview.png"));
+    state.repo.upsert_item(&item, false, true).unwrap();
+
+    let app = build_router(state.clone());
+
+    // 1. First call while DB preview URL returns 503: degrades to text-only (0.20) AND skips caching!
+    let (c1, b1) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "77001" })),
+    )
+    .await;
+    assert_eq!(c1, StatusCode::OK);
+    let p1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b1).unwrap();
+    assert!((p1.prob - 0.20).abs() < 1e-5);
+    assert_eq!(p1.image_prob, None);
+
+    // 2. Preview CDN recovers: next call MUST NOT serve stale text-only cache; it fetches the image AND
+    //    backfills both `textProb` (0.20) and `imageProb` (0.86) from vanilla upstream!
+    serve_image_ok.store(true, Ordering::SeqCst);
+    let (c2, b2) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "workshopId": "77001" })),
+    )
+    .await;
+    assert_eq!(c2, StatusCode::OK);
+    let p2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b2).unwrap();
+    assert!((p2.prob - 0.90).abs() < 1e-5);
+    assert_eq!(p2.text_prob, Some(0.20));
+    assert_eq!(p2.image_prob, Some(0.86));
+    assert_eq!(p2.per_image_probs, vec![0.86]);
+
+    // 3. Direct base64 + text call also populates unimodal breakdown.
+    let img_b64 = base64::engine::general_purpose::STANDARD.encode(sample_png);
+    let (c3, b3) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Direct Multimodal", "imageBase64": img_b64 })),
+    )
+    .await;
+    assert_eq!(c3, StatusCode::OK);
+    let p3: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b3).unwrap();
+    assert_eq!(p3.text_prob, Some(0.20));
+    assert_eq!(p3.image_prob, Some(0.86));
+
+    srv_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filter_managed_python_auto_recovers_after_child_kill_and_handles_non_utf8_pipes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let deploy_dir = dir.path().join("deploy");
+    let py_shim_dir = dir.path().join("pyshims");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    std::fs::create_dir_all(py_shim_dir.join("PIL")).unwrap();
+
+    std::fs::write(py_shim_dir.join("numpy.py"), "float32 = float\n").unwrap();
+    std::fs::write(
+        py_shim_dir.join("PIL").join("Image.py"),
+        "MAX_IMAGE_PIXELS = None\n",
+    )
+    .unwrap();
+    std::fs::write(py_shim_dir.join("PIL").join("__init__.py"), "").unwrap();
+
+    // Emit raw non-UTF-8 bytes to both stdout (before ready) and stderr (during predict)
+    // to verify pipe drainers never drop pipes or trigger BrokenPipeError/SIGPIPE!
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        r#"import sys
+
+class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        sys.stdout.buffer.write(b"pre-ready-non-utf8:\xff\xfe\n")
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(b"init-stderr-non-utf8:\xff\xfe\n")
+        sys.stderr.buffer.flush()
+        self.config = {"model_name": "CrashRecoverMock", "version": "1.0.0"}
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        sys.stdout.buffer.write(b"predict-stdout-non-utf8:\x80\xff\n")
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(b"predict-stderr-non-utf8:\x80\xff\n")
+        sys.stderr.buffer.flush()
+        return {"prob": 0.55, "gore_prob": 0.25, "nsfw_prob": 0.50}
+"#,
+    )
+    .unwrap();
+
+    let py_wrapper = dir.path().join("python_wrapper.sh");
+    std::fs::write(
+        &py_wrapper,
+        format!(
+            "#!/usr/bin/env bash\nexport PYTHONPATH=\"{}:${{PYTHONPATH:-}}\"\nexec python3 \"$@\"\n",
+            py_shim_dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&py_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let state = ServerState::in_memory("recover-secret").unwrap();
+    let app = build_router(state.clone());
+    let admin_hdr = vec![("x-admin-token", "recover-secret")];
+
+    let dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(deploy_dir.display().to_string()),
+        python_bin: Some(py_wrapper.display().to_string()),
+        upstream_url: None,
+        cache_ttl_secs: 0,
+        params: l4a_protocol::FilterModelParams::default(),
+    };
+    configure_host_filter_paths(&state, &dto);
+    let (c1, b1) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&dto).unwrap()),
+    )
+    .await;
+    assert_eq!(c1, StatusCode::OK);
+    let st1: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&b1).unwrap();
+    assert!(st1.ready, "last_error={:?}", st1.last_error);
+    let pid1 = st1.running_pid.unwrap();
+
+    // Multiple predictions succeed without BrokenPipeError despite non-UTF-8 stdout/stderr writes.
+    for i in 0..3 {
+        let (pc, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "title": format!("NonUtf8 Check {i}") })),
+        )
+        .await;
+        assert_eq!(pc, StatusCode::OK);
+    }
+
+    // Force-kill the managed Python child process (`SIGKILL`) and wait briefly for OS reap readiness.
+    let kill_status = std::process::Command::new("kill")
+        .args(["-9", &pid1.to_string()])
+        .status()
+        .unwrap();
+    assert!(kill_status.success());
+    for _ in 0..40 {
+        // Poll until child becomes zombie/reapable so try_wait() observes exit.
+        let (st_code, st_bytes) = json_request(
+            &app,
+            "GET",
+            "/api/v1/admin/filter/status",
+            admin_hdr.clone(),
+            None,
+        )
+        .await;
+        assert_eq!(st_code, StatusCode::OK);
+        let st_now: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&st_bytes).unwrap();
+        if st_now.running_pid != Some(pid1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Next `POST /api/v1/filter/predict` automatically recovers with a fresh PID!
+    let (rec_code, rec_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Recovered After Crash" })),
+    )
+    .await;
+    assert_eq!(rec_code, StatusCode::OK);
+    let rec_probs: l4a_protocol::FilterProbabilities = serde_json::from_slice(&rec_bytes).unwrap();
+    assert!((rec_probs.prob - 0.55).abs() < 1e-5);
+
+    let (_, st2_bytes) =
+        json_request(&app, "GET", "/api/v1/admin/filter/status", admin_hdr, None).await;
+    let st2: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&st2_bytes).unwrap();
+    assert!(st2.ready);
+    let pid2 = st2.running_pid.unwrap();
+    assert_ne!(pid1, pid2, "crashed child must be replaced by a new PID");
+
+    state.filter.shutdown().await;
+}
+
+#[tokio::test]
+async fn filter_stock_left4filters_wire_format_gallery_aggregation_unicode_and_scoring_revision() {
+    use axum::routing::{get, post};
+    use base64::Engine;
+
+    let make_png = |w: u32, h: u32| -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR".to_vec();
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        v
+    };
+    let png_hi = make_png(16, 16);
+    let png_lo = make_png(32, 32);
+    let png_mid = make_png(48, 48);
+
+    let b64_hi = base64::engine::general_purpose::STANDARD.encode(&png_hi);
+    let b64_lo = base64::engine::general_purpose::STANDARD.encode(&png_lo);
+    let b64_mid = base64::engine::general_purpose::STANDARD.encode(&png_mid);
+
+    let hi_cl = b64_hi.clone();
+    let lo_cl = b64_lo.clone();
+    let mid_cl = b64_mid.clone();
+
+    // Stock `Left4Filters/deploy/server.py` mock:
+    // - Rejects camelCase `imagesBase64` / `imageBase64` with 400!
+    // - ONLY reads snake_case `images_base64`!
+    // - Returns raw `prob`, `gore_prob`, `nsfw_prob` only.
+    let stock_srv = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                axum::Json(json!({
+                    "status": "ok",
+                    "model": "StockLeft4Filters",
+                    "version": "1.2.0"
+                }))
+            }),
+        )
+        .route(
+            "/predict",
+            post(move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                let hi = hi_cl.clone();
+                let lo = lo_cl.clone();
+                let mid = mid_cl.clone();
+                async move {
+                    if payload.get("imagesBase64").is_some()
+                        || payload.get("imageBase64").is_some()
+                    {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({ "error": "camelCase image field forbidden on stock Left4Filters" })),
+                        );
+                    }
+                    let has_txt = !payload["title"].as_str().unwrap_or_default().is_empty()
+                        || !payload["description"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .is_empty();
+                    let imgs: Vec<&str> = payload["images_base64"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                        .unwrap_or_default();
+
+                    let (prob, gore, nsfw) = if imgs.is_empty() {
+                        if has_txt {
+                            (0.15, 0.05, 0.12)
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        }
+                    } else {
+                        // Stock server.py default max behavior if multiple images sent at once,
+                        // or exact per-image score when 1 image is sent.
+                        let mut p_max = 0.0f32;
+                        let mut g_max = 0.0f32;
+                        let mut n_max = 0.0f32;
+                        for im in imgs {
+                            let (ip, ig, in_) = if im == hi {
+                                if has_txt {
+                                    (0.94, 0.84, 0.30)
+                                } else {
+                                    (0.90, 0.80, 0.20)
+                                }
+                            } else if im == lo {
+                                if has_txt {
+                                    (0.20, 0.10, 0.16)
+                                } else {
+                                    (0.10, 0.04, 0.08)
+                                }
+                            } else if im == mid {
+                                if has_txt {
+                                    (0.66, 0.56, 0.24)
+                                } else {
+                                    (0.60, 0.50, 0.20)
+                                }
+                            } else {
+                                (0.40, 0.20, 0.30)
+                            };
+                            p_max = p_max.max(ip);
+                            g_max = g_max.max(ig);
+                            n_max = n_max.max(in_);
+                        }
+                        (p_max, g_max, n_max)
+                    };
+
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "prob": prob,
+                            "gore_prob": gore,
+                            "nsfw_prob": nsfw
+                        })),
+                    )
+                }
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, stock_srv).await;
+    });
+
+    let state = ServerState::in_memory("stock-admin-pw").unwrap();
+    let app = build_router(state);
+    let admin_hdr = vec![("x-admin-token", "stock-admin-pw")];
+
+    // Before enabling: `scoringRevision` is None.
+    let (_, off_info_bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    let off_info: l4a_protocol::CatalogFilterPublicInfo =
+        serde_json::from_slice(&off_info_bytes).unwrap();
+    assert!(!off_info.enabled);
+    assert_eq!(off_info.scoring_revision, None);
+
+    // 1. Enable UpstreamHttp with `gallery_aggregation = Max`, `max_images = 4`.
+    let cfg_max = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::UpstreamHttp,
+        deploy_dir: None,
+        python_bin: None,
+        upstream_url: Some(format!("http://{addr}")),
+        cache_ttl_secs: 3600,
+        params: l4a_protocol::FilterModelParams {
+            max_images: 4,
+            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Max,
+            ..Default::default()
+        },
+    };
+    let (c_cfg1, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_max).unwrap()),
+    )
+    .await;
+    assert_eq!(c_cfg1, StatusCode::OK);
+
+    let (_, info1_bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    let info1: l4a_protocol::CatalogFilterPublicInfo =
+        serde_json::from_slice(&info1_bytes).unwrap();
+    let rev1 = info1
+        .scoring_revision
+        .expect("enabled filter/info must include scoringRevision");
+    assert_eq!(rev1.len(), 16);
+
+    // 2. Malformed Unicode base64 image inputs return 400 Bad Request without panicking!
+    for bad_img in ["data:中文;base64,AAAA", "中文中文"] {
+        let (bad_code, _) = json_request(
+            &app,
+            "POST",
+            "/api/v1/filter/predict",
+            vec![],
+            Some(json!({ "imageBase64": bad_img })),
+        )
+        .await;
+        assert_eq!(bad_code, StatusCode::BAD_REQUEST, "input={bad_img}");
+    }
+
+    // 3. Single image-only & 2-image Max requests on stock `images_base64` server score non-zero!
+    let (c_single, b_single) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "imageBase64": b64_hi })),
+    )
+    .await;
+    assert_eq!(c_single, StatusCode::OK);
+    let p_single: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b_single).unwrap();
+    assert!((p_single.prob - 0.90).abs() < 1e-5);
+    assert_eq!(p_single.image_prob, Some(0.90));
+    assert_eq!(p_single.scoring_revision.as_deref(), Some(rev1.as_str()));
+
+    let (c_max_img, b_max_img) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "imagesBase64": [b64_hi, b64_lo] })),
+    )
+    .await;
+    assert_eq!(c_max_img, StatusCode::OK);
+    let p_max_img: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b_max_img).unwrap();
+    assert!((p_max_img.prob - 0.90).abs() < 1e-5);
+    assert!((p_max_img.gore_prob - 0.80).abs() < 1e-5);
+    assert_eq!(p_max_img.image_prob, Some(0.90));
+    assert_eq!(p_max_img.per_image_probs, vec![0.90, 0.10]);
+    assert_eq!(p_max_img.scoring_revision.as_deref(), Some(rev1.as_str()));
+
+    let (c_max_mm, b_max_mm) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Gallery Multimodal",
+            "imagesBase64": [b64_hi, b64_lo]
+        })),
+    )
+    .await;
+    assert_eq!(c_max_mm, StatusCode::OK);
+    let p_max_mm: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b_max_mm).unwrap();
+    assert!((p_max_mm.prob - 0.94).abs() < 1e-5);
+    assert_eq!(p_max_mm.text_prob, Some(0.15));
+    assert_eq!(p_max_mm.image_prob, Some(0.90));
+    assert_eq!(p_max_mm.per_image_probs, vec![0.90, 0.10]);
+
+    // 4. Switch to `gallery_aggregation = Mean`: `scoringRevision` changes AND 2-image scores average!
+    let cfg_mean = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterModelParams {
+            max_images: 4,
+            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Mean,
+            ..Default::default()
+        },
+        ..cfg_max.clone()
+    };
+    let (c_cfg2, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_mean).unwrap()),
+    )
+    .await;
+    assert_eq!(c_cfg2, StatusCode::OK);
+
+    let (_, info2_bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    let info2: l4a_protocol::CatalogFilterPublicInfo =
+        serde_json::from_slice(&info2_bytes).unwrap();
+    let rev2 = info2.scoring_revision.unwrap();
+    assert_ne!(
+        rev1, rev2,
+        "scoringRevision must change when gallery_aggregation changes"
+    );
+
+    let (c_mean_img, b_mean_img) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "imagesBase64": [b64_hi, b64_lo] })),
+    )
+    .await;
+    assert_eq!(c_mean_img, StatusCode::OK);
+    let p_mean_img: l4a_protocol::FilterProbabilities =
+        serde_json::from_slice(&b_mean_img).unwrap();
+    assert!((p_mean_img.prob - 0.50).abs() < 1e-5);
+    assert!((p_mean_img.gore_prob - 0.42).abs() < 1e-5);
+    assert!((p_mean_img.nsfw_prob - 0.14).abs() < 1e-5);
+    assert_eq!(p_mean_img.image_prob, Some(0.50));
+    assert_eq!(p_mean_img.per_image_probs, vec![0.90, 0.10]);
+    assert_eq!(p_mean_img.scoring_revision.as_deref(), Some(rev2.as_str()));
+
+    let (c_mean_mm, b_mean_mm) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Gallery Multimodal",
+            "imagesBase64": [b64_hi, b64_lo]
+        })),
+    )
+    .await;
+    assert_eq!(c_mean_mm, StatusCode::OK);
+    let p_mean_mm: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b_mean_mm).unwrap();
+    assert!((p_mean_mm.prob - 0.57).abs() < 1e-5);
+    assert!((p_mean_mm.gore_prob - 0.47).abs() < 1e-5);
+    assert!((p_mean_mm.nsfw_prob - 0.23).abs() < 1e-5);
+    assert_eq!(p_mean_mm.text_prob, Some(0.15));
+    assert_eq!(p_mean_mm.image_prob, Some(0.50));
+    assert_eq!(p_mean_mm.per_image_probs, vec![0.90, 0.10]);
+
+    // 5. Switch to `Top2Mean` + calibration `bias` change: `scoringRevision` updates again & Top2Mean works across 3 images!
+    let cfg_top2 = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterModelParams {
+            max_images: 4,
+            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Top2Mean,
+            ..Default::default()
+        },
+        ..cfg_max.clone()
+    };
+    let (c_cfg3, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&cfg_top2).unwrap()),
+    )
+    .await;
+    assert_eq!(c_cfg3, StatusCode::OK);
+
+    let (c_top2, b_top2) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "imagesBase64": [b64_hi, b64_lo, b64_mid] })),
+    )
+    .await;
+    assert_eq!(c_top2, StatusCode::OK);
+    let p_top2: l4a_protocol::FilterProbabilities = serde_json::from_slice(&b_top2).unwrap();
+    // Top 2 of [0.90, 0.10, 0.60] -> (0.90 + 0.60) / 2 = 0.75
+    assert!((p_top2.prob - 0.75).abs() < 1e-5);
+    assert_eq!(p_top2.image_prob, Some(0.75));
+    assert_eq!(p_top2.per_image_probs, vec![0.90, 0.10, 0.60]);
+    let rev3 = p_top2.scoring_revision.unwrap();
+    assert_ne!(rev2, rev3);
+
+    let cfg_calibrated = l4a_protocol::CatalogFilterConfigDto {
+        params: l4a_protocol::FilterModelParams {
+            bias: 0.4,
+            ..cfg_top2.params
+        },
+        ..cfg_top2
+    };
+    let (c_cfg4, _) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr,
+        Some(serde_json::to_value(&cfg_calibrated).unwrap()),
+    )
+    .await;
+    assert_eq!(c_cfg4, StatusCode::OK);
+    let (_, info4_bytes) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    let info4: l4a_protocol::CatalogFilterPublicInfo =
+        serde_json::from_slice(&info4_bytes).unwrap();
+    assert_ne!(info4.scoring_revision.as_deref(), Some(rev3.as_str()));
+
+    srv_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filter_managed_python_preserves_symlinked_virtualenv_site_packages() {
+    use std::os::unix::fs::symlink;
+
+    // Query system python3 canonical path and major.minor version to build a genuine
+    // symlink-based `pyvenv.cfg` virtualenv WITHOUT any `PYTHONPATH` wrapper!
+    let py_probe = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import os, sys; print(os.path.realpath(sys.executable)); print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .expect("python3 must be available");
+    assert!(py_probe.status.success());
+    let probe_lines: Vec<String> = String::from_utf8(py_probe.stdout)
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .map(str::to_owned)
+        .collect();
+    let real_sys_python = std::path::PathBuf::from(&probe_lines[0]);
+    let py_ver = &probe_lines[1];
+    let real_home = real_sys_python.parent().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("Left4Filters");
+    let deploy_dir = repo_root.join("deploy");
+    let venv_dir = repo_root.join("venv");
+    let venv_bin = venv_dir.join("bin");
+    let site_packages = venv_dir
+        .join("lib")
+        .join(format!("python{py_ver}"))
+        .join("site-packages");
+
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    std::fs::create_dir_all(&venv_bin).unwrap();
+    std::fs::create_dir_all(site_packages.join("PIL")).unwrap();
+
+    // Symlink `venv/bin/python -> /usr/bin/python3.x` + `pyvenv.cfg`.
+    let venv_python = venv_bin.join("python");
+    symlink(&real_sys_python, &venv_python).unwrap();
+    std::fs::write(
+        venv_dir.join("pyvenv.cfg"),
+        format!(
+            "home = {}\ninclude-system-site-packages = false\nversion = {py_ver}.0\n",
+            real_home.display()
+        ),
+    )
+    .unwrap();
+
+    // Place `l4a_venv_marker` + `numpy` + `PIL` ONLY inside `venv/lib/pythonX.Y/site-packages`!
+    // If `venv/bin/python` were canonicalized to `/usr/bin/python3.x`, Python would ignore `pyvenv.cfg`
+    // and `import l4a_venv_marker` would immediately fail with `ModuleNotFoundError`!
+    std::fs::write(
+        site_packages.join("l4a_venv_marker.py"),
+        "ACTIVE_FROM_VENV = True\n",
+    )
+    .unwrap();
+    std::fs::write(site_packages.join("numpy.py"), "float32 = float\n").unwrap();
+    std::fs::write(
+        site_packages.join("PIL").join("Image.py"),
+        "MAX_IMAGE_PIXELS = None\n",
+    )
+    .unwrap();
+    std::fs::write(site_packages.join("PIL").join("__init__.py"), "").unwrap();
+
+    let expected_venv_prefix = std::fs::canonicalize(&venv_dir).unwrap();
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        format!(
+            r#"import os
+import sys
+import l4a_venv_marker
+
+assert l4a_venv_marker.ACTIVE_FROM_VENV is True
+assert os.path.realpath(sys.prefix) == {expected_prefix:?}, f"unexpected sys.prefix={{sys.prefix}}"
+assert sys.executable.endswith("venv/bin/python"), f"expected symlink path in sys.executable, got {{sys.executable}}"
+
+class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        self.config = {{"model_name": "VenvSymlinkMock", "version": "1.0.0"}}
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        return {{"prob": 0.77, "gore_prob": 0.44, "nsfw_prob": 0.66}}
+"#,
+            expected_prefix = expected_venv_prefix.display().to_string(),
+        ),
+    )
+    .unwrap();
+
+    let state = ServerState::in_memory("venv-secret").unwrap();
+    let app = build_router(state.clone());
+    let admin_hdr = vec![("x-admin-token", "venv-secret")];
+
+    // 1. Auto-discovered `<deploy_dir>/../venv/bin/python` (`python_bin = None`).
+    let dto_auto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(deploy_dir.display().to_string()),
+        python_bin: None,
+        upstream_url: None,
+        cache_ttl_secs: 0,
+        params: l4a_protocol::FilterModelParams::default(),
+    };
+    configure_host_filter_paths(&state, &dto_auto);
+    let (c1, b1) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr.clone(),
+        Some(serde_json::to_value(&dto_auto).unwrap()),
+    )
+    .await;
+    assert_eq!(c1, StatusCode::OK);
+    let st1: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&b1).unwrap();
+    assert!(st1.ready, "auto venv failed: {:?}", st1.last_error);
+    assert_eq!(st1.model_name.as_deref(), Some("VenvSymlinkMock"));
+
+    let (pc1, pb1) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "Venv Auto Check" })),
+    )
+    .await;
+    assert_eq!(pc1, StatusCode::OK);
+    let pr1: l4a_protocol::FilterProbabilities = serde_json::from_slice(&pb1).unwrap();
+    assert!((pr1.prob - 0.77).abs() < 1e-5);
+
+    // 2. Explicit `python_bin = Some(.../venv/bin/python)` also preserves symlink!
+    let dto_explicit = l4a_protocol::CatalogFilterConfigDto {
+        python_bin: Some(venv_python.display().to_string()),
+        ..dto_auto
+    };
+    configure_host_filter_paths(&state, &dto_explicit);
+    let (c2, b2) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr,
+        Some(serde_json::to_value(&dto_explicit).unwrap()),
+    )
+    .await;
+    assert_eq!(c2, StatusCode::OK);
+    let st2: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&b2).unwrap();
+    assert!(st2.ready, "explicit venv failed: {:?}", st2.last_error);
+
+    state.filter.shutdown().await;
+}
+
+#[tokio::test]
+async fn filter_public_admission_limit_returns_429_before_buffering_request_body() {
+    use axum::routing::get;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let sample_png: &'static [u8] =
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x02\x00\x00\x00\x00\x00\x00\x00";
+    let in_flight_images = Arc::new(AtomicUsize::new(0));
+    let all_admitted = Arc::new(tokio::sync::Notify::new());
+    let release_gate = Arc::new(tokio::sync::Notify::new());
+
+    let in_flight_cl = in_flight_images.clone();
+    let admitted_cl = all_admitted.clone();
+    let gate_cl = release_gate.clone();
+
+    let max_admissions = l4a_server::filter::MAX_PUBLIC_PREDICT_ADMISSIONS;
+    let slow_srv = axum::Router::new()
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({ "status": "ok" })) }),
+        )
+        .route(
+            "/slow.png",
+            get(move || {
+                let count = in_flight_cl.clone();
+                let admitted = admitted_cl.clone();
+                let gate = gate_cl.clone();
+                async move {
+                    let prev = count.fetch_add(1, Ordering::SeqCst);
+                    if prev + 1 == max_admissions {
+                        admitted.notify_waiters();
+                    }
+                    gate.notified().await;
+                    ([(header::CONTENT_TYPE, "image/png")], sample_png)
+                }
+            }),
+        )
+        .route(
+            "/predict",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "prob": 0.30,
+                    "gore_prob": 0.10,
+                    "nsfw_prob": 0.25
+                }))
+            }),
+        );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let srv_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, slow_srv).await;
+    });
+
+    let mut cfg = CatalogConfig::default();
+    cfg.admin.password = "adm-pw".to_string();
+    cfg.filter.enabled = true;
+    cfg.filter.backend = l4a_protocol::CatalogFilterBackendKind::UpstreamHttp;
+    cfg.filter.upstream_url = Some(format!("http://{addr}"));
+    cfg.filter.cache_ttl_secs = 0;
+
+    let store = Arc::new(CatalogConfigStore::new(None, cfg));
+    let repo = Arc::new(ServerRepo::open_in_memory().unwrap());
+    let state = ServerState::with_components(store, repo, Arc::new(MockWorkshopUpstream::new()));
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+    state
+        .filter
+        .set_public_admission_timeout_for_testing(std::time::Duration::from_millis(60));
+
+    let app = build_router(state);
+
+    // Warm up backend health initialization first.
+    let (info_code, _) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(info_code, StatusCode::OK);
+
+    // Launch `MAX_PUBLIC_PREDICT_ADMISSIONS` concurrent requests and wait until all 8 hold permits.
+    let admitted_wait = all_admitted.notified();
+    let mut handles = Vec::with_capacity(max_admissions);
+    for idx in 0..max_admissions {
+        let app_cl = app.clone();
+        let img_url = format!("http://{addr}/slow.png?slot={idx}");
+        handles.push(tokio::spawn(async move {
+            json_request(
+                &app_cl,
+                "POST",
+                "/api/v1/filter/predict",
+                vec![],
+                Some(json!({
+                    "title": format!("Concurrent {idx}"),
+                    "imageUrls": [img_url]
+                })),
+            )
+            .await
+        }));
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(5), admitted_wait)
+        .await
+        .expect("all 8 admission slots should enter slow image fetch");
+
+    // 9th concurrent request with an unbuffered stream MUST be rejected with 429 BEFORE reading body!
+    let body_read_attempted = Arc::new(AtomicBool::new(false));
+    let flag_cl = body_read_attempted.clone();
+    let unbuffered_stream = futures_util::stream::poll_fn(move |_| {
+        flag_cl.store(true, Ordering::SeqCst);
+        std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+            b"{\"title\":\"overflow\"}",
+        ))))
+    });
+    let overload_req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/filter/predict")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(unbuffered_stream))
+        .unwrap();
+    let overload_resp = app.clone().oneshot(overload_req).await.unwrap();
+    assert_eq!(overload_resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        !body_read_attempted.load(Ordering::SeqCst),
+        "overloaded request must be rejected with 429 BEFORE buffering request body"
+    );
+    let overload_json: serde_json::Value = serde_json::from_slice(
+        &overload_resp
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(overload_json["error"], "内容过滤请求繁忙，请稍后重试");
+
+    // Release the 8 in-flight requests and verify they all finish cleanly, restoring capacity!
+    release_gate.notify_waiters();
+    for h in handles {
+        let (code, _) = h.await.unwrap();
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    let (after_code, _) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({ "title": "After Drain" })),
+    )
+    .await;
+    assert_eq!(after_code, StatusCode::OK);
+
+    srv_task.abort();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn filter_large_multi_image_requests_split_into_subbatches_under_runner_limit() {
+    use axum::extract::Path as AxumPath;
+    use axum::routing::get;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Build 4 valid 12 MiB PNGs (`4 * 12 MiB = 48 MiB` raw > `MAX_RUNNER_BATCH_RAW_IMAGE_BYTES` (30 MiB),
+    // and ~64+ MiB base64 JSON which would exceed `filter_runner.py`'s 64 MiB request body cap if unsplit!).
+    let make_12mb_png = |marker: u8| -> bytes::Bytes {
+        let total = 12 * 1024 * 1024;
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR");
+        buf.extend_from_slice(&32u32.to_be_bytes());
+        buf.extend_from_slice(&32u32.to_be_bytes());
+        buf.extend_from_slice(&[8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        buf.push(marker);
+        buf.resize(total, 0u8);
+        bytes::Bytes::from(buf)
+    };
+    let imgs: Arc<Vec<bytes::Bytes>> = Arc::new(vec![
+        make_12mb_png(1),
+        make_12mb_png(2),
+        make_12mb_png(3),
+        make_12mb_png(4),
+    ]);
+    assert!(
+        imgs.iter().map(|b| b.len()).sum::<usize>()
+            > l4a_server::filter::MAX_RUNNER_BATCH_RAW_IMAGE_BYTES
+    );
+
+    let imgs_srv = imgs.clone();
+    let img_cdn = axum::Router::new().route(
+        "/large/{idx}",
+        get(move |AxumPath(idx): AxumPath<usize>| {
+            let store = imgs_srv.clone();
+            async move { ([(header::CONTENT_TYPE, "image/png")], store[idx].clone()) }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdn_addr = listener.local_addr().unwrap();
+    let cdn_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, img_cdn).await;
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let deploy_dir = dir.path().join("deploy");
+    let py_shim_dir = dir.path().join("pyshims");
+    std::fs::create_dir_all(&deploy_dir).unwrap();
+    std::fs::create_dir_all(py_shim_dir.join("PIL")).unwrap();
+
+    // Minimal numpy shim supporting `np.asarray` + `.mean(axis=0)` / `.max(axis=0)` for SDK fallback gallery aggregation!
+    std::fs::write(
+        py_shim_dir.join("numpy.py"),
+        r#"float32 = float
+
+class _FakeMatrix(list):
+    @property
+    def shape(self):
+        return (len(self), len(self[0]) if self else 0)
+
+    def mean(self, axis=0):
+        cols = len(self[0])
+        return [sum(r[c] for r in self) / len(self) for c in range(cols)]
+
+    def max(self, axis=0):
+        cols = len(self[0])
+        return [max(r[c] for r in self) for c in range(cols)]
+
+def asarray(rows, dtype=None):
+    return _FakeMatrix([[float(x) for x in r] for r in rows])
+
+def sort(rows, axis=0):
+    return _FakeMatrix(list(zip(*(sorted(col) for col in zip(*rows)))))
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        py_shim_dir.join("PIL").join("Image.py"),
+        r#"MAX_IMAGE_PIXELS = None
+
+class ImageHeader:
+    size = (4, 4)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+def open(_stream):
+    return ImageHeader()
+"#,
+    )
+    .unwrap();
+    std::fs::write(py_shim_dir.join("PIL").join("__init__.py"), "").unwrap();
+
+    std::fs::write(
+        deploy_dir.join("l4filter.py"),
+        r#"class Left4Filter:
+    def __init__(self, deploy_dir, num_threads=4):
+        self.config = {"model_name": "SubBatchMock", "version": "1.0.0"}
+
+    def predict(self, title="", description="", tags=None, image=None, images=None):
+        if image is None:
+            return {"prob": 0.10, "gore_prob": 0.05, "nsfw_prob": 0.10}
+        p = {1: 0.90, 2: 0.10, 3: 0.80, 4: 0.30}[image[33]]
+        return {"prob": p, "gore_prob": p * 0.5, "nsfw_prob": p}
+"#,
+    )
+    .unwrap();
+
+    let py_wrapper = dir.path().join("python_wrapper.sh");
+    std::fs::write(
+        &py_wrapper,
+        format!(
+            "#!/usr/bin/env bash\nexport PYTHONPATH=\"{}:${{PYTHONPATH:-}}\"\nexec python3 \"$@\"\n",
+            py_shim_dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&py_wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let state = ServerState::in_memory("batch-secret").unwrap();
+    state.filter.set_allow_loopback_image_urls_for_testing(true);
+    let app = build_router(state.clone());
+    let admin_hdr = vec![("x-admin-token", "batch-secret")];
+
+    let dto = l4a_protocol::CatalogFilterConfigDto {
+        enabled: true,
+        backend: l4a_protocol::CatalogFilterBackendKind::ManagedPython,
+        deploy_dir: Some(deploy_dir.display().to_string()),
+        python_bin: Some(py_wrapper.display().to_string()),
+        upstream_url: None,
+        cache_ttl_secs: 0,
+        params: l4a_protocol::FilterModelParams {
+            max_images: 4,
+            gallery_aggregation: l4a_protocol::FilterGalleryAggregation::Top2Mean,
+            ..Default::default()
+        },
+    };
+    configure_host_filter_paths(&state, &dto);
+    let (c_cfg, b_cfg) = json_request(
+        &app,
+        "PATCH",
+        "/api/v1/admin/config/filter",
+        admin_hdr,
+        Some(serde_json::to_value(&dto).unwrap()),
+    )
+    .await;
+    assert_eq!(c_cfg, StatusCode::OK);
+    let st: l4a_protocol::CatalogFilterStatus = serde_json::from_slice(&b_cfg).unwrap();
+    assert!(st.ready, "last_error={:?}", st.last_error);
+
+    let urls: Vec<String> = (0..4)
+        .map(|i| format!("http://{cdn_addr}/large/{i}"))
+        .collect();
+    let (p_code, p_bytes) = json_request(
+        &app,
+        "POST",
+        "/api/v1/filter/predict",
+        vec![],
+        Some(json!({
+            "title": "Oversized Gallery SubBatch Test",
+            "imageUrls": urls
+        })),
+    )
+    .await;
+    assert_eq!(
+        p_code,
+        StatusCode::OK,
+        "resp={}",
+        String::from_utf8_lossy(&p_bytes)
+    );
+    let probs: l4a_protocol::FilterProbabilities = serde_json::from_slice(&p_bytes).unwrap();
+    assert_eq!(probs.per_image_probs, vec![0.90, 0.10, 0.80, 0.30]);
+    assert_eq!(probs.prob, 0.85);
+    assert_eq!(probs.image_prob, Some(0.85));
+    assert!(probs.scoring_revision.is_some());
+    state.filter.shutdown().await;
+    cdn_task.abort();
+}
+
+#[tokio::test]
+async fn filter_public_info_reports_zero_max_images_when_disabled_and_runner_rejects_negative_chunks(
+) {
+    let state = ServerState::in_memory("info-secret").unwrap();
+    let app = build_router(state.clone());
+
+    state
+        .config_store
+        .update(|cfg| {
+            cfg.filter.enabled = false;
+            cfg.filter.enable_image = false;
+            cfg.filter.max_images = 4;
+        })
+        .unwrap();
+    let (code, body) = json_request(&app, "GET", "/api/v1/filter/info", vec![], None).await;
+    assert_eq!(code, StatusCode::OK);
+    let info: l4a_protocol::CatalogFilterPublicInfo = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        info.max_images, 0,
+        "public_info must advertise maxImages = 0 when enable_image = false"
+    );
+
+    // Verify filter_runner.py rejects negative chunk sizes and handles JSON null booleans safely.
+    let runner_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../filter-assets/filter_runner.py");
+    let py_check = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            r#"
+import importlib.util, io, sys, types
+sys.modules.setdefault("numpy", types.ModuleType("numpy"))
+pil = types.ModuleType("PIL")
+pil_img = types.ModuleType("PIL.Image")
+pil_img.Image = object
+pil.Image = pil_img
+sys.modules.setdefault("PIL", pil)
+sys.modules.setdefault("PIL.Image", pil_img)
+
+spec = importlib.util.spec_from_file_location("filter_runner", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# 1. Negative, prefixed, and malformed chunk sizes / oversized headers / trailers must be rejected
+for bad_chunk in [
+    b"-1\r\nhello\r\n0\r\n\r\n",
+    b"0x5\r\nhello\r\n0\r\n\r\n",
+    b"+5\r\nhello\r\n0\r\n\r\n",
+    b"1_0\r\n0123456789abcdef\r\n0\r\n\r\n",
+    b"5;" + (b"x" * 70000) + b"\r\nhello\r\n0\r\n\r\n",
+]:
+    try:
+        mod.read_chunked_body(io.BytesIO(bad_chunk), 1024)
+        raise AssertionError(f"expected ValueError for malformed chunk: {bad_chunk[:20]!r}")
+    except ValueError:
+        pass
+
+# Oversized chunk trailers must raise OverflowError
+huge_trailer = b"0\r\n" + (b"X-Pad: " + b"a" * 4096 + b"\r\n") * 20 + b"\r\n"
+try:
+    mod.read_chunked_body(io.BytesIO(huge_trailer), 1024)
+    raise AssertionError("expected OverflowError for oversized chunk trailers")
+except OverflowError:
+    pass
+
+# Valid chunked body with extension and small trailer succeeds
+assert mod.read_chunked_body(io.BytesIO(b"5;ext=1\r\nhello\r\n0\r\nX-Ok: 1\r\n\r\n"), 1024) == b"hello"
+
+# 2. Explicit JSON null booleans must default to True and camelCase None must fall back to snake_case
+norm = mod.RunnerEngine._normalize_params({"enableText": None, "enableImage": None})
+assert norm["enable_text"] is True
+assert norm["enable_image"] is True
+norm2 = mod.RunnerEngine._normalize_params({
+    "maxImages": None,
+    "max_images": 4,
+    "goreWeight": None,
+    "gore_weight": 2.5,
+    "nsfwWeight": None,
+    "nsfw_weight": 0.5,
+})
+assert norm2["max_images"] == 4
+assert norm2["gore_weight"] == 2.5
+assert norm2["nsfw_weight"] == 0.5
+"#,
+        )
+        .arg(&runner_path)
+        .output();
+    if let Ok(out) = py_check {
+        assert!(
+            out.status.success(),
+            "filter_runner.py regression check failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

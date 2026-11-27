@@ -3,15 +3,22 @@ import {
   applyProfile,
   applyRenames,
   cancelDownload,
+  checkLocalFilterUpdates,
+  clearFilterCache,
   createManualBundle,
   deleteAddons,
   deleteBundle,
+  deleteFilterExclusion,
   deleteProfile,
   deleteUserGroup,
+  deployLocalFilter,
   detectGameAddonsPath,
   downloadWorkshopItem,
+  evaluateFilterItems,
   fetchWorkshopItem,
   getDashboardSnapshot,
+  getFilterTokenStatus,
+  getLocalFilterStatus,
   getSteamCapabilities,
   getSubscribedWorkshopIds,
   IpcError,
@@ -32,14 +39,19 @@ import {
   searchByMapCode,
   searchWorkshop,
   setBundleLocked,
+  setFilterLlmToken,
+  startLocalFilterService,
+  stopLocalFilterService,
   subscribeCoreEvents,
   syncWorkshop,
   toggleAddons,
   trackCollection,
   untrackCollection,
   updateWorkshopItem,
+  upsertFilterExclusion,
   type CoreEvent,
 } from './ipc';
+import { createDefaultFilterConfig } from '../utils/contentFilter';
 
 const invokeMock = vi.fn();
 let listenCallback: ((event: { payload: CoreEvent }) => void) | null = null;
@@ -235,9 +247,130 @@ describe('v2 IPC client wrapper', () => {
       httpsOnly: true,
       sourceOrder: ['catalog-server'],
       renameRules: rules,
+      filter: createDefaultFilterConfig(),
     };
     await saveConfig(config);
     expect(invokeMock).toHaveBeenCalledWith('save_config', { config });
+  });
+
+  it('forwards all 11 content filter, deployment, token, evaluation, and exclusion IPC commands', async () => {
+    invokeMock.mockResolvedValue({});
+
+    await getLocalFilterStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_local_filter_status');
+
+    await checkLocalFilterUpdates();
+    expect(invokeMock).toHaveBeenCalledWith('check_local_filter_updates');
+
+    const deployRequest = {
+      repoUrl: 'https://github.com/FallenCrystal/Left4Filters.git',
+      trackLatest: false,
+      targetCommit: 'a94f18e',
+      startAfterDeploy: true,
+      installWebGpu: true,
+    };
+    await deployLocalFilter(deployRequest);
+    expect(invokeMock).toHaveBeenCalledWith('deploy_local_filter', {
+      request: deployRequest,
+    });
+
+    await startLocalFilterService();
+    expect(invokeMock).toHaveBeenCalledWith('start_local_filter_service');
+
+    await stopLocalFilterService();
+    expect(invokeMock).toHaveBeenCalledWith('stop_local_filter_service');
+
+    await getFilterTokenStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_filter_token_status');
+
+    await setFilterLlmToken('sk-test-secret');
+    expect(invokeMock).toHaveBeenCalledWith('set_filter_llm_token', {
+      token: 'sk-test-secret',
+    });
+
+    await setFilterLlmToken(null);
+    expect(invokeMock).toHaveBeenCalledWith('set_filter_llm_token', {
+      token: null,
+    });
+
+    const targets = [
+      {
+        targetKey: 'addon:ws:2814104912',
+        addonId: 'ws:2814104912',
+        workshopId: '2814104912',
+        title: 'Sample Addon',
+        tags: ['Campaign'],
+        imageSources: ['https://example.com/cover.jpg'],
+        revisionHint: 'rev-1',
+        bypassCache: true,
+      },
+      {
+        targetKey: 'ws:999999999',
+        workshopId: '999999999',
+        title: 'Broken Endpoint Target',
+        tags: [],
+        imageSources: [],
+      },
+    ];
+    const batchResponse = {
+      policySignature: 'pol_0123456789abcdef0123456789abcdef',
+      items: [
+        {
+          targetKey: 'addon:ws:2814104912',
+          status: 'completed' as const,
+          complete: false,
+          verdict: {
+            targetKey: 'addon:ws:2814104912',
+            revisionHint: 'rev-1',
+            flagged: false,
+            decisionSource: 'model_safe' as const,
+            evaluatedScore: 0.02,
+            probabilities: {
+              prob: 0.02,
+              goreProb: 0.01,
+              nsfwProb: 0.01,
+              scoringRevision: 'cat_r1',
+            },
+            textSensitive: false,
+            titleSensitive: false,
+            descriptionSensitive: false,
+            imageSensitive: false,
+            evaluatedImageIndices: [],
+            sensitiveImageIndices: [],
+            complete: false,
+            evaluatedAt: '2026-11-25T00:00:00Z',
+          },
+        },
+        {
+          targetKey: 'ws:999999999',
+          status: 'failed' as const,
+          error: 'Inference upstream timeout',
+        },
+      ],
+    };
+    invokeMock.mockResolvedValueOnce(batchResponse);
+    expect(await evaluateFilterItems(targets)).toEqual(batchResponse);
+    expect(invokeMock).toHaveBeenCalledWith('evaluate_filter_items', { targets });
+
+    const cacheClear = { count: 2, cacheGeneration: 1 };
+    invokeMock.mockResolvedValueOnce(cacheClear);
+    expect(await clearFilterCache()).toEqual(cacheClear);
+    expect(invokeMock).toHaveBeenCalledWith('clear_filter_cache');
+
+    const exclusionReq = {
+      addonId: 'ws:2814104912',
+      displayLevel: 'lazy_load' as const,
+      bindFingerprint: true,
+    };
+    await upsertFilterExclusion(exclusionReq);
+    expect(invokeMock).toHaveBeenCalledWith('upsert_filter_exclusion', {
+      request: exclusionReq,
+    });
+
+    await deleteFilterExclusion('ws:2814104912');
+    expect(invokeMock).toHaveBeenCalledWith('delete_filter_exclusion', {
+      addonId: 'ws:2814104912',
+    });
   });
 
   it('normalizes serialized CoreEvent payloads including nullable optional fields', async () => {
@@ -269,28 +402,68 @@ describe('v2 IPC client wrapper', () => {
         speedBps: 1048576,
       },
     });
-    expect(received).toEqual([
-      {
-        type: 'download_progress',
-        taskId: 't-1',
-        workshopId: '2814104912',
-        title: undefined,
-        downloaded: 1024,
-        total: undefined,
-        percent: 42,
-        speedBps: undefined,
+    listenCallback?.({
+      payload: {
+        type: 'filter_verdicts_updated',
+        policySignature: null,
+        verdicts: [
+          {
+            targetKey: 'ws:3410887766',
+            revisionHint: '1763900000:Crimson:imgs=1:https://example.com/0.jpg',
+            flagged: true,
+            decisionSource: 'model_direct_flag',
+            evaluatedScore: 0.88,
+            probabilities: { prob: 0.88, goreProb: 0.87, nsfwProb: 0.01 },
+            textSensitive: true,
+            titleSensitive: true,
+            descriptionSensitive: false,
+            imageSensitive: true,
+            evaluatedImageIndices: [0],
+            sensitiveImageIndices: [0],
+            complete: true,
+            evaluatedAt: '2026-11-25T00:00:00Z',
+          },
+        ],
       },
-      {
-        type: 'download_progress',
-        taskId: 't-2',
-        workshopId: '3011942811',
-        title: 'Yama Campaign Remastered',
-        downloaded: 2048,
-        total: 4096,
-        percent: 50,
-        speedBps: 1048576,
+    });
+    listenCallback?.({
+      payload: {
+        type: 'filter_verdicts_updated',
+        policySignature: 'pol_abcdef0123456789abcdef0123456789',
+        verdicts: [],
       },
-    ]);
+    });
+    expect(received).toHaveLength(4);
+    expect(received[0]).toEqual({
+      type: 'download_progress',
+      taskId: 't-1',
+      workshopId: '2814104912',
+      title: undefined,
+      downloaded: 1024,
+      total: undefined,
+      percent: 42,
+      speedBps: undefined,
+    });
+    expect(received[1]).toEqual({
+      type: 'download_progress',
+      taskId: 't-2',
+      workshopId: '3011942811',
+      title: 'Yama Campaign Remastered',
+      downloaded: 2048,
+      total: 4096,
+      percent: 50,
+      speedBps: 1048576,
+    });
+    expect(received[2]).toMatchObject({
+      type: 'filter_verdicts_updated',
+      policySignature: undefined,
+      verdicts: [{ targetKey: 'ws:3410887766', flagged: true, complete: true }],
+    });
+    expect(received[3]).toEqual({
+      type: 'filter_verdicts_updated',
+      policySignature: 'pol_abcdef0123456789abcdef0123456789',
+      verdicts: [],
+    });
     unlisten();
   });
 

@@ -43,6 +43,41 @@
 ### `GET /api/v1/collections/{collection_id}?refresh=false`
 查询合集元数据及其子条目明细（若目标或子条目缺失会自动穿透拉取并补全 `items`；若目标 ID 非合集类型返回 `404`）。
 
+### `GET /api/v1/filter/info`
+查询内容过滤概率推理服务的公开能力信息 (`CatalogFilterPublicInfo`)：
+```json
+{
+  "enabled": true,
+  "ready": true,
+  "modelName": "Left4FiltersModel",
+  "modelVersion": "1.0.0",
+  "maxImages": 2,
+  "scoringRevision": "a1b2c3d4e5f60718"
+}
+```
+- 当服务端关闭图片模态 (`enable_image = false`) 时，`maxImages` 返回 `0`。
+- `scoringRevision` 为当前服务端评分配置与模型标识的摘要。外接节点可通过 `/health` 提供 `version` 或 `scoringRevision`。对于未报告版本的官方 Left4Filters 服务，Catalog 检查其是否提供尸体识别分数。后端未就绪或禁用时省略 `scoringRevision`。
+
+### `POST /api/v1/filter/predict`
+对创意工坊条目或给定多模态输入执行敏感度概率评估 (`FilterPredictRequest` -> `FilterProbabilities`)：
+```json
+{
+  "workshopId": "2814104912",
+  "title": "Optional Title",
+  "description": "Optional Description",
+  "tags": ["Survivors"],
+  "imagesBase64": [],
+  "imageUrls": ["https://images.steamusercontent.com/ugc/..."]
+}
+```
+- **仅返回纯概率 (`FilterProbabilities`)**：返回 `prob`、`goreProb`、`nsfwProb`、`scoringRevision` 以及可选单模态分项 (`textProb`、`textGoreProb`、`textNsfwProb`、`titleProb`、`descriptionProb`、`imageProb`、`imageGoreProb`、`imageNsfwProb`、`perImageProbs`)；**绝不发起任何外部 LLM 请求**，也不返回二值封禁结论。
+- 支持尸体识别的模型可返回 `corpseProb` 和 `corpsePileProb`。任意输入图片达到识别阈值时，`corpseReviewFloor` 给出整体路由分数 `prob` 的复核下限。`prob` 位于该下限时，`fusionProb` 给出直判采用的融合分数。外接节点若只报告等于下限的整体路由分数，直判采用保守值 `0`。`corpseImageIndices` 给出已定位的命中图片下标，从 0 开始，按服务实际评分的图片顺序排列。血腥权重为零时停用尸体复核。
+- **参数严格受服务端管控**：公开请求体不接受任何模型参数或校准权重覆盖；参数仅可通过 `catalog.toml` `[filter]` 或管理员接口 `PATCH /api/v1/admin/config/filter` 修改。
+- 公开预测和管理员试算共用并发配额，JSON 请求体上限为 48 MiB。读取超时返回 `408 Request Timeout`，配额已满时返回 `429 Too Many Requests`。管理员试算在读取请求体前验证身份。
+- **按 `workshopId` 补全与可见性隔离**：当传入 `workshopId` 且请求未携带标题/简介/图片时，仅在本地缓存存在**公开且正常可用 (`status == active` 且非未列出 `is_listed != 0`)** 的记录时读取其元数据与 Steam 预览图（最多 `maxImages` 张）；私密 (`private_or_unavailable`)、未列出或不存在的条目统一返回 `404 Not Found`，绝不泄露受限元数据。
+- **SSRF 与载荷限制**：`imageUrls` 允许受信任的 Steam CDN 域名白名单（`media.steampowered.com`、`*.steamusercontent.com`、`*.steamstatic.com`、`steamuserimages*.akamaihd.net`、`steamcdn*.akamaihd.net` 以及 `cloud*.steampowered.com/ugc/*`），支持 `https://` 并将历史 `http://` Steam CDN 链接自动升级为 `https://` 后抓取；最多跟随 3 次 HTTP 重定向且每跳均须通过 Steam CDN 白名单校验，单图上限 `16 MiB`、像素上限 `4096×4096`、超时 `8s`；任意非白名单 URL 或超限图片返回 `400 Bad Request`。未开启过滤服务或后端未就绪时返回 `503 Service Unavailable`。
+- 当服务端无法读取请求中的预览图 URL 时，响应附带 `code: "image_fetch_failed"`。客户端可以读取预览图后用 `imagesBase64` 重试。
+
 ---
 
 ## 2. 管理员认证接口
@@ -61,7 +96,7 @@
 ## 3. 控制台运维与 SteamKit CM 接口
 
 ### 总览、同步与审计
-- `GET /api/v1/admin/overview` — 获取缓存统计、Steam CM 状态、同步引擎进度与实例配置路径
+- `GET /api/v1/admin/overview` — 获取缓存统计、Steam CM 状态、同步引擎进度、内容过滤服务状态 (`filter`) 与实例配置路径
 - `GET /api/v1/admin/stats` — 获取缓存分类计数 (`CatalogStats`)
 - `GET /api/v1/admin/audit?limit=200` — 查询运维与下架墓碑审计日志
 - `GET /api/v1/admin/sync/status` — 获取同步策略与游标进度
@@ -69,6 +104,12 @@
 - `POST /api/v1/admin/sync/trigger` — 立即执行一轮 `RankedByLastUpdatedDate` 增量同步
 - `POST /api/v1/admin/sync/reset-cursor` — 将全量创意工坊回填游标重置为 `*`
 - `POST /api/v1/admin/sync/fetch` — 手动按指定 Workshop ID 列表强制从 Steam CM 抓取预热（若含合集自动展开抓取子项）
+
+### 内容过滤模型服务
+- `GET /api/v1/admin/filter/status` — 获取内容过滤后端配置、就绪态、运行 PID / 活动端点、请求与缓存命中计数及最近错误 (`CatalogFilterStatus`)
+- `PATCH /api/v1/admin/config/filter` — 更新 `[filter]` 后端模式与模型校准参数，持久化写回 `catalog.toml`，热更新 `ManagedPython` 参数或切换后端，并写入 `filter_config_update` 审计日志。`deployDir` 和 `pythonBin` 只能通过主机上的 `catalog.toml` 修改，控制台显示当前值。
+- `POST /api/v1/admin/filter/restart` — 重启托管 Python 过滤子进程或重新探测 `UpstreamHttp` 健康状态，清空推理缓存并写入 `filter_restart` 审计日志
+- `POST /api/v1/admin/filter/test` — 管理员在线概率试算沙盒接口（输入 `FilterPredictRequest`，返回 `FilterProbabilities`）
 
 ### SteamKit CM 账号会话
 - `GET /api/v1/admin/steam/status` — 查看当前 CM 连接详情与进行中的认证流状态

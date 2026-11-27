@@ -31,6 +31,7 @@ export interface UseAddonActionsParams {
   setSyncReport: Dispatch<SetStateAction<SyncReport | null>>;
   setSteamCaps: Dispatch<SetStateAction<SteamCapabilities | null>>;
   setBatchReport: Dispatch<SetStateAction<BatchDialogPayload | null>>;
+  onClearFailedFilterEvaluations?: () => void;
 }
 
 export function useAddonActions({
@@ -49,6 +50,7 @@ export function useAddonActions({
   setSyncReport,
   setSteamCaps,
   setBatchReport,
+  onClearFailedFilterEvaluations,
 }: UseAddonActionsParams) {
   const handleBatchReport = useCallback(
     (report: AddonBatchReport, refreshOk: boolean) => {
@@ -72,6 +74,7 @@ export function useAddonActions({
 
   const scan = useCallback(async (): Promise<boolean> => {
     setScanning(true);
+    onClearFailedFilterEvaluations?.();
     const seq = nextSnapshotSeq();
     try {
       const next = await client.scanWorkspace();
@@ -84,7 +87,15 @@ export function useAddonActions({
     } finally {
       setScanning(false);
     }
-  }, [client, commitSnapshot, nextSnapshotSeq, notify, setScanning, tRef]);
+  }, [
+    client,
+    commitSnapshot,
+    nextSnapshotSeq,
+    notify,
+    onClearFailedFilterEvaluations,
+    setScanning,
+    tRef,
+  ]);
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -103,7 +114,7 @@ export function useAddonActions({
   }, [client, notify, refresh, setSyncReport, setSyncing]);
 
   const saveConfig = useCallback(
-    async (config: AppConfig, forceRescan = false, silent = false): Promise<boolean> => {
+    async (config: AppConfig, forceRescan = false, silent = false): Promise<AppConfig | null> => {
       setBusy(true);
       const prevConfig = snapshotRef.current?.config;
       const dirsChanged =
@@ -115,7 +126,8 @@ export function useAddonActions({
         !prevConfig || prevConfig.disableSteamworksSdk !== config.disableSteamworksSdk;
 
       try {
-        commitSavedConfig(await client.saveConfig(config));
+        const saved = await client.saveConfig(config);
+        commitSavedConfig(saved);
         if (sdkFlagChanged) {
           setSteamCaps(null);
         }
@@ -142,10 +154,10 @@ export function useAddonActions({
         } else if (!silent) {
           notify(tRef.current('settings.saved'));
         }
-        return true;
+        return saved;
       } catch (err) {
         notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
-        return false;
+        return null;
       } finally {
         setBusy(false);
       }
@@ -325,9 +337,10 @@ export function useAddonActions({
 
   const searchWorkshop = useCallback(
     async (query: SearchQuery) => {
+      onClearFailedFilterEvaluations?.();
       return client.searchWorkshop(query);
     },
-    [client],
+    [client, onClearFailedFilterEvaluations],
   );
 
   const fetchWorkshopItem = useCallback(

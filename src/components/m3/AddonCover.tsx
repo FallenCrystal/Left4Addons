@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   Box,
   Crosshair,
+  Eye,
+  EyeOff,
   FileCode2,
+  Image as ImageIcon,
   LayoutTemplate,
   Map as MapIcon,
   Music,
@@ -11,6 +15,10 @@ import {
   User,
 } from 'lucide-react';
 import { isTauriRuntime, readCachedImage, workshopCoverUrl } from '../../api/ipc';
+import type { CoverFilterMode, FilterEvaluationDisplay } from '../../utils/contentFilter';
+import { FilterProgress } from './ContentFilterIndicators';
+
+export type { CoverFilterMode };
 
 const cacheUrlMap = new Map<string, string>();
 const inFlightCacheLoads = new Map<string, Promise<string | null>>();
@@ -108,37 +116,75 @@ const TONAL_PAIR_VARS = [
   ['var(--md-sys-color-tertiary-container)', 'var(--md-sys-color-on-tertiary-container)'],
 ] as const;
 
+export interface AddonCoverProps {
+  src?: string;
+  fallbackSrc?: string;
+  title: string;
+  category?: string;
+  compact?: boolean;
+  filterMode?: CoverFilterMode;
+  evaluation?: FilterEvaluationDisplay & { blurWholeCard?: boolean };
+  allowPeek?: boolean;
+}
+
 export function AddonCover({
   src,
   fallbackSrc,
   title,
   category,
   compact = false,
-}: {
-  src?: string;
-  fallbackSrc?: string;
-  title: string;
-  category?: string;
-  compact?: boolean;
-}) {
+  filterMode = 'none',
+  evaluation,
+  allowPeek = false,
+}: AddonCoverProps) {
+  const { t } = useTranslation();
+  const srcKey = `${src ?? ''}|${fallbackSrc ?? ''}`;
+  const resetKey = `${filterMode}|${srcKey}`;
+
+  const [trackedSrcKey, setTrackedSrcKey] = useState(srcKey);
+  const [trackedResetKey, setTrackedResetKey] = useState(resetKey);
   const [failedCandidates, setFailedCandidates] = useState<string[]>([]);
   const [resolvedCacheUrls, setResolvedCacheUrls] = useState<Record<string, string>>({});
+  const [lazyLoaded, setLazyLoaded] = useState(false);
+  const [peeked, setPeeked] = useState(false);
+
+  if (trackedSrcKey !== srcKey) {
+    setTrackedSrcKey(srcKey);
+    if (failedCandidates.length > 0) {
+      setFailedCandidates([]);
+    }
+  }
+  if (trackedResetKey !== resetKey) {
+    setTrackedResetKey(resetKey);
+    if (lazyLoaded) setLazyLoaded(false);
+    if (peeked) setPeeked(false);
+  }
 
   const markFailed = (candidate: string) => {
     setFailedCandidates((prev) => (prev.includes(candidate) ? prev : [...prev, candidate]));
   };
 
-  const candidates = [src, fallbackSrc].filter(
+  const validCandidates = [src, fallbackSrc].filter(
     (v, idx, arr): v is string =>
       Boolean(v) &&
       arr.indexOf(v) === idx &&
       Boolean(resolveDirectUrl(v) || (isTauriRuntime() && isLocalCacheKey(v))),
   );
-  const activeSrc = candidates.find((candidate) => !failedCandidates.includes(candidate));
+  const nonFailedCandidates = validCandidates.filter(
+    (candidate) => !failedCandidates.includes(candidate),
+  );
+  const hasValidCandidate = nonFailedCandidates.length > 0;
+
+  const isLazyDeferred = filterMode === 'lazy' && hasValidCandidate && !lazyLoaded;
+  const skipImageLoad = filterMode === 'hide' || isLazyDeferred;
+  const isPeeked = allowPeek && peeked;
+  const showFailureNotice = evaluation?.failureDisplay === 'notice';
+
+  const activeSrc = skipImageLoad ? undefined : nonFailedCandidates[0];
 
   const directUrl = resolveDirectUrl(activeSrc);
   const shouldLoadCache = Boolean(
-    activeSrc && !directUrl && isTauriRuntime() && isLocalCacheKey(activeSrc),
+    !skipImageLoad && activeSrc && !directUrl && isTauriRuntime() && isLocalCacheKey(activeSrc),
   );
   const cachedImmediate = shouldLoadCache && activeSrc ? cacheUrlMap.get(activeSrc) : undefined;
   const cachedStateUrl = shouldLoadCache && activeSrc ? resolvedCacheUrls[activeSrc] : undefined;
@@ -161,10 +207,59 @@ export function AddonCover({
     };
   }, [shouldLoadCache, activeSrc, cachedImmediate, cachedStateUrl]);
 
-  const resolvedUrl = directUrl ?? cachedImmediate ?? cachedStateUrl;
-
-  if (activeSrc && resolvedUrl) {
+  if (filterMode === 'hide') {
     return (
+      <div
+        className="l4a-cover-filtered"
+        data-filter-mode="hide"
+        data-compact={compact ? 'true' : 'false'}
+      >
+        {evaluation?.pendingEvaluation ? (
+          !evaluation.blurWholeCard && <FilterProgress size={compact ? 15 : 22} />
+        ) : (
+          <>
+            <EyeOff size={compact ? 15 : 22} strokeWidth={1.8} />
+            {!compact && (
+              <span className="l4a-cover-filter-label">
+                {t(showFailureNotice ? 'filter.unverifiedImageHidden' : 'filter.imageHidden')}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+    );
+  }
+
+  if (isLazyDeferred) {
+    const lazyText = t('filter.lazyLoadPreview');
+    return (
+      <div
+        className="l4a-cover-filtered"
+        data-filter-mode="lazy"
+        data-compact={compact ? 'true' : 'false'}
+      >
+        <button
+          type="button"
+          className="l4a-cover-lazy-btn"
+          data-compact={compact ? 'true' : 'false'}
+          aria-label={lazyText}
+          onClick={(e) => {
+            e.stopPropagation();
+            setLazyLoaded(true);
+          }}
+        >
+          <ImageIcon size={compact ? 14 : 16} />
+          {!compact && <span>{lazyText}</span>}
+        </button>
+      </div>
+    );
+  }
+
+  const resolvedUrl = directUrl ?? cachedImmediate ?? cachedStateUrl;
+  const pair = TONAL_PAIR_VARS[hashSeed(title) % TONAL_PAIR_VARS.length];
+
+  const visualContent =
+    activeSrc && resolvedUrl ? (
       <img
         src={resolvedUrl}
         alt={title}
@@ -173,32 +268,65 @@ export function AddonCover({
         draggable={false}
         onError={() => markFailed(activeSrc)}
       />
+    ) : (
+      <div
+        className="l4a-cover-fallback"
+        style={{
+          backgroundColor: pair[0],
+          color: pair[1],
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            width: compact ? 42 : 120,
+            height: compact ? 42 : 120,
+            borderRadius: '32%',
+            backgroundColor: 'currentColor',
+            opacity: 0.08,
+            transform: 'rotate(24deg) translate(28%, 18%)',
+          }}
+        />
+        <div style={{ opacity: 0.85, display: 'grid', placeItems: 'center' }}>
+          <CategoryGlyph category={category} size={compact ? 18 : 30} />
+        </div>
+      </div>
+    );
+
+  if (filterMode === 'blur' && hasValidCandidate) {
+    const blurred = !isPeeked;
+    return (
+      <div
+        className="l4a-cover-blur-wrap"
+        data-filter-mode="blur"
+        data-blurred={blurred ? 'true' : 'false'}
+      >
+        <div className="l4a-cover-blur-stage" data-blurred={blurred ? 'true' : 'false'}>
+          {visualContent}
+        </div>
+        <div className="l4a-cover-blur-overlay" data-compact={compact ? 'true' : 'false'}>
+          {allowPeek && !compact ? (
+            <button
+              type="button"
+              className="l4a-cover-peek-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPeeked((v) => !v);
+              }}
+            >
+              {isPeeked ? <EyeOff size={13} /> : <Eye size={13} />}
+              <span>{isPeeked ? t('filter.peekHide') : t('filter.peekShow')}</span>
+            </button>
+          ) : blurred ? (
+            <span className="md-pill" data-tone="surface">
+              <EyeOff size={12} />
+              {!compact && t(showFailureNotice ? 'filter.unverifiedImageBlurred' : 'filter.blurredImage')}
+            </span>
+          ) : null}
+        </div>
+      </div>
     );
   }
 
-  const pair = TONAL_PAIR_VARS[hashSeed(title) % TONAL_PAIR_VARS.length];
-  return (
-    <div
-      className="l4a-cover-fallback"
-      style={{
-        backgroundColor: pair[0],
-        color: pair[1],
-      }}
-    >
-      <div
-        style={{
-          position: 'absolute',
-          width: compact ? 42 : 120,
-          height: compact ? 42 : 120,
-          borderRadius: '32%',
-          backgroundColor: 'currentColor',
-          opacity: 0.08,
-          transform: 'rotate(24deg) translate(28%, 18%)',
-        }}
-      />
-      <div style={{ opacity: 0.85, display: 'grid', placeItems: 'center' }}>
-        <CategoryGlyph category={category} size={compact ? 18 : 30} />
-      </div>
-    </div>
-  );
+  return visualContent;
 }

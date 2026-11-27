@@ -2,9 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import * as ipc from '../api/ipc';
 import type { AppConfig, DashboardSnapshot, SteamCapabilities, SyncReport } from '../api/ipc';
+import {
+  computeFilterPolicySignature,
+  isLinkedWorkshopTitleRedacted,
+  type FilterLookupSource,
+} from '../utils/contentFilter';
 import type { BatchDialogPayload, NotifyOptions, SnackbarItem } from './controller/types';
 import { getClient } from './controller/types';
 import { useAddonActions } from './controller/useAddonActions';
+import { useContentFilter } from './controller/useContentFilter';
 import { useLiveDownloads } from './controller/useLiveDownloads';
 import { useOrganizeActions } from './controller/useOrganizeActions';
 
@@ -14,6 +20,19 @@ export type {
   LiveDownloadState,
   SnackbarItem,
 } from './controller/types';
+
+function samePolicy(a: AppConfig, b: AppConfig): boolean {
+  return (
+    computeFilterPolicySignature(a.filter, {
+      catalogServerUrl: a.catalogServerUrl,
+      httpsOnly: a.httpsOnly,
+    }) ===
+    computeFilterPolicySignature(b.filter, {
+      catalogServerUrl: b.catalogServerUrl,
+      httpsOnly: b.httpsOnly,
+    })
+  );
+}
 
 export function useAppController(onOpenReconcile?: () => void) {
   const { t } = useTranslation();
@@ -38,7 +57,7 @@ export function useAppController(onOpenReconcile?: () => void) {
   const snapshotSeqRef = useRef(0);
   const lastCommittedSeqRef = useRef(0);
   const lastSavedConfigSeqRef = useRef(0);
-  const refreshInFlightRef = useRef(false);
+  const refreshPromiseRef = useRef<Promise<boolean> | null>(null);
   const refreshQueuedRef = useRef(false);
   const snapshotRef = useRef<DashboardSnapshot | null>(null);
   const tRef = useRef(t);
@@ -77,7 +96,16 @@ export function useAppController(onOpenReconcile?: () => void) {
       // A refresh started before a config save can still contain fresh addon data.
       publishSnapshot(
         current && seq < lastSavedConfigSeqRef.current
-          ? { ...next, config: current.config }
+          ? {
+              ...next,
+              config: current.config,
+              cachedFilterVerdicts: samePolicy(current.config, next.config)
+                ? next.cachedFilterVerdicts
+                : current.cachedFilterVerdicts,
+              filterPolicySignature: samePolicy(current.config, next.config)
+                ? (next.filterPolicySignature ?? current.filterPolicySignature)
+                : current.filterPolicySignature,
+            }
           : next,
       );
       return true;
@@ -95,7 +123,18 @@ export function useAppController(onOpenReconcile?: () => void) {
       const current = snapshotRef.current;
       if (!current) return;
       lastSavedConfigSeqRef.current = nextSnapshotSeq();
-      publishSnapshot({ ...current, config });
+      const policyUnchanged = samePolicy(current.config, config);
+      publishSnapshot({
+        ...current,
+        config,
+        cachedFilterVerdicts: policyUnchanged ? current.cachedFilterVerdicts : [],
+        filterPolicySignature: policyUnchanged
+          ? current.filterPolicySignature
+          : computeFilterPolicySignature(config.filter, {
+              catalogServerUrl: config.catalogServerUrl,
+              httpsOnly: config.httpsOnly,
+            }),
+      });
     },
     [nextSnapshotSeq, publishSnapshot],
   );
@@ -125,28 +164,32 @@ export function useAppController(onOpenReconcile?: () => void) {
   }, []);
 
   const refresh = useCallback(async (): Promise<boolean> => {
-    if (refreshInFlightRef.current) {
+    if (refreshPromiseRef.current) {
       refreshQueuedRef.current = true;
-      return true;
+      return refreshPromiseRef.current;
     }
-    refreshInFlightRef.current = true;
-    let ok = true;
-    try {
-      do {
-        refreshQueuedRef.current = false;
-        const seq = nextSnapshotSeq();
-        try {
-          const next = await client.getDashboardSnapshot();
-          commitSnapshot(seq, next);
-        } catch (err) {
-          ok = false;
-          notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
-        }
-      } while (refreshQueuedRef.current);
-    } finally {
-      refreshInFlightRef.current = false;
-    }
-    return ok;
+    const run = (async () => {
+      let ok = true;
+      try {
+        do {
+          refreshQueuedRef.current = false;
+          ok = true;
+          const seq = nextSnapshotSeq();
+          try {
+            const next = await client.getDashboardSnapshot();
+            commitSnapshot(seq, next);
+          } catch (err) {
+            ok = false;
+            notify(err instanceof Error ? err.message : String(err), { tone: 'error' });
+          }
+        } while (refreshQueuedRef.current);
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+      return ok;
+    })();
+    refreshPromiseRef.current = run;
+    return run;
   }, [client, commitSnapshot, nextSnapshotSeq, notify]);
 
   const [bootstrapNonce, setBootstrapNonce] = useState(0);
@@ -212,6 +255,53 @@ export function useAppController(onOpenReconcile?: () => void) {
     };
   }, [bootstrapNonce, client, commitSnapshot, isTauri, nextSnapshotSeq, notify]);
 
+  const contentFilter = useContentFilter({
+    client,
+    snapshot,
+    snapshotRef,
+    tRef,
+    commitSnapshot,
+    commitSavedConfig,
+    nextSnapshotSeq,
+    notify,
+    setBusy,
+  });
+
+  const isWorkshopTitleRedacted = useCallback(
+    (
+      workshopId: string,
+      rawTitle?: string,
+      addonId?: string,
+      options?: { transferKind?: 'download' | 'update' },
+    ): boolean => {
+      const liveSnapshot = snapshotRef.current;
+      const freshExclusions = liveSnapshot
+        ? new Map(liveSnapshot.filterExclusions.map((e) => [e.addonId, e]))
+        : contentFilter.exclusionsByAddonId;
+      const lookup: FilterLookupSource = {
+        filterConfig: liveSnapshot?.config.filter ?? contentFilter.filterConfig,
+        verdicts: contentFilter.filterVerdicts,
+        evaluatedRevisions: contentFilter.evaluatedRevisions,
+        exclusionsByAddonId: freshExclusions,
+        revealedCardIds: contentFilter.revealedCardIds,
+        failedTargetKeys: contentFilter.failedTargetKeys,
+      };
+      const addons = liveSnapshot?.addons ?? [];
+      const found =
+        (addonId ? addons.find((a) => a.id === addonId) : undefined) ??
+        addons.find((a) => a.workshopId === workshopId);
+      return isLinkedWorkshopTitleRedacted(workshopId, found, rawTitle, lookup, options);
+    },
+    [
+      contentFilter.evaluatedRevisions,
+      contentFilter.exclusionsByAddonId,
+      contentFilter.failedTargetKeys,
+      contentFilter.filterConfig,
+      contentFilter.filterVerdicts,
+      contentFilter.revealedCardIds,
+    ],
+  );
+
   const liveDownloadController = useLiveDownloads({
     client,
     snapshotRef,
@@ -219,6 +309,9 @@ export function useAppController(onOpenReconcile?: () => void) {
     onOpenReconcileRef,
     notify,
     refresh,
+    isWorkshopTitleRedacted,
+    onFilterVerdictsUpdated: contentFilter.handleFilterVerdictsUpdated,
+    onLocalFilterStatusChanged: contentFilter.handleLocalFilterStatusChanged,
   });
 
   const addonActions = useAddonActions({
@@ -237,6 +330,7 @@ export function useAppController(onOpenReconcile?: () => void) {
     setSyncReport,
     setSteamCaps,
     setBatchReport,
+    onClearFailedFilterEvaluations: contentFilter.retryFailedEvaluations,
   });
 
   const organizeActions = useOrganizeActions({
@@ -301,6 +395,31 @@ export function useAppController(onOpenReconcile?: () => void) {
     searchByMapCode: addonActions.searchByMapCode,
     openExternalUrl: addonActions.openExternalUrl,
     openInFileManager: addonActions.openInFileManager,
+    filterConfig: contentFilter.filterConfig,
+    filterVerdicts: contentFilter.filterVerdicts,
+    evaluatedRevisions: contentFilter.evaluatedRevisions,
+    exclusionsByAddonId: contentFilter.exclusionsByAddonId,
+    localFilterStatus: contentFilter.localFilterStatus,
+    filterStatusBusy: contentFilter.filterStatusBusy,
+    filterTokenStatus: contentFilter.filterTokenStatus,
+    filterEvaluationLog: contentFilter.filterEvaluationLog,
+    revealedCardIds: contentFilter.revealedCardIds,
+    failedTargetKeys: contentFilter.failedTargetKeys,
+    revealCard: contentFilter.revealCard,
+    retryFailedEvaluations: contentFilter.retryFailedEvaluations,
+    prioritizeFilterTargets: contentFilter.prioritizeFilterTargets,
+    registerWorkshopItems: contentFilter.registerWorkshopItems,
+    refreshLocalFilterStatus: contentFilter.refreshLocalFilterStatus,
+    checkLocalFilterUpdates: contentFilter.checkLocalFilterUpdates,
+    deployLocalFilter: contentFilter.deployLocalFilter,
+    startLocalFilterService: contentFilter.startLocalFilterService,
+    stopLocalFilterService: contentFilter.stopLocalFilterService,
+    refreshFilterTokenStatus: contentFilter.refreshFilterTokenStatus,
+    setFilterLlmToken: contentFilter.setFilterLlmToken,
+    clearFilterCache: contentFilter.clearFilterCache,
+    evaluateSandboxTarget: contentFilter.evaluateSandboxTarget,
+    upsertFilterExclusion: contentFilter.upsertFilterExclusion,
+    deleteFilterExclusion: contentFilter.deleteFilterExclusion,
   };
 }
 

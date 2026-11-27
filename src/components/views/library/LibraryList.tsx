@@ -1,5 +1,6 @@
 import { useTranslation } from 'react-i18next';
 import {
+  AlertTriangle,
   ArrowUpCircle,
   CloudOff,
   Download,
@@ -9,9 +10,19 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, BundleRecord } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
+import {
+  getFilteredAddonFallbackCover,
+  addonFilterKey,
+  formatDiagnosticVerdictBadge,
+  formatRedactedAddonLabel,
+  resolveBundleCoverPresentation,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
 import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, Checkbox, IconButton, Switch } from '../../m3/primitives';
 import {
   isRemoteUnavailable,
@@ -27,6 +38,7 @@ export interface LibraryListProps {
   batchMode: boolean;
   liveDownloads: Record<string, LiveDownloadState>;
   busy: boolean;
+  forceShowHiddenCards?: boolean;
   onToggleSelect: (id: string) => void;
   onToggleSelectMany: (ids: string[]) => void;
   onSelectAddon: (addon: AddonSummary) => void;
@@ -44,6 +56,7 @@ interface BundleListRowProps {
   validSelectedIds: Set<string>;
   batchMode: boolean;
   busy: boolean;
+  forceShowHiddenCards: boolean;
   onToggleSelectMany: (ids: string[]) => void;
   onInspectBundle: (bundleId: string) => void;
   onBatchToggle: (addonIds: string[], enabled: boolean) => void;
@@ -57,12 +70,15 @@ function BundleListRow({
   validSelectedIds,
   batchMode,
   busy,
+  forceShowHiddenCards,
   onToggleSelectMany,
   onInspectBundle,
   onBatchToggle,
   onOpenInFileManager,
 }: BundleListRowProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
+  const { revealCard } = filterCtx;
   const summary = summarizeBundle(allMembers);
   const visibleSummary = summarizeBundle(visibleMembers);
   const visibleIds = visibleMembers.map((m) => m.id);
@@ -71,113 +87,155 @@ function BundleListRow({
   const muted = visibleSummary.installed.length > 0 && visibleSummary.enabledInstalled.length === 0;
   const firstPath = visibleSummary.firstPath;
 
+  const coverPres = resolveBundleCoverPresentation(visibleMembers, filterCtx, {
+    allMembers,
+    bundleCoverImage: bundle.coverImage,
+    bundleName: bundle.name,
+    forceShowHiddenCards,
+  });
+  const bundleDisplayName =
+    coverPres.redactTitle || coverPres.blurWholeCard
+      ? formatRedactedAddonLabel(
+          visibleSummary.firstWorkshopId ?? summary.firstWorkshopId,
+          t,
+          coverPres.failureDisplay,
+        )
+      : bundle.name;
+  const authorText = coverPres.redactAuthor
+    ? t('filter.redactedAuthor')
+    : coverPres.author || t('common.unknown');
+
   return (
     <div
       className="l4a-list-row"
       data-selected={selected ? 'true' : 'false'}
       data-muted={muted ? 'true' : 'false'}
+      data-blur-card={coverPres.blurWholeCard ? 'true' : 'false'}
+      data-pending-eval={coverPres.pendingEvaluation ? 'true' : undefined}
     >
-      <Checkbox
-        checked={selected}
-        label={bundle.name}
-        onChange={() => onToggleSelectMany(visibleIds)}
-      />
-      <div className="l4a-list-thumb">
-        <AddonCover
-          compact
-          src={bundle.coverImage ?? summary.firstCover}
-          fallbackSrc={summary.firstLocalCover}
-          title={bundle.name}
-          category="Campaign"
-        />
-      </div>
-      <button
-        type="button"
-        className="l4a-card-trigger l4a-list-main"
-        onClick={() => {
-          if (batchMode) onToggleSelectMany(visibleIds);
-          else onInspectBundle(bundle.id);
+      <FilterCardOverlay
+        state={coverPres}
+        onReveal={() => {
+          if (batchMode) {
+            onToggleSelectMany(visibleIds);
+          } else {
+            for (const member of visibleMembers) {
+              revealCard(addonFilterKey(member.id));
+            }
+          }
         }}
+      />
+
+      <div
+        className="l4a-blur-row-inner"
+        inert={coverPres.blurWholeCard || undefined}
+        aria-hidden={coverPres.blurWholeCard || undefined}
       >
-        <div className="l4a-row-wrap" style={{ gap: 6 }}>
-          <span className="md-title-small l4a-truncate">{bundle.name}</span>
-          <span className="md-pill" data-tone="secondary">
-            <Layers size={11} />
-            {t('library.bundleParts', { count: allMembers.length })}
-          </span>
-          {summary.hasDummyBypass && (
-            <span className="md-pill" data-tone="primary">
-              <ShieldCheck size={11} />
-            </span>
-          )}
-          {summary.updateAvailable && (
-            <span className="md-pill" data-tone="tertiary">
-              <ArrowUpCircle size={11} />
-            </span>
-          )}
-          {summary.removedUpstream && (
-            <span className="md-pill" data-tone="error">
-              <CloudOff size={11} />
-            </span>
-          )}
-          {loadingIds.length > 0 && !visibleSummary.allLoadingEnabled && (
-            <span
-              className="md-pill"
-              data-tone={visibleSummary.noneLoadingEnabled ? 'surface' : 'tertiary'}
-            >
-              {visibleSummary.noneLoadingEnabled
-                ? t('common.disabled')
-                : t('organize.statusPartial', {
-                    enabled: visibleSummary.enabledLoading.length,
-                    total: loadingIds.length,
-                  })}
-            </span>
-          )}
-        </div>
-        <div className="l4a-addon-meta">
-          <span className="l4a-truncate">{summary.firstAuthor || t('common.unknown')}</span>
-          <span>·</span>
-          <span>{formatBytes(summary.totalSize)}</span>
-          {bundle.maps.length > 0 && (
-            <>
-              <span>·</span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
-                <MapIcon size={11} />
-                {bundle.maps.length}
-              </span>
-            </>
-          )}
-        </div>
-      </button>
-      <div className="l4a-list-trailing">
-        {visibleSummary.primaryDir && (
-          <span className="md-pill" data-tone="surface">
-            {visibleSummary.primaryDir === 'loading'
-              ? t('library.loadingDir')
-              : t('library.workshopDir')}
-          </span>
-        )}
-        {firstPath && (
-          <IconButton
-            size="sm"
-            label={t('common.openInExplorer')}
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenInFileManager(firstPath);
-            }}
-          >
-            <FolderOpen size={15} />
-          </IconButton>
-        )}
-        {loadingIds.length > 0 && (
-          <Switch
+        <Checkbox
+          checked={selected}
+          label={bundleDisplayName}
+          onChange={() => onToggleSelectMany(visibleIds)}
+        />
+        <div className="l4a-list-thumb">
+          <AddonCover
             compact
-            checked={visibleSummary.allLoadingEnabled}
-            disabled={busy}
-            label={bundle.name}
-            onChange={(next) => onBatchToggle(loadingIds, next)}
+            src={coverPres.src}
+            fallbackSrc={coverPres.fallbackSrc}
+            title={bundleDisplayName}
+            category="Campaign"
+            filterMode={coverPres.coverMode}
+            evaluation={coverPres.coverEvaluation}
           />
-        )}
+        </div>
+        <button
+          type="button"
+          className="l4a-card-trigger l4a-list-main"
+          onClick={() => {
+            if (batchMode) onToggleSelectMany(visibleIds);
+            else onInspectBundle(bundle.id);
+          }}
+        >
+          <div className="l4a-row-wrap" style={{ gap: 6 }}>
+            <span className="md-title-small l4a-truncate">{bundleDisplayName}</span>
+            <FilterFailureBadge state={coverPres} />
+            <span className="md-pill" data-tone="secondary">
+              <Layers size={11} />
+              {t('library.bundleParts', { count: allMembers.length })}
+            </span>
+            {summary.hasDummyBypass && (
+              <span className="md-pill" data-tone="primary">
+                <ShieldCheck size={11} />
+              </span>
+            )}
+            {summary.updateAvailable && (
+              <span className="md-pill" data-tone="tertiary">
+                <ArrowUpCircle size={11} />
+              </span>
+            )}
+            {summary.removedUpstream && (
+              <span className="md-pill" data-tone="error">
+                <CloudOff size={11} />
+              </span>
+            )}
+            {loadingIds.length > 0 && !visibleSummary.allLoadingEnabled && (
+              <span
+                className="md-pill"
+                data-tone={visibleSummary.noneLoadingEnabled ? 'surface' : 'tertiary'}
+              >
+                {visibleSummary.noneLoadingEnabled
+                  ? t('common.disabled')
+                  : t('organize.statusPartial', {
+                      enabled: visibleSummary.enabledLoading.length,
+                      total: loadingIds.length,
+                    })}
+              </span>
+            )}
+          </div>
+          <div className="l4a-addon-meta">
+            <span className="l4a-truncate">{authorText}</span>
+            <span>·</span>
+            <span>{formatBytes(summary.totalSize)}</span>
+            {bundle.maps.length > 0 && (
+              <>
+                <span>·</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                  <MapIcon size={11} />
+                  {bundle.maps.length}
+                </span>
+              </>
+            )}
+          </div>
+        </button>
+        <div className="l4a-list-trailing">
+          {visibleSummary.primaryDir && (
+            <span className="md-pill" data-tone="surface">
+              {visibleSummary.primaryDir === 'loading'
+                ? t('library.loadingDir')
+                : t('library.workshopDir')}
+            </span>
+          )}
+          {firstPath && (
+            <IconButton
+              size="sm"
+              label={t('common.openInExplorer')}
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenInFileManager(firstPath);
+              }}
+            >
+              <FolderOpen size={15} />
+            </IconButton>
+          )}
+          {loadingIds.length > 0 && (
+            <Switch
+              compact
+              checked={visibleSummary.allLoadingEnabled}
+              disabled={busy}
+              label={bundleDisplayName}
+              onChange={(next) => onBatchToggle(loadingIds, next)}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -190,6 +248,7 @@ interface AddonListRowProps {
   batchMode: boolean;
   dl?: LiveDownloadState;
   busy: boolean;
+  forceShowHiddenCards: boolean;
   onToggleSelect: (id: string) => void;
   onSelectAddon: (addon: AddonSummary) => void;
   onToggleSingle: (addon: AddonSummary, enabled: boolean) => void;
@@ -204,6 +263,7 @@ function AddonListRow({
   batchMode,
   dl,
   busy,
+  forceShowHiddenCards,
   onToggleSelect,
   onSelectAddon,
   onToggleSingle,
@@ -211,7 +271,24 @@ function AddonListRow({
   onOpenInFileManager,
 }: AddonListRowProps) {
   const { t } = useTranslation();
-  const displayName = formatAddonDisplayName(addon, namePreference);
+  const filterCtx = useContentFilterContext();
+  const { verdicts, revealCard } = filterCtx;
+
+  const cardKey = addonFilterKey(addon.id);
+  const verdict = verdicts[cardKey];
+  const cardFilter = resolveLibraryAddonCardFilter(addon, filterCtx, {
+    forceShowHiddenCards,
+  });
+
+  const rawDisplayName = formatAddonDisplayName(addon, namePreference);
+  const displayName = cardFilter.redactTitle
+    ? formatRedactedAddonLabel(addon.workshopId, t, cardFilter.failureDisplay)
+    : rawDisplayName;
+  const authorText = cardFilter.redactMeta
+    ? t('filter.redactedAuthor')
+    : addon.author || t('common.unknown');
+  const description = addon.addonInfo.addondescription ?? addon.addonInfo.description;
+
   const installed = addon.installState === 'installed';
   const remoteUnavailable = isRemoteUnavailable(addon);
 
@@ -220,114 +297,173 @@ function AddonListRow({
       className="l4a-list-row"
       data-selected={selected ? 'true' : 'false'}
       data-muted={installed && !addon.enabled ? 'true' : 'false'}
+      data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
+      data-pending-eval={cardFilter.pendingEvaluation ? 'true' : undefined}
     >
-      <Checkbox
-        checked={selected}
-        label={displayName}
-        onChange={() => onToggleSelect(addon.id)}
-      />
-      <div className="l4a-list-thumb">
-        <AddonCover
-          compact
-          src={addon.coverImage}
-          fallbackSrc={addon.localCoverImage}
-          title={displayName}
-          category={addon.categories[0]}
-        />
-      </div>
-      <button
-        type="button"
-        className="l4a-card-trigger l4a-list-main"
-        onClick={() => {
+      <FilterCardOverlay
+        state={cardFilter}
+        onReveal={() => {
           if (batchMode) onToggleSelect(addon.id);
-          else onSelectAddon(addon);
+          else revealCard(cardKey);
         }}
+      />
+
+      <div
+        className="l4a-blur-row-inner"
+        inert={cardFilter.blurWholeCard || undefined}
+        aria-hidden={cardFilter.blurWholeCard || undefined}
       >
-        <div className="l4a-row-wrap" style={{ gap: 6 }}>
-          <span className="md-title-small l4a-truncate">{displayName}</span>
-          {addon.hasDummyBypass && (
-            <span className="md-pill" data-tone="primary">
-              <ShieldCheck size={11} />
-            </span>
-          )}
-          {addon.updateAvailable && (
-            <span className="md-pill" data-tone="tertiary">
-              <ArrowUpCircle size={11} />
-            </span>
-          )}
-          {remoteUnavailable && (
-            <span className="md-pill" data-tone="error">
-              <CloudOff size={11} />
-            </span>
-          )}
-          {addon.installState === 'missing_file' && (
-            <span className="md-pill" data-tone="error">
-              {t('library.missingFile')}
-            </span>
-          )}
-          {installed && !addon.enabled && (
-            <span className="md-pill" data-tone="surface">
-              {t('common.disabled')}
-            </span>
-          )}
+        <Checkbox
+          checked={selected}
+          label={displayName}
+          onChange={() => onToggleSelect(addon.id)}
+        />
+        <div className="l4a-list-thumb">
+          <AddonCover
+            compact
+            src={addon.coverImage}
+            fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
+            title={displayName}
+            category={addon.categories[0]}
+            filterMode={cardFilter.coverMode}
+            evaluation={cardFilter}
+          />
         </div>
-        <div className="l4a-addon-meta">
-          <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
-          <span>·</span>
-          <span>{formatBytes(addon.fileSize)}</span>
-          {addon.workshopId && (
-            <>
-              <span>·</span>
-              <span className="md-mono">#{addon.workshopId}</span>
-            </>
-          )}
-        </div>
-      </button>
-      <div className="l4a-list-trailing">
-        {addon.primaryDir && (
-          <span className="md-pill" data-tone="surface">
-            {addon.primaryDir === 'loading' ? t('library.loadingDir') : t('library.workshopDir')}
-          </span>
-        )}
-        {installed ? (
-          <>
-            {addon.currentPath && (
-              <IconButton
-                size="sm"
-                label={t('common.openInExplorer')}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onOpenInFileManager(addon.currentPath!);
-                }}
-              >
-                <FolderOpen size={15} />
-              </IconButton>
+        <button
+          type="button"
+          className="l4a-card-trigger l4a-list-main"
+          onClick={() => {
+            if (batchMode) onToggleSelect(addon.id);
+            else onSelectAddon(addon);
+          }}
+        >
+          <div className="l4a-row-wrap" style={{ gap: 6 }}>
+            <span className="md-title-small l4a-truncate">{displayName}</span>
+            <FilterFailureBadge state={cardFilter} />
+            {cardFilter.exclusionActive &&
+              cardFilter.exclusionDisplayLevel &&
+              cardFilter.exclusionDisplayLevel !== 'normal' && (
+                <span className="md-pill" data-tone="secondary">
+                  {t('filter.exclusionBadge', {
+                    level: t(`filter.levels.${cardFilter.exclusionDisplayLevel}`),
+                  })}
+                </span>
+              )}
+            {cardFilter.exclusionInvalidated && (
+              <span className="md-pill" data-tone="error">
+                <AlertTriangle size={11} />
+                {t('filter.exclusionInvalidPill')}
+              </span>
             )}
-            <Switch
-              compact
-              checked={addon.enabled}
-              disabled={busy}
-              label={displayName}
-              onChange={(next) => onToggleSingle(addon, next)}
-            />
-          </>
-        ) : addon.workshopId && !remoteUnavailable ? (
-          <Button
-            variant="tonal"
-            size="sm"
-            disabled={Boolean(dl)}
-            icon={<Download size={13} />}
-            onClick={() =>
-              onDownloadItem(addon.workshopId!, resolveLibraryMetadataTitle(addon, namePreference))
-            }
-          >
-            {dl
-              ? dl.cancelling
-                ? t('common.cancelling')
-                : `${dl.percent}%`
-              : t('common.download')}
-          </Button>
-        ) : null}
+            {cardFilter.showDiagnosticBadge && verdict && (
+              <span className="md-pill" data-tone="tertiary">
+                {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                  imageTag: t('filter.modImageShort'),
+                  textTag: t('filter.modTextShort'),
+                })}
+              </span>
+            )}
+            {addon.hasDummyBypass && (
+              <span className="md-pill" data-tone="primary">
+                <ShieldCheck size={11} />
+              </span>
+            )}
+            {addon.updateAvailable && (
+              <span className="md-pill" data-tone="tertiary">
+                <ArrowUpCircle size={11} />
+              </span>
+            )}
+            {remoteUnavailable && (
+              <span className="md-pill" data-tone="error">
+                <CloudOff size={11} />
+              </span>
+            )}
+            {addon.installState === 'missing_file' && (
+              <span className="md-pill" data-tone="error">
+                {t('library.missingFile')}
+              </span>
+            )}
+            {installed && !addon.enabled && (
+              <span className="md-pill" data-tone="surface">
+                {t('common.disabled')}
+              </span>
+            )}
+          </div>
+          <div className="l4a-addon-meta">
+            <span className="l4a-truncate">{authorText}</span>
+            <span>·</span>
+            <span>{formatBytes(addon.fileSize)}</span>
+            {addon.workshopId && (
+              <>
+                <span>·</span>
+                <span className="md-mono">#{addon.workshopId}</span>
+              </>
+            )}
+          </div>
+          {cardFilter.isBlurCardRevealed && (
+            <div className="l4a-revealed-desc">
+              {cardFilter.redactDescription
+                ? t('filter.redactedDescription')
+                : description?.trim() || t('filter.noDescription')}
+            </div>
+          )}
+        </button>
+        <div className="l4a-list-trailing">
+          {cardFilter.isBlurCardRevealed && (
+            <Button variant="text" size="sm" onClick={() => onSelectAddon(addon)}>
+              {t('common.inspect')}
+            </Button>
+          )}
+          {addon.primaryDir && (
+            <span className="md-pill" data-tone="surface">
+              {addon.primaryDir === 'loading'
+                ? t('library.loadingDir')
+                : t('library.workshopDir')}
+            </span>
+          )}
+          {installed ? (
+            <>
+              {addon.currentPath && (
+                <IconButton
+                  size="sm"
+                  label={t('common.openInExplorer')}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenInFileManager(addon.currentPath!);
+                  }}
+                >
+                  <FolderOpen size={15} />
+                </IconButton>
+              )}
+              <Switch
+                compact
+                checked={addon.enabled}
+                disabled={busy}
+                label={displayName}
+                onChange={(next) => onToggleSingle(addon, next)}
+              />
+            </>
+          ) : addon.workshopId && !remoteUnavailable ? (
+            <Button
+              variant="tonal"
+              size="sm"
+              disabled={Boolean(dl)}
+              icon={<Download size={13} />}
+              onClick={() =>
+                onDownloadItem(
+                  addon.workshopId!,
+                  resolveLibraryMetadataTitle(addon, namePreference, filterCtx),
+                )
+              }
+            >
+              {dl
+                ? dl.cancelling
+                  ? t('common.cancelling')
+                  : `${dl.percent}%`
+                : t('common.download')}
+            </Button>
+          ) : null}
+        </div>
       </div>
     </div>
   );
@@ -340,6 +476,7 @@ export function LibraryList({
   batchMode,
   liveDownloads,
   busy,
+  forceShowHiddenCards = false,
   onToggleSelect,
   onToggleSelectMany,
   onSelectAddon,
@@ -362,6 +499,7 @@ export function LibraryList({
               validSelectedIds={validSelectedIds}
               batchMode={batchMode}
               busy={busy}
+              forceShowHiddenCards={forceShowHiddenCards}
               onToggleSelectMany={onToggleSelectMany}
               onInspectBundle={onInspectBundle}
               onBatchToggle={onBatchToggle}
@@ -380,6 +518,7 @@ export function LibraryList({
             batchMode={batchMode}
             dl={addon.workshopId ? liveDownloads[addon.workshopId] : undefined}
             busy={busy}
+            forceShowHiddenCards={forceShowHiddenCards}
             onToggleSelect={onToggleSelect}
             onSelectAddon={onSelectAddon}
             onToggleSingle={onToggleSingle}

@@ -305,20 +305,42 @@ export function buildSteamProtocolUrl(workshopId: string): string {
   return `steam://url/CommunityFilePage/${workshopId}`;
 }
 
-export function matchesAddonSearch(addon: AddonSummary, needle: string): boolean {
+export interface AddonSearchRedactionOptions {
+  redactTitle?: boolean;
+  redactDescription?: boolean;
+  redactMeta?: boolean;
+}
+
+export function matchesAddonSearch(
+  addon: AddonSummary,
+  needle: string,
+  redaction?: AddonSearchRedactionOptions,
+): boolean {
   const q = needle.trim().toLowerCase();
   if (!q) return true;
-  if (addon.title.toLowerCase().includes(q)) return true;
-  if (addon.addonTitle?.toLowerCase().includes(q)) return true;
-  if (addon.workshopTitle?.toLowerCase().includes(q)) return true;
-  if (addon.author?.toLowerCase().includes(q)) return true;
+  if (!redaction?.redactTitle) {
+    if (addon.title.toLowerCase().includes(q)) return true;
+    if (addon.addonTitle?.toLowerCase().includes(q)) return true;
+    if (addon.workshopTitle?.toLowerCase().includes(q)) return true;
+    if (!redaction?.redactMeta && addon.currentFileName?.toLowerCase().includes(q)) {
+      return true;
+    }
+  }
+  if (!redaction?.redactMeta && addon.author?.toLowerCase().includes(q)) return true;
   if (addon.workshopId?.toLowerCase().includes(q)) return true;
-  if (addon.currentFileName?.toLowerCase().includes(q)) return true;
   if (addon.categories.some((c) => c.toLowerCase().includes(q))) return true;
-  if (addon.maps.some((m) => m.code.toLowerCase().includes(q) || m.name.toLowerCase().includes(q))) {
+  if (
+    addon.maps.some(
+      (m) =>
+        m.code.toLowerCase().includes(q) ||
+        (!redaction?.redactTitle && m.name.toLowerCase().includes(q)),
+    )
+  ) {
     return true;
   }
-  const desc = addon.addonInfo.addondescription ?? addon.addonInfo.description;
-  if (desc?.toLowerCase().includes(q)) return true;
+  if (!redaction?.redactDescription) {
+    const desc = addon.addonInfo.addondescription ?? addon.addonInfo.description;
+    if (desc?.toLowerCase().includes(q)) return true;
+  }
   return false;
 }

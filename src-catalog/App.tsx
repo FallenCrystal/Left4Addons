@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Database,
+  Filter,
   Gauge,
   LogOut,
   Moon,
@@ -11,13 +12,16 @@ import {
 } from 'lucide-react';
 import {
   ApiError,
+  DEFAULT_FILTER_STATUS,
   getAdminSession,
   getOverview,
   logoutAdmin,
   setSessionToken,
+  type CatalogFilterStatus,
   type CatalogOverviewResponse,
   type CatalogSteamStatus,
 } from './api';
+import { FilterPanel } from './components/FilterPanel';
 import { ItemInspectorDrawer } from './components/ItemInspectorDrawer';
 import { LoginScreen } from './components/LoginScreen';
 import { OverviewPanel } from './components/OverviewPanel';
@@ -25,7 +29,7 @@ import { SettingsAuditPanel } from './components/SettingsAuditPanel';
 import { SteamAuthPanel } from './components/SteamAuthPanel';
 import { WorkshopCachePanel } from './components/WorkshopCachePanel';
 
-type NavTab = 'overview' | 'cache' | 'steam' | 'settings';
+type NavTab = 'overview' | 'cache' | 'steam' | 'filter' | 'settings';
 
 export function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
@@ -37,6 +41,7 @@ export function App() {
   const [loggingOut, setLoggingOut] = useState(false);
   const [activeTab, setActiveTab] = useState<NavTab>('overview');
   const [overview, setOverview] = useState<CatalogOverviewResponse | null>(null);
+  const overviewEpochRef = useRef(0);
   const [inspectId, setInspectId] = useState<string | null>(null);
   const closeInspector = useCallback(() => setInspectId(null), []);
   const [toast, setToast] = useState<{ msg: string; tone: 'default' | 'error' } | null>(null);
@@ -57,13 +62,21 @@ export function App() {
   }, [toast]);
 
   const refreshOverview = useCallback(async () => {
+    const reqEpoch = ++overviewEpochRef.current;
     try {
       const data = await getOverview();
+      if (reqEpoch !== overviewEpochRef.current) {
+        return;
+      }
       setOverview(data);
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        overviewEpochRef.current += 1;
         setUsername(null);
         setSessionToken(null);
+        return;
+      }
+      if (reqEpoch !== overviewEpochRef.current) {
         return;
       }
       notify(err instanceof Error ? err.message : String(err), 'error');
@@ -98,6 +111,7 @@ export function App() {
     setLoggingOut(true);
     try {
       await logoutAdmin();
+      overviewEpochRef.current += 1;
       setUsername(null);
       setOverview(null);
       closeInspector();
@@ -110,7 +124,13 @@ export function App() {
   };
 
   const handleSteamUpdated = useCallback((nextSteam: CatalogSteamStatus) => {
+    overviewEpochRef.current += 1;
     setOverview((prev) => (prev ? { ...prev, steam: nextSteam } : prev));
+  }, []);
+
+  const handleFilterUpdated = useCallback((nextFilter: CatalogFilterStatus) => {
+    overviewEpochRef.current += 1;
+    setOverview((prev) => (prev ? { ...prev, filter: nextFilter } : prev));
   }, []);
 
   if (checkingSession) {
@@ -174,6 +194,15 @@ export function App() {
           >
             <Radio size={16} />
             <span>SteamKit 账号会话</span>
+          </button>
+          <button
+            type="button"
+            className="cat-nav-btn"
+            data-active={activeTab === 'filter' ? 'true' : 'false'}
+            onClick={() => setActiveTab('filter')}
+          >
+            <Filter size={16} />
+            <span>内容过滤模型</span>
           </button>
           <button
             type="button"
@@ -258,6 +287,12 @@ export function App() {
                 onNotify={notify}
               />
             )}
+            <FilterPanel
+              hidden={activeTab !== 'filter'}
+              filter={overview.filter ?? DEFAULT_FILTER_STATUS}
+              onFilterUpdated={handleFilterUpdated}
+              onNotify={notify}
+            />
             {activeTab === 'settings' && (
               <SettingsAuditPanel
                 overview={overview}

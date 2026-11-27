@@ -12,7 +12,7 @@ pub fn parse_enum<T: serde::de::DeserializeOwned>(raw: &str, fallback: T) -> T {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).unwrap_or(fallback)
 }
 
-pub(super) fn strip_vpk_file_stem(raw_name: &str) -> String {
+pub(crate) fn strip_vpk_file_stem(raw_name: &str) -> String {
     let trimmed = raw_name.trim();
     let lower = trimmed.to_ascii_lowercase();
     let cut = if lower.ends_with(".vpk.disabled") {

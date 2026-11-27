@@ -7,13 +7,21 @@ import type {
   LoadoutProfile,
   UserGroup,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import {
+  getFilteredAddonFallbackCover,
+  formatFilteredAddonTitle,
+  formatRedactedAddonLabel,
+  getAddonSearchRedaction,
+  resolveLibraryAddonCardFilter,
+} from '../../utils/contentFilter';
 import {
   extractWorkshopIdInput,
-  formatAddonDisplayName,
   formatBytes,
   matchesAddonSearch,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
+import { FilterFailureBadge } from '../m3/ContentFilterIndicators';
 import { Button, Checkbox, Dialog, FilterChip, IconButton, Switch, TextField } from '../m3/primitives';
 
 const GROUP_COLORS = ['#246A4D', '#006399', '#964422', '#6750A4', '#8B5E00', '#AD2E56', '#3D6373'];
@@ -38,22 +46,30 @@ function AddonPicker({
   onClearAll?: () => void;
 }) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   const [filter, setFilter] = useState('');
   const [mode, setMode] = useState<PickerFilterMode>('all');
 
+  const nonHiddenAddons = useMemo(
+    () => addons.filter((a) => !resolveLibraryAddonCardFilter(a, filterCtx).hiddenCard),
+    [addons, filterCtx],
+  );
+
   const visible = useMemo(() => {
     const q = filter.trim();
-    return addons.filter((a) => {
+    return nonHiddenAddons.filter((a) => {
       if (mode === 'selected' && !selected.has(a.id)) return false;
       if (mode === 'manual' && a.primaryDir !== 'loading') return false;
       if (!q) return true;
-      return matchesAddonSearch(a, q);
+      return matchesAddonSearch(a, q, getAddonSearchRedaction(a, filterCtx));
     });
-  }, [addons, filter, mode, selected]);
+  }, [nonHiddenAddons, filter, mode, selected, filterCtx]);
 
   const hasMixedDirs = useMemo(
-    () => addons.some((a) => a.primaryDir === 'loading') && addons.some((a) => a.primaryDir === 'workshop'),
-    [addons],
+    () =>
+      nonHiddenAddons.some((a) => a.primaryDir === 'loading') &&
+      nonHiddenAddons.some((a) => a.primaryDir === 'workshop'),
+    [nonHiddenAddons],
   );
 
   return (
@@ -100,7 +116,7 @@ function AddonPicker({
       <div className="md-chip-row">
         <FilterChip
           label={t('organize.pickerAll')}
-          count={addons.length}
+          count={nonHiddenAddons.length}
           selected={mode === 'all'}
           onClick={() => setMode('all')}
         />
@@ -140,7 +156,15 @@ function AddonPicker({
         ) : (
           visible.map((addon) => {
             const checked = selected.has(addon.id);
-            const displayName = formatAddonDisplayName(addon, namePreference);
+            const cardFilter = resolveLibraryAddonCardFilter(addon, filterCtx);
+            const searchRedaction = getAddonSearchRedaction(addon, filterCtx);
+            const displayName = formatFilteredAddonTitle(addon, namePreference, filterCtx, t);
+            const authorText =
+              searchRedaction.redactMeta || cardFilter.blurWholeCard
+                ? t('filter.redactedAuthor')
+                : addon.author || t('common.unknown');
+            const { pendingEvaluation, failureDisplay, coverMode } = cardFilter;
+            const evaluation = { pendingEvaluation, failureDisplay, coverMode };
             return (
               <div
                 key={addon.id}
@@ -157,17 +181,20 @@ function AddonPicker({
                   <AddonCover
                     compact
                     src={addon.coverImage}
-                    fallbackSrc={addon.localCoverImage}
+                    fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
                     title={displayName}
                     category={addon.categories[0]}
+                    filterMode={coverMode}
+                    evaluation={evaluation}
                   />
                 </div>
                 <div className="l4a-list-main">
                   <span className="md-title-small l4a-truncate">{displayName}</span>
                   <div className="l4a-addon-meta">
-                    <span className="l4a-truncate">{addon.author || t('common.unknown')}</span>
+                    <span className="l4a-truncate">{authorText}</span>
                     <span>·</span>
                     <span>{formatBytes(addon.fileSize)}</span>
+                    <FilterFailureBadge state={evaluation} />
                   </div>
                 </div>
                 {addon.primaryDir && (
@@ -637,19 +664,29 @@ export function AddToGroupDialog({
 
 export function WorkshopToggleDialog({
   target,
+  namePreference = 'workshop_title',
   busy,
   onClose,
   onMoveThenToggle,
   onToggleDirectly,
 }: {
   target: { addon: AddonSummary; enabled: boolean } | null;
+  namePreference?: AddonNamePreference;
   busy: boolean;
   onClose: () => void;
   onMoveThenToggle: (addon: AddonSummary, enabled: boolean) => Promise<void>;
   onToggleDirectly: (addon: AddonSummary, enabled: boolean) => Promise<void>;
 }) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
   if (!target) return null;
+
+  const redaction = getAddonSearchRedaction(target.addon, filterCtx);
+  const targetLabel =
+    redaction.redactTitle || redaction.redactMeta
+      ? formatRedactedAddonLabel(target.addon.workshopId, t)
+      : target.addon.currentFileName ||
+        formatFilteredAddonTitle(target.addon, namePreference, filterCtx, t);
 
   return (
     <Dialog
@@ -679,9 +716,7 @@ export function WorkshopToggleDialog({
       }
     >
       <div className="l4a-path-chip">
-        <span className="md-mono l4a-truncate">
-          {target.addon.currentFileName || target.addon.title}
-        </span>
+        <span className="md-mono l4a-truncate">{targetLabel}</span>
       </div>
     </Dialog>
   );

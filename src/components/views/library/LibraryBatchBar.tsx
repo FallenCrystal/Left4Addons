@@ -12,6 +12,7 @@ import {
   X,
 } from 'lucide-react';
 import type { AddonDirType, AddonNamePreference, AddonSummary } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import { Button, FilterChip, IconButton } from '../../m3/primitives';
 import { isRemoteUnavailable, resolveLibraryMetadataTitle } from './helpers';
 
@@ -53,6 +54,7 @@ export function LibraryBatchBar({
   onUpdateItem,
 }: LibraryBatchBarProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
 
   const loadingToggleTargets = visibleSelectedAddons
     .filter((a) => a.installState === 'installed' && a.primaryDir === 'loading')
@@ -168,7 +170,7 @@ export function LibraryBatchBar({
               if (item.workshopId) {
                 onDownloadItem(
                   item.workshopId,
-                  resolveLibraryMetadataTitle(item, namePreference),
+                  resolveLibraryMetadataTitle(item, namePreference, filterCtx),
                 );
               }
             }
@@ -186,7 +188,10 @@ export function LibraryBatchBar({
           onClick={() => {
             for (const item of updatableTargets) {
               if (item.workshopId) {
-                onUpdateItem(item.workshopId, resolveLibraryMetadataTitle(item, namePreference));
+                onUpdateItem(
+                  item.workshopId,
+                  resolveLibraryMetadataTitle(item, namePreference, filterCtx),
+                );
               }
             }
           }}

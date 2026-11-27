@@ -1,10 +1,12 @@
-import { useId } from 'react';
+import { useEffect, useId } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
+  AlertTriangle,
   ArrowRightLeft,
   ArrowUpCircle,
   Copy,
   Download,
+  EyeOff,
   FolderOpen,
   Layers,
   Map as MapIcon,
@@ -17,9 +19,20 @@ import type {
   AddonSummary,
   BundleRecord,
 } from '../../../api/ipc';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
 import type { LiveDownloadState } from '../../../state/useAppController';
+import {
+  getFilteredAddonFallbackCover,
+  addonFilterKey,
+  buildFilteredBundleMaps,
+  formatDiagnosticVerdictBadge,
+  formatRedactedAddonLabel,
+  resolveBundleCoverPresentation,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
 import { formatBundleMemberLabel, formatBytes } from '../../../utils/format';
 import { AddonCover } from '../../m3/AddonCover';
+import { FilterCardOverlay, FilterFailureBadge } from '../../m3/ContentFilterIndicators';
 import { Button, IconButton, SideSheet, Switch, Tabs } from '../../m3/primitives';
 import {
   isRemoteUnavailable,
@@ -34,6 +47,7 @@ export interface BundleDetailSheetProps {
   liveDownloads: Record<string, LiveDownloadState>;
   busy: boolean;
   bundleTab: 'members' | 'maps';
+  forceShowHiddenCards?: boolean;
   onBundleTabChange: (tab: 'members' | 'maps') => void;
   onClose: () => void;
   onSelectAddon: (addon: AddonSummary) => void;
@@ -54,6 +68,7 @@ export function BundleDetailSheet({
   liveDownloads,
   busy,
   bundleTab,
+  forceShowHiddenCards,
   onBundleTabChange,
   onClose,
   onSelectAddon,
@@ -68,23 +83,95 @@ export function BundleDetailSheet({
 }: BundleDetailSheetProps) {
   const { t } = useTranslation();
   const bundleTabsId = useId();
+  const filterCtx = useContentFilterContext();
+  const { verdicts, revealCard, prioritizeFilterTargets } = filterCtx;
 
-  const members = bundle
+  const allMembers = bundle
     ? bundle.memberAddonIds
         .map((id) => addonsById.get(id))
         .filter((a): a is AddonSummary => Boolean(a))
     : [];
+
+  const memberStates = allMembers.map((member) => {
+    const key = addonFilterKey(member.id);
+    const verdict = verdicts[key];
+    return {
+      member,
+      key,
+      verdict,
+      state: resolveLibraryAddonCardFilter(member, filterCtx, { forceShowHiddenCards }),
+    };
+  });
+
+  const hiddenMemberCount = memberStates.filter((entry) => entry.state.hiddenCard).length;
+  const visibleMemberEntries = memberStates.filter((entry) => !entry.state.hiddenCard);
+  const members = visibleMemberEntries.map((entry) => entry.member);
+
+  const orderedBundleMemberKeysSig = (() => {
+    if (!bundle) return '';
+    const ordered: string[] = [];
+    const seen = new Set<string>();
+    for (const entry of visibleMemberEntries) {
+      if (!seen.has(entry.key)) {
+        seen.add(entry.key);
+        ordered.push(entry.key);
+      }
+    }
+    for (const id of bundle.memberAddonIds) {
+      const key = addonFilterKey(id);
+      if (!seen.has(key)) {
+        seen.add(key);
+        ordered.push(key);
+      }
+    }
+    return ordered.join('\0');
+  })();
+
+  useEffect(() => {
+    prioritizeFilterTargets(
+      orderedBundleMemberKeysSig ? orderedBundleMemberKeysSig.split('\0') : [],
+      { urgent: true, owner: 'bundle-detail' },
+    );
+  }, [orderedBundleMemberKeysSig, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'bundle-detail' });
+    };
+  }, [prioritizeFilterTargets]);
+
   const summary = bundle ? summarizeBundle(members) : null;
+  const coverPres = bundle
+    ? resolveBundleCoverPresentation(members, filterCtx, {
+        allMembers,
+        bundleCoverImage: bundle.coverImage,
+        bundleName: bundle.name,
+        forceShowHiddenCards,
+      })
+    : null;
+  const sheetTitle = bundle
+    ? coverPres?.redactTitle || coverPres?.blurWholeCard
+      ? formatRedactedAddonLabel(
+          summary?.firstWorkshopId ?? allMembers.find((m) => m.workshopId)?.workshopId,
+          t,
+          coverPres.failureDisplay,
+        )
+      : bundle.name
+    : '';
+
+  const filteredMaps = bundle
+    ? buildFilteredBundleMaps(bundle, members, allMembers, filterCtx)
+    : [];
   const loadingIds = summary ? summary.loading.map((m) => m.id) : [];
   const workshopIds = summary ? summary.workshopInstalled.map((m) => m.id) : [];
-  const hasBundleMaps = Boolean(bundle && bundle.maps.length > 0);
+  const hasBundleMaps = filteredMaps.length > 0;
   const activeTab: 'members' | 'maps' = hasBundleMaps ? bundleTab : 'members';
 
   return (
     /* Inline Campaign Bundle Inspector */
     <SideSheet
       open={Boolean(bundle)}
-      title={bundle?.name ?? ''}
+      title={sheetTitle}
       onClose={onClose}
       headerTrailing={
         bundle && summary && loadingIds.length > 0 ? (
@@ -164,7 +251,7 @@ export function BundleDetailSheet({
                 {
                   value: 'maps',
                   label: t('detail.maps'),
-                  count: bundle.maps.length,
+                  count: filteredMaps.length,
                 },
               ]}
             />
@@ -186,6 +273,12 @@ export function BundleDetailSheet({
                   <span className="md-pill" data-tone="surface">
                     {formatBytes(summary.totalSize)}
                   </span>
+                  {hiddenMemberCount > 0 && (
+                    <span className="md-pill" data-tone="surface">
+                      <EyeOff size={12} />
+                      {t('filter.filteredCount', { count: hiddenMemberCount })}
+                    </span>
+                  )}
                   {summary.loading.length > 0 && (
                     <span
                       className="md-pill"
@@ -210,127 +303,176 @@ export function BundleDetailSheet({
                 </div>
 
                 <div className="l4a-list">
-                  {members.map((member, idx) => {
+                  {visibleMemberEntries.map(({ member, key, verdict, state: cardFilter }, idx) => {
                     const installed = member.installState === 'installed';
                     const remoteUnavailable = isRemoteUnavailable(member);
                     const dl = member.workshopId ? liveDownloads[member.workshopId] : undefined;
-                    const memberLabel = formatBundleMemberLabel(
+                    const rawLabel = formatBundleMemberLabel(
                       member,
                       members,
                       namePreference,
                       bundle.name,
                     );
+                    const memberLabel = cardFilter.redactTitle
+                      ? formatRedactedAddonLabel(member.workshopId, t, cardFilter.failureDisplay)
+                      : rawLabel;
+                    const description =
+                      member.addonInfo.addondescription ?? member.addonInfo.description;
+
                     return (
                       <div
                         key={member.id}
                         className="l4a-list-row l4a-list-row-dense"
                         data-muted={installed && !member.enabled ? 'true' : 'false'}
+                        data-blur-card={cardFilter.blurWholeCard ? 'true' : 'false'}
                       >
-                        <div className="l4a-picker-thumb">
-                          <AddonCover
-                            compact
-                            src={member.coverImage}
-                            fallbackSrc={member.localCoverImage}
-                            title={memberLabel}
-                            category={member.categories[0]}
-                          />
-                        </div>
-                        <button
-                          type="button"
-                          className="l4a-card-trigger l4a-list-main"
-                          onClick={() => {
-                            onClose();
-                            onSelectAddon(member);
-                          }}
+                        <FilterCardOverlay state={cardFilter} onReveal={() => revealCard(key)} />
+                        <div
+                          className="l4a-blur-row-inner"
+                          inert={cardFilter.blurWholeCard || undefined}
+                          aria-hidden={cardFilter.blurWholeCard || undefined}
                         >
-                          <div className="l4a-row-wrap" style={{ gap: 6 }}>
-                            <span className="md-pill md-mono" data-tone="secondary">
-                              #{idx + 1}
-                            </span>
-                            <span className="md-title-small l4a-truncate">{memberLabel}</span>
-                            {member.updateAvailable && (
-                              <span className="md-pill" data-tone="tertiary">
-                                <ArrowUpCircle size={11} />
-                              </span>
-                            )}
-                            {member.installState === 'missing_file' && (
-                              <span className="md-pill" data-tone="error">
-                                {t('library.missingFile')}
-                              </span>
-                            )}
-                            {member.installState === 'uninstalled_known' && (
-                              <span className="md-pill" data-tone="surface">
-                                {t('scope.uninstalled')}
-                              </span>
-                            )}
+                          <div className="l4a-picker-thumb">
+                            <AddonCover
+                              compact
+                              src={member.coverImage}
+                              fallbackSrc={getFilteredAddonFallbackCover(member, filterCtx)}
+                              title={memberLabel}
+                              category={member.categories[0]}
+                              filterMode={cardFilter.coverMode}
+                              evaluation={cardFilter}
+                            />
                           </div>
-                          <div className="l4a-addon-meta">
-                            {member.currentFileName ? (
-                              <span className="md-mono l4a-truncate">{member.currentFileName}</span>
-                            ) : (
-                              <span className="l4a-truncate">
-                                {member.author || t('common.unknown')}
+                          <button
+                            type="button"
+                            className="l4a-card-trigger l4a-list-main"
+                            onClick={() => {
+                              onClose();
+                              onSelectAddon(member);
+                            }}
+                          >
+                            <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                              <span className="md-pill md-mono" data-tone="secondary">
+                                #{idx + 1}
                               </span>
-                            )}
-                            <span>·</span>
-                            <span>{formatBytes(member.fileSize)}</span>
-                            {member.maps.length > 0 && (
-                              <>
-                                <span>·</span>
-                                <span
-                                  style={{
-                                    display: 'inline-flex',
-                                    alignItems: 'center',
-                                    gap: 3,
-                                  }}
-                                >
-                                  <MapIcon size={11} />
-                                  {member.maps.length}
+                              <span className="md-title-small l4a-truncate">{memberLabel}</span>
+                              <FilterFailureBadge state={cardFilter} />
+                              {cardFilter.exclusionActive &&
+                                cardFilter.exclusionDisplayLevel &&
+                                cardFilter.exclusionDisplayLevel !== 'normal' && (
+                                  <span className="md-pill" data-tone="secondary">
+                                    {t(`filter.levels.${cardFilter.exclusionDisplayLevel}`)}
+                                  </span>
+                                )}
+                              {cardFilter.exclusionInvalidated && (
+                                <span className="md-pill" data-tone="error">
+                                  <AlertTriangle size={11} />
+                                  {t('filter.exclusionInvalidPill')}
                                 </span>
-                              </>
-                            )}
-                          </div>
-                        </button>
-                        <div className="l4a-list-trailing">
-                          {installed ? (
-                            <>
-                              {member.currentPath && (
-                                <IconButton
-                                  size="sm"
-                                  label={t('common.openInExplorer')}
-                                  onClick={() => onOpenInFileManager(member.currentPath!)}
-                                >
-                                  <FolderOpen size={15} />
-                                </IconButton>
                               )}
-                              <Switch
-                                compact
-                                checked={member.enabled}
-                                disabled={busy}
-                                label={memberLabel}
-                                onChange={(next) => onToggleSingle(member, next)}
-                              />
-                            </>
-                          ) : member.workshopId && !remoteUnavailable ? (
-                            <Button
-                              variant="tonal"
-                              size="sm"
-                              disabled={Boolean(dl)}
-                              icon={<Download size={13} />}
-                              onClick={() =>
-                                onDownloadItem(
-                                  member.workshopId!,
-                                  resolveLibraryMetadataTitle(member, namePreference),
-                                )
-                              }
-                            >
-                              {dl
-                                ? dl.cancelling
-                                  ? t('common.cancelling')
-                                  : `${dl.percent}%`
-                                : t('common.download')}
-                            </Button>
-                          ) : null}
+                              {cardFilter.showDiagnosticBadge && verdict && (
+                                <span className="md-pill" data-tone="tertiary">
+                                  {formatDiagnosticVerdictBadge(verdict, cardFilter, {
+                                    imageTag: t('filter.modImageShort'),
+                                    textTag: t('filter.modTextShort'),
+                                  })}
+                                </span>
+                              )}
+                              {member.updateAvailable && (
+                                <span className="md-pill" data-tone="tertiary">
+                                  <ArrowUpCircle size={11} />
+                                </span>
+                              )}
+                              {member.installState === 'missing_file' && (
+                                <span className="md-pill" data-tone="error">
+                                  {t('library.missingFile')}
+                                </span>
+                              )}
+                              {member.installState === 'uninstalled_known' && (
+                                <span className="md-pill" data-tone="surface">
+                                  {t('scope.uninstalled')}
+                                </span>
+                              )}
+                            </div>
+                            <div className="l4a-addon-meta">
+                              {cardFilter.redactMeta ? (
+                                <span className="l4a-truncate">{t('filter.redactedAuthor')}</span>
+                              ) : member.currentFileName && !cardFilter.redactTitle ? (
+                                <span className="md-mono l4a-truncate">
+                                  {member.currentFileName}
+                                </span>
+                              ) : (
+                                <span className="l4a-truncate">
+                                  {member.author || t('common.unknown')}
+                                </span>
+                              )}
+                              <span>·</span>
+                              <span>{formatBytes(member.fileSize)}</span>
+                              {member.maps.length > 0 && (
+                                <>
+                                  <span>·</span>
+                                  <span
+                                    style={{
+                                      display: 'inline-flex',
+                                      alignItems: 'center',
+                                      gap: 3,
+                                    }}
+                                  >
+                                    <MapIcon size={11} />
+                                    {member.maps.length}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                            {cardFilter.isBlurCardRevealed && (
+                              <div className="l4a-revealed-desc">
+                                {cardFilter.redactDescription
+                                  ? t('filter.redactedDescription')
+                                  : description?.trim() || t('filter.noDescription')}
+                              </div>
+                            )}
+                          </button>
+                          <div className="l4a-list-trailing">
+                            {installed ? (
+                              <>
+                                {member.currentPath && (
+                                  <IconButton
+                                    size="sm"
+                                    label={t('common.openInExplorer')}
+                                    onClick={() => onOpenInFileManager(member.currentPath!)}
+                                  >
+                                    <FolderOpen size={15} />
+                                  </IconButton>
+                                )}
+                                <Switch
+                                  compact
+                                  checked={member.enabled}
+                                  disabled={busy}
+                                  label={memberLabel}
+                                  onChange={(next) => onToggleSingle(member, next)}
+                                />
+                              </>
+                            ) : member.workshopId && !remoteUnavailable ? (
+                              <Button
+                                variant="tonal"
+                                size="sm"
+                                disabled={Boolean(dl)}
+                                icon={<Download size={13} />}
+                                onClick={() =>
+                                  onDownloadItem(
+                                    member.workshopId!,
+                                    resolveLibraryMetadataTitle(member, namePreference, filterCtx),
+                                  )
+                                }
+                              >
+                                {dl
+                                  ? dl.cancelling
+                                    ? t('common.cancelling')
+                                    : `${dl.percent}%`
+                                  : t('common.download')}
+                              </Button>
+                            ) : null}
+                          </div>
                         </div>
                       </div>
                     );
@@ -339,43 +481,49 @@ export function BundleDetailSheet({
               </>
             ) : (
               <div className="l4a-list">
-                {bundle.maps.map((m) => (
-                  <div
-                    key={m.code}
-                    className="l4a-list-row"
-                    style={{ minHeight: 56, cursor: 'default' }}
-                  >
-                    {m.imagePath && (
-                      <div className="l4a-list-thumb">
-                        <AddonCover
-                          compact
-                          src={m.imagePath}
-                          title={m.name}
-                          category="Map"
-                        />
-                      </div>
-                    )}
-                    <div className="l4a-list-main">
-                      <span className="md-title-small">{m.name}</span>
-                      <span
-                        className="md-body-small md-mono"
-                        style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                      >
-                        {m.code}
-                      </span>
-                    </div>
-                    <Button
-                      variant="tonal"
-                      size="sm"
-                      icon={<Copy size={13} />}
-                      title={t('detail.copyMapCode')}
-                      aria-label={`${t('detail.copyMapCode')} ${m.code}`}
-                      onClick={() => onCopy(m.code)}
+                {filteredMaps.map((entry) => {
+                  const { map: m, coverMode, redactText } = entry;
+                  const mapTitle = redactText ? m.code : m.name;
+                  return (
+                    <div
+                      key={m.code}
+                      className="l4a-list-row"
+                      style={{ minHeight: 56, cursor: 'default' }}
                     >
-                      {t('common.copy')}
-                    </Button>
-                  </div>
-                ))}
+                      {m.imagePath && (
+                        <div className="l4a-list-thumb">
+                          <AddonCover
+                            compact
+                            src={m.imagePath}
+                            title={mapTitle}
+                            category="Map"
+                            filterMode={coverMode}
+                            evaluation={entry}
+                          />
+                        </div>
+                      )}
+                      <div className="l4a-list-main">
+                        <span className="md-title-small">{mapTitle}</span>
+                        <span
+                          className="md-body-small md-mono"
+                          style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                        >
+                          {m.code}
+                        </span>
+                      </div>
+                      <Button
+                        variant="tonal"
+                        size="sm"
+                        icon={<Copy size={13} />}
+                        title={t('detail.copyMapCode')}
+                        aria-label={`${t('detail.copyMapCode')} ${m.code}`}
+                        onClick={() => onCopy(m.code)}
+                      >
+                        {t('common.copy')}
+                      </Button>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

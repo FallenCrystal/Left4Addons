@@ -1,7 +1,12 @@
 import type { RefObject } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { DashboardSnapshot } from '../../api/ipc';
+import type {
+  DashboardSnapshot,
+  FilterItemVerdict,
+  LocalFilterDeploymentStatus,
+} from '../../api/ipc';
 import { IpcError } from '../../api/ipc';
+import { formatRedactedAddonLabel } from '../../utils/contentFilter';
 import type {
   DesktopClient,
   DownloadSpeedTracker,
@@ -17,6 +22,18 @@ export interface UseLiveDownloadsParams {
   onOpenReconcileRef: RefObject<(() => void) | undefined>;
   notify: NotifyFn;
   refresh: () => Promise<boolean>;
+  isWorkshopTitleRedacted?: (
+    workshopId: string,
+    rawTitle?: string,
+    addonId?: string,
+    options?: { transferKind?: 'download' | 'update' },
+  ) => boolean;
+  onFilterVerdictsUpdated?: (
+    verdicts: FilterItemVerdict[],
+    policySignature?: string,
+    cacheGeneration?: number,
+  ) => void;
+  onLocalFilterStatusChanged?: (status: LocalFilterDeploymentStatus) => void;
 }
 
 export function useLiveDownloads({
@@ -26,11 +43,19 @@ export function useLiveDownloads({
   onOpenReconcileRef,
   notify,
   refresh,
+  isWorkshopTitleRedacted,
+  onFilterVerdictsUpdated,
+  onLocalFilterStatusChanged,
 }: UseLiveDownloadsParams) {
   const [liveDownloads, setLiveDownloads] = useState<Record<string, LiveDownloadState>>({});
   const downloadSeqRef = useRef(0);
   const liveDownloadsRef = useRef<Record<string, LiveDownloadState>>({});
   const speedTrackersRef = useRef<Map<string, DownloadSpeedTracker>>(new Map());
+  const isWorkshopTitleRedactedRef = useRef(isWorkshopTitleRedacted);
+
+  useEffect(() => {
+    isWorkshopTitleRedactedRef.current = isWorkshopTitleRedacted;
+  }, [isWorkshopTitleRedacted]);
 
   useEffect(() => {
     liveDownloadsRef.current = liveDownloads;
@@ -78,7 +103,11 @@ export function useLiveDownloads({
             const fallbackTitle = snapshotRef.current?.addons.find(
               (a) => a.workshopId === ev.workshopId,
             )?.title;
-            const title = ev.title?.trim() || existing?.title || fallbackTitle;
+            const rawTitle = ev.title?.trim() || existing?.title || fallbackTitle;
+            const title =
+              rawTitle && !isWorkshopTitleRedactedRef.current?.(ev.workshopId, rawTitle)
+                ? rawTitle
+                : undefined;
             return {
               ...prev,
               [ev.workshopId]: {
@@ -103,6 +132,10 @@ export function useLiveDownloads({
           });
         } else if (ev.type === 'watch_error') {
           notify(ev.message, { tone: 'error' });
+        } else if (ev.type === 'filter_verdicts_updated') {
+          onFilterVerdictsUpdated?.(ev.verdicts, ev.policySignature ?? undefined, ev.cacheGeneration);
+        } else if (ev.type === 'local_filter_status_changed') {
+          onLocalFilterStatusChanged?.(ev.status);
         }
       })
       .then((fn) => {
@@ -121,7 +154,16 @@ export function useLiveDownloads({
       active = false;
       unlisten?.();
     };
-  }, [client, notify, onOpenReconcileRef, refresh, snapshotRef, tRef]);
+  }, [
+    client,
+    notify,
+    onFilterVerdictsUpdated,
+    onLocalFilterStatusChanged,
+    onOpenReconcileRef,
+    refresh,
+    snapshotRef,
+    tRef,
+  ]);
 
   const hasLiveDownloads = Object.keys(liveDownloads).length > 0;
 
@@ -184,9 +226,15 @@ export function useLiveDownloads({
       }
       downloadSeqRef.current += 1;
       const requestId = downloadSeqRef.current;
+      const shouldRedactTitle = (
+        rawTitle?: string,
+        addonId?: string,
+        options?: { transferKind?: 'download' | 'update' },
+      ): boolean =>
+        isWorkshopTitleRedactedRef.current?.(workshopId, rawTitle, addonId, options) ?? false;
+      const trimmedHint = titleHint?.trim() || undefined;
       const initialTitle =
-        titleHint?.trim() ||
-        snapshotRef.current?.addons.find((a) => a.workshopId === workshopId)?.title;
+        trimmedHint && !shouldRedactTitle(trimmedHint) ? trimmedHint : undefined;
 
       notify(
         tRef.current(kind === 'update' ? 'toast.updateStarted' : 'toast.downloadStarted', {
@@ -223,9 +271,12 @@ export function useLiveDownloads({
           return copy;
         });
         await refresh();
+        const toastTitle = shouldRedactTitle(summary.title, summary.id, { transferKind: kind })
+          ? formatRedactedAddonLabel(workshopId, tRef.current)
+          : summary.title;
         notify(
           tRef.current(kind === 'update' ? 'toast.updateDone' : 'toast.downloadDone', {
-            title: summary.title,
+            title: toastTitle,
           }),
         );
         return summary;
@@ -246,7 +297,7 @@ export function useLiveDownloads({
         return null;
       }
     },
-    [client, notify, refresh, snapshotRef, tRef],
+    [client, notify, refresh, tRef],
   );
 
   const downloadWorkshopItem = useCallback(

@@ -1,7 +1,12 @@
 import { useTranslation } from 'react-i18next';
 import { ExternalLink, FolderKanban, FolderOpen, Pencil, Trash2 } from 'lucide-react';
 import type { AddonNamePreference, AddonSummary, UserGroup } from '../../../api/ipc';
-import { formatAddonDisplayName, formatBytes } from '../../../utils/format';
+import { useContentFilterContext } from '../../../state/ContentFilterContext';
+import {
+  formatFilteredAddonTitle,
+  resolveLibraryAddonCardFilter,
+} from '../../../utils/contentFilter';
+import { formatBytes } from '../../../utils/format';
 import { EmptyState, IconButton, Switch } from '../../m3/primitives';
 import type { ExternalAddonFilter } from '../LibraryView';
 import { summarizeGroupMembers } from './helpers';
@@ -35,6 +40,7 @@ export function GroupsTab({
   onDeleteGroup,
 }: GroupsTabProps) {
   const { t } = useTranslation();
+  const filterCtx = useContentFilterContext();
 
   if (filteredGroups.length === 0) {
     return (
@@ -48,7 +54,11 @@ export function GroupsTab({
   return (
     <div className="l4a-card-grid-wide">
       {filteredGroups.map((group) => {
-        const summary = summarizeGroupMembers(group.addonIds, addonsById);
+        const visibleAddonIds = group.addonIds.filter((id) => {
+          const addon = addonsById.get(id);
+          return !addon || !resolveLibraryAddonCardFilter(addon, filterCtx).hiddenCard;
+        });
+        const summary = summarizeGroupMembers(visibleAddonIds, addonsById);
         const toggleableIds = summary.loading.map((a) => a.id);
         const accent = group.color || 'var(--md-sys-color-primary)';
 
@@ -83,7 +93,7 @@ export function GroupsTab({
                 </div>
 
                 <div className="l4a-addon-meta" style={{ marginTop: 6 }}>
-                  <span>{t('common.items', { count: group.addonIds.length })}</span>
+                  <span>{t('common.items', { count: visibleAddonIds.length })}</span>
                   {summary.totalSize > 0 && (
                     <>
                       <span>·</span>
@@ -106,7 +116,7 @@ export function GroupsTab({
                   <div className="l4a-member-preview">
                     {summary.members.slice(0, 3).map((m) => (
                       <span key={m.id} className="l4a-member-chip l4a-truncate">
-                        {formatAddonDisplayName(m, namePreference)}
+                        {formatFilteredAddonTitle(m, namePreference, filterCtx, t)}
                       </span>
                     ))}
                     {summary.members.length > 3 && (
@@ -144,7 +154,7 @@ export function GroupsTab({
                     onClick={() =>
                       onOpenFilterInLibrary({
                         label: group.name,
-                        addonIds: group.addonIds,
+                        addonIds: visibleAddonIds,
                       })
                     }
                   >

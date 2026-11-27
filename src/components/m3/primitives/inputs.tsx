@@ -67,13 +67,15 @@ export function TextField({ label, trailing, id, ...rest }: TextFieldProps) {
   const autoId = useId();
   const fieldId = id ?? autoId;
   return (
-    <label className="md-field" htmlFor={fieldId}>
-      <span className="md-field-label">{label}</span>
+    <div className="md-field">
+      <label className="md-field-label" htmlFor={fieldId}>
+        {label}
+      </label>
       <span className="md-field-control">
         <input id={fieldId} className="md-field-input" {...rest} />
         {trailing}
       </span>
-    </label>
+    </div>
   );
 }
 

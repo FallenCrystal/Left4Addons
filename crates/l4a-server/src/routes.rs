@@ -1,10 +1,13 @@
 use crate::auth::{build_clear_session_cookie, build_session_cookie};
 use crate::db::ServerRepo;
+use crate::filter::FilterServiceError;
 use crate::sync::with_catalog_source;
 use crate::web_assets;
 use crate::ServerState;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{
+        rejection::JsonRejection, DefaultBodyLimit, FromRequest, Path, Query, Request, State,
+    },
     http::{
         header::{ACCEPT_LANGUAGE, CACHE_CONTROL, SET_COOKIE, VARY},
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
@@ -17,16 +20,19 @@ use axum::{
 use l4a_protocol::{
     AdminChangePasswordRequest, AdminFetchUpstreamRequest, AdminFetchUpstreamResponse,
     AdminItemDetailResponse, AdminItemOverrideRequest, AdminLoginRequest, AdminSessionInfo,
-    AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogOverviewResponse, CatalogStats,
-    CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, SearchQuery, SearchResponse,
-    SetRefreshTokenRequest, StartCredentialsAuthRequest, SteamAuthFlowStatus,
-    SubmitSteamGuardRequest, WorkshopCollectionRecord, WorkshopFileType, WorkshopId,
-    WorkshopItemRecord, WorkshopItemStatus,
+    AuditLogEntry, BatchItemsRequest, BatchItemsResponse, CatalogFilterConfigDto,
+    CatalogFilterPublicInfo, CatalogFilterStatus, CatalogOverviewResponse, CatalogStats,
+    CatalogSteamStatus, CatalogSyncConfigDto, CatalogSyncStatus, FilterPredictRequest,
+    FilterProbabilities, SearchQuery, SearchResponse, SetRefreshTokenRequest,
+    StartCredentialsAuthRequest, SteamAuthFlowStatus, SubmitSteamGuardRequest,
+    WorkshopCollectionRecord, WorkshopFileType, WorkshopId, WorkshopItemRecord, WorkshopItemStatus,
+    CATALOG_FILTER_MAX_BODY_BYTES,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::time::Duration;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 const MAX_BATCH_SIZE: usize = 200;
@@ -63,11 +69,26 @@ pub fn router(state: ServerState) -> Router {
         .layer(CorsLayer::permissive())
         .layer(middleware::from_fn(append_search_vary));
 
+    let filter_predict_route = post(filter_predict)
+        .layer(DefaultBodyLimit::max(CATALOG_FILTER_MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_filter_enabled,
+        ));
+    let admin_filter_test_route = post(admin_test_filter)
+        .layer(DefaultBodyLimit::max(CATALOG_FILTER_MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            guard_admin_filter_test,
+        ));
+
     let public_routes = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/items/batch", post(batch_items))
         .route("/api/v1/items/{workshop_id}", get(get_item))
         .route("/api/v1/collections/{collection_id}", get(get_collection))
+        .route("/api/v1/filter/info", get(filter_info))
+        .route("/api/v1/filter/predict", filter_predict_route)
         .layer(CorsLayer::permissive());
 
     let admin_routes = Router::new()
@@ -90,6 +111,13 @@ pub fn router(state: ServerState) -> Router {
             post(admin_reset_backfill_cursor),
         )
         .route("/api/v1/admin/sync/fetch", post(admin_fetch_upstream))
+        .route("/api/v1/admin/filter/status", get(admin_filter_status))
+        .route(
+            "/api/v1/admin/config/filter",
+            patch(admin_update_filter_config),
+        )
+        .route("/api/v1/admin/filter/restart", post(admin_restart_filter))
+        .route("/api/v1/admin/filter/test", admin_filter_test_route)
         .route("/api/v1/admin/steam/status", get(admin_steam_status))
         .route("/api/v1/admin/steam/reconnect", post(admin_steam_reconnect))
         .route(
@@ -508,12 +536,14 @@ async fn admin_overview(
     let stats = state.db(move |repo| repo.stats()).await?;
     let steam = state.server.upstream.status().await;
     let sync = state.server.sync.status().await.map_err(internal_err)?;
+    let filter = state.server.filter.status().await;
     let cfg = state.server.config_store.get();
 
     Ok(Json(CatalogOverviewResponse {
         stats,
         steam,
         sync,
+        filter,
         config_path: state
             .server
             .config_store
@@ -870,4 +900,263 @@ async fn admin_clear_item_override(
         .await?
         .ok_or_else(|| err_resp(StatusCode::NOT_FOUND, format!("未找到条目 {wid}")))?;
     Ok(Json(detail))
+}
+
+async fn guard_filter_enabled(
+    State(state): State<RouteState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    if !state.server.filter.is_enabled() {
+        return Err(err_resp(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "内容过滤服务未启用",
+        ));
+    }
+    admit_filter_request(&state, request, next).await
+}
+
+async fn guard_admin_filter_test(
+    State(state): State<RouteState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    state.require_admin(request.headers())?;
+    admit_filter_request(&state, request, next).await
+}
+
+async fn admit_filter_request(
+    state: &RouteState,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let _admission_permit = state
+        .server
+        .filter
+        .acquire_request_admission()
+        .await
+        .ok_or_else(|| {
+            err_resp(
+                StatusCode::TOO_MANY_REQUESTS,
+                "内容过滤请求繁忙，请稍后重试",
+            )
+        })?;
+    Ok(next.run(request).await)
+}
+
+struct FilterPredictJson(FilterPredictRequest);
+
+enum FilterJsonRejection {
+    Json(JsonRejection),
+    Timeout,
+}
+
+impl IntoResponse for FilterJsonRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Json(rejection) => rejection.into_response(),
+            Self::Timeout => {
+                err_resp(StatusCode::REQUEST_TIMEOUT, "读取内容过滤请求超时").into_response()
+            }
+        }
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for FilterPredictJson {
+    type Rejection = FilterJsonRejection;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        read_filter_json(request, state, Duration::from_secs(10)).await
+    }
+}
+
+async fn read_filter_json<S: Send + Sync>(
+    request: Request,
+    state: &S,
+    deadline: Duration,
+) -> Result<FilterPredictJson, FilterJsonRejection> {
+    match tokio::time::timeout(deadline, Json::from_request(request, state)).await {
+        Ok(Ok(Json(body))) => Ok(FilterPredictJson(body)),
+        Ok(Err(rejection)) => Err(FilterJsonRejection::Json(rejection)),
+        Err(_) => Err(FilterJsonRejection::Timeout),
+    }
+}
+
+fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
+    match err {
+        FilterServiceError::Disabled(_) => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务未启用")
+        }
+        FilterServiceError::Unavailable(detail) => {
+            tracing::warn!(error = %detail, "公开内容过滤接口后端暂不可用");
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务暂不可用")
+        }
+        FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
+        FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
+        FilterServiceError::BackendRejected(detail) => {
+            tracing::debug!(error = %detail, "过滤推理后端拒绝请求");
+            err_resp(StatusCode::BAD_REQUEST, "内容过滤模型无法处理该请求")
+        }
+        FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
+        FilterServiceError::ScoringChanged => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
+        FilterServiceError::Internal(err) => internal_err(err),
+    }
+}
+
+fn admin_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
+    match err {
+        FilterServiceError::Disabled(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
+        FilterServiceError::Unavailable(msg) => err_resp(StatusCode::SERVICE_UNAVAILABLE, msg),
+        FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
+        FilterServiceError::BadRequest(msg) | FilterServiceError::BackendRejected(msg) => {
+            err_resp(StatusCode::BAD_REQUEST, msg)
+        }
+        FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),
+        FilterServiceError::ScoringChanged => {
+            err_resp(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+        }
+        FilterServiceError::Internal(err) => internal_err(err),
+    }
+}
+
+fn filter_image_fetch_err(msg: String) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": msg, "code": l4a_protocol::CATALOG_FILTER_IMAGE_FETCH_FAILED })),
+    )
+}
+
+async fn filter_info(State(state): State<RouteState>) -> ApiResult<CatalogFilterPublicInfo> {
+    Ok(Json(state.server.filter.public_info().await))
+}
+
+async fn filter_predict(
+    State(state): State<RouteState>,
+    FilterPredictJson(req): FilterPredictJson,
+) -> ApiResult<FilterProbabilities> {
+    let probs = state
+        .server
+        .filter
+        .predict(req)
+        .await
+        .map_err(public_filter_err)?;
+    Ok(Json(probs))
+}
+
+async fn admin_filter_status(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+) -> ApiResult<CatalogFilterStatus> {
+    state.require_admin(&headers)?;
+    Ok(Json(state.server.filter.status().await))
+}
+
+async fn admin_update_filter_config(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+    Json(dto): Json<CatalogFilterConfigDto>,
+) -> ApiResult<CatalogFilterStatus> {
+    let actor = state.require_admin(&headers)?;
+    if !state
+        .server
+        .config_store
+        .get()
+        .filter
+        .host_paths_match(&dto)
+    {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "请在主机的 catalog.toml 中配置过滤模型部署路径和 Python 解释器",
+        ));
+    }
+    if let Some(raw_url) = dto
+        .upstream_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        crate::filter::validate_upstream_base_url(raw_url)
+            .map_err(|msg| err_resp(StatusCode::BAD_REQUEST, msg))?;
+    }
+    state
+        .server
+        .config_store
+        .update(|cfg| cfg.filter.apply_admin_dto(&dto))
+        .map_err(internal_err)?;
+    let status = state.server.filter.reconfigure().await;
+
+    let reason = format!(
+        "更新内容过滤模型配置: enabled={}, backend={:?}, ttl={}s, threads={}, max_images={}, gore_w={:.2}, nsfw_w={:.2}, temp={:.2}, bias={:.2}",
+        status.config.enabled,
+        status.config.backend,
+        status.config.cache_ttl_secs,
+        status.config.params.threads,
+        status.config.params.max_images,
+        status.config.params.gore_weight,
+        status.config.params.nsfw_weight,
+        status.config.params.temperature,
+        status.config.params.bias,
+    );
+    let _ = state
+        .db(move |repo| {
+            repo.append_audit_log(None, &actor, "filter_config_update", &reason, None, None)
+        })
+        .await;
+
+    Ok(Json(status))
+}
+
+async fn admin_restart_filter(
+    State(state): State<RouteState>,
+    headers: HeaderMap,
+) -> ApiResult<CatalogFilterStatus> {
+    let actor = state.require_admin(&headers)?;
+    let status = state.server.filter.restart().await;
+
+    let reason = format!(
+        "重启/探测内容过滤模型后端: backend={:?}, ready={}",
+        status.config.backend, status.ready
+    );
+    let _ = state
+        .db(move |repo| repo.append_audit_log(None, &actor, "filter_restart", &reason, None, None))
+        .await;
+
+    Ok(Json(status))
+}
+
+async fn admin_test_filter(
+    State(state): State<RouteState>,
+    FilterPredictJson(req): FilterPredictJson,
+) -> ApiResult<FilterProbabilities> {
+    let probs = state
+        .server
+        .filter
+        .predict(req)
+        .await
+        .map_err(admin_filter_err)?;
+    Ok(Json(probs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+
+    #[tokio::test]
+    async fn filter_json_read_has_a_deadline() {
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let result = read_filter_json(request, &(), Duration::from_millis(1)).await;
+        assert_eq!(
+            result.err().unwrap().into_response().status(),
+            StatusCode::REQUEST_TIMEOUT
+        );
+    }
 }

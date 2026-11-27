@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertCircle,
@@ -7,6 +7,7 @@ import {
   Check,
   Cpu,
   Download,
+  Filter,
   FolderOpen,
   FolderSearch,
   Palette,
@@ -15,11 +16,21 @@ import {
   TextCursorInput,
 } from 'lucide-react';
 import type {
+  AddonId,
+  AddonSummary,
   AppConfig,
+  DeployLocalFilterRequest,
+  FilterEvaluationTarget,
+  FilterExclusionRecord,
+  FilterItemVerdict,
+  FilterTokenStatus,
   GameUpdateDummyPolicy,
   InvalidCharReplace,
+  LocalFilterDeploymentStatus,
   SteamCapabilities,
+  UpsertFilterExclusionRequest,
 } from '../../api/ipc';
+import type { FilterEvaluationLogEntry } from '../../state/controller/useContentFilter';
 import { previewFilenameByRules } from '../../utils/format';
 import { THEME_SEEDS, type ThemeMode, type ThemePreference } from '../../utils/theme';
 import {
@@ -29,12 +40,14 @@ import {
   Switch,
   TextField,
 } from '../m3/primitives';
+import { FilterSettingsSection } from './settings/FilterSettingsSection';
 
 export type SettingsSection =
   | 'paths'
   | 'bypass'
   | 'downloads'
   | 'sources'
+  | 'filter'
   | 'rename'
   | 'appearance';
 
@@ -47,14 +60,41 @@ export interface SettingsViewProps {
   busy: boolean;
   themePref: ThemePreference;
   language: 'zh' | 'en';
-  onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<boolean>;
+  addons?: AddonSummary[];
+  exclusions?: FilterExclusionRecord[];
+  localFilterStatus?: LocalFilterDeploymentStatus | null;
+  filterStatusBusy?: boolean;
+  filterTokenStatus?: FilterTokenStatus | null;
+  filterEvaluationLog?: readonly FilterEvaluationLogEntry[];
+  onSaveConfig: (next: AppConfig, forceRescan?: boolean) => Promise<AppConfig | null>;
   onDetectPath: () => Promise<string | null>;
   onOpenInFileManager: (path: string) => void;
   onRefreshSteamCaps: () => void;
   onChangeTheme: (pref: ThemePreference) => void;
   onChangeLanguage: (lang: 'zh' | 'en') => void;
   onNotify: (msg: string, tone?: 'default' | 'error') => void;
+  onRefreshLocalFilterStatus?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onCheckLocalFilterUpdates?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onDeployLocalFilter?: (
+    request: DeployLocalFilterRequest,
+  ) => Promise<LocalFilterDeploymentStatus | null>;
+  onStartLocalFilterService?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onStopLocalFilterService?: () => Promise<LocalFilterDeploymentStatus | null>;
+  onRefreshFilterTokenStatus?: () => Promise<FilterTokenStatus | null>;
+  onSetFilterLlmToken?: (token: string | null) => Promise<FilterTokenStatus | null>;
+  onClearFilterCache?: () => Promise<number | null>;
+  onRetryFailedEvaluations?: () => void;
+  onEvaluateSandboxTarget?: (
+    target: FilterEvaluationTarget,
+  ) => Promise<FilterItemVerdict | null>;
+  onUpsertFilterExclusion?: (request: UpsertFilterExclusionRequest) => Promise<boolean>;
+  onDeleteFilterExclusion?: (addonId: AddonId) => Promise<boolean>;
+  onSelectAddon?: (addon: AddonSummary) => void;
 }
+
+const NOOP_ASYNC_NULL = async () => null;
+const NOOP_ASYNC_FALSE = async () => false;
+const NOOP_VOID = () => {};
 
 export function SettingsView({
   config,
@@ -65,6 +105,12 @@ export function SettingsView({
   busy,
   themePref,
   language,
+  addons = [],
+  exclusions = [],
+  localFilterStatus = null,
+  filterStatusBusy = false,
+  filterTokenStatus = null,
+  filterEvaluationLog = [],
   onSaveConfig,
   onDetectPath,
   onOpenInFileManager,
@@ -72,6 +118,19 @@ export function SettingsView({
   onChangeTheme,
   onChangeLanguage,
   onNotify,
+  onRefreshLocalFilterStatus = NOOP_ASYNC_NULL,
+  onCheckLocalFilterUpdates = NOOP_ASYNC_NULL,
+  onDeployLocalFilter = NOOP_ASYNC_NULL,
+  onStartLocalFilterService = NOOP_ASYNC_NULL,
+  onStopLocalFilterService = NOOP_ASYNC_NULL,
+  onRefreshFilterTokenStatus = NOOP_ASYNC_NULL,
+  onSetFilterLlmToken = NOOP_ASYNC_NULL,
+  onClearFilterCache = NOOP_ASYNC_NULL,
+  onRetryFailedEvaluations = NOOP_VOID,
+  onEvaluateSandboxTarget = NOOP_ASYNC_NULL,
+  onUpsertFilterExclusion = NOOP_ASYNC_FALSE,
+  onDeleteFilterExclusion = NOOP_ASYNC_FALSE,
+  onSelectAddon,
 }: SettingsViewProps) {
   const { t } = useTranslation();
   const [draft, setDraft] = useState<AppConfig | null>(null);
@@ -90,6 +149,7 @@ export function SettingsView({
     { id: 'bypass', label: t('settings.sections.bypass'), icon: Shield },
     { id: 'downloads', label: t('settings.sections.downloads'), icon: Download },
     { id: 'sources', label: t('settings.sections.sources'), icon: Cpu },
+    { id: 'filter', label: t('settings.sections.filter'), icon: Filter },
     { id: 'rename', label: t('settings.sections.rename'), icon: TextCursorInput },
     { id: 'appearance', label: t('settings.sections.appearance'), icon: Palette },
   ];
@@ -121,22 +181,47 @@ export function SettingsView({
   }, [dirty, saveBarMounted]);
 
   const handleSave = useCallback(async () => {
-    if (!dirty || busy) return;
+    if (!dirty || busy || filterStatusBusy) return;
+    const savedDraft = draft;
     const ok = await onSaveConfig(effective, pathsChanged);
-    if (ok) setDraft(null);
-  }, [busy, dirty, effective, onSaveConfig, pathsChanged]);
+    if (ok) {
+      setDraft((curr) => (curr === savedDraft ? null : curr));
+    }
+  }, [busy, dirty, draft, effective, filterStatusBusy, onSaveConfig, pathsChanged]);
+
+  const handleSaveRef = useRef(handleSave);
+  const pendingShortcutSaveRef = useRef(false);
 
   useEffect(() => {
-    if (!dirty) return;
+    handleSaveRef.current = handleSave;
+    if (pendingShortcutSaveRef.current) {
+      pendingShortcutSaveRef.current = false;
+      void handleSave();
+    }
+  }, [handleSave]);
+
+  useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
         e.preventDefault();
-        void handleSave();
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+          pendingShortcutSaveRef.current = true;
+          active.blur();
+          window.setTimeout(() => {
+            if (pendingShortcutSaveRef.current) {
+              pendingShortcutSaveRef.current = false;
+              void handleSaveRef.current();
+            }
+          }, 0);
+        } else {
+          void handleSaveRef.current();
+        }
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [dirty, handleSave]);
+  }, []);
 
   const handleDetect = async () => {
     setDetecting(true);
@@ -510,6 +595,83 @@ export function SettingsView({
             </>
           )}
 
+          {section === 'filter' && (
+            <FilterSettingsSection
+              effectiveConfig={effective}
+              dirty={
+                draft !== null && JSON.stringify(draft.filter) !== JSON.stringify(config.filter)
+              }
+              busy={busy}
+              filterStatusBusy={filterStatusBusy}
+              localStatus={localFilterStatus}
+              tokenStatus={filterTokenStatus}
+              evaluationLog={filterEvaluationLog}
+              addons={addons}
+              namePreference={effective.addonNamePreference ?? 'workshop_title'}
+              exclusions={exclusions}
+              onUpdateFilter={(updater) =>
+                updateDraft((d) => ({ ...d, filter: updater(d.filter) }))
+              }
+              onSaveDraftFirst={async () => {
+                if (busy || filterStatusBusy) return null;
+                if (!draft) return config;
+                if (JSON.stringify(draft.filter) === JSON.stringify(config.filter)) {
+                  return config;
+                }
+                const savedFilterDraft = draft.filter;
+                const saved = await onSaveConfig(
+                  { ...config, filter: savedFilterDraft },
+                  false,
+                );
+                if (saved) {
+                  setDraft((curr) => {
+                    if (!curr) return null;
+                    const merged: AppConfig = {
+                      ...curr,
+                      filter: curr.filter === savedFilterDraft ? saved.filter : curr.filter,
+                    };
+                    return JSON.stringify(merged) === JSON.stringify(saved) ? null : merged;
+                  });
+                }
+                return saved;
+              }}
+              onRefreshLocalStatus={onRefreshLocalFilterStatus}
+              onCheckLocalUpdates={onCheckLocalFilterUpdates}
+              onDeployLocalFilter={async (request) => {
+                const status = await onDeployLocalFilter(request);
+                if (status) {
+                  const nextPinned = request.trackLatest
+                    ? null
+                    : (request.targetCommit?.trim() || null);
+                  setDraft((curr) =>
+                    curr
+                      ? {
+                          ...curr,
+                          filter: {
+                            ...curr.filter,
+                            repoUrl: request.repoUrl?.trim() || curr.filter.repoUrl,
+                            trackLatest: request.trackLatest,
+                            pinnedCommit: nextPinned,
+                          },
+                        }
+                      : null,
+                  );
+                }
+                return status;
+              }}
+              onStartLocalService={onStartLocalFilterService}
+              onStopLocalService={onStopLocalFilterService}
+              onRefreshTokenStatus={onRefreshFilterTokenStatus}
+              onSetLlmToken={onSetFilterLlmToken}
+              onClearFilterCache={onClearFilterCache}
+              onRetryFailedEvaluations={onRetryFailedEvaluations}
+              onEvaluateSandbox={onEvaluateSandboxTarget}
+              onUpsertExclusion={onUpsertFilterExclusion}
+              onDeleteExclusion={onDeleteFilterExclusion}
+              onSelectAddon={onSelectAddon}
+            />
+          )}
+
           {section === 'rename' && (
             <section className="l4a-section-card">
               <div className="md-field">
@@ -756,13 +918,18 @@ export function SettingsView({
           <span className="l4a-settings-save-dot" aria-hidden="true" />
           <span className="md-label-large">{t('settings.unsavedChanges')}</span>
           <div className="l4a-spacer" />
-          <Button variant="text" size="sm" disabled={busy || !dirty} onClick={() => setDraft(null)}>
+          <Button
+            variant="text"
+            size="sm"
+            disabled={busy || filterStatusBusy || !dirty}
+            onClick={() => setDraft(null)}
+          >
             {t('common.cancel')}
           </Button>
           <Button
             variant="filled"
             size="sm"
-            disabled={busy || !dirty}
+            disabled={busy || filterStatusBusy || !dirty}
             onClick={() => void handleSave()}
           >
             {(dirty ? pathsChanged : lastPathsChanged)

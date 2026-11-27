@@ -1,3 +1,4 @@
+use crate::filter::CatalogFilterStatus;
 use crate::ids::WorkshopId;
 use crate::workshop::{MetadataSource, WorkshopDependency, WorkshopItemRecord, WorkshopItemStatus};
 use chrono::{DateTime, Utc};
@@ -271,12 +272,14 @@ pub struct CatalogStats {
     pub audit_logs_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogOverviewResponse {
     pub stats: CatalogStats,
     pub steam: CatalogSteamStatus,
     pub sync: CatalogSyncStatus,
+    #[serde(default)]
+    pub filter: CatalogFilterStatus,
     pub config_path: Option<String>,
     pub bind_addr: String,
     pub db_path: String,

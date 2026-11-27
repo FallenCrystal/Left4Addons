@@ -1,4 +1,4 @@
-import { useId, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
@@ -14,6 +14,8 @@ import {
   Map as MapIcon,
   Pencil,
   Plus,
+  RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Store,
   Trash2,
@@ -22,8 +24,19 @@ import type {
   AddonNamePreference,
   AddonSummary,
   BundleRecord,
+  ExclusionDisplayLevel,
   UserGroup,
 } from '../../api/ipc';
+import { useContentFilterContext } from '../../state/ContentFilterContext';
+import {
+  addonFilterKey,
+  getFilteredAddonFallbackCover,
+  collectAddonImageSources,
+  formatRedactedAddonLabel,
+  isAddonTitleRedacted,
+  resolveAddonVerdict,
+  resolveLibraryAddonDetailFilter,
+} from '../../utils/contentFilter';
 import {
   buildSteamProtocolUrl,
   buildWorkshopUrl,
@@ -33,7 +46,8 @@ import {
   resolveAddonMetadataTitle,
 } from '../../utils/format';
 import { AddonCover } from '../m3/AddonCover';
-import { Button, FilterChip, IconButton, SideSheet, Switch, Tabs } from '../m3/primitives';
+import { FilterFailureBadge } from '../m3/ContentFilterIndicators';
+import { Button, FilterChip, IconButton, Select, SideSheet, Switch, Tabs } from '../m3/primitives';
 
 export interface AddonDetailSheetProps {
   addon: AddonSummary | null;
@@ -63,6 +77,14 @@ function isZeroContentFlag(key: string, value: string): boolean {
   return key.startsWith('addoncontent_') && value.trim() === '0';
 }
 
+const EXCLUSION_LEVELS: ExclusionDisplayLevel[] = [
+  'normal',
+  'lazy_load',
+  'blur_image',
+  'hide_image',
+  'hide_text',
+];
+
 export function AddonDetailSheet({
   addon,
   namePreference = 'workshop_title',
@@ -83,13 +105,51 @@ export function AddonDetailSheet({
   onCopy,
 }: AddonDetailSheetProps) {
   const { t } = useTranslation();
+  const [trackedAddonId, setTrackedAddonId] = useState<string | null>(addon?.id ?? null);
   const [tab, setTab] = useState<'info' | 'maps'>('info');
   const [showZeroFlags, setShowZeroFlags] = useState(false);
+  const [draftExclAddonId, setDraftExclAddonId] = useState<string | null>(null);
+  const [draftLevel, setDraftLevel] = useState<ExclusionDisplayLevel>('lazy_load');
+  const [draftBindFingerprint, setDraftBindFingerprint] = useState<boolean>(true);
   const tabsId = useId();
+
+  const currentAddonId = addon?.id ?? null;
+  if (trackedAddonId !== currentAddonId) {
+    setTrackedAddonId(currentAddonId);
+    setTab('info');
+    setShowZeroFlags(false);
+    setDraftExclAddonId(null);
+    setDraftLevel('lazy_load');
+    setDraftBindFingerprint(true);
+  }
+
+  const filterCtx = useContentFilterContext();
+  const {
+    exclusionsByAddonId,
+    prioritizeFilterTargets,
+    upsertFilterExclusion,
+    deleteFilterExclusion,
+  } = filterCtx;
+
+  useEffect(() => {
+    prioritizeFilterTargets(currentAddonId ? [addonFilterKey(currentAddonId)] : [], {
+      urgent: true,
+      owner: 'addon-detail',
+    });
+  }, [currentAddonId, prioritizeFilterTargets]);
+
+  useEffect(() => {
+    return () => {
+      prioritizeFilterTargets([], { urgent: true, owner: 'addon-detail' });
+    };
+  }, [prioritizeFilterTargets]);
 
   const { primaryInfoEntries, zeroFlagEntries } = useMemo(() => {
     if (!addon) {
-      return { primaryInfoEntries: [] as [string, string][], zeroFlagEntries: [] as [string, string][] };
+      return {
+        primaryInfoEntries: [] as [string, string][],
+        zeroFlagEntries: [] as [string, string][],
+      };
     }
     const primary: [string, string][] = [];
     const zeros: [string, string][] = [];
@@ -107,11 +167,42 @@ export function AddonDetailSheet({
 
   if (!addon) return null;
 
-  const displayName = formatAddonDisplayName(addon, namePreference);
-  const metadataTitle = resolveAddonMetadataTitle(
-    addon,
-    namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
-  );
+  const installed = addon.installState === 'installed';
+  const exclusion = exclusionsByAddonId.get(addon.id);
+  const verdict = resolveAddonVerdict(addon, filterCtx) ?? undefined;
+  const detailFilter = resolveLibraryAddonDetailFilter(addon, filterCtx);
+  const addonImageSources = collectAddonImageSources(addon);
+
+  const canBindFingerprint = installed && Boolean(addon.contentHash);
+  const activeFingerprint = installed ? addon.contentHash : exclusion?.currentFingerprint;
+
+  const isSameDraftAddon = draftExclAddonId === addon.id;
+  const effectiveDraftLevel: ExclusionDisplayLevel = exclusion
+    ? exclusion.displayLevel
+    : isSameDraftAddon
+      ? draftLevel
+      : 'lazy_load';
+  const effectiveDraftBind: boolean = exclusion
+    ? exclusion.bindFingerprint
+    : !canBindFingerprint
+      ? false
+      : isSameDraftAddon
+        ? draftBindFingerprint
+        : true;
+
+  const rawDisplayName = formatAddonDisplayName(addon, namePreference);
+  const displayName = detailFilter.redactText
+    ? formatRedactedAddonLabel(addon.workshopId, t, detailFilter.failureDisplay)
+    : rawDisplayName;
+
+  const titleRedactedForTasks =
+    detailFilter.redactText || isAddonTitleRedacted(addon, filterCtx);
+  const metadataTitle = titleRedactedForTasks
+    ? undefined
+    : resolveAddonMetadataTitle(
+        addon,
+        namePreference === 'addon_title' ? 'addon_title' : 'workshop_title',
+      );
   const workshopTitle = addon.workshopTitle?.trim();
   const addonInfoTitle = addon.addonTitle?.trim();
   const hasMaps = addon.maps.length > 0;
@@ -122,7 +213,6 @@ export function AddonDetailSheet({
   const visibleInfoEntries = showZeroFlags
     ? [...primaryInfoEntries, ...zeroFlagEntries]
     : primaryInfoEntries;
-  const installed = addon.installState === 'installed';
   const remoteUnavailable =
     addon.remoteStatus === 'removed' || addon.remoteStatus === 'private_or_unavailable';
 
@@ -229,12 +319,16 @@ export function AddonDetailSheet({
             >
               <AddonCover
                 src={addon.coverImage}
-                fallbackSrc={addon.localCoverImage}
+                fallbackSrc={getFilteredAddonFallbackCover(addon, filterCtx)}
                 title={displayName}
                 category={addon.categories[0]}
+                filterMode={detailFilter.coverMode}
+                evaluation={detailFilter}
+                allowPeek={detailFilter.coverMode === 'blur'}
               />
               <div className="l4a-cover-overlay-top">
                 <div className="l4a-status-pills">
+                  <FilterFailureBadge state={detailFilter} />
                   {addon.primaryDir && (
                     <span className="md-pill" data-tone="surface">
                       {addon.primaryDir === 'loading' ? (
@@ -332,7 +426,11 @@ export function AddonDetailSheet({
             <div className="l4a-kv-grid">
               <div className="l4a-kv-item">
                 <span className="l4a-kv-label">{t('detail.author')}</span>
-                <span className="l4a-kv-value">{addon.author || t('common.unknown')}</span>
+                <span className="l4a-kv-value">
+                  {detailFilter.redactText
+                    ? t('filter.redactedAuthor')
+                    : addon.author || t('common.unknown')}
+                </span>
               </div>
               <div className="l4a-kv-item">
                 <span className="l4a-kv-label">{t('detail.version')}</span>
@@ -346,35 +444,42 @@ export function AddonDetailSheet({
                 <span className="l4a-kv-label">{t('detail.filesCount')}</span>
                 <span className="l4a-kv-value">{addon.filesCount}</span>
               </div>
-              {workshopTitle && workshopTitle !== displayName && (
+              {!detailFilter.redactText && workshopTitle && workshopTitle !== displayName && (
                 <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                   <span className="l4a-kv-label">{t('detail.workshopTitle')}</span>
                   <span className="l4a-kv-value selectable">{workshopTitle}</span>
                 </div>
               )}
-              {addonInfoTitle && addonInfoTitle !== displayName && addonInfoTitle !== workshopTitle && (
-                <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
-                  <span className="l4a-kv-label">{t('detail.addonTitle')}</span>
-                  <span className="l4a-kv-value selectable">{addonInfoTitle}</span>
-                </div>
-              )}
+              {!detailFilter.redactText &&
+                addonInfoTitle &&
+                addonInfoTitle !== displayName &&
+                addonInfoTitle !== workshopTitle && (
+                  <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
+                    <span className="l4a-kv-label">{t('detail.addonTitle')}</span>
+                    <span className="l4a-kv-value selectable">{addonInfoTitle}</span>
+                  </div>
+                )}
               <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                 <span className="l4a-kv-label">{t('detail.fileName')}</span>
                 <span className="l4a-kv-value md-mono selectable">
-                  {addon.currentFileName || '—'}
+                  {detailFilter.redactText
+                    ? addon.workshopId
+                      ? `#${addon.workshopId}`
+                      : '—'
+                    : addon.currentFileName || '—'}
                 </span>
               </div>
-              {addon.contentHash && (
+              {activeFingerprint && (
                 <div className="l4a-kv-item" style={{ gridColumn: '1 / -1' }}>
                   <span className="l4a-kv-label">{t('detail.hash')}</span>
                   <div className="l4a-row-wrap">
                     <span className="l4a-kv-value md-mono">
-                      {addon.contentHash.slice(0, 16)}
+                      {activeFingerprint.slice(0, 16)}
                     </span>
                     <IconButton
                       size="sm"
                       label={t('common.copy')}
-                      onClick={() => onCopy(addon.contentHash!)}
+                      onClick={() => onCopy(activeFingerprint)}
                     >
                       <Copy size={14} />
                     </IconButton>
@@ -407,6 +512,196 @@ export function AddonDetailSheet({
 
             <div className="l4a-divider" />
 
+            {/* Content Filter Verdict & Library Exclusion Controls */}
+            <div className="l4a-filter-box">
+              <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                  <ShieldAlert
+                    size={15}
+                    style={{ color: 'var(--md-sys-color-primary)', flexShrink: 0 }}
+                  />
+                  <span className="md-label-large">{t('filter.detailSectionTitle')}</span>
+                </div>
+                {exclusion && (
+                  <span
+                    className="md-pill"
+                    data-tone={exclusion.fingerprintValid ? 'primary' : 'error'}
+                  >
+                    {exclusion.fingerprintValid
+                      ? t(`filter.levels.${exclusion.displayLevel}`)
+                      : t('filter.exclusionInvalidPill')}
+                  </span>
+                )}
+              </div>
+
+              {detailFilter.flagged && verdict && (
+                <div className="l4a-callout">
+                  <ShieldAlert
+                    size={15}
+                    style={{ color: 'var(--md-sys-color-tertiary)', flexShrink: 0, marginTop: 2 }}
+                  />
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <div className="l4a-row-wrap" style={{ gap: 6 }}>
+                      <span className="md-label-medium">{t('filter.flaggedBannerTitle')}</span>
+                      <span className="md-pill" data-tone="tertiary">
+                        {t(`filter.decisionSource.${verdict.decisionSource}`)}
+                      </span>
+                      {detailFilter.imageSensitive && (
+                        <span className="md-pill" data-tone="secondary">
+                          [{t('filter.modImageShort')}]
+                        </span>
+                      )}
+                      {detailFilter.textSensitive && (
+                        <span className="md-pill" data-tone="secondary">
+                          [{t('filter.modTextShort')}]
+                        </span>
+                      )}
+                    </div>
+                    <span
+                      className="md-body-small"
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    >
+                      {t('filter.scoreSummary', {
+                        score: verdict.evaluatedScore.toFixed(2),
+                        nsfw: verdict.probabilities.nsfwProb.toFixed(2),
+                        gore: verdict.probabilities.goreProb.toFixed(2),
+                      })}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {exclusion && !exclusion.fingerprintValid && (
+                <div className="l4a-callout" data-tone="error">
+                  <AlertTriangle size={16} style={{ flexShrink: 0, marginTop: 2 }} />
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1 }}>
+                    <span className="md-label-large">{t('filter.fingerprintInvalidBanner')}</span>
+                    <span className="md-body-small md-mono">
+                      {t('filter.fingerprintChangedDetail', {
+                        bound: exclusion.boundFingerprint?.slice(0, 12) ?? '—',
+                        current:
+                          (exclusion.currentFingerprint ?? activeFingerprint)?.slice(0, 12) ?? '—',
+                      })}
+                    </span>
+                    <div>
+                      <Button
+                        variant="filled"
+                        size="sm"
+                        disabled={busy || !canBindFingerprint}
+                        icon={<RefreshCw size={14} />}
+                        onClick={() =>
+                          void upsertFilterExclusion({
+                            addonId: addon.id,
+                            displayLevel: exclusion.displayLevel,
+                            bindFingerprint: canBindFingerprint,
+                            note: exclusion.note,
+                          })
+                        }
+                      >
+                        {t('filter.rebindFingerprint')}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                <span className="md-body-small">{t('filter.exclusionLevelLabel')}</span>
+                <Select<ExclusionDisplayLevel>
+                  ariaLabel={t('filter.exclusionLevelLabel')}
+                  value={effectiveDraftLevel}
+                  disabled={busy}
+                  onChange={(nextLevel) => {
+                    setDraftExclAddonId(addon.id);
+                    setDraftLevel(nextLevel);
+                    if (exclusion) {
+                      void upsertFilterExclusion({
+                        addonId: addon.id,
+                        displayLevel: nextLevel,
+                        note: exclusion.note,
+                      });
+                    }
+                  }}
+                  options={EXCLUSION_LEVELS.map((lvl) => ({
+                    value: lvl,
+                    label: t(`filter.levels.${lvl}`),
+                  }))}
+                />
+              </div>
+
+              <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                  <span className="md-body-small">{t('filter.bindFingerprint')}</span>
+                  <span
+                    className="md-body-small md-mono"
+                    style={{ color: 'var(--md-sys-color-on-surface-variant)', fontSize: 11 }}
+                  >
+                    {activeFingerprint
+                      ? activeFingerprint.slice(0, 16)
+                      : t('filter.noFingerprintHint')}
+                  </span>
+                </div>
+                <Switch
+                  compact
+                  checked={effectiveDraftBind}
+                  disabled={busy || (!canBindFingerprint && !effectiveDraftBind)}
+                  label={t('filter.bindFingerprint')}
+                  onChange={(nextBind) => {
+                    setDraftExclAddonId(addon.id);
+                    setDraftBindFingerprint(nextBind);
+                    if (exclusion) {
+                      void upsertFilterExclusion({
+                        addonId: addon.id,
+                        displayLevel: exclusion.displayLevel,
+                        bindFingerprint: nextBind,
+                        note: exclusion.note,
+                      });
+                    }
+                  }}
+                />
+              </div>
+
+              <div className="l4a-row-wrap" style={{ justifyContent: 'flex-end' }}>
+                {exclusion ? (
+                  <Button
+                    variant="text"
+                    tone="error"
+                    size="sm"
+                    disabled={busy}
+                    icon={<Trash2 size={14} />}
+                    onClick={async () => {
+                      const ok = await deleteFilterExclusion(addon.id);
+                      if (ok) {
+                        setDraftExclAddonId(null);
+                        setDraftLevel('lazy_load');
+                        setDraftBindFingerprint(true);
+                      }
+                    }}
+                  >
+                    {t('filter.removeExclusion')}
+                  </Button>
+                ) : (
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    disabled={busy}
+                    icon={<Plus size={14} />}
+                    onClick={() =>
+                      void upsertFilterExclusion({
+                        addonId: addon.id,
+                        displayLevel: effectiveDraftLevel,
+                        bindFingerprint: effectiveDraftBind && canBindFingerprint,
+                      })
+                    }
+                  >
+                    {t('filter.addExclusion')}
+                  </Button>
+                )}
+              </div>
+            </div>
+
+            <div className="l4a-divider" />
+
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
                 <span
@@ -418,6 +713,7 @@ export function AddonDetailSheet({
                 <IconButton
                   size="sm"
                   label={t('library.addToGroup')}
+                  disabled={busy}
                   onClick={() => onAddToGroup(addon)}
                 >
                   <Plus size={16} />
@@ -437,6 +733,7 @@ export function AddonDetailSheet({
                       key={g.id}
                       label={g.name}
                       tone="surface"
+                      disabled={busy}
                       icon={
                         g.color ? (
                           <span
@@ -468,7 +765,9 @@ export function AddonDetailSheet({
                   {memberBundles.map((b) => (
                     <span key={b.id} className="md-pill" data-tone="primary">
                       <Layers size={12} />
-                      {b.name}
+                      {titleRedactedForTasks
+                        ? formatRedactedAddonLabel(undefined, t, detailFilter.failureDisplay)
+                        : b.name}
                     </span>
                   ))}
                 </div>
@@ -483,70 +782,86 @@ export function AddonDetailSheet({
                 >
                   {t('detail.description')}
                 </span>
-                <div className="md-body-small selectable l4a-description-box">{description}</div>
+                <div className="md-body-small selectable l4a-description-box">
+                  {detailFilter.redactText
+                    ? detailFilter.pendingEvaluation
+                      ? t('filter.evaluatingMedia')
+                      : t('filter.redactedDescription')
+                    : description}
+                </div>
               </div>
             )}
 
-            {(visibleInfoEntries.length > 0 || zeroFlagEntries.length > 0) && (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
-                  <span
-                    className="md-label-medium"
-                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                  >
-                    {t('detail.metadata')}
-                  </span>
-                  {zeroFlagEntries.length > 0 && (
-                    <Button
-                      variant="text"
-                      size="sm"
-                      onClick={() => setShowZeroFlags((v) => !v)}
-                    >
-                      {showZeroFlags
-                        ? t('detail.hideZeroFlags')
-                        : t('detail.showAllFields', {
-                            count: primaryInfoEntries.length + zeroFlagEntries.length,
-                          })}
-                    </Button>
-                  )}
-                </div>
-                <div className="l4a-list">
-                  {visibleInfoEntries.map(([k, v]) => {
-                    const urlValue = isHttpUrl(v);
-                    const stacked = urlValue || v.length > 28 || v.includes('\n');
-                    return (
-                      <div
-                        key={k}
-                        className="l4a-info-row"
-                        data-stacked={stacked ? 'true' : 'false'}
-                      >
-                        <span className="l4a-info-key md-body-small md-mono">{k}</span>
-                        {urlValue ? (
-                          <div className="l4a-info-url-wrap">
-                            <button
-                              type="button"
-                              className="l4a-info-link md-body-small selectable"
-                              onClick={() => onOpenExternal(v.trim())}
-                            >
-                              <span>{v.trim()}</span>
-                              <ExternalLink size={12} style={{ flexShrink: 0 }} />
-                            </button>
-                            <IconButton
-                              size="sm"
-                              label={t('common.copy')}
-                              onClick={() => onCopy(v.trim())}
-                            >
-                              <Copy size={13} />
-                            </IconButton>
-                          </div>
-                        ) : (
-                          <span className="l4a-info-value md-body-small selectable">{v}</span>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+            {detailFilter.redactText ? (
+              <div className="md-body-small l4a-description-box">
+                {detailFilter.pendingEvaluation
+                  ? t('filter.evaluatingMedia')
+                  : detailFilter.exclusionActive
+                    ? t('filter.redactedMeta')
+                    : t('filter.redactedDescription')}
               </div>
+            ) : (
+              (visibleInfoEntries.length > 0 || zeroFlagEntries.length > 0) && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div className="l4a-row-wrap" style={{ justifyContent: 'space-between' }}>
+                    <span
+                      className="md-label-medium"
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    >
+                      {t('detail.metadata')}
+                    </span>
+                    {zeroFlagEntries.length > 0 && (
+                      <Button
+                        variant="text"
+                        size="sm"
+                        onClick={() => setShowZeroFlags((v) => !v)}
+                      >
+                        {showZeroFlags
+                          ? t('detail.hideZeroFlags')
+                          : t('detail.showAllFields', {
+                              count: primaryInfoEntries.length + zeroFlagEntries.length,
+                            })}
+                      </Button>
+                    )}
+                  </div>
+                  <div className="l4a-list">
+                    {visibleInfoEntries.map(([k, v]) => {
+                      const urlValue = isHttpUrl(v);
+                      const stacked = urlValue || v.length > 28 || v.includes('\n');
+                      return (
+                        <div
+                          key={k}
+                          className="l4a-info-row"
+                          data-stacked={stacked ? 'true' : 'false'}
+                        >
+                          <span className="l4a-info-key md-body-small md-mono">{k}</span>
+                          {urlValue ? (
+                            <div className="l4a-info-url-wrap">
+                              <button
+                                type="button"
+                                className="l4a-info-link md-body-small selectable"
+                                onClick={() => onOpenExternal(v.trim())}
+                              >
+                                <span>{v.trim()}</span>
+                                <ExternalLink size={12} style={{ flexShrink: 0 }} />
+                              </button>
+                              <IconButton
+                                size="sm"
+                                label={t('common.copy')}
+                                onClick={() => onCopy(v.trim())}
+                              >
+                                <Copy size={13} />
+                              </IconButton>
+                            </div>
+                          ) : (
+                            <span className="l4a-info-value md-body-small selectable">{v}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )
             )}
           </>
         ) : addon.maps.length === 0 ? (
@@ -558,38 +873,55 @@ export function AddonDetailSheet({
           </div>
         ) : (
           <div className="l4a-list">
-            {addon.maps.map((m) => (
-              <div
-                key={m.code}
-                className="l4a-list-row"
-                style={{ minHeight: 56, cursor: 'default' }}
-              >
-                {m.imagePath && (
-                  <div className="l4a-list-thumb">
-                    <AddonCover compact src={m.imagePath} title={m.name} category="Map" />
-                  </div>
-                )}
-                <div className="l4a-list-main">
-                  <span className="md-title-small">{m.name}</span>
-                  <span
-                    className="md-body-small md-mono"
-                    style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
-                  >
-                    {m.code}
-                  </span>
-                </div>
-                <Button
-                  variant="tonal"
-                  size="sm"
-                  icon={<Copy size={13} />}
-                  title={t('detail.copyMapCode')}
-                  aria-label={`${t('detail.copyMapCode')} ${m.code}`}
-                  onClick={() => onCopy(m.code)}
+            {addon.maps.map((m) => {
+              const trimmedImg = m.imagePath?.trim();
+              const imgIdx = trimmedImg ? addonImageSources.indexOf(trimmedImg) : -1;
+              const mapImgMode = trimmedImg
+                ? imgIdx >= 0
+                  ? detailFilter.imageModeAt(imgIdx)
+                  : detailFilter.mapCoverMode
+                : 'none';
+              const mapLabel = detailFilter.redactText ? m.code : m.name;
+              return (
+                <div
+                  key={m.code}
+                  className="l4a-list-row"
+                  style={{ minHeight: 56, cursor: 'default' }}
                 >
-                  {t('common.copy')}
-                </Button>
-              </div>
-            ))}
+                  {m.imagePath && (
+                    <div className="l4a-list-thumb">
+                      <AddonCover
+                        compact
+                        src={m.imagePath}
+                        title={mapLabel}
+                        category="Map"
+                        filterMode={mapImgMode}
+                        evaluation={detailFilter}
+                      />
+                    </div>
+                  )}
+                  <div className="l4a-list-main">
+                    <span className="md-title-small">{mapLabel}</span>
+                    <span
+                      className="md-body-small md-mono"
+                      style={{ color: 'var(--md-sys-color-on-surface-variant)' }}
+                    >
+                      {m.code}
+                    </span>
+                  </div>
+                  <Button
+                    variant="tonal"
+                    size="sm"
+                    icon={<Copy size={13} />}
+                    title={t('detail.copyMapCode')}
+                    aria-label={`${t('detail.copyMapCode')} ${m.code}`}
+                    onClick={() => onCopy(m.code)}
+                  >
+                    {t('common.copy')}
+                  </Button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

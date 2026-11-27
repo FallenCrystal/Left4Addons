@@ -46,3 +46,28 @@ steam_timeout_ms = 4500
 cache_ttl_secs = 60
 # 将实时检索到的公开条目异步写入按 ID 查询缓存
 cache_steam_results = true
+
+[filter]
+# 是否对外提供 `/api/v1/filter/predict` 敏感内容概率推理接口（仅返回纯概率，绝不调用任何外部 LLM）
+enabled = false
+# 推理后端模式："managed_python"（由 l4a-server 自动托管 Left4Filters Python 子进程）或 "upstream_http"
+backend = "managed_python"
+# ManagedPython 模式下 Left4Filters 仓库目录或 deploy 目录路径
+# deploy_dir = "./Left4Filters"
+# 可选：指定 Python 解释器路径（留空则自动探测虚拟环境与 python3 / python）
+# python_bin = "/opt/left4filters/.venv/bin/python"
+# UpstreamHttp 模式下外部推理服务基础地址（需提供 GET /health 与 POST /predict）
+# upstream_url = "http://127.0.0.1:8090"
+# 概率推理内存缓存 TTL（秒，0..=86400；0 表示禁用缓存）
+cache_ttl_secs = 3600
+# 模型运行与校准参数（仅允许通过 catalog.toml 或管理员控制台修改，公开 API 客户端无法覆写）
+threads = 4
+enable_text = true
+enable_image = true
+max_images = 2
+# 多图聚合策略："max" | "top2_mean" | "mean"
+gallery_aggregation = "max"
+gore_weight = 1.0
+nsfw_weight = 1.0
+temperature = 1.0
+bias = 0.0
