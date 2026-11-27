@@ -2,6 +2,8 @@ use super::FILTER_RUNNER_PY;
 use crate::config::AppPaths;
 use crate::engine::EventSink;
 use crate::error::CoreError;
+use l4a_logging::http::AuditedSend;
+use l4a_logging::process::CommandAudit;
 use l4a_protocol::{
     merge_managed_predictions, CoreEvent, DeployLocalFilterRequest, FilterCommitInfo,
     FilterEnvReport, FilterModelParams, FilterProbabilities, LocalFilterDeploymentStatus,
@@ -277,7 +279,10 @@ pub(crate) fn probe_python_candidates(
             .stderr(Stdio::null());
         configure_std_cmd(&mut cmd);
 
-        let Ok(out) = cmd.output() else {
+        let audit = CommandAudit::start_quiet("filter.probe.python", &cmd);
+        let result = cmd.output();
+        audit.finish_output(&result);
+        let Ok(out) = result else {
             continue;
         };
         if !out.status.success() {
@@ -411,7 +416,10 @@ fn probe_environment_for_backend(web_gpu_enabled: bool) -> FilterEnvReport {
         .stderr(Stdio::null());
     configure_std_cmd(&mut git_cmd);
 
-    if let Ok(out) = git_cmd.output() {
+    let audit = CommandAudit::start_quiet("filter.probe.git", &git_cmd);
+    let git_result = git_cmd.output();
+    audit.finish_output(&git_result);
+    if let Ok(out) = git_result {
         if out.status.success() {
             let raw_ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
             let clean_ver = raw_ver
@@ -898,6 +906,14 @@ impl LocalFilterManager {
         };
 
         *self.last_auto_restart_at.lock().unwrap() = None;
+        let deploy_started = Instant::now();
+        tracing::info!(
+            repo_url = %l4a_logging::redact::redact_url_str(&validated_url),
+            target_commit = target_commit.as_deref().unwrap_or("latest"),
+            web_gpu_enabled,
+            start_after_deploy = request.start_after_deploy,
+            "Starting local filter model deployment"
+        );
 
         self.reap_exited_runner(&mut runner_guard);
         let restart_previous_runner =
@@ -952,10 +968,27 @@ impl LocalFilterManager {
                         }
                     }
                 }
+                tracing::warn!(
+                    elapsed_ms = deploy_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "Local filter model deployment failed"
+                );
                 self.emit_stage(LocalFilterServiceState::Error, None, Some(err.to_string()));
                 return Err(err);
             }
         };
+        tracing::info!(
+            elapsed_ms = deploy_started.elapsed().as_millis() as u64,
+            commit = current_commit
+                .as_ref()
+                .map(|c| c.sha.as_str())
+                .unwrap_or("-"),
+            remote_latest = remote_latest_commit
+                .as_ref()
+                .map(|c| c.sha.as_str())
+                .unwrap_or("-"),
+            "Local filter model deployment steps completed"
+        );
 
         {
             let mut st = self.state.lock().unwrap();
@@ -1156,7 +1189,7 @@ impl LocalFilterManager {
                     Err(err) => {
                         tracing::warn!(
                             error = %err,
-                            "现有 Python 虚拟环境解释器不可执行或已损坏，准备重建虚拟环境"
+                            "Existing Python venv interpreter is not executable or is corrupted; recreating the venv"
                         );
                         false
                     }
@@ -1474,7 +1507,7 @@ impl LocalFilterManager {
                 }
                 tracing::warn!(
                     error = %cfg_err,
-                    "同步本地过滤运行参数失败，正在重启守护进程以避免旧参数误判"
+                    "Failed to sync local filter runtime parameters; restarting daemon to avoid stale-parameter verdicts"
                 );
                 self.stop_runner_inner(runner_guard).await;
                 if let Err(restart_err) = self
@@ -1521,7 +1554,7 @@ impl LocalFilterManager {
             .timeout(CONFIGURE_HTTP_TIMEOUT)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
             .json(&params.sanitized())
-            .send();
+            .send_audited("filter.local.configure");
         let resp = tokio::select! {
             biased;
             _ = self.shutdown_token.cancelled() => {
@@ -1794,7 +1827,7 @@ impl LocalFilterManager {
             .post(&url)
             .timeout(PREDICT_HTTP_TIMEOUT)
             .json(payload)
-            .send();
+            .send_audited_quiet("filter.local.predict");
         let resp = tokio::select! {
             biased;
             _ = self.shutdown_token.cancelled() => {
@@ -1917,8 +1950,16 @@ impl LocalFilterManager {
         configure_runner_vision_provider(&mut cmd, web_gpu_enabled, inherited_provider.as_deref());
         configure_tokio_cmd(&mut cmd);
 
-        let mut child = cmd.spawn()?;
+        let audit = CommandAudit::start("filter.runner", cmd.as_std());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                audit.finish_error(&err);
+                return Err(err.into());
+            }
+        };
         let pid = child.id();
+        audit.finish_spawned(pid);
         let stdin = child
             .stdin
             .take()
@@ -1937,11 +1978,24 @@ impl LocalFilterManager {
         tokio::spawn(async move {
             let mut stderr = stderr;
             let mut buf = [0u8; 4096];
+            let mut pending_line = String::new();
             loop {
                 match stderr.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        log_runner_stderr_line(pid, &pending_line);
+                        break;
+                    }
                     Ok(n) => {
                         let chunk = String::from_utf8_lossy(&buf[..n]);
+                        pending_line.push_str(&chunk);
+                        while let Some(pos) = pending_line.find('\n') {
+                            log_runner_stderr_line(pid, &pending_line[..pos]);
+                            pending_line.drain(..=pos);
+                        }
+                        if pending_line.len() > MAX_STDERR_TAIL_BYTES {
+                            log_runner_stderr_line(pid, &pending_line);
+                            pending_line.clear();
+                        }
                         let mut guard = stderr_tail_writer.lock().unwrap();
                         guard.push_str(&chunk);
                         if guard.len() > MAX_STDERR_TAIL_BYTES {
@@ -2094,7 +2148,7 @@ impl LocalFilterManager {
             {
                 Ok(()) => Some(latest_desired),
                 Err(PredictLocalError::Transport(err) | PredictLocalError::HttpStatus(err)) => {
-                    tracing::warn!(error = %err, "守护进程启动后同步最新过滤参数失败，标记为待重配");
+                    tracing::warn!(error = %err, "Failed to sync latest filter parameters after daemon start; marked for reconfiguration");
                     None
                 }
             }
@@ -2182,6 +2236,20 @@ impl LocalFilterManager {
         stage_message: Option<String>,
         last_error: Option<String>,
     ) {
+        if let Some(err) = last_error.as_deref() {
+            tracing::warn!(
+                state = ?service_state,
+                stage = stage_message.as_deref().unwrap_or_default(),
+                error = %err,
+                "Local filter service stage changed (with error)"
+            );
+        } else {
+            tracing::info!(
+                state = ?service_state,
+                stage = stage_message.as_deref().unwrap_or_default(),
+                "Local filter service stage changed"
+            );
+        }
         let status = {
             let mut st = self.state.lock().unwrap();
             st.service_state = service_state;
@@ -2224,6 +2292,19 @@ impl LocalFilterManager {
             last_error: st.last_error.clone(),
             cache_generation: None,
         }
+    }
+}
+
+/// Forwards one line of the Python runner's stderr into the application log.
+fn log_runner_stderr_line(pid: Option<u32>, line: &str) {
+    let line = line.trim();
+    if !line.is_empty() {
+        tracing::info!(
+            target: "l4a::filter_runner",
+            pid,
+            "{}",
+            l4a_logging::redact::truncate(line, 1000)
+        );
     }
 }
 
@@ -2294,9 +2375,17 @@ async fn run_cancellable_command(
     }
     configure_tokio_cmd(&mut cmd);
 
-    let child = cmd.spawn()?;
+    let audit = CommandAudit::start("filter.deploy", cmd.as_std());
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            audit.finish_error(&err);
+            return Err(err.into());
+        }
+    };
     tokio::select! {
         () = cancel.cancelled() => {
+            audit.finish_message("cancelled because the application is exiting");
             Err(CoreError::Io(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "操作在应用退出时被取消",
@@ -2304,12 +2393,19 @@ async fn run_cancellable_command(
         }
         res = tokio::time::timeout(timeout_dur, child.wait_with_output()) => {
             match res {
-                Ok(Ok(output)) => Ok(output),
-                Ok(Err(err)) => Err(CoreError::Io(err)),
-                Err(_) => Err(CoreError::Network(format!(
-                    "外部命令执行超时 ({}s)",
-                    timeout_dur.as_secs()
-                ))),
+                Ok(Ok(output)) => {
+                    audit.record_output(&output);
+                    Ok(output)
+                }
+                Ok(Err(err)) => {
+                    audit.finish_error(&err);
+                    Err(CoreError::Io(err))
+                }
+                Err(_) => {
+                    audit.finish_message(&format!("timed out after {}s", timeout_dur.as_secs()));
+                    let message = format!("外部命令执行超时 ({}s)", timeout_dur.as_secs());
+                    Err(CoreError::Network(message))
+                }
             }
         }
     }

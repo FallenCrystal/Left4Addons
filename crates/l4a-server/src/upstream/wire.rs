@@ -235,7 +235,7 @@ pub(super) fn decode_response_lossy<Response: RpcMessage>(
                     tracing::warn!(
                         method = method_name,
                         error = %original_err,
-                        "Steam CM 响应触发 UTF-8 解码错误，但已知字符串字段中未发现非法字节（可能存在未覆盖的新字段）"
+                        "Steam CM response triggered a UTF-8 decode error, but no invalid bytes were found in known string fields (possibly an unhandled new field)"
                     );
                     return Err(MalformedBody::new(
                         EMsg::k_EMsgServiceMethodResponse,
@@ -248,7 +248,7 @@ pub(super) fn decode_response_lossy<Response: RpcMessage>(
                         method = method_name,
                         error = %original_err,
                         sanitize_error = %sanitize_err,
-                        "Steam CM 响应 UTF-8 容错清洗失败，保留原始解析错误"
+                        "Steam CM response UTF-8 sanitization failed; keeping original parse error"
                     );
                     return Err(MalformedBody::new(
                         EMsg::k_EMsgServiceMethodResponse,
@@ -260,7 +260,7 @@ pub(super) fn decode_response_lossy<Response: RpcMessage>(
             tracing::warn!(
                 method = method_name,
                 repaired_fields = stats.repaired_fields,
-                "Steam CM 响应包含非法 UTF-8 字节，已按 lossy 模式清洗并继续解析"
+                "Steam CM response contained invalid UTF-8 bytes; sanitized lossily and continued parsing"
             );
             let mut sanitized_slice = sanitized.as_slice();
             Response::parse(&mut sanitized_slice)

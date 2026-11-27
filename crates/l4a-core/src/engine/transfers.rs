@@ -383,7 +383,7 @@ impl L4aEngine {
             if let Err(update_error) =
                 update_task(&self.db, &mut task, status, 0, None, Some(err.to_string()))
             {
-                tracing::error!(error = %update_error, "保存下载任务终态失败");
+                tracing::error!(error = %update_error, "Failed to persist final download task state");
             }
         }
         self.emit_workspace_update();

@@ -26,3 +26,4 @@
 - [Catalog Server REST API 规范](./api/catalog-server-api.md)
 - [镜像代理配置指南 (`mirrors.json`)](./guides/mirrors-configuration.md)
 - [Steamworks SDK 实测细节与限制](./guides/steamworks-sdk-details.md)
+- [日志系统指南 (`l4a-logging`)](./guides/logging.md) — 日志位置、启动滚动与 tar.gz 归档、审计范围与脱敏规则

@@ -33,7 +33,11 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::time::Duration;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer},
+};
+use tracing::Level;
 
 const MAX_BATCH_SIZE: usize = 200;
 
@@ -163,7 +167,44 @@ pub fn router(state: ServerState) -> Router {
         .merge(public_routes)
         .merge(admin_routes)
         .with_state(state)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(access_log_span)
+                .on_request(())
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
+        )
+}
+
+/// Access-log span: method and path only. The query string is deliberately omitted because it
+/// may carry search terms or credentials; `on_response` adds status and latency.
+fn access_log_span(request: &Request) -> tracing::Span {
+    let client = request
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        })
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|info| info.0.ip().to_string())
+        })
+        .unwrap_or_default();
+    tracing::info_span!(
+        target: "l4a::access",
+        "http",
+        method = %request.method(),
+        path = %request.uri().path(),
+        client = %client,
+    )
 }
 
 async fn append_search_vary(request: Request, next: Next) -> Response {
@@ -218,7 +259,7 @@ fn err_resp(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json
 }
 
 fn internal_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
-    tracing::error!(error = %err, "l4a-server 内部处理异常");
+    tracing::error!(error = %err, "l4a-server internal error");
     err_resp(StatusCode::INTERNAL_SERVER_ERROR, "服务端内部错误")
 }
 
@@ -227,7 +268,7 @@ fn search_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::db::QueryAbortedError>())
     {
-        tracing::warn!(error = %aborted, "搜索请求因并发限流或超时中止");
+        tracing::warn!(error = %aborted, "Search request aborted due to concurrency limit or timeout");
         return match aborted {
             crate::db::QueryAbortedError::Timeout => err_resp(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -502,7 +543,7 @@ async fn admin_change_password(
                     .update(|cfg| cfg.admin.password = password.to_owned())
                     .map(|_| ())
                     .map_err(|err| {
-                        tracing::error!(error = %err, "无法保存管理员密码");
+                        tracing::error!(error = %err, "Failed to save admin password");
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "无法保存管理员密码".into(),
@@ -988,13 +1029,13 @@ fn public_filter_err(err: FilterServiceError) -> (StatusCode, Json<Value>) {
             err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务未启用")
         }
         FilterServiceError::Unavailable(detail) => {
-            tracing::warn!(error = %detail, "公开内容过滤接口后端暂不可用");
+            tracing::warn!(error = %detail, "Public content filter backend temporarily unavailable");
             err_resp(StatusCode::SERVICE_UNAVAILABLE, "内容过滤服务暂不可用")
         }
         FilterServiceError::NotFound(msg) => err_resp(StatusCode::NOT_FOUND, msg),
         FilterServiceError::BadRequest(msg) => err_resp(StatusCode::BAD_REQUEST, msg),
         FilterServiceError::BackendRejected(detail) => {
-            tracing::debug!(error = %detail, "过滤推理后端拒绝请求");
+            tracing::debug!(error = %detail, "Filter inference backend rejected request");
             err_resp(StatusCode::BAD_REQUEST, "内容过滤模型无法处理该请求")
         }
         FilterServiceError::ImageFetch(msg) => filter_image_fetch_err(msg),

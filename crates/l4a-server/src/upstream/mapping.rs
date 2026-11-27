@@ -52,7 +52,7 @@ pub(super) fn map_detail(
             }),
         },
         _ => {
-            tracing::warn!(%workshop_id, result = ?d.result, "Steam CM 未返回可核验的条目状态");
+            tracing::warn!(%workshop_id, result = ?d.result, "Steam CM returned no verifiable item state");
             return None;
         }
     };

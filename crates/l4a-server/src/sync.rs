@@ -132,7 +132,7 @@ impl CatalogSyncCoordinator {
             let refresh = self.singleflight_refresh(&[wid], deadline).await;
             let current = self.db_call(move |r| r.get_item(wid)).await?;
             if let Err(err) = refresh {
-                tracing::warn!(workshop_id = %wid, error = %err, "Steam CM 上游刷新失败");
+                tracing::warn!(workshop_id = %wid, error = %err, "Steam CM upstream refresh failed");
                 if force_refresh && current.is_none() {
                     return Err(err);
                 }
@@ -197,7 +197,7 @@ impl CatalogSyncCoordinator {
 
         if !to_refresh.is_empty() {
             if let Err(err) = self.singleflight_refresh(&to_refresh, deadline).await {
-                tracing::warn!(error = %err, count = to_refresh.len(), "批量穿透刷新部分失败，回退使用本地缓存");
+                tracing::warn!(error = %err, count = to_refresh.len(), "Batch upstream refresh partially failed; falling back to local cache");
             }
         }
 
@@ -709,7 +709,7 @@ impl CatalogSyncCoordinator {
                         >= Duration::from_secs(sync_cfg.incremental_interval_secs.max(30))
                 {
                     if let Err(err) = coordinator.run_incremental_once().await {
-                        tracing::warn!(error = %err, "后台增量同步执行失败");
+                        tracing::warn!(error = %err, "Background incremental sync failed");
                     }
                     last_inc = tokio::time::Instant::now();
                 }
@@ -719,7 +719,7 @@ impl CatalogSyncCoordinator {
                         >= Duration::from_secs(sync_cfg.backfill_interval_secs.max(2))
                 {
                     if let Err(err) = coordinator.run_backfill_step_once().await {
-                        tracing::warn!(error = %err, "后台全量游标回填执行失败");
+                        tracing::warn!(error = %err, "Background full cursor backfill failed");
                     }
                     last_bf = tokio::time::Instant::now();
                 }
@@ -747,7 +747,7 @@ impl CatalogSyncCoordinator {
 
                 let ttl_secs = coordinator.config_store.get().sync.item_ttl_secs;
                 if let Err(err) = coordinator.recheck_listings(&mut cursor, ttl_secs).await {
-                    tracing::warn!(error = %err, "后台公开条目核验未完成");
+                    tracing::warn!(error = %err, "Background public item verification did not complete");
                 }
             }
         });

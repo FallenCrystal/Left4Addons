@@ -336,7 +336,7 @@ impl TokenVault {
                     Err(CoreError::Config(msg)) => {
                         tracing::warn!(
                             error = %msg,
-                            "现有本地密钥文件内容已损坏或无法解封，保存新 Token 时将重新生成密钥"
+                            "Existing local key file is corrupted or cannot be unsealed; a new key will be generated when saving the token"
                         );
                     }
                     Err(err) => return Err(err),

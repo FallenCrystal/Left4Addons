@@ -427,7 +427,7 @@ impl L4aEngine {
 
         let active_policy_sig = self.current_filter_policy_signature(&next);
         if let Err(err) = self.db.prune_filter_verdicts_except(&active_policy_sig) {
-            tracing::warn!(error = %err, "保存配置时清理旧策略过滤缓存失败");
+            tracing::warn!(error = %err, "Failed to clear stale filter verdict cache while saving config");
         }
         drop(filter_cache);
 
@@ -462,7 +462,7 @@ impl L4aEngine {
                 let lf = self.local_filter.clone();
                 handle.spawn(async move {
                     if let Err(err) = lf.reconfigure_to_desired().await {
-                        tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
+                        tracing::warn!(error = %err, "Failed to hot-reload local filter runtime parameters");
                     }
                 });
             }
@@ -474,7 +474,7 @@ impl L4aEngine {
         let (saved, filter_params_changed) = self.apply_saved_config(next)?;
         if filter_params_changed {
             if let Err(err) = self.local_filter.reconfigure_to_desired().await {
-                tracing::warn!(error = %err, "热更新本地过滤运行参数失败");
+                tracing::warn!(error = %err, "Failed to hot-reload local filter runtime parameters");
             }
         }
         Ok(saved)
@@ -490,7 +490,7 @@ impl L4aEngine {
 
     fn refresh_bundles_logged(&self) {
         if let Err(err) = rebuild_auto_bundles(&self.db) {
-            tracing::warn!(error = %err, "自动重建战役整合包失败");
+            tracing::warn!(error = %err, "Failed to rebuild campaign bundles automatically");
         }
     }
 
@@ -604,7 +604,7 @@ impl L4aEngine {
 
     fn refresh_after_error(&self, cfg: &AppConfig) {
         if let Err(err) = scan_workspace(&self.db, cfg, &self.paths.image_cache_dir) {
-            tracing::warn!(error = %err, "操作失败后重新扫描目录失败");
+            tracing::warn!(error = %err, "Failed to rescan addons directory after operation failure");
         }
     }
 

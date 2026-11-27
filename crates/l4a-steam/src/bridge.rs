@@ -266,6 +266,7 @@ impl DynamicBridgeState {
 
         match unsafe { load_bridge_api(&lib_path) } {
             Ok((api, caps)) => {
+                tracing::info!(target: "l4a::steam", library = %lib_path.display(), capabilities = ?caps, "Loaded Steam bridge library");
                 let api = Arc::new(api);
                 *guard = Some(LoadedBridge {
                     api: api.clone(),
@@ -277,6 +278,7 @@ impl DynamicBridgeState {
                 Ok((api, caps))
             }
             Err(msg) => {
+                tracing::warn!(target: "l4a::steam", library = %lib_path.display(), error = %msg, "Failed to load Steam bridge library");
                 if let Ok(mut err) = self.last_error.lock() {
                     *err = Some(msg.clone());
                 }
@@ -286,6 +288,25 @@ impl DynamicBridgeState {
     }
 
     fn call_sync(&self, method: &str, payload: Value) -> Result<Value, BridgeError> {
+        let started = std::time::Instant::now();
+        let result = self.call_sync_inner(method, payload);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            // Download progress is polled; keep it out of INFO.
+            Ok(_) if method.contains("status") => {
+                tracing::debug!(target: "l4a::steam", method, elapsed_ms, "Steamworks call completed")
+            }
+            Ok(_) => {
+                tracing::info!(target: "l4a::steam", method, elapsed_ms, "Steamworks call completed")
+            }
+            Err(err) => {
+                tracing::warn!(target: "l4a::steam", method, elapsed_ms, error = %err, "Steamworks call failed")
+            }
+        }
+        result
+    }
+
+    fn call_sync_inner(&self, method: &str, payload: Value) -> Result<Value, BridgeError> {
         let (api, _) = self.ensure_loaded()?;
         let req = serde_json::to_string(&RawRequest {
             method: method.to_string(),

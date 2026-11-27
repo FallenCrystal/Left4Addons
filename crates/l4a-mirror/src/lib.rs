@@ -79,7 +79,7 @@ impl MirrorRouter {
             match Regex::new(&pattern) {
                 Ok(regex) => compiled.push(CompiledRule { regex, raw: rule }),
                 Err(err) => {
-                    tracing::warn!(pattern = %pattern, error = %err, "忽略无效镜像规则正则");
+                    tracing::warn!(pattern = %pattern, error = %err, "Ignoring invalid mirror rule regex");
                 }
             }
         }
@@ -200,7 +200,7 @@ impl MirrorRouter {
         let https_only = self.https_only.load(Ordering::Relaxed);
         let insecure_tls = resolved.insecure_tls && !https_only;
         if insecure_tls {
-            tracing::warn!("镜像规则启用了 insecure-tls 跳过证书校验");
+            tracing::warn!("Mirror rule enables insecure-tls; certificate verification is skipped");
         }
         Ok(Client::builder()
             .https_only(https_only)

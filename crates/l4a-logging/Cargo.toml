@@ -1,0 +1,18 @@
+[package]
+name = "l4a-logging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Left4Addons shared logging: dated log files, startup rotation with tar.gz archives, and network/process audit helpers"
+
+[dependencies]
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+url.workspace = true
+flate2.workspace = true
+tar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -22,4 +22,4 @@ serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tauri.workspace = true
-tauri-plugin-log.workspace = true
+l4a-logging.workspace = true

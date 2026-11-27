@@ -1,3 +1,4 @@
+mod audit;
 mod commands;
 
 use l4a_core::{EventSink, L4aEngine};
@@ -48,10 +49,28 @@ fn resolve_writable_runtime_dir(app: &tauri::App, preferred: PathBuf) -> PathBuf
     preferred
 }
 
+/// Starts file + console logging under `<runtime_dir>/logs`, rolling the previous session log
+/// into a timestamped `.tar.gz`.
+fn init_logging(runtime_dir: &Path) {
+    let mut options = l4a_logging::LogOptions::new(runtime_dir.join("logs"), "l4a");
+    options.app_label = format!("Left4Addons {}", env!("CARGO_PKG_VERSION"));
+    options.console = if cfg!(debug_assertions) {
+        l4a_logging::ConsoleTarget::Stderr
+    } else {
+        l4a_logging::ConsoleTarget::None
+    };
+    let session = l4a_logging::init(options);
+    if !session.installed {
+        eprintln!("[l4a] a global log subscriber is already installed; skipping logging init");
+    }
+}
+
 pub(crate) fn spawn_workshop_hydration(engine: &Arc<L4aEngine>) {
     let engine = engine.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = engine.hydrate_missing_workshop_metadata().await;
+        if let Err(err) = engine.hydrate_missing_workshop_metadata().await {
+            tracing::warn!(error = %err, "Failed to hydrate Workshop metadata");
+        }
     });
 }
 
@@ -124,37 +143,34 @@ pub fn run() {
                 host_runtime_dir.join("l4a")
             };
             let runtime_dir = resolve_writable_runtime_dir(app, preferred_dir);
+            init_logging(&runtime_dir);
 
             let sink = Arc::new(TauriEventSink {
                 app_handle: app.handle().clone(),
             });
             let engine = Arc::new(
-                L4aEngine::open_default(&runtime_dir, sink.clone())
-                    .map_err(|e| format!("初始化 L4A v2 引擎失败: {e}"))?,
+                L4aEngine::open_default(&runtime_dir, sink.clone()).map_err(|e| {
+                    tracing::error!(runtime_dir = %runtime_dir.display(), error = %e, "Failed to initialize L4A v2 engine");
+                    format!("初始化 L4A v2 引擎失败: {e}")
+                })?,
             );
+            tracing::info!(runtime_dir = %runtime_dir.display(), "L4A v2 engine initialized");
 
             spawn_workshop_hydration(&engine);
 
             let watcher_engine = engine.clone();
             if let Err(err) = engine.start_watcher(Arc::new(move || {
+                tracing::debug!("Addons directory change detected; rescanning");
                 if watcher_engine.scan_external().is_ok() {
                     spawn_workshop_hydration(&watcher_engine);
                 }
             })) {
                 let message = format!("启动模组目录监听失败: {err}");
-                eprintln!("{message}");
+                tracing::error!("{message}");
                 sink.emit(CoreEvent::WatchError { message });
             }
 
             app.manage(TauriState { engine });
-
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(tauri_plugin_log::log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -210,8 +226,10 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
+            tracing::info!("Application exiting; stopping engine and background services");
             let engine = app_handle.state::<TauriState>().engine.clone();
             tauri::async_runtime::block_on(engine.shutdown());
+            tracing::info!("Application exited");
         }
     });
 }

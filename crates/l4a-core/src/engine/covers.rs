@@ -2,6 +2,7 @@ use super::L4aEngine;
 use crate::db::repo::normalize_valid_remote_cover_url;
 use crate::error::CoreError;
 use crate::file_changes::same_file;
+use l4a_logging::http::AuditedSend;
 use l4a_workshop::WorkshopError;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -100,7 +101,7 @@ impl L4aEngine {
             .build_client_for(&url, Some(Duration::from_secs(15)))
             .map_err(|err| WorkshopError::Network(err.to_string()))?;
         let (request, _) = self.mirror.prepare_get(&client, &url);
-        let mut response = match request.send().await {
+        let mut response = match request.send_audited_quiet("workshop.cover").await {
             Ok(resp) => match resp.error_for_status() {
                 Ok(ok_resp) => ok_resp,
                 Err(status_err) => {

@@ -1,6 +1,7 @@
 use crate::engine::L4aEngine;
 use crate::error::CoreError;
 use crate::filter::secret::TokenVault;
+use l4a_logging::http::AuditedSend;
 use l4a_protocol::ClientFilterConfig;
 use regex::Regex;
 use serde_json::{json, Value};
@@ -374,7 +375,7 @@ pub(crate) async fn judge_with_openai_llm_using_token(
     let resp = request
         .header(reqwest::header::AUTHORIZATION, auth_header.as_str())
         .json(&body)
-        .send()
+        .send_audited("filter.llm.judge")
         .await
         .map_err(|e| CoreError::Network(format!("请求 OpenAI 兼容审核接口失败: {e}")))?;
 

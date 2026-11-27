@@ -2,6 +2,7 @@ use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::Utc;
+use l4a_logging::http::AuditedSend;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     BatchItemsRequest, BatchItemsResponse, MetadataSource, SearchQuery, SearchResponse,
@@ -77,7 +78,7 @@ impl WorkshopProvider for CatalogBackendProvider {
                 ids: ids.to_vec(),
                 force_refresh: false,
             })
-            .send()
+            .send_audited("catalog.items.batch")
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
@@ -138,7 +139,7 @@ impl WorkshopProvider for CatalogBackendProvider {
 
         let (req, _) = self.mirror.prepare_get(&client, &url);
         let resp = req
-            .send()
+            .send_audited("catalog.collection")
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
@@ -224,7 +225,7 @@ impl WorkshopProvider for CatalogBackendProvider {
         let (req, _) = self.mirror.prepare_get(&client, &url);
         let resp = req
             .query(&params)
-            .send()
+            .send_audited("catalog.search")
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 

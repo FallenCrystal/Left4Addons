@@ -12,6 +12,7 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
 use chrono::{TimeDelta, Utc};
 use futures_util::stream::{self, StreamExt};
+use l4a_logging::http::AuditedSend;
 use l4a_protocol::{
     AddonId, AddonSummary, AppConfig, CatalogFilterPublicInfo, ClientFilterConfig,
     ClientFilterSourceMode, CoreEvent, FilterDecisionSource, FilterEvaluationBatchResponse,
@@ -327,7 +328,7 @@ fn record_catalog_observation(
     if changed {
         let active_sig = engine.current_filter_policy_signature(&live);
         if let Err(err) = engine.db().prune_filter_verdicts_except(&active_sig) {
-            tracing::warn!(error = %err, "更新目录服务器评分版本后清理旧缓存失败");
+            tracing::warn!(error = %err, "Failed to clear stale cache after catalog server score version changed");
         }
         engine.emit_event(CoreEvent::SnapshotUpdated {
             external_change: false,
@@ -380,7 +381,7 @@ async fn ensure_catalog_scoring_revision_fresh(
         return;
     };
 
-    if let Ok(resp) = req.send().await {
+    if let Ok(resp) = req.send_audited("filter.catalog.info").await {
         if resp.status().is_success() {
             if let Ok(info) = resp.json::<CatalogFilterPublicInfo>().await {
                 record_catalog_observation(
@@ -574,6 +575,7 @@ async fn evaluate_on_policy(
 ) -> Result<Vec<FilterEvaluationItemResult>, CoreError> {
     let cfg = &app_cfg.filter;
     let max_age = remote_verdict_cache_max_age(cfg);
+    let batch_started = std::time::Instant::now();
 
     let mut addons = HashMap::new();
     for id in targets.iter().filter_map(target_addon_id) {
@@ -594,7 +596,7 @@ async fn evaluate_on_policy(
 
         if target.target_key.trim().is_empty() {
             let err = CoreError::InvalidInput("targetKey 不能为空".into());
-            tracing::warn!(index = idx, error = %err, "过滤目标缺少有效的 targetKey");
+            tracing::warn!(index = idx, error = %err, "Filter target is missing a valid targetKey");
             ordered_outcomes[idx] = Some(FilterTargetOutcome::Failed {
                 error: err.to_string(),
             });
@@ -657,6 +659,18 @@ async fn evaluate_on_policy(
         }
     }
 
+    let cache_hit_count = cached_hits.len();
+    let miss_count = miss_groups.len();
+    for hit in &cached_hits {
+        tracing::debug!(
+            target_key = %hit.target.target_key,
+            flagged = hit.verdict.flagged,
+            source = ?hit.verdict.decision_source,
+            score = hit.verdict.evaluated_score,
+            "Filter verdict cache hit"
+        );
+    }
+
     // Emit cache hits immediately so already-known cards render without waiting for uncached misses.
     emit_cached_verdicts_if_still_valid(engine, policy, cached_hits);
 
@@ -676,7 +690,7 @@ async fn evaluate_on_policy(
         };
 
         if let Some(err) = prestart_err {
-            tracing::warn!(error = %err, "预启动本地过滤服务失败");
+            tracing::warn!(error = %err, "Failed to pre-start local filter service");
             let err_msg = err.to_string();
             for group in miss_groups {
                 for idx in group.indices {
@@ -694,6 +708,27 @@ async fn evaluate_on_policy(
             }
         }
     }
+
+    let (mut flagged, mut safe, mut failed) = (0usize, 0usize, 0usize);
+    for outcome in &ordered_outcomes {
+        match outcome {
+            Some(FilterTargetOutcome::Completed { verdict, .. }) if verdict.flagged => flagged += 1,
+            Some(FilterTargetOutcome::Completed { .. }) => safe += 1,
+            _ => failed += 1,
+        }
+    }
+    tracing::info!(
+        mode = ?cfg.mode,
+        automatic = policy.automatic,
+        targets = targets.len(),
+        cache_hits = cache_hit_count,
+        evaluated = miss_count,
+        flagged,
+        safe,
+        failed,
+        elapsed_ms = batch_started.elapsed().as_millis() as u64,
+        "Content filter batch completed"
+    );
 
     Ok(target_keys
         .into_iter()
@@ -733,11 +768,27 @@ async fn run_deduplicated_misses(
                         },
                     );
                 };
-                evaluate_single_target(engine, app_cfg, &group.target, policy).await
+                let started = std::time::Instant::now();
+                let result = evaluate_single_target(engine, app_cfg, &group.target, policy).await;
+                (result, started.elapsed().as_millis() as u64)
             };
+            let (result, elapsed_ms) = result;
 
             match result {
                 Ok(verdict) => {
+                    tracing::info!(
+                        target_key = %group.target.target_key,
+                        title = %l4a_logging::redact::truncate(&group.target.title, 80),
+                        mode = ?app_cfg.filter.mode,
+                        flagged = verdict.flagged,
+                        source = ?verdict.decision_source,
+                        score = verdict.evaluated_score,
+                        complete = verdict.complete,
+                        evaluated_images = verdict.evaluated_image_indices.len(),
+                        sensitive_images = verdict.sensitive_image_indices.len(),
+                        elapsed_ms,
+                        "Content filter evaluation completed"
+                    );
                     if verdict.complete {
                         persist_and_emit_verdict_if_still_valid(engine, policy, &group, &verdict);
                     }
@@ -753,8 +804,9 @@ async fn run_deduplicated_misses(
                 Err(err) => {
                     tracing::warn!(
                         target_key = %group.target.target_key,
+                        elapsed_ms,
                         error = %err,
-                        "单项内容过滤评估失败"
+                        "Content filter evaluation failed for item"
                     );
                     (
                         group.indices,
@@ -865,7 +917,7 @@ fn persist_and_emit_verdict_if_still_valid(
             tracing::warn!(
                 target_key = %group.target.target_key,
                 error = %db_err,
-                "写入过滤判定缓存失败"
+                "Failed to write filter verdict cache"
             );
         }
     }
@@ -1242,12 +1294,12 @@ fn prepare_catalog_images(
                 Ok(ValidatedRemoteImage::Mirrored(_)) => return CatalogImagePlan::InlineBase64,
                 Err(err) => {
                     had_load_error = true;
-                    tracing::debug!(source = %trimmed, error = %err, "拒绝不安全的远程过滤预览图地址");
+                    tracing::debug!(source = %trimmed, error = %err, "Rejected unsafe remote filter preview image URL");
                 }
             }
         } else {
             had_load_error = true;
-            tracing::debug!(source = %trimmed, "跳过不受支持的过滤预览图来源格式");
+            tracing::debug!(source = %trimmed, "Skipping unsupported filter preview image source format");
         }
     }
 
@@ -1282,7 +1334,7 @@ async fn resolve_catalog_inline_images(
             Ok(_) => missing = true,
             Err(err) => {
                 missing = true;
-                tracing::debug!(slot, error = %err, "无法加载 Catalog 过滤预览图");
+                tracing::debug!(slot, error = %err, "Failed to load catalog filter preview image");
             }
         }
     }
@@ -1300,7 +1352,7 @@ async fn materialize_deferred_remotes_for_llm(
             Ok(img) => out.push((*slot, img)),
             Err(err) => {
                 had_error = true;
-                tracing::debug!(slot = *slot, error = %err, "LLM 复核阶段下载远程预览图失败");
+                tracing::debug!(slot = *slot, error = %err, "Failed to download remote preview image during LLM review");
             }
         }
     }
@@ -1334,7 +1386,7 @@ async fn resolve_target_images(
                     slot = slot_idx,
                     source = %trimmed,
                     error = %err,
-                    "跳过无法加载的过滤预览图"
+                    "Skipping filter preview image that failed to load"
                 );
             }
         }
@@ -1547,7 +1599,7 @@ async fn fetch_loopback_image(
         .loopback_http_client()
         .get(url)
         .timeout(Duration::from_secs(15))
-        .send()
+        .send_audited_quiet("filter.image.loopback")
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| CoreError::Network(e.to_string()))?;
@@ -1823,7 +1875,7 @@ async fn send_predict_request(
     builder: reqwest::RequestBuilder,
 ) -> Result<FilterProbabilities, PredictHttpOutcome> {
     let mut resp = builder
-        .send()
+        .send_audited("filter.predict")
         .await
         .map_err(|e| PredictHttpOutcome::Other(CoreError::Network(e.to_string())))?;
 

@@ -22,7 +22,9 @@ flowchart LR
 
 ## 二、`catalog.toml` 配置文件详解
 
-`l4a-server` 通过 `--config <PATH>`（默认 `./catalog.toml`）加载配置。文件不存在或缺少 `[admin].password` 时，服务会生成、保存并在启动日志中打印初始管理员密码。Unix 上新写入的配置与 Steam Guard 数据使用 `0600` 权限。
+`l4a-server` 通过 `--config <PATH>`（默认 `./catalog.toml`）加载配置。文件不存在或缺少 `[admin].password` 时，服务会生成、保存并在控制台打印初始管理员密码（明文不会写入日志文件）。Unix 上新写入的配置与 Steam Guard 数据使用 `0600` 权限。
+
+运行日志默认写入配置文件所在目录下的 `logs/latest.log`，每次启动会把上一会话日志压缩为 `l4a-server-YYYY-MM-DD_HH-MM-SS.tar.gz`；可用 `--log-dir` / `L4A_SERVER_LOG_DIR` 更改目录、`--log-keep` / `L4A_SERVER_LOG_KEEP` 调整保留数量，详见 [日志系统指南](./logging.md)。
 
 完整配置模板参见 [`crates/l4a-server/catalog.example.toml`](../../crates/l4a-server/catalog.example.toml)：
 

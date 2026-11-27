@@ -1,5 +1,6 @@
 use crate::error::WorkshopError;
 use futures_util::StreamExt;
+use l4a_logging::http::AuditedSend;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::WorkshopId;
 use reqwest::header::{CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
@@ -96,10 +97,20 @@ impl ResilientDownloader {
             }
         }
 
+        let started = std::time::Instant::now();
+        let url = l4a_logging::redact::redact_url_str(&req.url);
+        tracing::info!(
+            workshop_id = %req.workshop_id,
+            url = %url,
+            dest = %req.dest_path.display(),
+            max_retries = req.max_retries,
+            "Starting Workshop file download"
+        );
         let mut last_err: Option<WorkshopError> = None;
         for attempt in 0..=req.max_retries {
             if cancel.is_cancelled() {
                 self.cleanup_partial(req.workshop_id);
+                tracing::info!(workshop_id = %req.workshop_id, "Download cancelled");
                 return Err(WorkshopError::Cancelled);
             }
 
@@ -109,13 +120,34 @@ impl ResilientDownloader {
                 result = self.download_once(req, cancel.clone(), on_progress.as_ref()) => result,
             };
             match result {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    let elapsed = started.elapsed();
+                    let transferred = result.bytes_written.saturating_sub(result.resumed_from);
+                    tracing::info!(
+                        workshop_id = %req.workshop_id,
+                        bytes = result.bytes_written,
+                        resumed_from = result.resumed_from,
+                        attempts = attempt + 1,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        avg_kib_s = (transferred as f64 / 1024.0 / elapsed.as_secs_f64().max(0.001)) as u64,
+                        "Workshop file download completed"
+                    );
+                    return Ok(result);
+                }
                 Err(WorkshopError::Cancelled) => {
                     self.cleanup_partial(req.workshop_id);
+                    tracing::info!(workshop_id = %req.workshop_id, "Download cancelled");
                     return Err(WorkshopError::Cancelled);
                 }
                 Err(err) => {
                     let retryable = is_retryable(&err);
+                    tracing::warn!(
+                        workshop_id = %req.workshop_id,
+                        attempt = attempt + 1,
+                        retryable,
+                        error = %err,
+                        "Download attempt failed"
+                    );
                     last_err = Some(err);
                     if !retryable || attempt >= req.max_retries {
                         break;
@@ -131,7 +163,14 @@ impl ResilientDownloader {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| WorkshopError::Network("未知下载错误".into())))
+        let err = last_err.unwrap_or_else(|| WorkshopError::Network("未知下载错误".into()));
+        tracing::warn!(
+            workshop_id = %req.workshop_id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error = %err,
+            "Workshop file download failed"
+        );
+        Err(err)
     }
 
     async fn download_once(
@@ -176,7 +215,7 @@ impl ResilientDownloader {
             let (builder, _) = self.mirror.prepare_get(&client, &req.url);
             let resp = builder
                 .header(RANGE, format!("bytes={resume_from}-"))
-                .send()
+                .send_audited("workshop.download.resume")
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?;
             match resp.status() {
@@ -193,7 +232,7 @@ impl ResilientDownloader {
                     stored_meta = None;
                     let (fresh_builder, _) = self.mirror.prepare_get(&client, &req.url);
                     fresh_builder
-                        .send()
+                        .send_audited("workshop.download.restart")
                         .await
                         .map_err(|e| WorkshopError::Network(e.to_string()))?
                 }
@@ -202,7 +241,7 @@ impl ResilientDownloader {
         } else {
             let (builder, _) = self.mirror.prepare_get(&client, &req.url);
             builder
-                .send()
+                .send_audited("workshop.download")
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?
         };

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/l4a-protocol",
+    "crates/l4a-logging",
     "crates/l4a-vpk",
     "crates/l4a-mirror",
     "crates/l4a-steam",
@@ -13,6 +14,7 @@ members = [
 ]
 default-members = [
     "crates/l4a-protocol",
+    "crates/l4a-logging",
     "crates/l4a-vpk",
     "crates/l4a-mirror",
     "crates/l4a-steam",
@@ -70,9 +72,11 @@ ring = "0.17"
 zeroize = "1"
 tauri = { version = "2.11.5", features = [] }
 tauri-build = { version = "2.6.3", features = [] }
-tauri-plugin-log = "2"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
 
 l4a-protocol = { path = "crates/l4a-protocol" }
+l4a-logging = { path = "crates/l4a-logging" }
 l4a-vpk = { path = "crates/l4a-vpk" }
 l4a-mirror = { path = "crates/l4a-mirror" }
 l4a-steam = { path = "crates/l4a-steam" }

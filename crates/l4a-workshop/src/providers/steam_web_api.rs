@@ -2,6 +2,7 @@ use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use l4a_logging::http::AuditedSend;
 use l4a_mirror::MirrorRouter;
 use l4a_protocol::{
     MetadataSource, WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopFileType, WorkshopId,
@@ -87,7 +88,7 @@ impl WorkshopProvider for SteamWebApiProvider {
             let (req, _) = self.mirror.prepare_post(&client, &url);
             let resp = req
                 .form(&params)
-                .send()
+                .send_audited("steam_web_api.item_details")
                 .await
                 .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
@@ -250,7 +251,7 @@ impl WorkshopProvider for SteamWebApiProvider {
         let (req, _) = self.mirror.prepare_post(&client, &url);
         let resp = req
             .form(&params)
-            .send()
+            .send_audited("steam_web_api.collection_details")
             .await
             .map_err(|e| WorkshopError::Network(e.to_string()))?;
 

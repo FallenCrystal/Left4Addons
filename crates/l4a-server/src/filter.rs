@@ -3,6 +3,7 @@ use crate::credentials::write_private_file;
 use crate::db::ServerRepo;
 use base64::engine::general_purpose::{STANDARD as BASE64_STD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use l4a_logging::http::AuditedSend;
 use l4a_protocol::{
     aggregate_gallery_triplets, merge_managed_predictions, CatalogFilterBackendKind,
     CatalogFilterPublicInfo, CatalogFilterStatus, FilterModelParams, FilterPredictRequest,
@@ -388,11 +389,36 @@ impl CatalogFilterService {
         req: FilterPredictRequest,
     ) -> Result<FilterProbabilities, FilterServiceError> {
         self.total_requests.fetch_add(1, Ordering::Relaxed);
-        validate_predict_request_bounds(&req)?;
-        match self.predict_once(&req).await {
-            Err(FilterServiceError::ScoringChanged) => self.predict_once(&req).await,
-            result => result,
+        let started = Instant::now();
+        let result = match validate_predict_request_bounds(&req) {
+            Ok(()) => match self.predict_once(&req).await {
+                Err(FilterServiceError::ScoringChanged) => self.predict_once(&req).await,
+                result => result,
+            },
+            Err(err) => Err(err),
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let image_count =
+            req.image_base64.iter().count() + req.images_base64.len() + req.image_urls.len();
+        match &result {
+            Ok(probs) => tracing::info!(
+                workshop_id = ?req.workshop_id,
+                title = %l4a_logging::redact::truncate(req.title.as_deref().unwrap_or_default(), 80),
+                images = image_count,
+                fusion_score = probs.fusion_score(),
+                scoring_revision = probs.scoring_revision.as_deref().unwrap_or("-"),
+                elapsed_ms,
+                "Content filter inference completed"
+            ),
+            Err(err) => tracing::warn!(
+                workshop_id = ?req.workshop_id,
+                images = image_count,
+                elapsed_ms,
+                error = %err,
+                "Content filter inference failed"
+            ),
         }
+        result
     }
 
     async fn predict_once(
@@ -602,7 +628,7 @@ impl CatalogFilterService {
                 Ok(bytes) => final_images.push(bytes),
                 Err(err) => {
                     db_image_fetch_failed = true;
-                    tracing::debug!(url = %url, error = %err, "跳过无法拉取的工坊缓存预览图");
+                    tracing::debug!(url = %url, error = %err, "Skipping Workshop cached preview image that could not be fetched");
                 }
             }
         }
@@ -1205,7 +1231,7 @@ impl CatalogFilterService {
                                 Err(err) => {
                                     tracing::warn!(
                                         error = %err,
-                                        "热更新 Python 过滤参数失败，准备重启子进程"
+                                        "Failed to hot-reload Python filter parameters; restarting child process"
                                     );
                                 }
                             }
@@ -1367,7 +1393,7 @@ impl CatalogFilterService {
             .timeout(CONFIGURE_TIMEOUT)
             .header("Authorization", format!("Bearer {runner_token}"))
             .json(&params.sanitized())
-            .send()
+            .send_audited("filter.backend.configure")
             .await
             .map_err(|e| format!("请求 /configure 失败: {e}"))?;
         let status = resp.status();
@@ -1385,7 +1411,7 @@ impl CatalogFilterService {
             .backend_client
             .get(&url)
             .timeout(HEALTH_CHECK_TIMEOUT)
-            .send()
+            .send_audited_quiet("filter.backend.health")
             .await
             .map_err(|e| format!("连接上游过滤服务 {url} 失败: {e}"))?;
         if !resp.status().is_success() {
@@ -1431,7 +1457,7 @@ impl CatalogFilterService {
             .post(format!("{}/predict", base_url.trim_end_matches('/')))
             .timeout(HEALTH_CHECK_TIMEOUT)
             .json(&RawFilterPredictRequest::default())
-            .send()
+            .send_audited_quiet("filter.backend.probe_corpse")
             .await
             .ok()?;
         let status = response.status();
@@ -1509,7 +1535,13 @@ impl CatalogFilterService {
             images_base64: images_base64.to_vec(),
         };
 
-        let resp = match self.backend_client.post(&url).json(&payload).send().await {
+        let resp = match self
+            .backend_client
+            .post(&url)
+            .json(&payload)
+            .send_audited_quiet("filter.backend.predict")
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 self.refresh_managed_liveness();
@@ -1598,9 +1630,13 @@ impl CatalogFilterService {
                     &self.image_client
                 };
 
-                let mut resp = client.get(current.clone()).send().await.map_err(|e| {
-                    FilterServiceError::BadRequest(format!("拉取预览图失败 ({current}): {e}"))
-                })?;
+                let mut resp = client
+                    .get(current.clone())
+                    .send_audited_quiet("filter.image.fetch")
+                    .await
+                    .map_err(|e| {
+                        FilterServiceError::BadRequest(format!("拉取预览图失败 ({current}): {e}"))
+                    })?;
 
                 if resp.status().is_redirection() {
                     if hop == MAX_REDIRECT_HOPS {
@@ -2588,10 +2624,20 @@ async fn spawn_managed_python_runner(
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("启动 Python 解释器 `{}` 失败: {e}", python_exe.display()))?;
+    let audit =
+        l4a_logging::process::CommandAudit::start("filter.managed_runner", command.as_std());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            audit.finish_error(&e);
+            return Err(format!(
+                "启动 Python 解释器 `{}` 失败: {e}",
+                python_exe.display()
+            ));
+        }
+    };
     let pid = child.id();
+    audit.finish_spawned(pid);
 
     let stdin = child
         .stdin
@@ -2612,11 +2658,35 @@ async fn spawn_managed_python_runner(
     tokio::spawn(async move {
         let mut stderr = stderr;
         let mut chunk = [0u8; 4096];
+        let mut pending_line = String::new();
+        let forward_line = |line: &str| {
+            let line = line.trim();
+            if !line.is_empty() {
+                tracing::info!(
+                    target: "l4a::filter_runner",
+                    pid,
+                    "{}",
+                    l4a_logging::redact::truncate(line, 1000)
+                );
+            }
+        };
         loop {
             match stderr.read(&mut chunk).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    forward_line(&pending_line);
+                    break;
+                }
                 Ok(n) => {
                     let lossy = String::from_utf8_lossy(&chunk[..n]);
+                    pending_line.push_str(&lossy);
+                    while let Some(pos) = pending_line.find('\n') {
+                        forward_line(&pending_line[..pos]);
+                        pending_line.drain(..=pos);
+                    }
+                    if pending_line.len() > MAX_STDERR_BYTES {
+                        forward_line(&pending_line);
+                        pending_line.clear();
+                    }
                     let mut guard = stderr_writer.lock().unwrap();
                     guard.push_str(&lossy);
                     if guard.len() > MAX_STDERR_BYTES {

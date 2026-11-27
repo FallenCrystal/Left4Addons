@@ -189,6 +189,7 @@ impl SteamCmInner {
     }
 
     async fn connect_fresh(&self, reconnecting: bool) -> anyhow::Result<Connection> {
+        let connect_started = std::time::Instant::now();
         let mut state_guard = ConnectStateGuard::new(Arc::clone(&self.meta));
         {
             let mut m = self.meta.write().await;
@@ -229,12 +230,29 @@ impl SteamCmInner {
 
         match conn_res {
             Ok(mut conn) => {
+                tracing::info!(
+                    target: "l4a::net",
+                    purpose = "steam_cm.connect",
+                    mode = ?steam_cfg.mode,
+                    reconnecting,
+                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    "Steam CM session established"
+                );
                 conn.set_timeout(Duration::from_secs(20));
                 self.record_connected(&conn).await;
                 state_guard.disarm();
                 Ok(conn)
             }
             Err(err) => {
+                tracing::warn!(
+                    target: "l4a::net",
+                    purpose = "steam_cm.connect",
+                    mode = ?steam_cfg.mode,
+                    reconnecting,
+                    elapsed_ms = connect_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "Failed to establish Steam CM session"
+                );
                 let mut m = self.meta.write().await;
                 m.state = SteamConnectionState::Error;
                 m.last_error = Some(err.to_string());
@@ -455,11 +473,29 @@ impl WorkshopUpstream for SteamCmClient {
         let mut all_outcomes = Vec::with_capacity(ids.len());
         let mut last_error = None;
         for ids in ids.chunks(DETAILS_BATCH_SIZE) {
+            let started = std::time::Instant::now();
             match self.fetch_details_chunk(ids).await {
-                Ok(outcomes) => all_outcomes.extend(outcomes),
+                Ok(outcomes) => {
+                    tracing::info!(
+                        target: "l4a::net",
+                        purpose = "steam_cm.get_details",
+                        requested = ids.len(),
+                        returned = outcomes.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Steam CM details fetch completed"
+                    );
+                    all_outcomes.extend(outcomes)
+                }
                 Err(err) => {
                     self.inner.record_request_failure(err.to_string()).await;
-                    tracing::warn!(%err, count = ids.len(), "Steam CM 详情分块获取失败");
+                    tracing::warn!(
+                        target: "l4a::net",
+                        purpose = "steam_cm.get_details",
+                        %err,
+                        count = ids.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Steam CM details chunk fetch failed"
+                    );
                     last_error = Some(err);
                 }
             }
@@ -483,139 +519,191 @@ impl WorkshopUpstream for SteamCmClient {
         cursor: &str,
         num_per_page: u32,
     ) -> anyhow::Result<WorkshopQueryPage> {
-        let _permit = self.inner.request_gate.acquire().await?;
-        let app_id = self.inner.config_store.get().steam.app_id;
-        let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
-        self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let result: anyhow::Result<WorkshopQueryPage> = async {
+            let _permit = self.inner.request_gate.acquire().await?;
+            let app_id = self.inner.config_store.get().steam.app_id;
+            let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
+            self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        let make_req =
-            || build_query_files_proto(app_id, query_type, file_type, cursor, num_per_page);
+            let make_req =
+                || build_query_files_proto(app_id, query_type, file_type, cursor, num_per_page);
 
-        let mut observed_at = Utc::now();
-        let resp = match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA).await
-        {
-            Ok(r) => r,
-            Err(err) if should_retry_network(&err) => {
-                match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
-                    Ok((_, reconnected)) => conn = reconnected,
-                    Err(e) => {
-                        self.inner.record_request_failure(e.to_string()).await;
-                        return Err(e);
+            let mut observed_at = Utc::now();
+            let resp = match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA)
+                .await
+            {
+                Ok(r) => r,
+                Err(err) if should_retry_network(&err) => {
+                    match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
+                        Ok((_, reconnected)) => conn = reconnected,
+                        Err(e) => {
+                            self.inner.record_request_failure(e.to_string()).await;
+                            return Err(e);
+                        }
+                    }
+                    observed_at = Utc::now();
+                    match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA).await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = format!("Steam CM QueryFiles 重试失败: {e}");
+                            self.inner.record_request_failure(msg.clone()).await;
+                            return Err(anyhow::anyhow!(msg));
+                        }
                     }
                 }
-                observed_at = Utc::now();
-                match service_method_lossy(&conn, make_req(), QUERY_FILES_RESPONSE_SCHEMA).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let msg = format!("Steam CM QueryFiles 重试失败: {e}");
-                        self.inner.record_request_failure(msg.clone()).await;
-                        return Err(anyhow::anyhow!(msg));
-                    }
+                Err(err) => {
+                    let msg = format!("Steam CM QueryFiles 调用失败: {err}");
+                    self.inner.record_request_failure(msg.clone()).await;
+                    return Err(anyhow::anyhow!(msg));
                 }
-            }
-            Err(err) => {
-                let msg = format!("Steam CM QueryFiles 调用失败: {err}");
-                self.inner.record_request_failure(msg.clone()).await;
-                return Err(anyhow::anyhow!(msg));
-            }
-        };
+            };
 
-        let outcomes = self
-            .inner
-            .map_details(&conn, &resp.publishedfiledetails, observed_at)
-            .await;
-        anyhow::ensure!(
-            outcomes.len() == resp.publishedfiledetails.len(),
-            "Steam CM QueryFiles 包含未核验的条目"
-        );
-        self.inner.clear_last_error().await;
-        Ok(WorkshopQueryPage {
-            total: u64::from(resp.total.unwrap_or(0)),
-            next_cursor: resp
-                .next_cursor
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            outcomes,
-        })
+            let outcomes = self
+                .inner
+                .map_details(&conn, &resp.publishedfiledetails, observed_at)
+                .await;
+            anyhow::ensure!(
+                outcomes.len() == resp.publishedfiledetails.len(),
+                "Steam CM QueryFiles 包含未核验的条目"
+            );
+            self.inner.clear_last_error().await;
+            Ok(WorkshopQueryPage {
+                total: u64::from(resp.total.unwrap_or(0)),
+                next_cursor: resp
+                    .next_cursor
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                outcomes,
+            })
+        }
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(page) => tracing::info!(
+                target: "l4a::net",
+                purpose = "steam_cm.query_files",
+                query_type, file_type, num_per_page,
+                returned = page.outcomes.len(),
+                total = page.total,
+                elapsed_ms,
+                "Steam CM query completed"
+            ),
+            Err(err) => tracing::warn!(
+                target: "l4a::net",
+                purpose = "steam_cm.query_files",
+                query_type, file_type, num_per_page,
+                elapsed_ms,
+                error = %err,
+                "Steam CM query failed"
+            ),
+        }
+        result
     }
 
     async fn search_files(
         &self,
         request: &SteamSearchRequest,
     ) -> anyhow::Result<WorkshopQueryPage> {
-        let permit = self.inner.request_gate.acquire().await?;
-        let app_id = self.inner.config_store.get().steam.app_id;
-        let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
-        self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let result: anyhow::Result<WorkshopQueryPage> = async {
+            let permit = self.inner.request_gate.acquire().await?;
+            let app_id = self.inner.config_store.get().steam.app_id;
+            let (conn_gen, mut conn) = self.inner.get_or_connect().await?;
+            self.inner.total_requests.fetch_add(1, Ordering::Relaxed);
 
-        let mut observed_at = Utc::now();
-        let resp = match service_method_lossy(
-            &conn,
-            build_search_files_proto(app_id, request),
-            QUERY_FILES_RESPONSE_SCHEMA,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(err) if should_retry_network(&err) => {
-                match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
-                    Ok((_, reconnected)) => conn = reconnected,
-                    Err(e) => {
-                        self.inner.record_request_failure(e.to_string()).await;
-                        return Err(e);
+            let mut observed_at = Utc::now();
+            let resp = match service_method_lossy(
+                &conn,
+                build_search_files_proto(app_id, request),
+                QUERY_FILES_RESPONSE_SCHEMA,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(err) if should_retry_network(&err) => {
+                    match self.inner.invalidate_and_reconnect(Some(conn_gen)).await {
+                        Ok((_, reconnected)) => conn = reconnected,
+                        Err(e) => {
+                            self.inner.record_request_failure(e.to_string()).await;
+                            return Err(e);
+                        }
+                    }
+                    observed_at = Utc::now();
+                    match service_method_lossy(
+                        &conn,
+                        build_search_files_proto(app_id, request),
+                        QUERY_FILES_RESPONSE_SCHEMA,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = format!("Steam CM search_files 重试失败: {e}");
+                            self.inner.record_request_failure(msg.clone()).await;
+                            return Err(anyhow::anyhow!(msg));
+                        }
                     }
                 }
-                observed_at = Utc::now();
-                match service_method_lossy(
-                    &conn,
-                    build_search_files_proto(app_id, request),
-                    QUERY_FILES_RESPONSE_SCHEMA,
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let msg = format!("Steam CM search_files 重试失败: {e}");
-                        self.inner.record_request_failure(msg.clone()).await;
-                        return Err(anyhow::anyhow!(msg));
-                    }
+                Err(err) => {
+                    let msg = format!("Steam CM search_files 调用失败: {err}");
+                    self.inner.record_request_failure(msg.clone()).await;
+                    return Err(anyhow::anyhow!(msg));
                 }
-            }
-            Err(err) => {
-                let msg = format!("Steam CM search_files 调用失败: {err}");
+            };
+
+            let outcomes = self
+                .inner
+                .map_cached_details(&resp.publishedfiledetails, observed_at)
+                .await;
+            if !resp.publishedfiledetails.is_empty() && outcomes.is_empty() {
+                let msg = "Steam CM search_files 未核验任何返回的条目".to_string();
                 self.inner.record_request_failure(msg.clone()).await;
                 return Err(anyhow::anyhow!(msg));
             }
-        };
-
-        let outcomes = self
-            .inner
-            .map_cached_details(&resp.publishedfiledetails, observed_at)
-            .await;
-        if !resp.publishedfiledetails.is_empty() && outcomes.is_empty() {
-            let msg = "Steam CM search_files 未核验任何返回的条目".to_string();
-            self.inner.record_request_failure(msg.clone()).await;
-            return Err(anyhow::anyhow!(msg));
+            if outcomes.len() < resp.publishedfiledetails.len() {
+                tracing::warn!(
+                    returned = resp.publishedfiledetails.len(),
+                    verified = outcomes.len(),
+                    "Steam CM search_files: some item states could not be verified"
+                );
+            }
+            self.inner.clear_last_error().await;
+            drop(permit);
+            self.inner
+                .enrich_search_personas(conn, &resp.publishedfiledetails);
+            Ok(WorkshopQueryPage {
+                total: u64::from(resp.total.unwrap_or(0)),
+                next_cursor: resp
+                    .next_cursor
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                outcomes,
+            })
         }
-        if outcomes.len() < resp.publishedfiledetails.len() {
-            tracing::warn!(
-                returned = resp.publishedfiledetails.len(),
-                verified = outcomes.len(),
-                "Steam CM search_files 部分条目状态未核验"
-            );
+        .await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match &result {
+            Ok(page) => tracing::info!(
+                target: "l4a::net",
+                purpose = "steam_cm.search_files",
+                request = ?request,
+                returned = page.outcomes.len(),
+                total = page.total,
+                elapsed_ms,
+                "Steam CM query completed"
+            ),
+            Err(err) => tracing::warn!(
+                target: "l4a::net",
+                purpose = "steam_cm.search_files",
+                request = ?request,
+                elapsed_ms,
+                error = %err,
+                "Steam CM query failed"
+            ),
         }
-        self.inner.clear_last_error().await;
-        drop(permit);
-        self.inner
-            .enrich_search_personas(conn, &resp.publishedfiledetails);
-        Ok(WorkshopQueryPage {
-            total: u64::from(resp.total.unwrap_or(0)),
-            next_cursor: resp
-                .next_cursor
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            outcomes,
-        })
+        result
     }
 
     async fn status(&self) -> CatalogSteamStatus {

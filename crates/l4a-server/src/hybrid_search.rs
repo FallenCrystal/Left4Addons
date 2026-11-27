@@ -649,7 +649,7 @@ impl HybridSearchService {
                     {
                         tracing::warn!(
                             error = %err,
-                            "本地目录补充检索繁忙或超时，本次混合搜索降级为仅返回 Steam 实时结果"
+                            "Local catalog supplementary search busy or timed out; hybrid search degraded to live Steam results only"
                         );
                         (Vec::new(), true)
                     }
@@ -737,7 +737,7 @@ impl HybridSearchService {
             }
             remaining => {
                 let mode = if let Err(SteamSearchError::Unavailable(err)) = remaining {
-                    tracing::warn!(error = %err, "Steam CM 混合检索失败，回退至本地索引");
+                    tracing::warn!(error = %err, "Steam CM hybrid search failed; falling back to local index");
                     SearchExecutionMode::LocalFallback
                 } else {
                     SearchExecutionMode::Hybrid
@@ -849,7 +849,7 @@ impl HybridSearchService {
         match self.fetch_exact_singleflight(wid, ctx).await {
             Ok(observation) => Ok(ExactLookup::Steam(observation)),
             Err(SteamSearchError::Unavailable(err)) => {
-                tracing::warn!(workshop_id = %wid, error = %err, "精确 ID Steam CM 检索失败");
+                tracing::warn!(workshop_id = %wid, error = %err, "Steam CM exact-ID lookup failed");
                 Ok(ExactLookup::Unavailable)
             }
             Err(
@@ -1493,7 +1493,9 @@ impl HybridSearchService {
                                 );
                             }
                             Ok(()) => {}
-                            Err(err) => tracing::error!(error = %err, "保存搜索结果的可见性失败"),
+                            Err(err) => {
+                                tracing::error!(error = %err, "Failed to persist search result visibility")
+                            }
                         }
                     }
                 });
@@ -1666,10 +1668,10 @@ impl HybridSearchService {
                         match res {
                             Ok(Ok(_)) => {}
                             Ok(Err(err)) => {
-                                tracing::warn!(error = %err, "Steam 检索暖缓存写入失败");
+                                tracing::warn!(error = %err, "Failed to write Steam search warm cache");
                             }
                             Err(err) => {
-                                tracing::warn!(error = %err, "Steam 检索暖缓存任务异常退出");
+                                tracing::warn!(error = %err, "Steam search warm cache task exited abnormally");
                             }
                         }
                         if !remaining.is_empty() {
@@ -1711,7 +1713,7 @@ impl HybridSearchService {
             })
             .is_err()
         {
-            tracing::debug!("Steam 检索暖缓存队列已满，跳过本批预热写入");
+            tracing::debug!("Steam search warm cache queue full; skipping this warm-up batch");
         }
     }
 }

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 l4a-protocol.workspace = true
+l4a-logging.workspace = true
 l4a-vpk.workspace = true
 l4a-mirror.workspace = true
 l4a-steam.workspace = true
