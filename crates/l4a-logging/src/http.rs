@@ -31,7 +31,7 @@ pub async fn send_quiet(builder: RequestBuilder, purpose: &str) -> reqwest::Resu
     send_inner(builder, purpose, SuccessLevel::Debug, false).await
 }
 
-/// Audits a request in a redirect chain, omitting the query on server-provided URLs.
+/// Audits a request in a redirect chain, logging only the origin of server-provided URLs.
 pub async fn send_redirect_hop(
     builder: RequestBuilder,
     purpose: &str,
@@ -85,7 +85,7 @@ async fn send_inner(
     builder: RequestBuilder,
     purpose: &str,
     level: SuccessLevel,
-    omit_query: bool,
+    origin_only: bool,
 ) -> reqwest::Result<Response> {
     let (client, request) = builder.build_split();
     let request = match request.map_err(reqwest::Error::without_url) {
@@ -101,7 +101,7 @@ async fn send_inner(
         }
     };
     let method = request.method().clone();
-    let url = audit_url(request.url(), omit_query);
+    let url = audit_url(request.url(), origin_only);
     let started = Instant::now();
     match client
         .execute(request)
@@ -164,11 +164,9 @@ async fn send_inner(
     }
 }
 
-fn audit_url(url: &reqwest::Url, omit_query: bool) -> String {
-    if omit_query {
-        let mut url = url.clone();
-        url.set_query(None);
-        redact_url(&url)
+fn audit_url(url: &reqwest::Url, origin_only: bool) -> String {
+    if origin_only {
+        url.origin().ascii_serialization()
     } else {
         redact_url(url)
     }
@@ -179,10 +177,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn audit_omits_all_query_parameters_on_redirect_hops() {
-        let url =
-            reqwest::Url::parse("https://download.example.com/file?opaque=test-value").unwrap();
-        assert_eq!(audit_url(&url, true), "https://download.example.com/file");
-        assert_eq!(audit_url(&url, false), url.as_str());
+    fn audit_keeps_only_the_origin_on_redirect_hops() {
+        let url = reqwest::Url::parse(
+            "https://user:password@download.example.com:8443/signed/path-value?opaque=query-value#fragment",
+        )
+        .unwrap();
+        assert_eq!(audit_url(&url, true), "https://download.example.com:8443");
+        assert_eq!(
+            audit_url(&url, false),
+            "https://***@download.example.com:8443/signed/path-value?opaque=query-value"
+        );
     }
 }

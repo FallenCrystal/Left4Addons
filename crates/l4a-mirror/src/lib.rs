@@ -311,14 +311,14 @@ impl MirrorRouter {
 
     pub fn resolve(&self, url: &str) -> ResolvedRequest {
         let https_only = self.https_only.load(Ordering::Relaxed);
-        self.resolve_with_policy(url, https_only)
+        self.resolve_with_https_only(url, https_only)
     }
 
     pub fn resolve_with_https_only(&self, url: &str, https_only: bool) -> ResolvedRequest {
-        self.resolve_with_policy(url, https_only)
+        Self::resolve_with_rules(url, https_only, &self.rules)
     }
 
-    fn resolve_with_policy(&self, url: &str, https_only: bool) -> ResolvedRequest {
+    fn resolve_with_rules(url: &str, https_only: bool, rules: &[CompiledRule]) -> ResolvedRequest {
         let direct = |url: String| ResolvedRequest {
             url,
             original_host: None,
@@ -342,7 +342,7 @@ impl MirrorRouter {
         };
 
         let upgrade_cdn = is_legacy_steam_cdn_url(&parsed_url);
-        for compiled in &self.rules {
+        for compiled in rules {
             let Some(captures) = compiled.regex.captures(&host) else {
                 continue;
             };
@@ -388,7 +388,7 @@ impl MirrorRouter {
         url: &str,
         https_only: bool,
     ) -> Result<ResolvedRequest, MirrorError> {
-        let resolved = self.resolve_with_policy(url, https_only);
+        let resolved = self.resolve_with_https_only(url, https_only);
         ensure_https_if_required(&resolved.url, https_only)?;
         Ok(resolved)
     }
@@ -613,6 +613,7 @@ impl MirrorRouter {
     /// - 每一跳重新读取生效的 `https_only` 策略；
     /// - 同源重定向保留当前镜像的 `Host` / 自定义请求头 / TLS 配置；
     /// - 跨源重定向丢弃上一跳镜像特权与自定义头，按新目标重新匹配规则并切换至受校验客户端；
+    /// - 镜像显式重定向回源站时直连源站，并继续执行逐跳校验；
     /// - 每次重定向发起前回调 `validate_hop` 供调用方执行来源白名单等策略校验。
     pub async fn send_with_redirects<FBuild, FValidate, FSend, Fut, E>(
         &self,
@@ -637,6 +638,11 @@ impl MirrorRouter {
             .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
         let initial_resolved = self.validate_url_with_policy(url, initial_https_only)?;
         let mut current_resolved = initial_resolved.clone();
+        let mut mirror_source = if initial_resolved.matched_rule {
+            url::Url::parse(url).ok()
+        } else {
+            None
+        };
 
         for hop in 0..=max_redirects {
             let https_only = options
@@ -683,12 +689,9 @@ impl MirrorRouter {
                 return Err(RedirectSendError::Mirror(MirrorError::TooManyRedirects));
             }
 
-            let location = location_value
-                .to_str()
-                .map_err(|_| {
-                    MirrorError::InvalidRedirect("Location 头包含非 ASCII 字符".to_string())
-                })?
-                .trim();
+            let location = std::str::from_utf8(location_value.as_bytes()).map_err(|_| {
+                MirrorError::InvalidRedirect("Location 头包含无效的 UTF-8".to_string())
+            })?;
             let current_url = response.url();
             let next_url = current_url
                 .join(location)
@@ -704,19 +707,29 @@ impl MirrorRouter {
                 .unwrap_or_else(|| self.https_only.load(Ordering::Relaxed));
             let is_same_origin = urls_same_origin(current_url, &next_url);
             let next_resolved = if is_same_origin {
-                let candidate = ResolvedRequest {
+                ResolvedRequest {
                     url: next_url.to_string(),
-                    original_host: current_resolved.original_host.clone(),
-                    headers: current_resolved.headers.clone(),
-                    insecure_tls: current_resolved.insecure_tls,
-                    matched_rule: current_resolved.matched_rule,
-                };
-                ensure_https_if_required(&candidate.url, next_https_only)?;
-                candidate
+                    ..current_resolved
+                }
             } else {
-                // 跨源重定向：清空上一跳镜像的 insecure-tls / Host / headers，按新目标重新路由校验。
-                self.validate_url_with_policy(next_url.as_str(), next_https_only)?
+                // Match the same host and explicit port as the mirror rules. A direct route
+                // stays direct if the source changes scheme, for example to upgrade to HTTPS.
+                let current = (current_url.host_str(), current_url.port());
+                let target = (next_url.host_str(), next_url.port());
+                let use_direct_route = match &mirror_source {
+                    Some(source) => {
+                        current != target && (source.host_str(), source.port()) == target
+                    }
+                    None => current == target,
+                };
+                let rules = if use_direct_route {
+                    &[]
+                } else {
+                    self.rules.as_slice()
+                };
+                Self::resolve_with_rules(next_url.as_str(), next_https_only, rules)
             };
+            ensure_https_if_required(&next_resolved.url, next_https_only)?;
 
             let hop_info = RedirectHop {
                 hop: hop + 1,
@@ -729,6 +742,9 @@ impl MirrorRouter {
 
             drain_ready_redirect_body(&mut response);
             current_method = next_redirect_method(status, current_method);
+            if !is_same_origin {
+                mirror_source = next_resolved.matched_rule.then_some(next_url);
+            }
             current_resolved = next_resolved;
         }
 
@@ -1576,6 +1592,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follows_utf8_location_paths() {
+        let (base_url, requests) = start_keep_alive_server(|req| {
+            if req.path == "/start" {
+                (
+                    "302 Found".into(),
+                    "Location: /封面.jpg\r\n".into(),
+                    String::new(),
+                )
+            } else {
+                ("200 OK".into(), String::new(), "cover".into())
+            }
+        })
+        .await;
+        let router = MirrorRouter::empty();
+        router.set_no_proxy_for_testing(true);
+
+        let redirected = router
+            .send_with_redirects(
+                Method::GET,
+                &format!("{base_url}/start"),
+                RedirectRequestOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+                |req, _, _| req,
+                |_| Ok::<(), ()>(()),
+                |req, _| req.send(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(redirected.response.text().await.unwrap(), "cover");
+        assert_eq!(requests.lock().unwrap()[1].path, "/%E5%B0%81%E9%9D%A2.jpg");
+    }
+
+    #[tokio::test]
     async fn exhausted_timeout_stops_before_sending() {
         let result = MirrorRouter::empty()
             .send_with_redirects(
@@ -1974,6 +2026,130 @@ mod tests {
             b_entries[0].headers.get("host").map(String::as_str),
             Some("mirrored.example.test")
         );
+    }
+
+    #[tokio::test]
+    async fn mirror_can_return_to_source_after_switching_rules() {
+        let (source_url, source_requests) =
+            start_keep_alive_server(|_| ("200 OK".into(), String::new(), "from-source".into()))
+                .await;
+        let source_authority = source_url.strip_prefix("http://").unwrap();
+        let source_item = format!("{source_url}/item");
+        let redirect_to_source = format!("Location: {source_item}\r\n");
+        let (mirror_url, mirror_requests) = start_keep_alive_server(move |req| {
+            let location = if req.path == "/item" {
+                "Location: /mirror-step\r\n".into()
+            } else {
+                redirect_to_source.clone()
+            };
+            ("302 Found".into(), location, String::new())
+        })
+        .await;
+        let target = mirror_url.strip_prefix("http://").unwrap();
+        let entry_rule = MirrorRule {
+            rules: Some("entry.example.test".into()),
+            ..base_rule(target)
+        };
+        let source_rule = MirrorRule {
+            rules: Some(source_authority.into()),
+            keep_host: true,
+            insecure_tls: true,
+            headers: Some(HashMap::from([("X-Mirror-Route".into(), "source".into())])),
+            ..base_rule(target)
+        };
+        let router = MirrorRouter::from_rules(vec![entry_rule, source_rule]);
+        router.set_no_proxy_for_testing(true);
+        let mut matched_mirror = Vec::new();
+
+        let redirected = router
+            .send_with_redirects(
+                Method::GET,
+                "http://entry.example.test/start",
+                RedirectRequestOptions {
+                    timeout: Some(Duration::from_secs(5)),
+                    ..Default::default()
+                },
+                |req, _, _| req,
+                |hop| {
+                    matched_mirror.push(hop.matched_mirror_rule);
+                    Ok::<(), ()>(())
+                },
+                |req, _| req.send(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(redirected.final_resolved.url, source_item);
+        assert!(redirected.final_resolved.original_host.is_none());
+        assert!(!redirected.final_resolved.insecure_tls);
+        assert_eq!(redirected.response.text().await.unwrap(), "from-source");
+        assert_eq!(matched_mirror, [true, true, false]);
+
+        let mirror = mirror_requests.lock().unwrap();
+        let paths: Vec<_> = mirror.iter().map(|req| req.path.as_str()).collect();
+        assert_eq!(paths, ["/start", "/item", "/mirror-step"]);
+        assert_eq!(
+            mirror[1].headers.get("x-mirror-route").map(String::as_str),
+            Some("source")
+        );
+        let source = source_requests.lock().unwrap();
+        assert_eq!(source.len(), 1);
+        assert_eq!(source[0].headers.get("x-mirror-route"), None);
+    }
+
+    #[tokio::test]
+    async fn direct_mirror_fallback_obeys_https_policy_and_stays_direct_on_upgrade() {
+        use reqwest::ResponseBuilderExt;
+
+        let rule = MirrorRule {
+            rules: Some("source.example.test".into()),
+            ..base_rule("mirror.example.test")
+        };
+        let router = MirrorRouter::from_rules(vec![rule]);
+        let source_http = "http://source.example.test/item";
+        let source_https = "https://source.example.test/item";
+        let steps = [
+            ("https://mirror.example.test/item", Some(source_http)),
+            (source_http, Some(source_https)),
+            (source_https, None),
+        ];
+
+        for https_only in [false, true] {
+            let redirected = router
+                .send_with_redirects(
+                    Method::GET,
+                    source_https,
+                    RedirectRequestOptions {
+                        https_only_override: Some(https_only),
+                        ..Default::default()
+                    },
+                    |req, _, _| req,
+                    |_| Ok::<(), ()>(()),
+                    |req, hop| async move {
+                        let url = req.build()?.url().clone();
+                        let (expected_url, location) = steps[hop];
+                        assert_eq!(url.as_str(), expected_url);
+                        assert!(!https_only || hop == 0);
+                        let mut response = http::Response::builder().url(url);
+                        if let Some(location) = location {
+                            response = response
+                                .status(StatusCode::FOUND)
+                                .header(reqwest::header::LOCATION, location);
+                        }
+                        Ok(response.body(reqwest::Body::from("")).unwrap().into())
+                    },
+                )
+                .await;
+
+            if https_only {
+                assert!(matches!(
+                    redirected,
+                    Err(RedirectSendError::Mirror(MirrorError::HttpsRequired))
+                ));
+            } else {
+                assert_eq!(redirected.unwrap().final_resolved.url, source_https);
+            }
+        }
     }
 
     #[test]
