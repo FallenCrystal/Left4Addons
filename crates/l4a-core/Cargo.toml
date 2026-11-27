@@ -35,5 +35,11 @@ futures-util.workspace = true
 
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Registry"] }
+
 [dev-dependencies]
 axum.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security"] }

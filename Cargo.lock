@@ -2540,6 +2540,7 @@ dependencies = [
  "url",
  "uuid",
  "vtf",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

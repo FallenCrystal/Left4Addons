@@ -10,6 +10,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(windows)]
+mod windows_env;
+
 const INNER_MAGIC: &[u8; 8] = b"L4ATOK01";
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -50,6 +53,26 @@ pub fn validate_env_var_name(name: &str) -> Result<&str, CoreError> {
         ));
     }
     Ok(name)
+}
+
+fn resolve_env_token(
+    name: &str,
+    read_persisted: impl FnOnce(&str) -> Result<Option<Zeroizing<String>>, CoreError>,
+) -> Result<Zeroizing<String>, CoreError> {
+    let name = validate_env_var_name(name.trim())?;
+    let raw = match std::env::var(name) {
+        Ok(value) => Some(Zeroizing::new(value)),
+        Err(std::env::VarError::NotPresent) => read_persisted(name)?,
+        Err(std::env::VarError::NotUnicode(_)) => None,
+    }
+    .ok_or_else(|| CoreError::Config(format!("未检测到 LLM Token 环境变量 {name}")))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::Config(format!(
+            "LLM Token 环境变量 {name} 的值为空"
+        )));
+    }
+    Ok(Zeroizing::new(trimmed.to_string()))
 }
 
 const MAX_WIPE_BYTES: u64 = 16_384;
@@ -104,15 +127,22 @@ impl TokenVault {
     }
 
     pub fn status(&self, env_var_name: &str) -> FilterTokenStatus {
-        let trimmed = env_var_name.trim();
-        let env_var_present = validate_env_var_name(trimmed).is_ok()
-            && std::env::var(trimmed)
-                .map(Zeroizing::new)
-                .is_ok_and(|val| !val.trim().is_empty());
+        self.status_with_env_var(
+            env_var_name,
+            self.resolve_token(LlmTokenSource::EnvVar, env_var_name)
+                .is_ok(),
+        )
+    }
+
+    pub(crate) fn status_with_env_var(
+        &self,
+        env_var_name: &str,
+        env_var_present: bool,
+    ) -> FilterTokenStatus {
         FilterTokenStatus {
             cache_generation: 0,
             has_encrypted_token: self.has_sealed_token(),
-            env_var_name: trimmed.to_string(),
+            env_var_name: env_var_name.trim().to_string(),
             env_var_present,
         }
     }
@@ -269,17 +299,11 @@ impl TokenVault {
     ) -> Result<Zeroizing<String>, CoreError> {
         match source {
             LlmTokenSource::EnvVar => {
-                let name = validate_env_var_name(env_var_name.trim())?;
-                let raw = std::env::var(name).map(Zeroizing::new).map_err(|_| {
-                    CoreError::Config(format!("未检测到 LLM Token 环境变量 {name}"))
-                })?;
-                let trimmed = Zeroizing::new(raw.trim().to_string());
-                if trimmed.is_empty() {
-                    return Err(CoreError::Config(format!(
-                        "LLM Token 环境变量 {name} 的值为空"
-                    )));
-                }
-                Ok(trimmed)
+                #[cfg(windows)]
+                let read_persisted = windows_env::read;
+                #[cfg(not(windows))]
+                let read_persisted = |_: &str| Ok(None);
+                resolve_env_token(env_var_name, read_persisted)
             }
             LlmTokenSource::EncryptedLocal => self.unseal(),
         }

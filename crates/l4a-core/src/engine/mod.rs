@@ -18,11 +18,10 @@ use crate::grouping::rebuild_auto_bundles;
 use crate::reconcile::auto_resolve_by_policy;
 use crate::scanner::scan_workspace;
 use crate::watcher::AddonWatcher;
+pub(crate) use filter::FilterCacheState;
 use filter::{sanitize_filter_config, sanitize_filter_config_for_startup};
 use l4a_mirror::MirrorRouter;
-use l4a_protocol::{
-    AppConfig, ClientFilterSourceMode, CoreEvent, DashboardSnapshot, LlmTokenSource, WorkshopId,
-};
+use l4a_protocol::{AppConfig, ClientFilterSourceMode, CoreEvent, DashboardSnapshot, WorkshopId};
 use l4a_steam::{DynamicSteamBridge, SteamBridge, SteamCapabilities};
 use l4a_workshop::{ResilientDownloader, WorkshopResolver};
 use std::collections::HashMap;
@@ -90,7 +89,7 @@ pub struct L4aEngine {
     token_vault: RwLock<TokenVault>,
     pub(crate) filter_eval_semaphore: tokio::sync::Semaphore,
     // Serialize cache invalidation with writes and verdict events from active evaluations.
-    pub(crate) filter_cache_generation: Mutex<u64>,
+    pub(crate) filter_cache: Mutex<FilterCacheState>,
     pub(crate) catalog_scoring_cache: Mutex<Option<CatalogScoringState>>,
     pub(crate) catalog_scoring_probe: tokio::sync::Mutex<()>,
     allow_loopback_image_urls_for_testing: AtomicBool,
@@ -141,14 +140,11 @@ impl L4aEngine {
         let steam_bridge: Arc<dyn SteamBridge> = dynamic_bridge.clone();
 
         let db = Arc::new(LocalDb::open(&paths.db_path)?);
-        // The launch environment may supply a different API key each time.
-        if config.filter.llm_enabled && config.filter.llm_token_source == LlmTokenSource::EnvVar {
-            db.clear_llm_filter_verdicts()?;
-        }
         let resolver = build_resolver_from_config(&config, mirror.clone(), steam_bridge.clone());
         let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
         local_filter.set_desired_params(&config.filter.local_params);
-        let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
+        let token_vault = TokenVault::default_for_paths(&paths);
+        let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
         let (loopback_http_client, https_only_http_client, standard_http_client) =
             build_reusable_http_clients();
 
@@ -170,9 +166,9 @@ impl L4aEngine {
             hydration_pending: AtomicBool::new(false),
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
-            token_vault,
+            token_vault: RwLock::new(token_vault),
             filter_eval_semaphore: tokio::sync::Semaphore::new(4),
-            filter_cache_generation: Mutex::new(0),
+            filter_cache: Mutex::new(filter_cache),
             catalog_scoring_cache: Mutex::new(None),
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
@@ -197,7 +193,8 @@ impl L4aEngine {
         mirror.set_https_only(config.https_only);
         let local_filter = Arc::new(LocalFilterManager::new(paths.clone(), events.clone()));
         local_filter.set_desired_params(&config.filter.local_params);
-        let token_vault = RwLock::new(TokenVault::default_for_paths(&paths));
+        let token_vault = TokenVault::default_for_paths(&paths);
+        let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
         let (loopback_http_client, https_only_http_client, standard_http_client) =
             build_reusable_http_clients();
         Ok(Self {
@@ -218,9 +215,9 @@ impl L4aEngine {
             hydration_pending: AtomicBool::new(false),
             hydration_backoff: Mutex::new(HashMap::new()),
             local_filter,
-            token_vault,
+            token_vault: RwLock::new(token_vault),
             filter_eval_semaphore: tokio::sync::Semaphore::new(4),
-            filter_cache_generation: Mutex::new(0),
+            filter_cache: Mutex::new(filter_cache),
             catalog_scoring_cache: Mutex::new(None),
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
@@ -359,10 +356,6 @@ impl L4aEngine {
         &self.local_filter
     }
 
-    pub(crate) fn token_vault(&self) -> TokenVault {
-        self.token_vault.read().unwrap().clone()
-    }
-
     pub fn config(&self) -> AppConfig {
         self.config.read().unwrap().clone()
     }
@@ -419,7 +412,7 @@ impl L4aEngine {
         next.download_concurrency = next.download_concurrency.clamp(1, 8);
         sanitize_filter_config(&mut next.filter, next.https_only)?;
         save_config(&self.paths.settings_path, &next)?;
-        let filter_generation = self.filter_cache_generation.lock().unwrap();
+        let filter_cache = self.filter_cache.lock().unwrap();
         let (dirs_changed, filter_params_changed) = {
             let mut guard = self.config.write().unwrap();
             self.mirror.set_https_only(next.https_only);
@@ -436,7 +429,7 @@ impl L4aEngine {
         if let Err(err) = self.db.prune_filter_verdicts_except(&active_policy_sig) {
             tracing::warn!(error = %err, "保存配置时清理旧策略过滤缓存失败");
         }
-        drop(filter_generation);
+        drop(filter_cache);
 
         if let Some(ref dyn_bridge) = self.dynamic_bridge {
             dyn_bridge.set_enabled(!next.disable_steamworks_sdk);
@@ -526,8 +519,9 @@ impl L4aEngine {
     }
 
     fn snapshot_locked(&self) -> Result<DashboardSnapshot, CoreError> {
-        let filter_generation = self.filter_cache_generation.lock().unwrap();
+        let mut filter_cache = self.filter_cache.lock().unwrap();
         let config = self.config();
+        self.refresh_filter_env_token(&mut filter_cache, &config.filter)?;
         let addons = self.db.list_addons()?;
         let filter_policy_signature = self.current_filter_policy_signature(&config);
         let max_age = crate::filter::evaluator::remote_verdict_cache_max_age(&config.filter);
@@ -571,7 +565,7 @@ impl L4aEngine {
             filter_exclusions: self.db.list_filter_exclusions()?,
             cached_filter_verdicts,
             filter_policy_signature,
-            filter_cache_generation: *filter_generation,
+            filter_cache_generation: filter_cache.generation,
         })
     }
 
@@ -614,7 +608,7 @@ impl L4aEngine {
         }
     }
 
-    fn emit_workspace_update(&self) {
+    pub(crate) fn emit_workspace_update(&self) {
         self.events.emit(CoreEvent::SnapshotUpdated {
             external_change: false,
         });

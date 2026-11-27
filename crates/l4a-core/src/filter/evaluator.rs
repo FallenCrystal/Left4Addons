@@ -2,12 +2,12 @@ use crate::db::repo::{
     is_remote_image_url, is_valid_local_cover_key, normalize_valid_remote_cover_url,
     strip_vpk_file_stem,
 };
-use crate::engine::L4aEngine;
+use crate::engine::{FilterCacheState, L4aEngine};
 use crate::error::CoreError;
 use crate::filter::deploy::{
     merge_raw_max, split_images_by_raw_budget, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES,
 };
-use crate::filter::llm::{is_loopback_url, judge_with_openai_llm, LoadedImage};
+use crate::filter::llm::{is_loopback_url, judge_with_openai_llm_using_token, LoadedImage};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
 use chrono::{TimeDelta, Utc};
@@ -23,7 +23,9 @@ use l4a_protocol::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_IMAGES: usize = 8;
@@ -282,9 +284,9 @@ fn record_catalog_observation(
     revision: Option<&str>,
     info_max_images: Option<usize>,
 ) {
-    let gate = engine.filter_cache_generation.lock().unwrap();
+    let cache = engine.filter_cache.lock().unwrap();
     let live = engine.config();
-    if *gate != generation
+    if cache.generation != generation
         || live.filter.mode != ClientFilterSourceMode::Catalog
         || live.https_only != cfg.https_only
         || normalize_catalog_base_key(live.catalog_server_url.as_deref().unwrap_or_default())
@@ -395,8 +397,8 @@ async fn ensure_catalog_scoring_revision_fresh(
     }
 
     // Rate-limit info probes if an older Catalog has no /info endpoint.
-    let gate = engine.filter_cache_generation.lock().unwrap();
-    if *gate == generation {
+    let cache = engine.filter_cache.lock().unwrap();
+    if cache.generation == generation {
         let mut guard = engine.catalog_scoring_cache.lock().unwrap();
         if guard
             .as_ref()
@@ -436,22 +438,47 @@ fn is_automatic_target_enabled(cfg: &ClientFilterConfig, target: &FilterEvaluati
 }
 
 impl EvaluationPolicy {
+    fn lock_current<'a>(
+        &self,
+        engine: &'a L4aEngine,
+        refresh_env_token: bool,
+    ) -> Result<(MutexGuard<'a, FilterCacheState>, AppConfig), CoreError> {
+        let mut cache = engine.filter_cache.lock().unwrap();
+        let live = engine.config();
+        if cache.generation != self.cache_generation
+            || self.signature != engine.current_filter_policy_signature(&live)
+        {
+            return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
+        }
+        if refresh_env_token && engine.refresh_filter_env_token(&mut cache, &live.filter)? {
+            drop(cache);
+            engine.emit_workspace_update();
+            return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
+        }
+        Ok((cache, live))
+    }
+
     fn check_target(
         &self,
         engine: &L4aEngine,
         target: &FilterEvaluationTarget,
     ) -> Result<(), CoreError> {
-        let generation = engine.filter_cache_generation.lock().unwrap();
-        let live = engine.config();
-        if *generation != self.cache_generation
-            || self.signature != engine.current_filter_policy_signature(&live)
-        {
-            return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
-        }
+        let (_cache, live) = self.lock_current(engine, false)?;
         if self.automatic && !is_automatic_target_enabled(&live.filter, target) {
             return Err(CoreError::InvalidInput("该范围的自动内容过滤已停用".into()));
         }
         Ok(())
+    }
+
+    fn resolve_llm_token(&self, engine: &L4aEngine) -> Result<Zeroizing<String>, CoreError> {
+        let (mut cache, live) = self.lock_current(engine, false)?;
+        let token = engine.resolve_filter_llm_token(&mut cache, &live.filter);
+        if cache.generation != self.cache_generation {
+            drop(cache);
+            engine.emit_workspace_update();
+            return Err(CoreError::InvalidInput(POLICY_CHANGED.into()));
+        }
+        token
     }
 }
 
@@ -460,10 +487,15 @@ pub async fn evaluate_targets(
     targets: Vec<FilterEvaluationTarget>,
     automatic: bool,
 ) -> Result<FilterEvaluationBatchResponse, CoreError> {
-    let (generation, app_cfg) = {
-        let gate = engine.filter_cache_generation.lock().unwrap();
-        (*gate, engine.config())
+    let (generation, app_cfg, credential_changed) = {
+        let mut cache = engine.filter_cache.lock().unwrap();
+        let cfg = engine.config();
+        let changed = engine.refresh_filter_env_token(&mut cache, &cfg.filter)?;
+        (cache.generation, cfg, changed)
     };
+    if credential_changed {
+        engine.emit_workspace_update();
+    }
     let is_catalog = app_cfg.filter.mode == ClientFilterSourceMode::Catalog;
 
     for attempt in 0..2 {
@@ -489,11 +521,12 @@ pub async fn evaluate_targets(
             automatic,
         };
         let items = evaluate_on_policy(engine, &app_cfg, &targets, &policy).await?;
-        let gate = engine.filter_cache_generation.lock().unwrap();
+        let mut cache = engine.filter_cache.lock().unwrap();
         let live = engine.config();
+        let credential_changed = engine.refresh_filter_env_token(&mut cache, &live.filter)?;
         let current_policy = engine.current_filter_policy_signature(&live);
 
-        if *gate == generation && current_policy == policy.signature {
+        if cache.generation == generation && current_policy == policy.signature {
             return Ok(FilterEvaluationBatchResponse {
                 policy_signature: policy.signature,
                 cache_generation: generation,
@@ -503,13 +536,17 @@ pub async fn evaluate_targets(
 
         let latest_catalog_sig = engine.current_filter_policy_signature(&app_cfg);
         if is_catalog
-            && *gate == generation
+            && cache.generation == generation
             && attempt == 0
             && current_policy == latest_catalog_sig
             && policy.signature != latest_catalog_sig
         {
             // Re-evaluate the entire batch against one revision, including prior cache hits.
             continue;
+        }
+        if credential_changed {
+            drop(cache);
+            engine.emit_workspace_update();
         }
 
         return Ok(FilterEvaluationBatchResponse {
@@ -767,13 +804,10 @@ fn emit_cached_verdicts_if_still_valid(
     if cached_hits.is_empty() {
         return;
     }
-    let gate = engine.filter_cache_generation.lock().unwrap();
-    let live = engine.config();
-    if *gate != policy.cache_generation
-        || engine.current_filter_policy_signature(&live) != policy.signature
-    {
+    let has_llm_verdicts = cached_hits.iter().any(|hit| is_llm_verdict(&hit.verdict));
+    let Ok((_cache, live)) = policy.lock_current(engine, has_llm_verdicts) else {
         return;
-    }
+    };
     let mut seen_keys = HashSet::with_capacity(cached_hits.len());
     let verdicts: Vec<FilterItemVerdict> = cached_hits
         .into_iter()
@@ -804,12 +838,9 @@ fn persist_and_emit_verdict_if_still_valid(
     group: &DeduplicatedMiss,
     verdict: &FilterItemVerdict,
 ) {
-    let gate = engine.filter_cache_generation.lock().unwrap();
-    let live = engine.config();
-    let live_active_sig = engine.current_filter_policy_signature(&live);
-    if *gate != policy.cache_generation || live_active_sig != policy.signature {
+    let Ok((_cache, live)) = policy.lock_current(engine, is_llm_verdict(verdict)) else {
         return;
-    }
+    };
     if policy.automatic && !is_automatic_target_enabled(&live.filter, &group.target) {
         return;
     }
@@ -828,7 +859,7 @@ fn persist_and_emit_verdict_if_still_valid(
             &group.content_sig,
             group.expected_addon_sig.as_deref(),
             &policy.signature,
-            &live_active_sig,
+            &policy.signature,
             verdict,
         ) {
             tracing::warn!(
@@ -844,6 +875,13 @@ fn persist_and_emit_verdict_if_still_valid(
         policy_signature: Some(policy.signature.clone()),
         cache_generation: policy.cache_generation,
     });
+}
+
+fn is_llm_verdict(verdict: &FilterItemVerdict) -> bool {
+    matches!(
+        verdict.decision_source,
+        FilterDecisionSource::LlmFlaggedTrue | FilterDecisionSource::LlmFlaggedFalse
+    )
 }
 
 fn effective_max_images(cfg: &ClientFilterConfig) -> usize {
@@ -1037,11 +1075,10 @@ async fn evaluate_single_target(
             loaded_images = materialized.into_iter().map(|(_, img)| img).collect();
         }
         policy.check_target(engine, target)?;
-        let vault = engine.token_vault();
-        let is_sensitive = judge_with_openai_llm(
+        let is_sensitive = judge_with_openai_llm_using_token(
             engine,
             cfg,
-            &vault,
+            || policy.resolve_llm_token(engine),
             &target.title,
             &target.tags,
             target.description.as_deref(),

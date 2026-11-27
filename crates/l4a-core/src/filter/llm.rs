@@ -318,13 +318,34 @@ pub async fn judge_with_openai_llm(
     description: Option<&str>,
     images: &[LoadedImage],
 ) -> Result<bool, CoreError> {
+    judge_with_openai_llm_using_token(
+        engine,
+        cfg,
+        || vault.resolve_token(cfg.llm_token_source, &cfg.llm_token_env_var),
+        title,
+        tags,
+        description,
+        images,
+    )
+    .await
+}
+
+pub(crate) async fn judge_with_openai_llm_using_token(
+    engine: &L4aEngine,
+    cfg: &ClientFilterConfig,
+    resolve_token: impl FnOnce() -> Result<Zeroizing<String>, CoreError>,
+    title: &str,
+    tags: &[String],
+    description: Option<&str>,
+    images: &[LoadedImage],
+) -> Result<bool, CoreError> {
     let url = resolve_completions_url(&cfg.llm_endpoint)?;
     let model = cfg.llm_model.trim();
     if model.is_empty() {
         return Err(CoreError::Config("未配置 LLM 模型名称".into()));
     }
 
-    let token = vault.resolve_token(cfg.llm_token_source, &cfg.llm_token_env_var)?;
+    let token = resolve_token()?;
     let auth_header = Zeroizing::new(format!("Bearer {}", token.as_str()));
 
     let user_prompt = build_builtin_user_prompt(title, tags, description);

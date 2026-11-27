@@ -3839,6 +3839,178 @@ async fn ws_target_with_addon_id_caches_cleanly_failed_token_preserves_llm_cache
     }
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn environment_token_changes_retire_cached_and_in_flight_llm_verdicts() {
+    use tokio::sync::Notify;
+    use tokio::time::{timeout, Duration};
+
+    struct TestEnvVar(String);
+    impl Drop for TestEnvVar {
+        fn drop(&mut self) {
+            std::env::remove_var(&self.0);
+        }
+    }
+    let name = TestEnvVar(format!("L4A_TEST_TOKEN_{}", uuid::Uuid::new_v4().simple()));
+    std::env::set_var(&name.0, "token-a");
+
+    let llm_calls = Arc::new(Mutex::new(Vec::new()));
+    let started = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let app = Router::new()
+        .route(
+            "/api/v1/filter/predict",
+            post(|Json(req): Json<FilterPredictRequest>| async move {
+                let prob = if req.title.as_deref() == Some("model-only") {
+                    0.1
+                } else {
+                    0.5
+                };
+                Json(FilterProbabilities {
+                    prob,
+                    ..Default::default()
+                })
+            }),
+        )
+        .route(
+            "/v1/chat/completions",
+            post({
+                let calls = llm_calls.clone();
+                let started = started.clone();
+                let finish = finish.clone();
+                move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let calls = calls.clone();
+                    let started = started.clone();
+                    let finish = finish.clone();
+                    async move {
+                        let authorization = headers[header::AUTHORIZATION].to_str().unwrap();
+                        calls.lock().unwrap().push(authorization.to_owned());
+                        if body.to_string().contains("pending-review") {
+                            started.notify_one();
+                            finish.notified().await;
+                        }
+                        Json(json!({
+                            "choices": [{ "message": { "content": authorization == "Bearer token-b" } }]
+                        }))
+                    }
+                }
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempdir().unwrap();
+    let events = Arc::new(RecordedEvents::default());
+    let engine = Arc::new(make_engine_with_events(
+        dir.path(),
+        AppConfig {
+            https_only: false,
+            filter: ClientFilterConfig {
+                enabled: true,
+                mode: ClientFilterSourceMode::CustomEndpoint,
+                custom_endpoint_url: Some(format!("http://{addr}/api/v1/filter/predict")),
+                enable_direct_flag: false,
+                llm_enabled: true,
+                llm_threshold: 0.2,
+                llm_endpoint: format!("http://{addr}/v1/chat/completions"),
+                llm_token_source: LlmTokenSource::EnvVar,
+                llm_token_env_var: name.0.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        Arc::new(MockSteamBridge::new(false)),
+        events.clone(),
+    ));
+    let target = |name| FilterEvaluationTarget {
+        target_key: format!("ws:{name}"),
+        addon_id: None,
+        workshop_id: None,
+        title: name,
+        description: None,
+        tags: vec![],
+        image_sources: vec![],
+        revision_hint: None,
+        bypass_cache: false,
+    };
+    let review = target("review".to_owned());
+    let first = engine
+        .evaluate_filter_items(vec![review.clone(), target("model-only".to_owned())])
+        .await
+        .unwrap();
+    let first_generation = first.cache_generation;
+    assert_eq!(
+        unwrap_verdicts(first)[0].decision_source,
+        FilterDecisionSource::LlmFlaggedFalse
+    );
+    let reused = engine
+        .evaluate_filter_items(vec![review.clone()])
+        .await
+        .unwrap();
+    assert_eq!(reused.cache_generation, first_generation);
+    assert_eq!(*llm_calls.lock().unwrap(), ["Bearer token-a"]);
+
+    std::env::set_var(&name.0, "token-b");
+    let rotated = engine
+        .evaluate_filter_items(vec![review.clone()])
+        .await
+        .unwrap();
+    let rotated_generation = rotated.cache_generation;
+    assert!(rotated_generation > first_generation);
+    assert_eq!(
+        unwrap_verdicts(rotated)[0].decision_source,
+        FilterDecisionSource::LlmFlaggedTrue
+    );
+    assert_eq!(
+        *llm_calls.lock().unwrap(),
+        ["Bearer token-a", "Bearer token-b"]
+    );
+    events.drain();
+
+    let pending = {
+        let engine = engine.clone();
+        let item = target("pending-review".to_owned());
+        tokio::spawn(async move { engine.evaluate_filter_items(vec![item]).await.unwrap() })
+    };
+    timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    std::env::remove_var(&name.0);
+    finish.notify_one();
+    let pending = pending.await.unwrap();
+    assert!(matches!(
+        &pending.items[0].outcome,
+        FilterTargetOutcome::Failed { .. }
+    ));
+    let emitted = events.drain();
+    assert!(emitted
+        .iter()
+        .any(|event| matches!(event, CoreEvent::SnapshotUpdated { .. })));
+    assert!(!emitted
+        .iter()
+        .any(|event| matches!(event, CoreEvent::FilterVerdictsUpdated { .. })));
+
+    let status = engine.get_filter_token_status().unwrap();
+    assert!(!status.env_var_present);
+    assert!(status.cache_generation > rotated_generation);
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(snapshot.cached_filter_verdicts.len(), 1);
+    assert_eq!(
+        snapshot.cached_filter_verdicts[0].decision_source,
+        FilterDecisionSource::ModelSafe
+    );
+    let missing = engine.evaluate_filter_items(vec![review]).await.unwrap();
+    assert!(
+        matches!(&missing.items[0].outcome, FilterTargetOutcome::Failed { error } if error.contains(&name.0))
+    );
+
+    std::env::set_var(&name.0, "token-a");
+    let refreshed = engine.get_filter_token_status().unwrap();
+    assert!(refreshed.env_var_present);
+    assert!(refreshed.cache_generation > status.cache_generation);
+    server.abort();
+}
+
 #[tokio::test]
 async fn catalog_image_scoring_disabled_still_allows_llm_image_review() {
     use l4a_protocol::WorkshopId;
