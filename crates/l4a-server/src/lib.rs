@@ -4,11 +4,15 @@ mod credentials;
 pub mod db;
 pub mod filter;
 pub mod hybrid_search;
+#[path = "../../filter-assets/image_prep.rs"]
+mod image_prep;
 pub mod routes;
 pub mod search;
 pub mod sync;
 pub mod upstream;
 pub mod web_assets;
+
+pub use image_prep::init_filter_image_worker;
 
 use auth::AdminAuthManager;
 use config::{CatalogConfig, CatalogConfigStore};

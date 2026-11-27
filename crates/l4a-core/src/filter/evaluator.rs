@@ -7,6 +7,9 @@ use crate::error::CoreError;
 use crate::filter::deploy::{
     merge_raw_max, split_images_by_raw_budget, MAX_RAW_PREDICT_IMAGE_BATCH_BYTES,
 };
+use crate::filter::image_prep::{
+    self, PreparedImage, FILTER_MAX_IMAGE_BYTES as MAX_INLINE_IMAGE_BYTES,
+};
 use crate::filter::llm::{is_loopback_url, judge_with_openai_llm_using_token, LoadedImage};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;
@@ -28,7 +31,6 @@ use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
-const MAX_INLINE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CATALOG_IMAGES: usize = 8;
 const EVAL_CONCURRENCY: usize = 4;
 const CATALOG_SCORING_INFO_TTL: Duration = Duration::from_secs(30);
@@ -1517,24 +1519,15 @@ async fn fetch_validated_remote_image(
     engine: &L4aEngine,
     remote: &ValidatedRemoteImage,
 ) -> Result<LoadedImage, CoreError> {
-    match remote {
-        ValidatedRemoteImage::LoopbackTest(url) => {
-            let (mime, bytes) = fetch_loopback_image(engine, url).await?;
-            Ok(LoadedImage {
-                mime,
-                b64: STANDARD.encode(&bytes),
-            })
-        }
+    let (mime, bytes) = match remote {
+        ValidatedRemoteImage::LoopbackTest(url) => fetch_loopback_image(engine, url).await?,
         ValidatedRemoteImage::SteamCdn(url) | ValidatedRemoteImage::Mirrored(url) => {
-            let (mime, bytes) = engine
+            engine
                 .fetch_workshop_cover_with_hop_validator(url, validate_filter_image_redirect_hop)
-                .await?;
-            Ok(LoadedImage {
-                mime,
-                b64: STANDARD.encode(&bytes),
-            })
+                .await?
         }
-    }
+    };
+    finish_filter_image(mime, bytes).await
 }
 
 pub(crate) async fn load_single_image(
@@ -1544,14 +1537,12 @@ pub(crate) async fn load_single_image(
     if is_valid_local_cover_key(src) {
         let bytes = engine.read_cached_image(src)?;
         let mime = detect_image_mime(&bytes, Some(src))?;
-        return Ok(LoadedImage {
-            mime,
-            b64: STANDARD.encode(&bytes),
-        });
+        return finish_filter_image(mime, bytes).await;
     }
 
     if has_ascii_prefix_ignore_case(src, b"data:") {
-        return decode_data_image_url(src);
+        let (mime, bytes) = decode_data_image_url(src)?;
+        return finish_filter_image(mime, bytes).await;
     }
 
     if is_remote_image_url(src) {
@@ -1562,7 +1553,32 @@ pub(crate) async fn load_single_image(
     Err(CoreError::InvalidInput("不受支持的图片来源格式".into()))
 }
 
-pub(crate) fn decode_data_image_url(src: &str) -> Result<LoadedImage, CoreError> {
+/// Downscales images beyond the filter runner's pixel limits (which it would otherwise
+/// reject as decompression bombs) and base64-encodes the result.
+async fn finish_filter_image(mime: String, bytes: Vec<u8>) -> Result<LoadedImage, CoreError> {
+    let (mime, bytes) = match image_prep::prepare_for_filter(bytes)
+        .await
+        .map_err(|err| CoreError::InvalidInput(err.to_string()))?
+    {
+        PreparedImage::Original(bytes) => (mime, bytes),
+        PreparedImage::Shrunk(shrunk) => {
+            tracing::info!(
+                source_width = shrunk.source_size.0,
+                source_height = shrunk.source_size.1,
+                width = shrunk.output_size.0,
+                height = shrunk.output_size.1,
+                "Downscaled oversized preview image before content filtering"
+            );
+            (image_prep::SHRUNK_IMAGE_MIME.to_string(), shrunk.bytes)
+        }
+    };
+    Ok(LoadedImage {
+        mime,
+        b64: STANDARD.encode(&bytes),
+    })
+}
+
+pub(crate) fn decode_data_image_url(src: &str) -> Result<(String, Vec<u8>), CoreError> {
     let Some(rest) = strip_ascii_prefix_ignore_case(src.trim(), b"data:") else {
         return Err(CoreError::InvalidInput("无效的 data URL".into()));
     };
@@ -1595,10 +1611,7 @@ pub(crate) fn decode_data_image_url(src: &str) -> Result<LoadedImage, CoreError>
         return Err(CoreError::InvalidInput("内联图片为空或超出大小限制".into()));
     }
     let mime = detect_image_mime(&bytes, None)?;
-    Ok(LoadedImage {
-        mime,
-        b64: STANDARD.encode(&bytes),
-    })
+    Ok((mime, bytes))
 }
 
 fn detect_image_mime(bytes: &[u8], filename_hint: Option<&str>) -> Result<String, CoreError> {

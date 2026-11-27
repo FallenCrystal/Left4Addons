@@ -932,12 +932,17 @@ mod tests {
         // Mirrored Steam CDN fixture: `/ugc/ssrf` redirects to private_addr; `/ugc/same` redirects same-origin.
         let mirror_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mirror_addr = mirror_listener.local_addr().unwrap();
+        let mut jpeg_bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut jpeg_bytes)
+            .encode(&[255, 0, 0], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let jpeg_bytes = Arc::new(jpeg_bytes);
         tokio::spawn(async move {
-            let jpeg_bytes: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
             loop {
                 let Ok((mut socket, _)) = mirror_listener.accept().await else {
                     break;
                 };
+                let jpeg_bytes = Arc::clone(&jpeg_bytes);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let Ok(n) = socket.read(&mut buf).await else {
@@ -963,7 +968,7 @@ mod tests {
                             jpeg_bytes.len()
                         );
                         let _ = socket.write_all(head.as_bytes()).await;
-                        let _ = socket.write_all(jpeg_bytes).await;
+                        let _ = socket.write_all(&jpeg_bytes).await;
                     }
                 });
             }

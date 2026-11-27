@@ -40,8 +40,13 @@ fn default_log_dir(config: &Path) -> PathBuf {
         .join("logs")
 }
 
+fn main() -> anyhow::Result<()> {
+    l4a_server::init_filter_image_worker();
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn serve() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let mut log_options = l4a_logging::LogOptions::new(
         cli.log_dir

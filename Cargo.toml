@@ -55,7 +55,7 @@ crc32fast = "1"
 bytes = "1"
 futures-util = "0.3"
 tokio-util = "0.7"
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 vtf = "0.4"
 libloading = "0.8"
 notify = "6.1"
@@ -68,6 +68,7 @@ steam-vent-proto-common = "0.5.1"
 qrcode = { version = "0.15", default-features = false, features = ["svg"] }
 pinyin = "0.11"
 base64 = "0.22"
+libc = "0.2"
 ring = "0.17"
 zeroize = "1"
 tauri = { version = "2.11.5", features = [] }
