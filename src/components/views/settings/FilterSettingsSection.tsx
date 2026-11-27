@@ -316,26 +316,6 @@ export function FilterSettingsSection({
     });
   };
 
-  const recentCommitOptions = useMemo(() => {
-    const commits = localStatus?.recentCommits ?? [];
-    return [
-      ...commits.map((c) => ({
-        value: c.sha,
-        label: `${c.shortSha} · ${c.subject}`,
-      })),
-      { value: '__custom__', label: t('filter.settings.customCommitOption') },
-    ];
-  }, [localStatus?.recentCommits, t]);
-
-  const matchedCommitSha = useMemo(() => {
-    const pinned = filter.pinnedCommit?.trim();
-    if (!pinned) return '__custom__';
-    const hit = localStatus?.recentCommits.find(
-      (c) => c.sha === pinned || c.shortSha === pinned,
-    );
-    return hit ? hit.sha : '__custom__';
-  }, [filter.pinnedCommit, localStatus?.recentCommits]);
-
   const serviceRunning = localStatus?.serviceState === 'running';
   const serviceTransitioning =
     localStatus?.serviceState === 'deploying' || localStatus?.serviceState === 'starting';
@@ -696,31 +676,14 @@ export function FilterSettingsSection({
 
         {!filter.trackLatest && (
           <>
-            <div className="l4a-filter-param-grid">
-              <div className="md-field">
-                <span className="md-field-label">{t('filter.settings.commitSelect')}</span>
-                <Select<string>
-                  ariaLabel={t('filter.settings.commitSelect')}
-                  value={matchedCommitSha}
-                  onChange={(sha) => {
-                    if (sha === '__custom__') return;
-                    onUpdateFilter((curr) => ({ ...curr, pinnedCommit: sha }));
-                  }}
-                  options={recentCommitOptions}
-                />
-              </div>
-              <TextField
-                label={t('filter.settings.pinnedCommitInput')}
-                placeholder="a94f18e..."
-                value={filter.pinnedCommit ?? ''}
-                onChange={(e) =>
-                  onUpdateFilter((curr) => ({
-                    ...curr,
-                    pinnedCommit: e.target.value || null,
-                  }))
-                }
-              />
-            </div>
+            <TextField
+              label={t('filter.settings.pinnedCommitInput')}
+              placeholder="a94f18e..."
+              value={filter.pinnedCommit ?? ''}
+              onChange={(e) =>
+                onUpdateFilter((curr) => ({ ...curr, pinnedCommit: e.target.value || null }))
+              }
+            />
             {missingPinnedCommit && (
               <span
                 className="md-body-small"

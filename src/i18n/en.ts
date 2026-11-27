@@ -597,11 +597,9 @@ export const en = {
       repoUrl: 'Left4Filters Repository URL',
       autoStartService: 'Auto-start local service when needed',
       trackLatest: 'Track latest remote commit (HEAD)',
-      commitSelect: 'Select Recent Commit',
-      customCommitOption: 'Custom commit SHA',
       pinnedCommitInput: 'Pinned Commit SHA',
       pinnedCommitRequiredHint:
-        'Select or enter a target commit SHA before deploying when Track latest is turned off.',
+        'Enter a commit SHA to deploy when Track latest is turned off.',
       deployBtn: 'Deploy Now',
       redeployBtn: 'Redeploy',
       checkUpdatesBtn: 'Check Updates',

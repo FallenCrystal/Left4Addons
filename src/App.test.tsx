@@ -1191,16 +1191,23 @@ describe('Left4Addons v2 Material 3 frontend', () => {
       screen.getByText(/Warning: LLM Escalation Threshold is greater than or equal to Direct Flag Threshold/),
     ).toBeTruthy();
 
-    // 5. Disabling Track latest without a Pinned Commit SHA disables Deploy Now with helper hint
+    // 5. Disabling Track latest requires a manually entered commit SHA before deploying.
     fireEvent.click(screen.getByRole('switch', { name: 'Track latest remote commit (HEAD)' }));
+    const shaInput = screen.getByRole('textbox', { name: 'Pinned Commit SHA' });
+    const deploymentSection = within(shaInput.closest('section')!);
+    expect(deploymentSection.queryByRole('combobox')).toBeNull();
     expect(
       screen.getByText(
-        'Select or enter a target commit SHA before deploying when Track latest is turned off.',
+        'Enter a commit SHA to deploy when Track latest is turned off.',
       ),
     ).toBeTruthy();
-    expect(
-      (screen.getByRole('button', { name: 'Deploy Now' }) as HTMLButtonElement).disabled,
-    ).toBe(true);
+    const deployButton = deploymentSection.getByRole('button', {
+      name: 'Deploy Now',
+    }) as HTMLButtonElement;
+    expect(deployButton.disabled).toBe(true);
+
+    fireEvent.change(shaInput, { target: { value: 'a94f18e' } });
+    await waitFor(() => expect(deployButton.disabled).toBe(false));
   });
 
   it('shows evaluation progress, logs failed and incomplete checks, and rechecks them from settings', async () => {
