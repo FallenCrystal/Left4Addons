@@ -1,5 +1,6 @@
 use futures_util::FutureExt;
 use regex::Regex;
+use reqwest::header::{HeaderValue, LOCATION, REFERER};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -629,8 +630,9 @@ impl MirrorRouter {
     /// 逐跳安全执行 HTTP 请求并处理重定向：
     /// - 底层统一复用 `Policy::none()` 的缓存 `reqwest::Client`；
     /// - 每一跳重新读取生效的 `https_only` 策略；
-    /// - 同源重定向保留 URL 凭据与当前镜像的 `Host` / 自定义请求头 / TLS 配置；
+    /// - 同源重定向保留 URL 凭据与当前镜像的 `Host` / 自定义请求头 / TLS 配置，并发送 `Referer`；
     /// - 跨源重定向丢弃上一跳镜像特权与自定义头，按新目标重新匹配规则并切换至受校验客户端；
+    /// - 经过 HTTPS 后，拒绝向后续 HTTP 跳转发送 URL 凭据或镜像自定义头；
     /// - 镜像显式重定向回源站时直连源站，并继续执行逐跳校验；
     /// - 每次重定向发起前回调 `validate_hop` 供调用方执行来源白名单等策略校验。
     pub async fn send_with_redirects<FBuild, FValidate, FSend, Fut, E>(
@@ -657,6 +659,8 @@ impl MirrorRouter {
         let initial_resolved = self.validate_url_with_policy(url, initial_https_only)?;
         let mut current_resolved = initial_resolved.clone();
         let mut mirror_sources = Vec::new();
+        let mut referer = None;
+        let mut used_https = false;
         let mut drop_payload_headers = false;
         if initial_resolved.matched_rule {
             if let Some(source) = url::Url::parse(url)
@@ -687,6 +691,9 @@ impl MirrorRouter {
                 &current_resolved,
             );
             let mut req = configure(req, hop, &current_method);
+            if let Some(value) = referer {
+                req = req.headers([(REFERER, value)].into_iter().collect());
+            }
             if let Some(total_timeout) = options.timeout {
                 let hop_timeout = total_timeout
                     .checked_sub(started_at.elapsed())
@@ -698,7 +705,7 @@ impl MirrorRouter {
             let mut response = send(req, hop).await?;
             let status = response.status();
             let Some(location_value) = is_redirect_status(status)
-                .then(|| response.headers().get(reqwest::header::LOCATION))
+                .then(|| response.headers().get(LOCATION))
                 .flatten()
             else {
                 return Ok(RedirectedResponse {
@@ -716,6 +723,7 @@ impl MirrorRouter {
                 MirrorError::InvalidRedirect("Location 头包含无效的 UTF-8".to_string())
             })?;
             let current_url = response.url();
+            used_https |= current_url.scheme() == "https";
             let next_url = current_url
                 .join(location)
                 .map_err(|e| MirrorError::InvalidRedirect(e.to_string()))?;
@@ -774,6 +782,17 @@ impl MirrorRouter {
                 });
             }
             ensure_https_if_required(&next_resolved.url, next_https_only)?;
+            if used_https
+                && next_resolved.url.starts_with("http://")
+                && (!next_resolved.headers.is_empty()
+                    || !next_url.username().is_empty()
+                    || next_url.password().is_some())
+            {
+                return Err(MirrorError::InvalidRedirect(
+                    "HTTPS 重定向到 HTTP 时禁止发送凭据或镜像自定义请求头".into(),
+                )
+                .into());
+            }
 
             let hop_info = RedirectHop {
                 hop: hop + 1,
@@ -784,6 +803,9 @@ impl MirrorRouter {
             };
             validate_hop(&hop_info).map_err(RedirectSendError::Rejected)?;
 
+            referer = is_same_origin
+                .then(|| redirect_referer(current_url))
+                .flatten();
             drain_ready_redirect_body(&mut response);
             current_method = next_method;
             if !is_same_origin && next_resolved.rewrites_authority(&next_url) {
@@ -929,6 +951,14 @@ fn urls_same_origin(a: &url::Url, b: &url::Url) -> bool {
             .zip(b.host_str())
             .is_some_and(|(ha, hb)| ha.eq_ignore_ascii_case(hb))
         && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn redirect_referer(url: &url::Url) -> Option<HeaderValue> {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_fragment(None);
+    HeaderValue::from_str(url.as_str()).ok()
 }
 
 fn same_origin_redirect_policy(max_redirects: usize) -> reqwest::redirect::Policy {
@@ -2127,7 +2157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirects_keep_url_credentials_on_the_same_origin() {
+    async fn redirects_keep_credentials_and_send_a_sanitized_referer_on_the_same_origin() {
         let (other_origin, other_requests) =
             start_keep_alive_server(|_| ("200 OK".into(), String::new(), "done".into())).await;
         let (origin, requests) = start_keep_alive_server(move |req| {
@@ -2146,6 +2176,7 @@ mod tests {
         let mut url = url::Url::parse(&format!("{origin}/start")).unwrap();
         url.set_username("fixture").unwrap();
         url.set_password(Some("test :@")).unwrap();
+        url.set_fragment(Some("not-for-the-server"));
         let router = MirrorRouter::empty();
         router.set_no_proxy_for_testing(true);
 
@@ -2174,9 +2205,12 @@ mod tests {
             requests[1].headers.get("authorization"),
             Some(authorization)
         );
+        assert!(!requests[0].headers.contains_key("referer"));
+        assert_eq!(requests[1].headers["referer"], format!("{origin}/start"));
         let other_requests = other_requests.lock().unwrap();
         assert_eq!(other_requests.len(), 1);
         assert!(!other_requests[0].headers.contains_key("authorization"));
+        assert!(!other_requests[0].headers.contains_key("referer"));
     }
 
     #[tokio::test]
@@ -2352,6 +2386,64 @@ mod tests {
             } else {
                 assert_eq!(redirected.unwrap().final_resolved.url, source_https);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn https_downgrade_rejects_mirror_headers_and_inline_credentials() {
+        use reqwest::ResponseBuilderExt;
+
+        let mut rule = base_rule("source.example.test");
+        rule.rules = Some("source.example.test".into());
+        rule.headers = Some(HashMap::from([(
+            "Authorization".into(),
+            "Bearer fixture-only".into(),
+        )]));
+
+        for (router, intermediate, location) in [
+            (
+                MirrorRouter::from_rules(vec![rule.clone()]),
+                None,
+                "http://source.example.test/final",
+            ),
+            (
+                MirrorRouter::from_rules(vec![rule]),
+                Some("http://fallback.example.test/next"),
+                "http://source.example.test/final",
+            ),
+            (
+                MirrorRouter::empty(),
+                None,
+                "http://fixture:fixture-only@source.example.test/final",
+            ),
+        ] {
+            let result = router
+                .send_with_redirects(
+                    Method::GET,
+                    "https://source.example.test/start",
+                    RedirectRequestOptions::default(),
+                    |req, _, _| req,
+                    |_| Ok::<(), ()>(()),
+                    |req, hop| async move {
+                        let location = match (hop, intermediate) {
+                            (0, Some(intermediate)) => intermediate,
+                            (0, None) | (1, Some(_)) => location,
+                            _ => panic!("the credentialed HTTP hop should not be requested"),
+                        };
+                        let response = http::Response::builder()
+                            .url(req.build()?.url().clone())
+                            .status(StatusCode::FOUND)
+                            .header(LOCATION, location)
+                            .body(reqwest::Body::from(""))
+                            .unwrap();
+                        Ok(response.into())
+                    },
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(RedirectSendError::Mirror(MirrorError::InvalidRedirect(_)))
+            ));
         }
     }
 
