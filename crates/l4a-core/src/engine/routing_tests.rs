@@ -114,7 +114,7 @@ async fn covers_and_routed_requests_reuse_tcp_keep_alive_connections() {
         }))
         .unwrap(),
         serde_json::from_value(serde_json::json!({
-            "rules": "filter.insecure.test",
+            "rules": "192.168.0.1",
             "target": addr.to_string(),
             "insecure-tls": true,
         }))
@@ -164,10 +164,7 @@ async fn covers_and_routed_requests_reuse_tcp_keep_alive_connections() {
 
     // 2. The insecure mirror follows same-origin redirects on its pooled connection.
     let resp_get = engine
-        .prepare_routed_get(
-            "http://filter.insecure.test/redirect/get",
-            Duration::from_secs(5),
-        )
+        .prepare_routed_get("http://192.168.0.1/redirect/get", Duration::from_secs(5))
         .unwrap()
         .send_audited_quiet("test.routed.cross_origin.get")
         .await
@@ -177,10 +174,7 @@ async fn covers_and_routed_requests_reuse_tcp_keep_alive_connections() {
     tokio::task::yield_now().await;
 
     let resp_post = engine
-        .prepare_routed_post(
-            "http://filter.insecure.test/redirect/post",
-            Duration::from_secs(5),
-        )
+        .prepare_routed_post("http://192.168.0.1/redirect/post", Duration::from_secs(5))
         .unwrap()
         .body("{}")
         .send_audited_quiet("test.routed.same_origin.post")
@@ -250,18 +244,18 @@ async fn shared_mirror_router_does_not_override_engine_https_only_policy() {
 
     // Strict engine MUST still reject plain HTTP even though shared_mirror was mutated.
     assert!(strict_engine
-        .prepare_routed_get("http://filter.example.com/info", Duration::from_secs(5))
+        .prepare_routed_get("http://192.168.0.1/info", Duration::from_secs(5))
         .is_err());
     assert!(strict_engine
-        .prepare_routed_post("http://filter.example.com/predict", Duration::from_secs(5))
+        .prepare_routed_post("http://192.168.0.1/predict", Duration::from_secs(5))
         .is_err());
     assert!(strict_engine
-        .fetch_workshop_cover("http://other.example.com/cover.jpg")
+        .fetch_workshop_cover("http://192.168.0.2/cover.jpg")
         .await
         .is_err());
 
     // Permissive engine continues to accept HTTP according to its own config.
     assert!(permissive_engine
-        .prepare_routed_get("http://filter.example.com/info", Duration::from_secs(5))
+        .prepare_routed_get("http://192.168.0.1/info", Duration::from_secs(5))
         .is_ok());
 }

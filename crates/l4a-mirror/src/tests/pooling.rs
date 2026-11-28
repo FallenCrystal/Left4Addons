@@ -1,6 +1,6 @@
 use super::support::{
-    base_rule, distinct_serving_conns, serve_http_stream, start_keep_alive_server, test_tls_config,
-    RecordedRequest,
+    base_rule, distinct_serving_conns, serve_http_stream, start_keep_alive_server,
+    start_self_signed_tls_server, test_tls_config, RecordedRequest,
 };
 use crate::pool::MAX_CUSTOM_TIMEOUT_CLIENTS;
 use crate::MirrorRouter;
@@ -176,15 +176,15 @@ async fn streaming_client_reuses_client_and_tcp_connection() {
 
 #[tokio::test]
 async fn no_redirect_get_and_post_preserve_policy_and_reuse_connection_for_insecure_rules() {
-    let (base_url, log) = start_keep_alive_server(|_| {
+    let (base_url, log) = start_self_signed_tls_server(|_| {
         (
             "302 Found".into(),
-            "Location: http://127.0.0.1:1/never-follow\r\n".into(),
+            "Location: https://127.0.0.1:1/never-follow\r\n".into(),
             String::new(),
         )
     })
     .await;
-    let target = base_url.strip_prefix("http://").unwrap().to_string();
+    let target = base_url.strip_prefix("https://").unwrap().to_string();
     let mut rule = base_rule(&target);
     rule.rules = Some("filter.mirror.test".to_string());
     rule.insecure_tls = true;
@@ -195,7 +195,7 @@ async fn no_redirect_get_and_post_preserve_policy_and_reuse_connection_for_insec
 
     let (get_req, resolved) = router
         .get_no_redirect(
-            "http://filter.mirror.test/info",
+            "https://filter.mirror.test/info",
             Some(Duration::from_secs(10)),
         )
         .unwrap();
@@ -211,7 +211,7 @@ async fn no_redirect_get_and_post_preserve_policy_and_reuse_connection_for_insec
 
     let (post_req, _) = router
         .post_no_redirect(
-            "http://filter.mirror.test/predict",
+            "https://filter.mirror.test/predict",
             Some(Duration::from_secs(10)),
         )
         .unwrap();
