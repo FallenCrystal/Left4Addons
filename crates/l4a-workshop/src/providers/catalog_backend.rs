@@ -2,12 +2,13 @@ use crate::error::WorkshopError;
 use crate::provider::{ProviderCapabilities, WorkshopProvider};
 use async_trait::async_trait;
 use chrono::Utc;
-use l4a_logging::http::AuditedSend;
-use l4a_mirror::MirrorRouter;
+use l4a_logging::http;
+use l4a_mirror::{MirrorRouter, RedirectRequestOptions};
 use l4a_protocol::{
     BatchItemsRequest, BatchItemsResponse, MetadataSource, SearchQuery, SearchResponse,
     WorkshopCollectionRecord, WorkshopFetchOutcome, WorkshopId, WorkshopItemStatus,
 };
+use reqwest::Method;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,20 +68,32 @@ impl WorkshopProvider for CatalogBackendProvider {
             return Ok(Vec::new());
         }
         let url = format!("{}/api/v1/items/batch", self.base_url);
-        let (client, _) = self
+        let payload = BatchItemsRequest {
+            ids: ids.to_vec(),
+            force_refresh: false,
+        };
+        let resp = self
             .mirror
-            .build_client_for(&url, Some(self.timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
-        let (req, _) = self.mirror.prepare_post(&client, &url);
-        let resp = req
-            .json(&BatchItemsRequest {
-                ids: ids.to_vec(),
-                force_refresh: false,
-            })
-            .send_audited("catalog.items.batch")
+            .send_with_redirects(
+                Method::POST,
+                &url,
+                RedirectRequestOptions {
+                    timeout: Some(self.timeout),
+                    ..Default::default()
+                },
+                |req, _, method| {
+                    if *method == Method::POST {
+                        req.json(&payload)
+                    } else {
+                        req
+                    }
+                },
+                |_| Ok::<(), WorkshopError>(()),
+                |req, hop| http::send_redirect_hop(req, "catalog.items.batch", hop),
+            )
             .await
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            .map_err(|e| WorkshopError::Network(e.to_string()))?
+            .response;
 
         let status = resp.status();
         if !status.is_success() {
@@ -132,16 +145,22 @@ impl WorkshopProvider for CatalogBackendProvider {
         collection_id: WorkshopId,
     ) -> Result<WorkshopCollectionRecord, WorkshopError> {
         let url = format!("{}/api/v1/collections/{collection_id}", self.base_url);
-        let (client, _) = self
+        let resp = self
             .mirror
-            .build_client_for(&url, Some(self.timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
-        let (req, _) = self.mirror.prepare_get(&client, &url);
-        let resp = req
-            .send_audited("catalog.collection")
+            .send_with_redirects(
+                Method::GET,
+                &url,
+                RedirectRequestOptions {
+                    timeout: Some(self.timeout),
+                    ..Default::default()
+                },
+                |req, _, _| req,
+                |_| Ok::<(), WorkshopError>(()),
+                |req, hop| http::send_redirect_hop(req, "catalog.collection", hop),
+            )
             .await
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            .map_err(|e| WorkshopError::Network(e.to_string()))?
+            .response;
 
         let status = resp.status();
         if !status.is_success() {
@@ -159,10 +178,6 @@ impl WorkshopProvider for CatalogBackendProvider {
 
     async fn search(&self, query: &SearchQuery) -> Result<SearchResponse, WorkshopError> {
         let url = format!("{}/api/v1/items/search", self.base_url);
-        let (client, _) = self
-            .mirror
-            .build_client_for(&url, Some(self.search_timeout))
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
 
         let page = query.page.max(1);
         let page_size = if query.page_size == 0 {
@@ -222,12 +237,22 @@ impl WorkshopProvider for CatalogBackendProvider {
             }
         }
 
-        let (req, _) = self.mirror.prepare_get(&client, &url);
-        let resp = req
-            .query(&params)
-            .send_audited("catalog.search")
+        let resp = self
+            .mirror
+            .send_with_redirects(
+                Method::GET,
+                &url,
+                RedirectRequestOptions {
+                    timeout: Some(self.search_timeout),
+                    ..Default::default()
+                },
+                |req, hop, _| if hop == 0 { req.query(&params) } else { req },
+                |_| Ok::<(), WorkshopError>(()),
+                |req, hop| http::send_redirect_hop(req, "catalog.search", hop),
+            )
             .await
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+            .map_err(|e| WorkshopError::Network(e.to_string()))?
+            .response;
 
         let status = resp.status();
         if !status.is_success() {

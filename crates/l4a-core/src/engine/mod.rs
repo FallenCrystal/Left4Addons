@@ -7,6 +7,12 @@ mod workshop;
 
 #[cfg(test)]
 mod download_tests;
+#[cfg(test)]
+mod path_tests;
+#[cfg(test)]
+mod preview_ssrf_tests;
+#[cfg(test)]
+mod routing_tests;
 
 use crate::config::{load_config, save_config, AppPaths};
 use crate::db::LocalDb;
@@ -47,23 +53,12 @@ impl EventSink for NullEventSink {
 
 type RescanCallback = Arc<dyn Fn() + Send + Sync>;
 
-fn build_reusable_http_clients() -> (reqwest::Client, reqwest::Client, reqwest::Client) {
-    let loopback = reqwest::Client::builder()
+fn build_loopback_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let https_only = reqwest::Client::builder()
-        .https_only(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let standard = reqwest::Client::builder()
-        .https_only(false)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    (loopback, https_only, standard)
+        .unwrap_or_else(|_| reqwest::Client::new())
 }
 
 /// 客户端核心门面：协调本地 SQLite 状态、VPK 扫描与 Dummy v2 对账、生命周期同步、
@@ -94,8 +89,6 @@ pub struct L4aEngine {
     pub(crate) catalog_scoring_probe: tokio::sync::Mutex<()>,
     allow_loopback_image_urls_for_testing: AtomicBool,
     loopback_http_client: reqwest::Client,
-    https_only_http_client: reqwest::Client,
-    standard_http_client: reqwest::Client,
 }
 
 impl L4aEngine {
@@ -145,8 +138,7 @@ impl L4aEngine {
         local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = TokenVault::default_for_paths(&paths);
         let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
-        let (loopback_http_client, https_only_http_client, standard_http_client) =
-            build_reusable_http_clients();
+        let loopback_http_client = build_loopback_http_client();
 
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
@@ -173,8 +165,6 @@ impl L4aEngine {
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
-            https_only_http_client,
-            standard_http_client,
         })
     }
 
@@ -195,8 +185,7 @@ impl L4aEngine {
         local_filter.set_desired_params(&config.filter.local_params);
         let token_vault = TokenVault::default_for_paths(&paths);
         let filter_cache = FilterCacheState::new(&db, &config.filter, &token_vault)?;
-        let (loopback_http_client, https_only_http_client, standard_http_client) =
-            build_reusable_http_clients();
+        let loopback_http_client = build_loopback_http_client();
         Ok(Self {
             downloader: ResilientDownloader::new(&paths.download_cache_dir, mirror.clone()),
             download_gate: DownloadGate::new(config.download_concurrency),
@@ -222,8 +211,6 @@ impl L4aEngine {
             catalog_scoring_probe: tokio::sync::Mutex::new(()),
             allow_loopback_image_urls_for_testing: AtomicBool::new(false),
             loopback_http_client,
-            https_only_http_client,
-            standard_http_client,
         })
     }
 
@@ -257,26 +244,17 @@ impl L4aEngine {
         if crate::filter::llm::is_loopback_url(url) {
             return Ok(self.loopback_http_client.get(url).timeout(timeout));
         }
-        let resolved = self
-            .mirror
-            .validate_url(url)
-            .map_err(|e| CoreError::Network(e.to_string()))?;
         let https_only = self.config.read().unwrap().https_only;
-        if resolved.insecure_tls && !https_only {
-            let (client, _) = self
-                .mirror
-                .build_client_for(url, Some(timeout))
-                .map_err(|e| CoreError::Network(e.to_string()))?;
-            let (req, _) = self.mirror.prepare_get(&client, url);
-            return Ok(req.timeout(timeout));
-        }
-        let client = if https_only {
-            &self.https_only_http_client
-        } else {
-            &self.standard_http_client
-        };
-        let (req, _) = self.mirror.prepare_get(client, url);
-        Ok(req.timeout(timeout))
+        let (req, _) = self
+            .mirror
+            .request_with_insecure_mirror_redirects(
+                reqwest::Method::GET,
+                url,
+                Some(timeout),
+                https_only,
+            )
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        Ok(req)
     }
 
     pub(crate) fn prepare_routed_post(
@@ -287,26 +265,17 @@ impl L4aEngine {
         if crate::filter::llm::is_loopback_url(url) {
             return Ok(self.loopback_http_client.post(url).timeout(timeout));
         }
-        let resolved = self
-            .mirror
-            .validate_url(url)
-            .map_err(|e| CoreError::Network(e.to_string()))?;
         let https_only = self.config.read().unwrap().https_only;
-        if resolved.insecure_tls && !https_only {
-            let (client, _) = self
-                .mirror
-                .build_client_for(url, Some(timeout))
-                .map_err(|e| CoreError::Network(e.to_string()))?;
-            let (req, _) = self.mirror.prepare_post(&client, url);
-            return Ok(req.timeout(timeout));
-        }
-        let client = if https_only {
-            &self.https_only_http_client
-        } else {
-            &self.standard_http_client
-        };
-        let (req, _) = self.mirror.prepare_post(client, url);
-        Ok(req.timeout(timeout))
+        let (req, _) = self
+            .mirror
+            .request_with_insecure_mirror_redirects(
+                reqwest::Method::POST,
+                url,
+                Some(timeout),
+                https_only,
+            )
+            .map_err(|e| CoreError::Network(e.to_string()))?;
+        Ok(req)
     }
 
     pub(crate) fn cached_catalog_scoring_revision(
@@ -618,84 +587,5 @@ impl L4aEngine {
         if let Ok(guard) = self.watcher.lock() {
             guard.suppress_internal();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn resolves_existing_paths_only_inside_managed_directories() {
-        let dir = tempdir().unwrap();
-        let loading = dir.path().join("addons");
-        let workshop = dir.path().join("workshop");
-        let outside = dir.path().join("addons-other");
-        for path in [&loading, &workshop, &outside] {
-            fs::create_dir(path).unwrap();
-        }
-        let loading_file = loading.join("local.vpk");
-        let workshop_file = workshop.join("123456.vpk");
-        let outside_file = outside.join("outside.vpk");
-        for path in [&loading_file, &workshop_file, &outside_file] {
-            fs::write(path, b"test").unwrap();
-        }
-        let paths = AppPaths::from_runtime_dir(dir.path().join("runtime"));
-        paths.ensure_dirs().unwrap();
-        save_config(
-            &paths.settings_path,
-            &AppConfig {
-                loading_dir: loading.to_str().unwrap().into(),
-                workshop_dir: workshop.to_str().unwrap().into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let engine = L4aEngine::open_default(&paths.runtime_dir, Arc::new(NullEventSink)).unwrap();
-        for path in [&loading, &workshop, &loading_file, &workshop_file] {
-            assert_eq!(
-                engine.resolve_managed_path(path.to_str().unwrap()).unwrap(),
-                path.canonicalize().unwrap()
-            );
-        }
-        for bad in ["", " \t", "nul\0path"] {
-            assert!(matches!(
-                engine.resolve_managed_path(bad),
-                Err(CoreError::InvalidInput(_))
-            ));
-        }
-        assert!(matches!(
-            engine.resolve_managed_path(loading.join("missing.vpk").to_str().unwrap()),
-            Err(CoreError::NotFound(_))
-        ));
-        for path in [
-            outside_file.clone(),
-            loading.join("../addons-other/outside.vpk"),
-        ] {
-            assert!(matches!(
-                engine.resolve_managed_path(path.to_str().unwrap()),
-                Err(CoreError::InvalidInput(_))
-            ));
-        }
-        #[cfg(unix)]
-        {
-            let link = loading.join("outside-link.vpk");
-            std::os::unix::fs::symlink(&outside_file, &link).unwrap();
-            assert!(matches!(
-                engine.resolve_managed_path(link.to_str().unwrap()),
-                Err(CoreError::InvalidInput(_))
-            ));
-        }
-
-        fs::remove_dir_all(workshop).unwrap();
-        assert!(engine
-            .resolve_managed_path(loading.to_str().unwrap())
-            .is_ok());
-        fs::remove_dir_all(loading).unwrap();
-        assert!(matches!(
-            engine.resolve_managed_path(outside_file.to_str().unwrap()),
-            Err(CoreError::NotFound(_))
-        ));
     }
 }

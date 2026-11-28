@@ -2558,12 +2558,20 @@ dependencies = [
 name = "l4a-mirror"
 version = "2.0.0-alpha.1"
 dependencies = [
+ "futures-util",
+ "h2",
+ "http",
  "regex",
  "reqwest 0.12.28",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls",
  "tracing",
  "url",
 ]
@@ -2696,6 +2704,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -4005,6 +4014,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "h2",
  "http",
  "http-body",
  "http-body-util",

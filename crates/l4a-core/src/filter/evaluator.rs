@@ -1474,21 +1474,43 @@ fn validate_remote_filter_image_url(
         return Ok(ValidatedRemoteImage::LoopbackTest(normalized));
     }
 
-    // Allow non-Steam URLs only if explicitly rewritten by a configured MirrorRouter rule
-    let resolved = engine.mirror_router().resolve(&normalized);
-    let rewritten_by_mirror = resolved.url != normalized
-        || resolved.original_host.is_some()
-        || !resolved.headers.is_empty();
-    if rewritten_by_mirror {
+    // An effective mirror rule changes the authority or supplies request headers.
+    let https_only = engine.config().https_only;
+    let resolved = engine
+        .mirror_router()
+        .resolve_with_https_only(&normalized, https_only);
+    if resolved.matched_rule {
         engine
             .mirror_router()
-            .validate_url(&normalized)
+            .validate_url_with_https_only(&normalized, https_only)
             .map_err(|e| CoreError::InvalidInput(e.to_string()))?;
         return Ok(ValidatedRemoteImage::Mirrored(normalized));
     }
 
     Err(CoreError::InvalidInput(
         "远程预览图地址不在受信任的 Steam 创意工坊 CDN 白名单内".into(),
+    ))
+}
+
+pub(crate) fn validate_filter_image_redirect_hop(
+    hop: &l4a_mirror::RedirectHop<'_>,
+) -> Result<(), CoreError> {
+    if !hop.url.username().is_empty() || hop.url.password().is_some() {
+        return Err(CoreError::InvalidInput(
+            "预览图重定向地址不得包含内联凭据".into(),
+        ));
+    }
+    // Same-origin hops inherit the effective mirror rule from their route.
+    if hop.matched_mirror_rule {
+        return Ok(());
+    }
+    // Unmirrored hops (same-origin or cross-origin) must stay strictly inside the trusted
+    // public Steam CDN allowlist and use HTTPS (blocking private/loopback SSRF and HTTP downgrades).
+    if is_allowed_steam_cdn_image_url(hop.url) && hop.resolved.url.starts_with("https://") {
+        return Ok(());
+    }
+    Err(CoreError::InvalidInput(
+        "预览图重定向地址不在受信任的 Steam 创意工坊 CDN 白名单内".into(),
     ))
 }
 
@@ -1499,13 +1521,16 @@ async fn fetch_validated_remote_image(
     let (mime, bytes) = match remote {
         ValidatedRemoteImage::LoopbackTest(url) => fetch_loopback_image(engine, url).await?,
         ValidatedRemoteImage::SteamCdn(url) | ValidatedRemoteImage::Mirrored(url) => {
-            engine.fetch_workshop_cover(url).await?
+            engine.fetch_filter_preview(url).await?
         }
     };
     finish_filter_image(mime, bytes).await
 }
 
-async fn load_single_image(engine: &L4aEngine, src: &str) -> Result<LoadedImage, CoreError> {
+pub(crate) async fn load_single_image(
+    engine: &L4aEngine,
+    src: &str,
+) -> Result<LoadedImage, CoreError> {
     if is_valid_local_cover_key(src) {
         let bytes = engine.read_cached_image(src)?;
         let mime = detect_image_mime(&bytes, Some(src))?;
@@ -2336,6 +2361,54 @@ mod tests {
                 "expected {rejected} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn preview_validation_requires_an_effective_mirror_rule() {
+        use l4a_mirror::{MirrorRouter, RedirectHop};
+        use l4a_steam::MockSteamBridge;
+        use l4a_workshop::{SourceRoutingPolicy, WorkshopResolver};
+        use std::sync::Arc;
+
+        let mirror = Arc::new(MirrorRouter::from_rules(vec![serde_json::from_value(
+            serde_json::json!({
+                "rules": "assets.example.test",
+                "target": "assets.example.test",
+            }),
+        )
+        .unwrap()]));
+        let dir = tempfile::tempdir().unwrap();
+        let engine = L4aEngine::with_dependencies(
+            crate::AppPaths::from_runtime_dir(dir.path()),
+            Arc::new(crate::db::LocalDb::open_in_memory().unwrap()),
+            AppConfig::default(),
+            Arc::clone(&mirror),
+            Arc::new(MockSteamBridge::new(false)),
+            Arc::new(WorkshopResolver::new(
+                vec![],
+                SourceRoutingPolicy::default(),
+            )),
+            Arc::new(crate::NullEventSink),
+        )
+        .unwrap();
+
+        let url = url::Url::parse("https://assets.example.test/cover.jpg").unwrap();
+        assert!(matches!(
+            validate_remote_filter_image_url(&engine, url.as_str()),
+            Err(CoreError::InvalidInput(_))
+        ));
+        let resolved = mirror.resolve(url.as_str());
+        let hop = RedirectHop {
+            hop: 1,
+            url: &url,
+            same_origin: false,
+            matched_mirror_rule: resolved.matched_rule,
+            resolved: &resolved,
+        };
+        assert!(matches!(
+            validate_filter_image_redirect_hop(&hop),
+            Err(CoreError::InvalidInput(_))
+        ));
     }
 
     #[test]

@@ -1,13 +1,18 @@
+mod resume;
+
 use crate::error::WorkshopError;
 use futures_util::StreamExt;
-use l4a_logging::http::AuditedSend;
-use l4a_mirror::MirrorRouter;
+use l4a_logging::http;
+use l4a_mirror::{MirrorRouter, RedirectRequestOptions, RedirectedResponse};
 use l4a_protocol::WorkshopId;
-use reqwest::header::{CONTENT_RANGE, ETAG, LAST_MODIFIED, RANGE};
-use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use reqwest::header::RANGE;
+use reqwest::{Method, Response, StatusCode};
+use resume::{
+    calc_percent, is_retryable, load_resume_state, resource_fingerprints, response_lengths,
+    response_strong_etag, ResumeMetadata,
+};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,15 +47,15 @@ pub struct DownloadResult {
     pub resumed_from: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ResumeMetadata {
-    workshop_id: WorkshopId,
-    resolved_url: String,
-    dest_file_name: String,
+struct OpenedDownloadStream {
+    response: Response,
+    initial_resolved_url: String,
+    fingerprint: String,
+    signed_fingerprint: Option<String>,
     total_size: Option<u64>,
+    range_end: Option<u64>,
     etag: Option<String>,
-    last_modified: Option<String>,
+    resume_from: u64,
 }
 
 pub struct ResilientDownloader {
@@ -188,146 +193,154 @@ impl ResilientDownloader {
             .unwrap_or("addon.vpk")
             .to_string();
 
-        let (client, resolved) = self
-            .mirror
-            .build_streaming_client_for(&req.url, self.connect_timeout, self.read_timeout)
-            .map_err(|e| WorkshopError::Network(e.to_string()))?;
-
-        let mut resume_from = 0u64;
-        let mut stored_meta: Option<ResumeMetadata> = None;
-        if partial_path.exists() && meta_path.exists() {
-            if let Ok(raw) = fs::read_to_string(&meta_path) {
-                if let Ok(meta) = serde_json::from_str::<ResumeMetadata>(&raw) {
-                    if meta.workshop_id == req.workshop_id
-                        && meta.resolved_url == resolved.url
-                        && meta.dest_file_name == dest_name
-                    {
-                        resume_from = fs::metadata(&partial_path).map(|m| m.len()).unwrap_or(0);
-                        stored_meta = Some(meta);
-                    } else {
-                        self.cleanup_partial(req.workshop_id);
-                    }
-                }
-            }
-        }
-
-        let response = if resume_from > 0 {
-            let (builder, _) = self.mirror.prepare_get(&client, &req.url);
-            let resp = builder
-                .header(RANGE, format!("bytes={resume_from}-"))
-                .send_audited("workshop.download.resume")
-                .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?;
-            match resp.status() {
-                StatusCode::PARTIAL_CONTENT => resp,
-                StatusCode::OK => {
-                    self.cleanup_partial(req.workshop_id);
-                    resume_from = 0;
-                    stored_meta = None;
-                    resp
-                }
-                StatusCode::RANGE_NOT_SATISFIABLE => {
-                    self.cleanup_partial(req.workshop_id);
-                    resume_from = 0;
-                    stored_meta = None;
-                    let (fresh_builder, _) = self.mirror.prepare_get(&client, &req.url);
-                    fresh_builder
-                        .send_audited("workshop.download.restart")
-                        .await
-                        .map_err(|e| WorkshopError::Network(e.to_string()))?
-                }
-                _ => resp,
-            }
-        } else {
-            let (builder, _) = self.mirror.prepare_get(&client, &req.url);
-            builder
-                .send_audited("workshop.download")
-                .await
-                .map_err(|e| WorkshopError::Network(e.to_string()))?
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(WorkshopError::HttpStatus {
-                status: status.as_u16(),
-                body,
-            });
-        }
-
-        let etag = header_str(response.headers(), ETAG);
-        let last_modified = header_str(response.headers(), LAST_MODIFIED);
-
-        let total_size = if status == StatusCode::PARTIAL_CONTENT {
-            let range_header = response
-                .headers()
-                .get(CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    WorkshopError::IntegrityMismatch("206 响应缺少 Content-Range 头".into())
-                })?;
-            let (start, total) = parse_content_range(range_header).ok_or_else(|| {
-                WorkshopError::IntegrityMismatch(format!("无效 Content-Range: {range_header}"))
-            })?;
-            if start != resume_from {
-                self.cleanup_partial(req.workshop_id);
-                return Err(WorkshopError::IntegrityMismatch(format!(
-                    "续传偏移不一致: 期望 {resume_from}, 实际 {start}"
-                )));
-            }
-            if let Some(ref prev) = stored_meta {
-                if let (Some(a), Some(b)) = (prev.etag.as_deref(), etag.as_deref()) {
-                    if a != b {
-                        self.cleanup_partial(req.workshop_id);
-                        return Err(WorkshopError::IntegrityMismatch("远端 ETag 已变化".into()));
-                    }
-                }
-                if let (Some(a), Some(b)) =
-                    (prev.last_modified.as_deref(), last_modified.as_deref())
-                {
-                    if a != b {
-                        self.cleanup_partial(req.workshop_id);
-                        return Err(WorkshopError::IntegrityMismatch(
-                            "远端 Last-Modified 已变化".into(),
-                        ));
-                    }
-                }
-                if let (Some(prev_total), Some(cur_total)) = (prev.total_size, total) {
-                    if prev_total != cur_total {
-                        self.cleanup_partial(req.workshop_id);
-                        return Err(WorkshopError::IntegrityMismatch(
-                            "远端总文件大小已变化".into(),
-                        ));
-                    }
-                }
-            }
-            total
-        } else {
-            response.content_length()
-        };
+        let opened = self
+            .open_download_stream(req, &partial_path, &meta_path, &dest_name)
+            .await?;
 
         let meta = ResumeMetadata {
             workshop_id: req.workshop_id,
-            resolved_url: resolved.url,
+            resolved_url: opened.initial_resolved_url,
+            resource_fingerprint: Some(opened.fingerprint),
+            signed_resource_fingerprint: opened.signed_fingerprint,
             dest_file_name: dest_name,
-            total_size,
-            etag,
-            last_modified,
+            total_size: opened.total_size,
+            etag: opened.etag,
         };
-        fs::write(
-            &meta_path,
-            serde_json::to_vec_pretty(&meta).unwrap_or_default(),
-        )?;
+        let mut file = prepare_partial_file(&partial_path, &meta_path, opened.resume_from, &meta)?;
 
-        let mut file = if resume_from > 0 {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&partial_path)?
+        let (downloaded, current_speed_bps) = self
+            .stream_partial_body(
+                req.workshop_id,
+                opened.response,
+                &mut file,
+                opened.resume_from,
+                opened.total_size,
+                opened.range_end,
+                cancel,
+                on_progress,
+            )
+            .await?;
+
+        file.flush()?;
+        drop(file);
+
+        if let Some(expected) = opened.total_size {
+            if downloaded != expected {
+                return Err(WorkshopError::Network(format!(
+                    "响应体流提前结束或被截断: 预期 {expected} 字节, 实际 {downloaded} 字节"
+                )));
+            }
+        }
+
+        promote_partial_file(&partial_path, &meta_path, &req.dest_path)?;
+
+        if let Some(sink) = on_progress {
+            sink(DownloadProgress {
+                workshop_id: req.workshop_id,
+                downloaded,
+                total: opened.total_size.or(Some(downloaded)),
+                percent: 100,
+                speed_bps: Some(current_speed_bps),
+            });
+        }
+
+        Ok(DownloadResult {
+            dest_path: req.dest_path.clone(),
+            bytes_written: downloaded,
+            resumed_from: opened.resume_from,
+        })
+    }
+
+    async fn open_download_stream(
+        &self,
+        req: &DownloadRequest,
+        partial_path: &Path,
+        meta_path: &Path,
+        dest_name: &str,
+    ) -> Result<OpenedDownloadStream, WorkshopError> {
+        let resolved = self
+            .mirror
+            .validate_url(&req.url)
+            .map_err(|e| WorkshopError::Network(e.to_string()))?;
+
+        let mut resume = load_resume_state(
+            meta_path,
+            partial_path,
+            req.workshop_id,
+            dest_name,
+            &resolved.url,
+        );
+        let mut purpose = if resume.is_some() {
+            "workshop.download.resume"
         } else {
-            fs::File::create(&partial_path)?
+            "workshop.download"
         };
 
+        loop {
+            let offset = resume.as_ref().map(|(offset, _)| *offset);
+            let redirected = self.send_request(&req.url, offset, purpose).await?;
+            let response = &redirected.response;
+            let status = response.status();
+            if status == StatusCode::RANGE_NOT_SATISFIABLE && resume.is_some() {
+                resume = None;
+                purpose = "workshop.download.restart";
+                continue;
+            }
+            if !matches!(status, StatusCode::OK | StatusCode::PARTIAL_CONTENT) {
+                let body = redirected.response.text().await.unwrap_or_default();
+                return Err(WorkshopError::HttpStatus {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+            if status == StatusCode::OK {
+                resume = None;
+            }
+            let fingerprints = resource_fingerprints(&redirected.final_resolved);
+            let previous_total = resume
+                .as_ref()
+                .and_then(|(_, previous)| previous.total_size);
+            let lengths = response_lengths(response, offset.unwrap_or(0), previous_total);
+            let etag = response_strong_etag(response);
+            if let Some((_, previous)) = &resume {
+                if !previous.matches_resource(&fingerprints.0, fingerprints.1.as_deref())
+                    || previous.strong_etag() != etag
+                    || lengths.is_err()
+                {
+                    // Preserve the partial until a usable replacement response arrives.
+                    resume = None;
+                    purpose = "workshop.download.restart";
+                    continue;
+                }
+            }
+            let etag = etag.map(str::to_owned);
+            let (total_size, range_end) = lengths?;
+            let resume_from = resume.map_or(0, |(offset, _)| offset);
+            return Ok(OpenedDownloadStream {
+                response: redirected.response,
+                initial_resolved_url: redirected.initial_resolved.url,
+                fingerprint: fingerprints.0,
+                signed_fingerprint: fingerprints.1,
+                total_size,
+                range_end,
+                etag,
+                resume_from,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_partial_body(
+        &self,
+        workshop_id: WorkshopId,
+        response: Response,
+        file: &mut fs::File,
+        resume_from: u64,
+        total_size: Option<u64>,
+        range_end: Option<u64>,
+        cancel: CancellationToken,
+        on_progress: Option<&ProgressSink>,
+    ) -> Result<(u64, u64), WorkshopError> {
         let mut downloaded = resume_from;
         let mut stream = response.bytes_stream();
         let start = tokio::time::Instant::now();
@@ -343,7 +356,7 @@ impl ResilientDownloader {
 
         if let Some(sink) = on_progress {
             sink(DownloadProgress {
-                workshop_id: req.workshop_id,
+                workshop_id,
                 downloaded,
                 total: total_size,
                 percent: calc_percent(downloaded, total_size),
@@ -355,7 +368,6 @@ impl ResilientDownloader {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    drop(file);
                     return Err(WorkshopError::Cancelled);
                 }
                 _ = speed_tick.tick() => {
@@ -372,7 +384,7 @@ impl ResilientDownloader {
                     last_emit_at = now;
                     if let Some(sink) = on_progress {
                         sink(DownloadProgress {
-                            workshop_id: req.workshop_id,
+                            workshop_id,
                             downloaded,
                             total: total_size,
                             percent: calc_percent(downloaded, total_size),
@@ -383,6 +395,12 @@ impl ResilientDownloader {
                 chunk = stream.next() => {
                     match chunk {
                         Some(Ok(bytes)) => {
+                            if range_end.is_some_and(|end| bytes.len() as u64 > end - downloaded) {
+                                file.set_len(resume_from)?;
+                                return Err(WorkshopError::IntegrityMismatch(
+                                    "206 响应体超出 Content-Range 声明的范围".into(),
+                                ));
+                            }
                             file.write_all(&bytes)?;
                             downloaded += bytes.len() as u64;
                             let now = tokio::time::Instant::now();
@@ -390,7 +408,7 @@ impl ResilientDownloader {
                                 last_emit_at = now;
                                 if let Some(sink) = on_progress {
                                     sink(DownloadProgress {
-                                        workshop_id: req.workshop_id,
+                                        workshop_id,
                                         downloaded,
                                         total: total_size,
                                         percent: calc_percent(downloaded, total_size),
@@ -408,46 +426,34 @@ impl ResilientDownloader {
             }
         }
 
-        file.flush()?;
-        drop(file);
+        Ok((downloaded, current_speed_bps))
+    }
 
-        if let Some(expected) = total_size {
-            if downloaded != expected {
-                return Err(WorkshopError::Network(format!(
-                    "响应体流提前结束或被截断: 预期 {expected} 字节, 实际 {downloaded} 字节"
-                )));
-            }
-        }
-
-        if fs::rename(&partial_path, &req.dest_path).is_err() {
-            let mut tmp_os = req.dest_path.as_os_str().to_os_string();
-            tmp_os.push(".l4a_tmp");
-            let tmp_path = PathBuf::from(tmp_os);
-            if let Err(err) = fs::copy(&partial_path, &tmp_path)
-                .and_then(|_| fs::rename(&tmp_path, &req.dest_path))
-            {
-                let _ = fs::remove_file(&tmp_path);
-                return Err(WorkshopError::Io(err));
-            }
-            let _ = fs::remove_file(&partial_path);
-        }
-        let _ = fs::remove_file(&meta_path);
-
-        if let Some(sink) = on_progress {
-            sink(DownloadProgress {
-                workshop_id: req.workshop_id,
-                downloaded,
-                total: total_size.or(Some(downloaded)),
-                percent: 100,
-                speed_bps: Some(current_speed_bps),
-            });
-        }
-
-        Ok(DownloadResult {
-            dest_path: req.dest_path.clone(),
-            bytes_written: downloaded,
-            resumed_from: resume_from,
-        })
+    async fn send_request(
+        &self,
+        url: &str,
+        offset: Option<u64>,
+        purpose: &'static str,
+    ) -> Result<RedirectedResponse, WorkshopError> {
+        let range = offset.map(|offset| format!("bytes={offset}-"));
+        self.mirror
+            .send_with_redirects(
+                Method::GET,
+                url,
+                RedirectRequestOptions {
+                    connect_timeout: Some(self.connect_timeout),
+                    read_timeout: Some(self.read_timeout),
+                    ..Default::default()
+                },
+                |builder, _, _| match &range {
+                    Some(range) => builder.header(RANGE, range),
+                    None => builder,
+                },
+                |_| Ok::<(), WorkshopError>(()),
+                |builder, hop| http::send_redirect_hop(builder, purpose, hop),
+            )
+            .await
+            .map_err(|e| WorkshopError::Network(e.to_string()))
     }
 
     fn partial_path(&self, id: WorkshopId) -> PathBuf {
@@ -464,42 +470,47 @@ impl ResilientDownloader {
     }
 }
 
-fn calc_percent(downloaded: u64, total_size: Option<u64>) -> u8 {
-    total_size
-        .filter(|t| *t > 0)
-        .map(|t| (((downloaded as f64 / t as f64) * 100.0) as u8).min(99))
-        .unwrap_or(0)
-}
-
-fn header_str(
-    headers: &reqwest::header::HeaderMap,
-    name: reqwest::header::HeaderName,
-) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string)
-}
-
-fn parse_content_range(header: &str) -> Option<(u64, Option<u64>)> {
-    let rest = header.trim().strip_prefix("bytes ")?;
-    let (range_part, total_part) = rest.split_once('/')?;
-    let (start_str, _end_str) = range_part.split_once('-')?;
-    let start = start_str.trim().parse::<u64>().ok()?;
-    let total = if total_part.trim() == "*" {
-        None
+fn prepare_partial_file(
+    partial_path: &Path,
+    meta_path: &Path,
+    resume_from: u64,
+    meta: &ResumeMetadata,
+) -> Result<fs::File, WorkshopError> {
+    let file = if resume_from > 0 {
+        let mut file = OpenOptions::new().write(true).open(partial_path)?;
+        if file.seek(SeekFrom::End(0))? != resume_from {
+            return Err(WorkshopError::IntegrityMismatch(
+                "本地断点文件长度已变化".into(),
+            ));
+        }
+        file
     } else {
-        total_part.trim().parse::<u64>().ok()
+        fs::File::create(partial_path)?
     };
-    Some((start, total))
+    fs::write(
+        meta_path,
+        serde_json::to_vec_pretty(meta).unwrap_or_default(),
+    )?;
+    Ok(file)
 }
 
-fn is_retryable(err: &WorkshopError) -> bool {
-    match err {
-        WorkshopError::Network(_) | WorkshopError::IntegrityMismatch(_) => true,
-        WorkshopError::HttpStatus { status, .. } => *status >= 500 || *status == 429,
-        _ => false,
+fn promote_partial_file(
+    partial_path: &Path,
+    meta_path: &Path,
+    dest_path: &Path,
+) -> Result<(), WorkshopError> {
+    if fs::rename(partial_path, dest_path).is_err() {
+        let mut tmp_os = dest_path.as_os_str().to_os_string();
+        tmp_os.push(".l4a_tmp");
+        let tmp_path = PathBuf::from(tmp_os);
+        if let Err(err) =
+            fs::copy(partial_path, &tmp_path).and_then(|_| fs::rename(&tmp_path, dest_path))
+        {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(WorkshopError::Io(err));
+        }
+        let _ = fs::remove_file(partial_path);
     }
+    let _ = fs::remove_file(meta_path);
+    Ok(())
 }

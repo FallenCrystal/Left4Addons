@@ -2535,6 +2535,7 @@ fn scan_refreshes_legacy_sidecar_cover_without_changing_the_vpk() {
 
 #[tokio::test]
 async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
+    use axum::http::HeaderValue;
     use std::sync::atomic::AtomicBool;
     use std::time::SystemTime;
 
@@ -2667,9 +2668,11 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
     ];
     let version_two = Arc::new(AtomicBool::new(false));
     let fail_upstream = Arc::new(AtomicBool::new(false));
+    let redirect_location = Arc::new(Mutex::new(None));
     let hits = Arc::new(AtomicUsize::new(0));
     let v2_route = version_two.clone();
     let fail_route = fail_upstream.clone();
+    let redirect_route = redirect_location.clone();
     let hits_route = hits.clone();
     let jpg_body = minimal_jpeg.clone();
     let png_body = minimal_png.clone();
@@ -2678,28 +2681,36 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
         get(move || {
             let v2 = v2_route.load(Ordering::SeqCst);
             let fail = fail_route.load(Ordering::SeqCst);
+            let redirect = redirect_route.lock().unwrap().clone();
             let hits_route = hits_route.clone();
             let jpg = jpg_body.clone();
             let png = png_body.clone();
             async move {
                 hits_route.fetch_add(1, Ordering::SeqCst);
+                if let Some(location) = redirect {
+                    return (
+                        axum::http::StatusCode::FOUND,
+                        [("location", location)],
+                        Vec::new(),
+                    );
+                }
                 if fail {
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        [("content-type", "text/plain")],
+                        [("content-type", HeaderValue::from_static("text/plain"))],
                         b"upstream down".to_vec(),
                     );
                 }
                 if v2 {
                     (
                         axum::http::StatusCode::OK,
-                        [("content-type", "image/png")],
+                        [("content-type", HeaderValue::from_static("image/png"))],
                         png,
                     )
                 } else {
                     (
                         axum::http::StatusCode::OK,
-                        [("content-type", "image/jpeg")],
+                        [("content-type", HeaderValue::from_static("image/jpeg"))],
                         jpg,
                     )
                 }
@@ -2747,4 +2758,18 @@ async fn hydration_sidecar_cover_utf8_category_and_ttl_regressions() {
     assert_eq!(mime3, "image/png");
     assert_eq!(bytes3, minimal_png);
     assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+    *redirect_location.lock().unwrap() = Some(HeaderValue::from_static("/rotating.img"));
+    let (mime, bytes) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime, "image/png");
+    assert_eq!(bytes, minimal_png);
+    assert!(hits.load(Ordering::SeqCst) > 4);
+
+    let previous_hits = hits.load(Ordering::SeqCst);
+    *redirect_location.lock().unwrap() =
+        Some(HeaderValue::from_bytes(b"/rotating-\xe9.img").unwrap());
+    let (mime, bytes) = engine.fetch_workshop_cover(&rotating_url).await.unwrap();
+    assert_eq!(mime, "image/png");
+    assert_eq!(bytes, minimal_png);
+    assert_eq!(hits.load(Ordering::SeqCst), previous_hits + 1);
 }
